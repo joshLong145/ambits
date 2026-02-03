@@ -1,4 +1,4 @@
-# claude-symbol-viewer
+# marker
 
 Tool for visualizing parts of your codebase an Claude has stored within a session log.
 
@@ -12,7 +12,9 @@ Tool for visualizing parts of your codebase an Claude has stored within a sessio
 - Detects when source files change and marks previously-read symbols as stale
 - supports parsing [Serena MCP](https://github.com/oraios/serena) symbol artifacts.
 
-
+## Todo
+- multi agent heirchies
+- 
 ## Supported languages
 
 **Tree-sitter parsing:**
@@ -30,7 +32,7 @@ cargo build --release
 ## Usage
 
 ```
-tokenvue --project <path>
+marker --project <path>
 ```
 
 ### Flags
@@ -47,13 +49,13 @@ tokenvue --project <path>
 
 ```
 # Launch TUI for current project
-tokenvue -p .
+marker -p .
 
 # Dump symbol tree without TUI
-tokenvue -p . --dump
+marker -p . --dump
 
 # Use Serena's symbol cache (more languages, finer detail)
-tokenvue -p . --serena
+marker -p . --serena
 ```
 
 ### Keybindings
