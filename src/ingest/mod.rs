@@ -1,3 +1,4 @@
+use std::ops::Range;
 pub mod claude;
 
 use std::path::PathBuf;
@@ -13,6 +14,10 @@ pub struct AgentToolCall {
     pub read_depth: ReadDepth,
     pub description: String,
     pub timestamp_str: String,
+    /// Optional symbol name path to target (e.g. "MyClass/my_method").
+    pub target_symbol: Option<String>,
+    /// Optional line range to target (1-based, e.g. 10..25).
+    pub target_lines: Option<Range<usize>>,
 }
 
 /// Trait for agent event sources.

@@ -238,9 +238,18 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str) -> Vec<AgentToolCall
 
         let input = block.get("input").cloned().unwrap_or(Value::Null);
 
-        if let Some(event) = map_tool_call(tool_name, &input, &agent_id, &timestamp_str) {
-            events.push(event);
-        }
+        let event = map_tool_call(tool_name, &input, &agent_id, &timestamp_str)
+            .unwrap_or_else(|| AgentToolCall {
+                agent_id: agent_id.clone(),
+                tool_name: tool_name.to_string(),
+                file_path: None,
+                read_depth: ReadDepth::Unseen,
+                description: format!("{tool_name} (untracked)"),
+                timestamp_str: timestamp_str.clone(),
+                target_symbol: None,
+                target_lines: None,
+            });
+        events.push(event);
     }
 
     events
@@ -253,14 +262,26 @@ fn map_tool_call(
     agent_id: &str,
     timestamp_str: &str,
 ) -> Option<AgentToolCall> {
-    let (file_path, depth, desc) = match tool_name {
+    let (file_path, depth, desc, target_symbol, target_lines) = match tool_name {
         // Full file reads.
         "mcp__acp__Read" | "Read" => {
             let path = input.get("file_path").and_then(|v| v.as_str())?;
+            // If offset and limit are present, compute a target line range.
+            let target_lines = match (
+                input.get("offset").and_then(|v| v.as_u64()),
+                input.get("limit").and_then(|v| v.as_u64()),
+            ) {
+                (Some(offset), Some(limit)) => {
+                    Some(offset as usize..(offset as usize + limit as usize))
+                }
+                _ => None,
+            };
             (
                 Some(PathBuf::from(path)),
                 ReadDepth::FullBody,
                 format!("Read {}", short_path(path)),
+                None,
+                target_lines,
             )
         }
 
@@ -271,6 +292,8 @@ fn map_tool_call(
                 Some(PathBuf::from(path)),
                 ReadDepth::FullBody,
                 format!("Edit {}", short_path(path)),
+                None,
+                None,
             )
         }
 
@@ -281,6 +304,8 @@ fn map_tool_call(
                 Some(PathBuf::from(path)),
                 ReadDepth::FullBody,
                 format!("Write {}", short_path(path)),
+                None,
+                None,
             )
         }
 
@@ -291,7 +316,11 @@ fn map_tool_call(
                 .or_else(|| input.get("file_mask"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("*");
-            (None, ReadDepth::NameOnly, format!("Glob {pattern}"))
+            let path = input
+                .get("path")
+                .or_else(|| input.get("relative_path"))
+                .and_then(|v| v.as_str());
+            (path.map(PathBuf::from), ReadDepth::NameOnly, format!("Glob {pattern}"), None, None)
         }
 
         // Grep/search: overview-level.
@@ -301,7 +330,11 @@ fn map_tool_call(
                 .or_else(|| input.get("substring_pattern"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
-            (None, ReadDepth::Overview, format!("Search \"{pattern}\""))
+            let path = input
+                .get("path")
+                .or_else(|| input.get("relative_path"))
+                .and_then(|v| v.as_str());
+            (path.map(PathBuf::from), ReadDepth::Overview, format!("Search \"{pattern}\""), None, None)
         }
 
         // Serena symbol overview.
@@ -311,6 +344,8 @@ fn map_tool_call(
                 path.map(PathBuf::from),
                 ReadDepth::Overview,
                 format!("Overview {}", path.unwrap_or("?")),
+                None,
+                None,
             )
         }
 
@@ -330,10 +365,128 @@ fn map_tool_call(
             } else {
                 ReadDepth::Signature
             };
+            let target = input
+                .get("name_path_pattern")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             (
                 path.map(PathBuf::from),
                 depth,
                 format!("Symbol {name}"),
+                target,
+                None,
+            )
+        }
+
+        // Serena find_referencing_symbols: overview-level.
+        "mcp__serena__find_referencing_symbols" => {
+            let name = input
+                .get("name_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let path = input.get("relative_path").and_then(|v| v.as_str());
+            let target = input
+                .get("name_path")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            (
+                path.map(PathBuf::from),
+                ReadDepth::Overview,
+                format!("FindRefs {name}"),
+                target,
+                None,
+            )
+        }
+
+        // Serena replace_symbol_body: full body read.
+        "mcp__serena__replace_symbol_body" => {
+            let name = input
+                .get("name_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let path = input.get("relative_path").and_then(|v| v.as_str());
+            let target = input
+                .get("name_path")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            (
+                path.map(PathBuf::from),
+                ReadDepth::FullBody,
+                format!("ReplaceSymbol {name}"),
+                target,
+                None,
+            )
+        }
+
+        // Serena insert_after_symbol: full body read.
+        "mcp__serena__insert_after_symbol" => {
+            let name = input
+                .get("name_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let path = input.get("relative_path").and_then(|v| v.as_str());
+            let target = input
+                .get("name_path")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            (
+                path.map(PathBuf::from),
+                ReadDepth::FullBody,
+                format!("InsertAfter {name}"),
+                target,
+                None,
+            )
+        }
+
+        // Serena insert_before_symbol: full body read.
+        "mcp__serena__insert_before_symbol" => {
+            let name = input
+                .get("name_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let path = input.get("relative_path").and_then(|v| v.as_str());
+            let target = input
+                .get("name_path")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            (
+                path.map(PathBuf::from),
+                ReadDepth::FullBody,
+                format!("InsertBefore {name}"),
+                target,
+                None,
+            )
+        }
+
+        // Serena rename_symbol: full body read.
+        "mcp__serena__rename_symbol" => {
+            let name = input
+                .get("name_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let path = input.get("relative_path").and_then(|v| v.as_str());
+            let target = input
+                .get("name_path")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            (
+                path.map(PathBuf::from),
+                ReadDepth::FullBody,
+                format!("Rename {name}"),
+                target,
+                None,
+            )
+        }
+
+        // Notebook edits.
+        "NotebookEdit" => {
+            let path = input.get("notebook_path").and_then(|v| v.as_str())?;
+            (
+                Some(PathBuf::from(path)),
+                ReadDepth::FullBody,
+                format!("NotebookEdit {}", short_path(path)),
+                None,
+                None,
             )
         }
 
@@ -347,6 +500,8 @@ fn map_tool_call(
         read_depth: depth,
         description: desc,
         timestamp_str: timestamp_str.to_string(),
+        target_symbol,
+        target_lines,
     })
 }
 
@@ -382,11 +537,7 @@ impl LogTailer {
         Self { files, positions }
     }
 
-    /// Create a tailer that starts from the beginning (reads all existing content).
-    pub fn new_from_start(files: Vec<PathBuf>) -> Self {
-        let positions = files.iter().map(|f| (f.clone(), 0u64)).collect();
-        Self { files, positions }
-    }
+
 
     /// Add a new file to tail (e.g., a newly created agent log).
     pub fn add_file(&mut self, path: PathBuf) {

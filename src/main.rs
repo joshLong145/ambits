@@ -9,6 +9,7 @@ mod ui;
 
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -50,6 +51,10 @@ struct Cli {
     /// Use Serena's LSP symbol cache instead of tree-sitter parsing.
     #[arg(long)]
     serena: bool,
+
+    /// Output directory for event logs. If set, writes processed events to <dir>/<session>.log.
+    #[arg(long)]
+    log_output: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -87,7 +92,20 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(project_tree, project_path.clone());
+    // Set up event log writer if --log-output is specified.
+    let event_log = if let Some(ref log_output_dir) = cli.log_output {
+        fs::create_dir_all(log_output_dir)?;
+        let log_name = session_id
+            .as_deref()
+            .unwrap_or("unknown-session");
+        let log_path = log_output_dir.join(format!("{log_name}.log"));
+        let file = fs::File::create(&log_path)?;
+        Some(io::BufWriter::new(file))
+    } else {
+        None
+    };
+
+    let mut app = App::new(project_tree, project_path.clone(), event_log);
     app.session_id = session_id.clone();
 
     // Pre-populate the ledger from existing session logs.
@@ -103,6 +121,11 @@ fn main() -> Result<()> {
 
     let serena_mode = cli.serena;
     let result = run_tui(&mut terminal, &mut app, &project_path, &log_dir, &session_id, &registry, serena_mode);
+
+    // Flush event log before exiting.
+    if let Some(ref mut writer) = app.event_log {
+        let _ = writer.flush();
+    }
 
     // Restore terminal.
     disable_raw_mode()?;

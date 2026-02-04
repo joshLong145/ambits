@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -59,10 +61,13 @@ pub struct App {
 
     // Session info for display.
     pub session_id: Option<String>,
+
+    // Optional event log writer.
+    pub event_log: Option<BufWriter<File>>,
 }
 
 impl App {
-    pub fn new(project_tree: ProjectTree, project_root: PathBuf) -> Self {
+    pub fn new(project_tree: ProjectTree, project_root: PathBuf, event_log: Option<BufWriter<File>>) -> Self {
         // Start with all files collapsed.
         let collapsed: std::collections::HashSet<String> = project_tree
             .files
@@ -85,6 +90,7 @@ impl App {
             search_mode: false,
             search_query: String::new(),
             session_id: None,
+            event_log,
         };
         app.rebuild_tree_rows();
         app
@@ -278,13 +284,48 @@ impl App {
 
             for file in &self.project_tree.files {
                 if file.file_path == tool_rel {
-                    mark_file_symbols(&file.symbols, &event, &mut self.ledger);
+                    if event.target_symbol.is_some() || event.target_lines.is_some() {
+                        mark_targeted_symbols(&file.symbols, &event, &mut self.ledger);
+                    } else {
+                        mark_file_symbols(&file.symbols, &event, &mut self.ledger);
+                    }
                 }
             }
         }
-        self.activity.push(event);
-        if self.activity.len() > 200 {
-            self.activity.drain(0..100);
+        // Write to event log if configured.
+        if let Some(ref mut writer) = self.event_log {
+            let path_str = event
+                .file_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let target = if let Some(ref sym) = event.target_symbol {
+                sym.clone()
+            } else if let Some(ref lines) = event.target_lines {
+                format!("L{}-{}", lines.start, lines.end)
+            } else {
+                "-".to_string()
+            };
+            let _ = writeln!(
+                writer,
+                "[{}] agent={} tool={} depth={:?} path={} target={} desc=\"{}\"",
+                event.timestamp_str,
+                event.agent_id,
+                event.tool_name,
+                event.read_depth,
+                path_str,
+                target,
+                event.description,
+            );
+            let _ = writer.flush();
+        }
+
+        // Only push tracked events to the activity feed.
+        if event.read_depth != ReadDepth::Unseen {
+            self.activity.push(event);
+            if self.activity.len() > 200 {
+                self.activity.drain(0..100);
+            }
         }
         self.rebuild_tree_rows();
     }
@@ -348,4 +389,54 @@ fn mark_file_symbols(
         );
         mark_file_symbols(&sym.children, event, ledger);
     }
+}
+
+/// Mark only the symbols that match the tool call's targeting info.
+fn mark_targeted_symbols(
+    symbols: &[SymbolNode],
+    event: &AgentToolCall,
+    ledger: &mut ContextLedger,
+) {
+    for sym in symbols {
+        let matches = symbol_matches_target(sym, event);
+        if matches {
+            ledger.record(
+                sym.id.clone(),
+                event.read_depth,
+                sym.content_hash,
+                event.agent_id.clone(),
+                sym.estimated_tokens,
+            );
+            // If we matched a parent (e.g. an impl block), also mark children
+            mark_file_symbols(&sym.children, event, ledger);
+        } else {
+            // Recurse — the target might be a child symbol
+            mark_targeted_symbols(&sym.children, event, ledger);
+        }
+    }
+}
+
+/// Check if a symbol matches the tool call's target_symbol or target_lines.
+fn symbol_matches_target(sym: &SymbolNode, event: &AgentToolCall) -> bool {
+    if let Some(ref target_name) = event.target_symbol {
+        // Match if the symbol's id ends with the target name path.
+        // SymbolId format is "file_path::name_path", e.g. "src/app.rs::impl App/handle_key"
+        // target_name is a Serena name_path like "App/handle_key" or just "handle_key"
+        if let Some(name_part) = sym.id.split("::").last() {
+            if name_part == target_name || name_part.ends_with(&format!("/{target_name}")) {
+                return true;
+            }
+        }
+        // Also check plain name match for simple names
+        if sym.name == *target_name {
+            return true;
+        }
+    }
+    if let Some(ref target_range) = event.target_lines {
+        // Check if symbol's line range overlaps with the target line range
+        if sym.line_range.start < target_range.end && target_range.start < sym.line_range.end {
+            return true;
+        }
+    }
+    false
 }
