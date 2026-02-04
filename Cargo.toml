@@ -1,6 +1,6 @@
 [package]
 name = "claude-marker"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "command line utility for symbols used by Claude agents"
 repository = "https://github.com/joshLong145/claude-marker"
