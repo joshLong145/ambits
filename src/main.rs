@@ -1,4 +1,5 @@
 mod app;
+mod coverage;
 mod events;
 mod ingest;
 mod parser;
@@ -48,6 +49,10 @@ struct Cli {
     #[arg(long)]
     dump: bool,
 
+    /// Print coverage report to stdout instead of launching TUI.
+    #[arg(long)]
+    coverage: bool,
+
     /// Use Serena's LSP symbol cache instead of tree-sitter parsing.
     #[arg(long)]
     serena: bool,
@@ -72,6 +77,10 @@ fn main() -> Result<()> {
     if cli.dump {
         dump_tree(&project_path, &project_tree);
         return Ok(());
+    }
+
+    if cli.coverage {
+        return run_coverage_report(&project_path, &project_tree, &cli.log_dir, &cli.session);
     }
 
     // Resolve log directory and session.
@@ -371,6 +380,141 @@ fn check_staleness(
     }
 }
 
+fn run_coverage_report(
+    project_path: &Path,
+    project_tree: &ProjectTree,
+    log_dir_opt: &Option<PathBuf>,
+    session_opt: &Option<String>,
+) -> Result<()> {
+    use coverage::{CoverageFormatter, CoverageReport, TextFormatter};
+    use tracking::ContextLedger;
+
+    // 1. Resolve log directory
+    let log_dir = log_dir_opt
+        .clone()
+        .or_else(|| ingest::claude::log_dir_for_project(project_path));
+
+    // 2. Find session (auto-detect if not provided)
+    let session_id = session_opt.clone().or_else(|| {
+        log_dir
+            .as_ref()
+            .and_then(|d| ingest::claude::find_latest_session(d))
+    });
+
+    // 3. Build ledger from session logs
+    let mut ledger = ContextLedger::new();
+    if let (Some(ref log_dir), Some(ref sid)) = (&log_dir, &session_id) {
+        let log_files = ingest::claude::session_log_files(log_dir, sid);
+        for log_file in &log_files {
+            let events = ingest::claude::parse_log_file(log_file);
+            for event in events {
+                if let Some(ref file_path) = event.file_path {
+                    // Normalize the tool call path
+                    let tool_rel = normalize_tool_path(file_path, project_path);
+
+                    for file in &project_tree.files {
+                        if file.file_path == tool_rel {
+                            if event.target_symbol.is_some() || event.target_lines.is_some() {
+                                mark_targeted_symbols(&file.symbols, &event, &mut ledger);
+                            } else {
+                                mark_file_symbols(&file.symbols, &event, &mut ledger);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Generate report
+    let mut report = CoverageReport::from_project(project_tree, &ledger);
+    report.session_id = session_id;
+
+    // 5. Format and print
+    let formatter = TextFormatter::default();
+    print!("{}", formatter.format(&report));
+
+    Ok(())
+}
+
+/// Convert a tool call file path (usually absolute) to a relative path matching
+/// the project tree's convention. Strips the project root prefix if present.
+fn normalize_tool_path(tool_path: &Path, project_root: &Path) -> PathBuf {
+    if tool_path.is_absolute() {
+        tool_path
+            .strip_prefix(project_root)
+            .unwrap_or(tool_path)
+            .to_path_buf()
+    } else {
+        tool_path.to_path_buf()
+    }
+}
+
+fn mark_file_symbols(
+    symbols: &[symbols::SymbolNode],
+    event: &ingest::AgentToolCall,
+    ledger: &mut tracking::ContextLedger,
+) {
+    for sym in symbols {
+        ledger.record(
+            sym.id.clone(),
+            event.read_depth,
+            sym.content_hash,
+            event.agent_id.clone(),
+            sym.estimated_tokens,
+        );
+        mark_file_symbols(&sym.children, event, ledger);
+    }
+}
+
+/// Mark only the symbols that match the tool call's targeting info.
+fn mark_targeted_symbols(
+    symbols: &[symbols::SymbolNode],
+    event: &ingest::AgentToolCall,
+    ledger: &mut tracking::ContextLedger,
+) {
+    for sym in symbols {
+        let matches = symbol_matches_target(sym, event);
+        if matches {
+            ledger.record(
+                sym.id.clone(),
+                event.read_depth,
+                sym.content_hash,
+                event.agent_id.clone(),
+                sym.estimated_tokens,
+            );
+            // If we matched a parent (e.g. an impl block), also mark children
+            mark_file_symbols(&sym.children, event, ledger);
+        } else {
+            // Recurse — the target might be a child symbol
+            mark_targeted_symbols(&sym.children, event, ledger);
+        }
+    }
+}
+
+/// Check if a symbol matches the tool call's target_symbol or target_lines.
+fn symbol_matches_target(sym: &symbols::SymbolNode, event: &ingest::AgentToolCall) -> bool {
+    if let Some(ref target_name) = event.target_symbol {
+        // Match if the symbol's id ends with the target name path.
+        if let Some(name_part) = sym.id.split("::").last() {
+            if name_part == target_name || name_part.ends_with(&format!("/{target_name}")) {
+                return true;
+            }
+        }
+        // Also check plain name match for simple names
+        if sym.name == *target_name {
+            return true;
+        }
+    }
+    if let Some(ref target_range) = event.target_lines {
+        // Check if symbol's line range overlaps with the target line range
+        if sym.line_range.start < target_range.end && target_range.start < sym.line_range.end {
+            return true;
+        }
+    }
+    false
+}
+
 fn dump_tree(root: &Path, project_tree: &ProjectTree) {
     println!(
         "Project: {} ({} files, {} symbols)",
@@ -393,7 +537,7 @@ fn print_symbol(sym: &symbols::SymbolNode, indent: usize) {
     println!(
         "{}{} {} [L{}-{}] (~{} tokens)",
         pad,
-        sym.kind,
+        sym.label,
         sym.name,
         sym.line_range.start,
         sym.line_range.end,

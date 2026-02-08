@@ -4,7 +4,7 @@ use color_eyre::eyre::eyre;
 use tree_sitter::{Node, Parser};
 
 use crate::symbols::merkle::{compute_merkle_hash, content_hash, estimate_tokens};
-use crate::symbols::{FileSymbols, SymbolKind, SymbolNode};
+use crate::symbols::{FileSymbols, SymbolCategory, SymbolNode};
 
 use super::LanguageParser;
 
@@ -55,6 +55,23 @@ impl LanguageParser for RustParser {
     }
 }
 
+/// Symbol metadata: category and display label
+struct SymbolMeta {
+    category: SymbolCategory,
+    label: &'static str,
+}
+
+const MOD: SymbolMeta = SymbolMeta { category: SymbolCategory::Module, label: "mod" };
+const STRUCT: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "struct" };
+const ENUM: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "enum" };
+const TRAIT: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "trait" };
+const IMPL: SymbolMeta = SymbolMeta { category: SymbolCategory::Implementation, label: "impl" };
+const FN: SymbolMeta = SymbolMeta { category: SymbolCategory::Function, label: "fn" };
+const CONST: SymbolMeta = SymbolMeta { category: SymbolCategory::Variable, label: "const" };
+const STATIC: SymbolMeta = SymbolMeta { category: SymbolCategory::Variable, label: "static" };
+const TYPE_ALIAS: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "type" };
+const MACRO: SymbolMeta = SymbolMeta { category: SymbolCategory::Macro, label: "macro" };
+
 fn extract_symbols(
     node: Node,
     src: &[u8],
@@ -66,20 +83,20 @@ fn extract_symbols(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         let symbol_info = match child.kind() {
-            "function_item" => named_symbol(&child, src, SymbolKind::Function),
-            "struct_item" => named_symbol(&child, src, SymbolKind::Struct),
-            "enum_item" => named_symbol(&child, src, SymbolKind::Enum),
-            "trait_item" => named_symbol(&child, src, SymbolKind::Trait),
+            "function_item" => named_symbol(&child, src, &FN),
+            "struct_item" => named_symbol(&child, src, &STRUCT),
+            "enum_item" => named_symbol(&child, src, &ENUM),
+            "trait_item" => named_symbol(&child, src, &TRAIT),
             "impl_item" => impl_symbol(&child, src),
-            "const_item" => named_symbol(&child, src, SymbolKind::Constant),
-            "static_item" => named_symbol(&child, src, SymbolKind::Static),
-            "type_item" => named_symbol(&child, src, SymbolKind::TypeAlias),
-            "macro_definition" => named_symbol(&child, src, SymbolKind::Macro),
-            "mod_item" => named_symbol(&child, src, SymbolKind::Module),
+            "const_item" => named_symbol(&child, src, &CONST),
+            "static_item" => named_symbol(&child, src, &STATIC),
+            "type_item" => named_symbol(&child, src, &TYPE_ALIAS),
+            "macro_definition" => named_symbol(&child, src, &MACRO),
+            "mod_item" => named_symbol(&child, src, &MOD),
             _ => None,
         };
 
-        if let Some((name, kind)) = symbol_info {
+        if let Some((name, meta)) = symbol_info {
             let name_path = if parent_name_path.is_empty() {
                 name.clone()
             } else {
@@ -95,7 +112,8 @@ fn extract_symbols(
             let mut sym = SymbolNode {
                 id,
                 name: name.clone(),
-                kind,
+                category: meta.category,
+                label: meta.label.to_string(),
                 file_path: file_path.to_path_buf(),
                 byte_range,
                 line_range: start_line..end_line,
@@ -106,7 +124,9 @@ fn extract_symbols(
             };
 
             // Recurse into container types for their children.
-            if matches!(kind, SymbolKind::Impl | SymbolKind::Trait | SymbolKind::Module) {
+            if matches!(meta.category, SymbolCategory::Implementation | SymbolCategory::Module)
+                || meta.label == "trait"
+            {
                 if let Some(body) = child_by_kind(&child, "declaration_list") {
                     extract_body_children(body, src, file_path, path_prefix, &name_path, &mut sym.children);
                 }
@@ -128,14 +148,14 @@ fn extract_body_children(
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
         let symbol_info = match child.kind() {
-            "function_item" => named_symbol(&child, src, SymbolKind::Method),
-            "const_item" => named_symbol(&child, src, SymbolKind::Constant),
-            "type_item" => named_symbol(&child, src, SymbolKind::TypeAlias),
-            "macro_definition" => named_symbol(&child, src, SymbolKind::Macro),
+            "function_item" => named_symbol(&child, src, &FN),
+            "const_item" => named_symbol(&child, src, &CONST),
+            "type_item" => named_symbol(&child, src, &TYPE_ALIAS),
+            "macro_definition" => named_symbol(&child, src, &MACRO),
             _ => None,
         };
 
-        if let Some((name, kind)) = symbol_info {
+        if let Some((name, meta)) = symbol_info {
             let name_path = format!("{parent_name_path}/{name}");
             let id = format!("{path_prefix}::{name_path}");
             let byte_range = child.byte_range();
@@ -146,7 +166,8 @@ fn extract_body_children(
             out.push(SymbolNode {
                 id,
                 name,
-                kind,
+                category: meta.category,
+                label: meta.label.to_string(),
                 file_path: file_path.to_path_buf(),
                 byte_range,
                 line_range: start_line..end_line,
@@ -160,14 +181,15 @@ fn extract_body_children(
 }
 
 /// Extract name from a node that has an `identifier` or `type_identifier` child.
-fn named_symbol(node: &Node, src: &[u8], kind: SymbolKind) -> Option<(String, SymbolKind)> {
+fn named_symbol(node: &Node, src: &[u8], meta: &SymbolMeta) -> Option<(String, SymbolMeta)> {
     let name = find_name(node, src)?;
-    Some((name, kind))
+    Some((name, SymbolMeta { category: meta.category, label: meta.label }))
 }
 
-/// Build a descriptive name for `impl` blocks: "impl Foo" or "impl Trait for Foo".
-fn impl_symbol(node: &Node, src: &[u8]) -> Option<(String, SymbolKind)> {
-    let mut parts = vec!["impl".to_string()];
+/// Build a descriptive name for `impl` blocks: "Foo" or "Trait for Foo".
+/// The label "impl" is provided separately, so we don't include it in the name.
+fn impl_symbol(node: &Node, src: &[u8]) -> Option<(String, SymbolMeta)> {
+    let mut parts = Vec::new();
     let mut cursor = node.walk();
 
     for child in node.children(&mut cursor) {
@@ -186,7 +208,11 @@ fn impl_symbol(node: &Node, src: &[u8]) -> Option<(String, SymbolKind)> {
         }
     }
 
-    Some((parts.join(" "), SymbolKind::Impl))
+    if parts.is_empty() {
+        return None;
+    }
+
+    Some((parts.join(" "), IMPL))
 }
 
 /// Find the first `identifier` or `type_identifier` child and return its text.

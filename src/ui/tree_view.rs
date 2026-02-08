@@ -56,7 +56,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 ));
             } else {
                 spans.push(Span::styled(
-                    format!("{} ", row.kind_label),
+                    format!("{} ", row.label),
                     Style::default().fg(Color::DarkGray),
                 ));
                 spans.push(Span::styled(&row.display_name, Style::default().fg(color)));

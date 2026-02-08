@@ -12,11 +12,10 @@ Tool for visualizing parts of your codebase an LLM agent has stored within a ses
 - Supports Tree sitter parsing for
   - Rust
   - Python
-- Symbol Dumps (Coverage reports coming soon)
+- Symbol dumps and coverage reports
 
 ## Todo
-- Coverage reports
-- multi agent heirchies
+- Multi agent hierarchies
 - Multi session visualization
 
 ## Supported languages
@@ -50,23 +49,47 @@ ambits --project <path>
 | Flag | Description |
 |---|---|
 | `--project`, `-p` | Path to the project root (required) |
-| `--dump` | Print symbol tree to stdout and exit |
-| `--serena` | Use Serena's LSP symbol cache instead of tree-sitter |
 | `--session`, `-s` | Session ID to track (auto-detects latest) |
+| `--dump` | Print symbol tree to stdout and exit |
+| `--coverage` | Print coverage report to stdout and exit |
+| `--serena` | Use Serena's LSP symbol cache instead of tree-sitter |
 | `--log-dir` | Path to Claude Code log directory (auto-derived) |
+| `--log-output` | Output directory for event logs |
 
 ### Examples
 
-```
+```bash
 # Launch TUI for current project
 ambits -p .
 
 # Dump symbol tree without TUI
 ambits -p . --dump
 
+# Print coverage report
+ambits -p . --coverage
+
 # Use Serena's symbol cache (more languages, finer detail)
 ambits -p . --serena
 ```
+
+### Coverage Report
+
+The `--coverage` flag outputs a tabular report showing per-file symbol visibility:
+
+```
+Coverage Report (session: 34e212cf-a176-4059-ba12-eca94b56e43b)
+─────────────────────────────────────────────────────────────────────────────
+File                                      Symbols    Seen    Full   Seen%   Full%
+─────────────────────────────────────────────────────────────────────────────
+src/events.rs                                   3       0       0      0%      0%
+src/parser/mod.rs                               8       8       1    100%     12%
+src/app.rs                                     23      23      23    100%    100%
+─────────────────────────────────────────────────────────────────────────────
+TOTAL                                         214     182     175     85%     82%
+```
+
+- **Seen%**: Symbols the agent has any awareness of (name, overview, signature, or full body)
+- **Full%**: Symbols the agent has read completely (full body)
 
 ### Keybindings
 

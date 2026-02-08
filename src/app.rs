@@ -14,7 +14,7 @@ use crate::ingest::AgentToolCall;
 pub struct TreeRow {
     pub symbol_id: String,
     pub display_name: String,
-    pub kind_label: String,
+    pub label: String,        // Language-specific label (e.g., "class", "def", "fn")
     pub depth: usize,         // nesting depth for indentation
     pub is_file: bool,        // true for file headers
     pub is_expanded: bool,
@@ -116,7 +116,7 @@ impl App {
             rows.push(TreeRow {
                 symbol_id: file_id.clone(),
                 display_name: file_path.clone(),
-                kind_label: String::new(),
+                label: String::new(),
                 depth: 0,
                 is_file: true,
                 is_expanded,
@@ -352,7 +352,7 @@ fn flatten_symbol(
     rows.push(TreeRow {
         symbol_id: sym.id.clone(),
         display_name: sym.name.clone(),
-        kind_label: sym.kind.to_string(),
+        label: sym.label.clone(),
         depth,
         is_file: false,
         is_expanded,

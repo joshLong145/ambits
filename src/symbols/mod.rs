@@ -6,37 +6,36 @@ pub mod merkle;
 
 pub type SymbolId = String;
 
+/// Universal symbol categories for cross-language operations.
+/// These represent broad semantic categories, not language-specific constructs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SymbolKind {
+pub enum SymbolCategory {
+    /// Modules, packages, namespaces
     Module,
-    Struct,
-    Enum,
-    Trait,
-    Impl,
+    /// Classes, structs, enums, interfaces, traits, type aliases
+    Type,
+    /// Functions, methods, procedures, lambdas
     Function,
-    Method,
-    Constant,
-    TypeAlias,
-    Static,
+    /// Variables, constants, fields, properties, statics
+    Variable,
+    /// Macros, decorators, annotations, attributes
     Macro,
-    Field,
+    /// Implementation blocks (useful for grouping)
+    Implementation,
+    /// Fallback for unrecognized node types
+    Unknown,
 }
 
-impl fmt::Display for SymbolKind {
+impl fmt::Display for SymbolCategory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SymbolKind::Module => write!(f, "mod"),
-            SymbolKind::Struct => write!(f, "struct"),
-            SymbolKind::Enum => write!(f, "enum"),
-            SymbolKind::Trait => write!(f, "trait"),
-            SymbolKind::Impl => write!(f, "impl"),
-            SymbolKind::Function => write!(f, "fn"),
-            SymbolKind::Method => write!(f, "fn"),
-            SymbolKind::Constant => write!(f, "const"),
-            SymbolKind::TypeAlias => write!(f, "type"),
-            SymbolKind::Static => write!(f, "static"),
-            SymbolKind::Macro => write!(f, "macro"),
-            SymbolKind::Field => write!(f, "field"),
+            SymbolCategory::Module => write!(f, "module"),
+            SymbolCategory::Type => write!(f, "type"),
+            SymbolCategory::Function => write!(f, "function"),
+            SymbolCategory::Variable => write!(f, "variable"),
+            SymbolCategory::Macro => write!(f, "macro"),
+            SymbolCategory::Implementation => write!(f, "impl"),
+            SymbolCategory::Unknown => write!(f, "unknown"),
         }
     }
 }
@@ -45,7 +44,8 @@ impl fmt::Display for SymbolKind {
 pub struct SymbolNode {
     pub id: SymbolId,
     pub name: String,
-    pub kind: SymbolKind,
+    pub category: SymbolCategory,
+    pub label: String, // Language-specific label (e.g., "class", "struct", "def")
     pub file_path: PathBuf,
     pub byte_range: Range<usize>,
     pub line_range: Range<usize>,

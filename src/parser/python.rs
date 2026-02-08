@@ -4,7 +4,7 @@ use color_eyre::eyre::eyre;
 use tree_sitter::{Node, Parser};
 
 use crate::symbols::merkle::{compute_merkle_hash, content_hash, estimate_tokens};
-use crate::symbols::{FileSymbols, SymbolKind, SymbolNode};
+use crate::symbols::{FileSymbols, SymbolCategory, SymbolNode};
 
 use super::LanguageParser;
 
@@ -55,6 +55,15 @@ impl LanguageParser for PythonParser {
     }
 }
 
+/// Symbol metadata: category and display label
+struct SymbolMeta {
+    category: SymbolCategory,
+    label: &'static str,
+}
+
+const CLASS: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "class" };
+const DEF: SymbolMeta = SymbolMeta { category: SymbolCategory::Function, label: "def" };
+
 /// Walk top-level children of a Python module node and extract symbols.
 fn extract_symbols(
     node: Node,
@@ -68,15 +77,9 @@ fn extract_symbols(
     for child in node.children(&mut cursor) {
         let symbol_info = match child.kind() {
             "function_definition" => {
-                let name = child_name(&child, src);
-                let kind = if parent_name_path.is_empty() {
-                    SymbolKind::Function
-                } else {
-                    SymbolKind::Method
-                };
-                name.map(|n| (n, kind))
+                child_name(&child, src).map(|n| (n, DEF))
             }
-            "class_definition" => child_name(&child, src).map(|n| (n, SymbolKind::Struct)),
+            "class_definition" => child_name(&child, src).map(|n| (n, CLASS)),
             // Decorated definitions: unwrap the decorator to find the inner def/class.
             "decorated_definition" => {
                 extract_decorated(&child, src, file_path, path_prefix, parent_name_path, out);
@@ -85,7 +88,7 @@ fn extract_symbols(
             _ => None,
         };
 
-        if let Some((name, kind)) = symbol_info {
+        if let Some((name, meta)) = symbol_info {
             let name_path = if parent_name_path.is_empty() {
                 name.clone()
             } else {
@@ -101,7 +104,8 @@ fn extract_symbols(
             let mut sym = SymbolNode {
                 id,
                 name: name.clone(),
-                kind,
+                category: meta.category,
+                label: meta.label.to_string(),
                 file_path: file_path.to_path_buf(),
                 byte_range,
                 line_range: start_line..end_line,
@@ -112,7 +116,7 @@ fn extract_symbols(
             };
 
             // For classes, recurse into the body block to find methods.
-            if kind == SymbolKind::Struct {
+            if meta.category == SymbolCategory::Type {
                 if let Some(body) = child.child_by_field_name("body") {
                     extract_symbols(body, src, file_path, path_prefix, &name_path, &mut sym.children);
                 }
@@ -141,10 +145,9 @@ fn extract_decorated(
                     Some(n) => n,
                     None => return,
                 };
-                let kind = match child.kind() {
-                    "class_definition" => SymbolKind::Struct,
-                    _ if parent_name_path.is_empty() => SymbolKind::Function,
-                    _ => SymbolKind::Method,
+                let meta = match child.kind() {
+                    "class_definition" => CLASS,
+                    _ => DEF,
                 };
 
                 let name_path = if parent_name_path.is_empty() {
@@ -163,7 +166,8 @@ fn extract_decorated(
                 let mut sym = SymbolNode {
                     id,
                     name: name.clone(),
-                    kind,
+                    category: meta.category,
+                    label: meta.label.to_string(),
                     file_path: file_path.to_path_buf(),
                     byte_range,
                     line_range: start_line..end_line,
@@ -173,7 +177,7 @@ fn extract_decorated(
                     estimated_tokens: estimate_tokens(text),
                 };
 
-                if kind == SymbolKind::Struct {
+                if meta.category == SymbolCategory::Type {
                     if let Some(body) = child.child_by_field_name("body") {
                         extract_symbols(body, src, file_path, path_prefix, &name_path, &mut sym.children);
                     }

@@ -7,7 +7,7 @@ use serde_pickle::value::{HashableValue, Value};
 use sha2::{Digest, Sha256};
 
 use crate::symbols::merkle::compute_merkle_hash;
-use crate::symbols::{FileSymbols, ProjectTree, SymbolKind, SymbolNode};
+use crate::symbols::{FileSymbols, ProjectTree, SymbolCategory, SymbolNode};
 
 /// Scan a project using Serena's cached symbol data (.pkl files).
 pub fn scan_project_serena(project_root: &Path) -> Result<ProjectTree> {
@@ -168,7 +168,7 @@ fn convert_symbol(
     let kind_int = dict_get(val, "kind")
         .and_then(as_i64)
         .unwrap_or(12); // default to Function
-    let kind = lsp_kind_to_symbol_kind(kind_int);
+    let (category, label) = lsp_kind_to_category_and_label(kind_int);
 
     let (start_line, start_char, end_line, end_char) = extract_range(val);
 
@@ -207,7 +207,8 @@ fn convert_symbol(
     let mut node = SymbolNode {
         id,
         name,
-        kind,
+        category,
+        label,
         file_path: file_path.to_path_buf(),
         byte_range: (start_line * 40 + start_char)..(end_line * 40 + end_char),
         line_range: (start_line + 1)..(end_line + 1), // 1-indexed like tree-sitter
@@ -248,20 +249,25 @@ fn estimate_total_lines(symbols: &[SymbolNode]) -> usize {
         .unwrap_or(0)
 }
 
-fn lsp_kind_to_symbol_kind(kind: i64) -> SymbolKind {
+fn lsp_kind_to_category_and_label(kind: i64) -> (SymbolCategory, String) {
     match kind {
-        2 | 3 => SymbolKind::Module,     // Module, Namespace
-        5 | 23 => SymbolKind::Struct,    // Class, Struct
-        6 | 9 => SymbolKind::Method,     // Method, Constructor
-        7 | 8 => SymbolKind::Field,      // Property, Field
-        10 => SymbolKind::Enum,
-        11 => SymbolKind::Trait,         // Interface
-        12 => SymbolKind::Function,
-        13 => SymbolKind::Static,        // Variable
-        14 | 22 => SymbolKind::Constant, // Constant, EnumMember
-        19 => SymbolKind::Impl,          // Object (used for impl blocks)
-        26 => SymbolKind::TypeAlias,     // TypeParameter
-        _ => SymbolKind::Function,       // fallback
+        2 => (SymbolCategory::Module, "module".to_string()),
+        3 => (SymbolCategory::Module, "namespace".to_string()),
+        5 => (SymbolCategory::Type, "class".to_string()),
+        6 => (SymbolCategory::Function, "method".to_string()),
+        7 => (SymbolCategory::Variable, "property".to_string()),
+        8 => (SymbolCategory::Variable, "field".to_string()),
+        9 => (SymbolCategory::Function, "constructor".to_string()),
+        10 => (SymbolCategory::Type, "enum".to_string()),
+        11 => (SymbolCategory::Type, "interface".to_string()),
+        12 => (SymbolCategory::Function, "function".to_string()),
+        13 => (SymbolCategory::Variable, "variable".to_string()),
+        14 => (SymbolCategory::Variable, "constant".to_string()),
+        19 => (SymbolCategory::Implementation, "impl".to_string()),
+        22 => (SymbolCategory::Variable, "enum_member".to_string()),
+        23 => (SymbolCategory::Type, "struct".to_string()),
+        26 => (SymbolCategory::Type, "type_param".to_string()),
+        _ => (SymbolCategory::Unknown, "unknown".to_string()),
     }
 }
 
