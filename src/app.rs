@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 use crate::symbols::{ProjectTree, SymbolNode};
 use crate::tracking::ReadDepth;
@@ -161,6 +161,14 @@ impl App {
             KeyCode::Tab => self.cycle_focus(),
             KeyCode::PageDown => self.move_selection(20),
             KeyCode::PageUp => self.move_selection(-20),
+            _ => {}
+        }
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.move_selection(-3),
+            MouseEventKind::ScrollDown => self.move_selection(3),
             _ => {}
         }
     }

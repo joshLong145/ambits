@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEvent};
+use crossterm::event::{self, Event, KeyEvent, MouseEvent};
 
 use crate::ingest::AgentToolCall;
 
@@ -10,6 +10,7 @@ use crate::ingest::AgentToolCall;
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     FileChanged(PathBuf),
     AgentEvent(AgentToolCall),
     Tick,
@@ -19,10 +20,18 @@ pub enum AppEvent {
 pub fn spawn_key_reader(tx: mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || loop {
         if event::poll(Duration::from_millis(50)).unwrap_or(false) {
-            if let Ok(Event::Key(key)) = event::read() {
-                if tx.send(AppEvent::Key(key)).is_err() {
-                    break;
+            match event::read() {
+                Ok(Event::Key(key)) => {
+                    if tx.send(AppEvent::Key(key)).is_err() {
+                        break;
+                    }
                 }
+                Ok(Event::Mouse(mouse)) => {
+                    if tx.send(AppEvent::Mouse(mouse)).is_err() {
+                        break;
+                    }
+                }
+                _ => {}
             }
         }
     });

@@ -19,6 +19,7 @@ use std::time::Duration;
 use clap::{Parser as ClapParser, Subcommand};
 use color_eyre::eyre::Result;
 use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -145,7 +146,7 @@ fn main() -> Result<()> {
     // Launch TUI.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -215,7 +216,7 @@ fn main() -> Result<()> {
 
     // Restore terminal.
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
 
     result
@@ -298,6 +299,7 @@ fn run_tui(
 
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(AppEvent::Key(key)) => app.handle_key(key),
+            Ok(AppEvent::Mouse(mouse)) => app.handle_mouse(mouse),
             Ok(AppEvent::FileChanged(path)) => {
                 // Re-parse the changed file and update the project tree.
                 if let Ok(rel) = path.strip_prefix(project_path) {
