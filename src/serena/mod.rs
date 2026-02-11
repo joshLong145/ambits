@@ -6,8 +6,8 @@ use color_eyre::eyre::{bail, eyre, Result};
 use serde_pickle::value::{HashableValue, Value};
 use sha2::{Digest, Sha256};
 
-use crate::symbols::merkle::compute_merkle_hash;
-use crate::symbols::{FileSymbols, ProjectTree, SymbolCategory, SymbolNode};
+use ambits::symbols::merkle::compute_merkle_hash;
+use ambits::symbols::{FileSymbols, ProjectTree, SymbolCategory, SymbolNode};
 
 /// Scan a project using Serena's cached symbol data (.pkl files).
 pub fn scan_project_serena(project_root: &Path) -> Result<ProjectTree> {

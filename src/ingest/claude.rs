@@ -583,6 +583,11 @@ impl LogTailer {
 }
 
 #[cfg(test)]
+#[path = "../../tests/helpers/mod.rs"]
+#[allow(dead_code)]
+mod helpers;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -709,5 +714,148 @@ mod tests {
         assert!(files.contains(&main_file));
         assert!(files.contains(&agent_ok));
         assert!(!files.contains(&agent_other));
+    }
+
+    // --- map_tool_call coverage tests (via parse_jsonl_line) ---
+
+    use super::helpers::{jsonl_assistant, jsonl_user_msg};
+
+    #[test]
+    fn map_edit_tool() {
+        let line = jsonl_assistant("mcp__acp__Edit", r#"{"file_path":"/src/app.rs","old_string":"a","new_string":"b"}"#);
+        let events = parse_jsonl_line(&line, "d");
+        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+        assert_eq!(events[0].file_path.as_ref().unwrap(), &PathBuf::from("/src/app.rs"));
+    }
+
+    #[test]
+    fn map_write_tool() {
+        let line = jsonl_assistant("mcp__acp__Write", r#"{"file_path":"/src/new.rs","content":"fn main(){}"}"#);
+        let events = parse_jsonl_line(&line, "d");
+        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+    }
+
+    #[test]
+    fn map_glob_tool() {
+        let line = jsonl_assistant("Glob", r#"{"pattern":"**/*.rs","path":"/src"}"#);
+        let events = parse_jsonl_line(&line, "d");
+        assert_eq!(events[0].read_depth, ReadDepth::NameOnly);
+    }
+
+    #[test]
+    fn map_find_file() {
+        let line = jsonl_assistant("mcp__serena__find_file", r#"{"file_mask":"*.rs","relative_path":"src"}"#);
+        let events = parse_jsonl_line(&line, "d");
+        assert_eq!(events[0].read_depth, ReadDepth::NameOnly);
+    }
+
+    #[test]
+    fn map_symbols_overview() {
+        let line = jsonl_assistant("mcp__serena__get_symbols_overview", r#"{"relative_path":"src/app.rs"}"#);
+        let events = parse_jsonl_line(&line, "d");
+        assert_eq!(events[0].read_depth, ReadDepth::Overview);
+        assert_eq!(events[0].file_path.as_ref().unwrap(), &PathBuf::from("src/app.rs"));
+    }
+
+    #[test]
+    fn map_find_symbol_no_body() {
+        let line = jsonl_assistant("mcp__serena__find_symbol", r#"{"name_path_pattern":"App","relative_path":"src/app.rs","include_body":false}"#);
+        let events = parse_jsonl_line(&line, "d");
+        assert_eq!(events[0].read_depth, ReadDepth::Signature);
+        assert_eq!(events[0].target_symbol.as_deref(), Some("App"));
+    }
+
+    #[test]
+    fn map_find_symbol_with_body() {
+        let line = jsonl_assistant("mcp__serena__find_symbol", r#"{"name_path_pattern":"App/new","relative_path":"src/app.rs","include_body":true}"#);
+        let events = parse_jsonl_line(&line, "d");
+        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+        assert_eq!(events[0].target_symbol.as_deref(), Some("App/new"));
+    }
+
+    #[test]
+    fn map_find_referencing() {
+        let line = jsonl_assistant("mcp__serena__find_referencing_symbols", r#"{"name_path":"ProjectTree","relative_path":"src/symbols/mod.rs"}"#);
+        let events = parse_jsonl_line(&line, "d");
+        assert_eq!(events[0].read_depth, ReadDepth::Overview);
+        assert_eq!(events[0].target_symbol.as_deref(), Some("ProjectTree"));
+    }
+
+    #[test]
+    fn map_replace_symbol() {
+        let line = jsonl_assistant("mcp__serena__replace_symbol_body", r#"{"name_path":"App/new","relative_path":"src/app.rs","body":"pub fn new() {}"}"#);
+        let events = parse_jsonl_line(&line, "d");
+        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+        assert_eq!(events[0].target_symbol.as_deref(), Some("App/new"));
+    }
+
+    #[test]
+    fn map_insert_after() {
+        let line = jsonl_assistant("mcp__serena__insert_after_symbol", r#"{"name_path":"App","relative_path":"src/app.rs","body":"fn foo() {}"}"#);
+        let events = parse_jsonl_line(&line, "d");
+        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+        assert_eq!(events[0].target_symbol.as_deref(), Some("App"));
+    }
+
+    #[test]
+    fn map_rename_symbol() {
+        let line = jsonl_assistant("mcp__serena__rename_symbol", r#"{"name_path":"old_fn","relative_path":"src/app.rs","new_name":"new_fn"}"#);
+        let events = parse_jsonl_line(&line, "d");
+        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+        assert_eq!(events[0].target_symbol.as_deref(), Some("old_fn"));
+    }
+
+    #[test]
+    fn map_notebook_edit() {
+        let line = jsonl_assistant("NotebookEdit", r#"{"notebook_path":"/nb/analysis.ipynb","new_source":"print(1)"}"#);
+        let events = parse_jsonl_line(&line, "d");
+        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+        assert_eq!(events[0].file_path.as_ref().unwrap(), &PathBuf::from("/nb/analysis.ipynb"));
+    }
+
+    #[test]
+    fn map_unknown_tool() {
+        let line = jsonl_assistant("SomeRandomTool", r#"{"data":"value"}"#);
+        let events = parse_jsonl_line(&line, "d");
+        // Unknown tools still produce an event, but with Unseen depth.
+        assert_eq!(events[0].read_depth, ReadDepth::Unseen);
+    }
+
+    #[test]
+    fn read_with_offset_limit() {
+        let line = jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/src/main.rs","offset":10,"limit":20}"#);
+        let events = parse_jsonl_line(&line, "d");
+        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+        assert_eq!(events[0].target_lines, Some(10..30));
+    }
+
+    #[test]
+    fn parse_malformed_json() {
+        let events = parse_jsonl_line("not valid json {{{", "d");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn parse_multi_tool_message() {
+        let line = r#"{"type":"assistant","sessionId":"s","message":{"role":"assistant","content":[{"type":"tool_use","name":"mcp__acp__Read","input":{"file_path":"/a.rs"}},{"type":"tool_use","name":"Grep","input":{"pattern":"foo"}}]}}"#;
+        let events = parse_jsonl_line(line, "d");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+        assert_eq!(events[1].read_depth, ReadDepth::Overview);
+    }
+
+    #[test]
+    fn parse_log_file_skips_non_assistant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("test.jsonl");
+        let mut f = fs::File::create(&log).unwrap();
+        writeln!(f, "{}", jsonl_user_msg()).unwrap();
+        writeln!(f, "{}", jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/a.rs"}"#)).unwrap();
+        writeln!(f, "{}", jsonl_user_msg()).unwrap();
+        writeln!(f, "{}", jsonl_assistant("Grep", r#"{"pattern":"x"}"#)).unwrap();
+        drop(f);
+
+        let events = parse_log_file(&log);
+        assert_eq!(events.len(), 2);
     }
 }

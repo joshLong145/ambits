@@ -1,12 +1,14 @@
-mod app;
-mod coverage;
+// Shared modules live in the library crate (src/lib.rs).
+use ambits::app;
+use ambits::coverage;
+use ambits::ingest;
+use ambits::symbols;
+use ambits::tracking;
+
+// Binary-only modules.
 mod events;
-mod ingest;
-mod parser;
 mod serena;
 mod skill;
-mod symbols;
-mod tracking;
 mod ui;
 
 use std::fs;
@@ -27,10 +29,10 @@ use notify::{Event as NotifyEvent, EventKind, RecursiveMode, Watcher};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use app::App;
+use ambits::app::App;
 use events::AppEvent;
-use parser::ParserRegistry;
-use symbols::{FileSymbols, ProjectTree};
+use ambits::parser::ParserRegistry;
+use ambits::symbols::{FileSymbols, ProjectTree};
 
 #[derive(ClapParser, Debug)]
 #[command(name = "ambits", about = "Visualize LLM agent context coverage")]
@@ -452,14 +454,14 @@ fn run_coverage_report(
             for event in events {
                 if let Some(ref file_path) = event.file_path {
                     // Normalize the tool call path
-                    let tool_rel = normalize_tool_path(file_path, project_path);
+                    let tool_rel = app::normalize_tool_path(file_path, project_path);
 
                     for file in &project_tree.files {
                         if file.file_path == tool_rel {
                             if event.target_symbol.is_some() || event.target_lines.is_some() {
-                                mark_targeted_symbols(&file.symbols, &event, &mut ledger);
+                                app::mark_targeted_symbols(&file.symbols, &event, &mut ledger);
                             } else {
-                                mark_file_symbols(&file.symbols, &event, &mut ledger);
+                                app::mark_file_symbols(&file.symbols, &event, &mut ledger);
                             }
                         }
                     }
@@ -477,84 +479,6 @@ fn run_coverage_report(
     print!("{}", formatter.format(&report));
 
     Ok(())
-}
-
-/// Convert a tool call file path (usually absolute) to a relative path matching
-/// the project tree's convention. Strips the project root prefix if present.
-fn normalize_tool_path(tool_path: &Path, project_root: &Path) -> PathBuf {
-    if tool_path.is_absolute() {
-        tool_path
-            .strip_prefix(project_root)
-            .unwrap_or(tool_path)
-            .to_path_buf()
-    } else {
-        tool_path.to_path_buf()
-    }
-}
-
-fn mark_file_symbols(
-    symbols: &[symbols::SymbolNode],
-    event: &ingest::AgentToolCall,
-    ledger: &mut tracking::ContextLedger,
-) {
-    for sym in symbols {
-        ledger.record(
-            sym.id.clone(),
-            event.read_depth,
-            sym.content_hash,
-            event.agent_id.clone(),
-            sym.estimated_tokens,
-        );
-        mark_file_symbols(&sym.children, event, ledger);
-    }
-}
-
-/// Mark only the symbols that match the tool call's targeting info.
-fn mark_targeted_symbols(
-    symbols: &[symbols::SymbolNode],
-    event: &ingest::AgentToolCall,
-    ledger: &mut tracking::ContextLedger,
-) {
-    for sym in symbols {
-        let matches = symbol_matches_target(sym, event);
-        if matches {
-            ledger.record(
-                sym.id.clone(),
-                event.read_depth,
-                sym.content_hash,
-                event.agent_id.clone(),
-                sym.estimated_tokens,
-            );
-            // If we matched a parent (e.g. an impl block), also mark children
-            mark_file_symbols(&sym.children, event, ledger);
-        } else {
-            // Recurse — the target might be a child symbol
-            mark_targeted_symbols(&sym.children, event, ledger);
-        }
-    }
-}
-
-/// Check if a symbol matches the tool call's target_symbol or target_lines.
-fn symbol_matches_target(sym: &symbols::SymbolNode, event: &ingest::AgentToolCall) -> bool {
-    if let Some(ref target_name) = event.target_symbol {
-        // Match if the symbol's id ends with the target name path.
-        if let Some(name_part) = sym.id.split("::").last() {
-            if name_part == target_name || name_part.ends_with(&format!("/{target_name}")) {
-                return true;
-            }
-        }
-        // Also check plain name match for simple names
-        if sym.name == *target_name {
-            return true;
-        }
-    }
-    if let Some(ref target_range) = event.target_lines {
-        // Check if symbol's line range overlaps with the target line range
-        if sym.line_range.start < target_range.end && target_range.start < sym.line_range.end {
-            return true;
-        }
-    }
-    false
 }
 
 fn dump_tree(root: &Path, project_tree: &ProjectTree) {

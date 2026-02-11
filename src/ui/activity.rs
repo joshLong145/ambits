@@ -4,7 +4,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::app::{App, FocusPanel};
+use ambits::app::{App, FocusPanel};
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let border_style = if app.focus == FocusPanel::Activity {

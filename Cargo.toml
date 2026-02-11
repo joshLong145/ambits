@@ -29,6 +29,10 @@ serde-pickle = "1.2"
 [dev-dependencies]
 tempfile = "3"
 
+[lib]
+name = "ambits"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ambits"
 path = "src/main.rs"

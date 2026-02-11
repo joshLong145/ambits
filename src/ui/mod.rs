@@ -5,7 +5,7 @@ pub mod activity;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 
-use crate::app::{App, SortMode};
+use ambits::app::{App, SortMode};
 
 pub fn render(f: &mut Frame, app: &App) {
     let outer = Layout::default()

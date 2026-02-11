@@ -115,3 +115,65 @@ impl ContextLedger {
         counts
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hash(s: &str) -> [u8; 32] {
+        crate::symbols::merkle::content_hash(s)
+    }
+
+    #[test]
+    fn record_upgrades_depth() {
+        let mut ledger = ContextLedger::new();
+        ledger.record("s1".into(), ReadDepth::NameOnly, hash("a"), "ag".into(), 10);
+        ledger.record("s1".into(), ReadDepth::FullBody, hash("a"), "ag".into(), 10);
+        assert_eq!(ledger.depth_of("s1"), ReadDepth::FullBody);
+    }
+
+    #[test]
+    fn record_never_downgrades() {
+        let mut ledger = ContextLedger::new();
+        ledger.record("s1".into(), ReadDepth::FullBody, hash("a"), "ag".into(), 10);
+        ledger.record("s1".into(), ReadDepth::NameOnly, hash("a"), "ag".into(), 10);
+        assert_eq!(ledger.depth_of("s1"), ReadDepth::FullBody);
+    }
+
+    #[test]
+    fn stale_overrides_everything() {
+        let mut ledger = ContextLedger::new();
+        ledger.record("s1".into(), ReadDepth::FullBody, hash("a"), "ag".into(), 10);
+        ledger.record("s1".into(), ReadDepth::Stale, hash("b"), "ag".into(), 10);
+        assert_eq!(ledger.depth_of("s1"), ReadDepth::Stale);
+    }
+
+    #[test]
+    fn mark_stale_if_changed() {
+        let mut ledger = ContextLedger::new();
+        let h1 = hash("v1");
+        let h2 = hash("v2");
+        ledger.record("s1".into(), ReadDepth::FullBody, h1, "ag".into(), 10);
+
+        // Same hash — no change.
+        ledger.mark_stale_if_changed("s1", h1);
+        assert_eq!(ledger.depth_of("s1"), ReadDepth::FullBody);
+
+        // Different hash — becomes stale.
+        ledger.mark_stale_if_changed("s1", h2);
+        assert_eq!(ledger.depth_of("s1"), ReadDepth::Stale);
+    }
+
+    #[test]
+    fn unseen_not_marked_stale() {
+        let mut ledger = ContextLedger::new();
+        ledger.mark_stale_if_changed("never_seen", hash("x"));
+        assert_eq!(ledger.depth_of("never_seen"), ReadDepth::Unseen);
+    }
+
+    #[test]
+    fn depth_of_defaults_unseen() {
+        let ledger = ContextLedger::new();
+        assert_eq!(ledger.depth_of("nonexistent"), ReadDepth::Unseen);
+    }
+}

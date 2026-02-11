@@ -431,7 +431,7 @@ fn flatten_symbol(
 
 /// Convert a tool call file path (usually absolute) to a relative path matching
 /// the project tree's convention. Strips the project root prefix if present.
-fn normalize_tool_path(tool_path: &Path, project_root: &Path) -> PathBuf {
+pub fn normalize_tool_path(tool_path: &Path, project_root: &Path) -> PathBuf {
     if tool_path.is_absolute() {
         tool_path
             .strip_prefix(project_root)
@@ -442,7 +442,7 @@ fn normalize_tool_path(tool_path: &Path, project_root: &Path) -> PathBuf {
     }
 }
 
-fn mark_file_symbols(
+pub fn mark_file_symbols(
     symbols: &[SymbolNode],
     event: &AgentToolCall,
     ledger: &mut ContextLedger,
@@ -460,7 +460,7 @@ fn mark_file_symbols(
 }
 
 /// Mark only the symbols that match the tool call's targeting info.
-fn mark_targeted_symbols(
+pub fn mark_targeted_symbols(
     symbols: &[SymbolNode],
     event: &AgentToolCall,
     ledger: &mut ContextLedger,
@@ -485,7 +485,7 @@ fn mark_targeted_symbols(
 }
 
 /// Check if a symbol matches the tool call's target_symbol or target_lines.
-fn symbol_matches_target(sym: &SymbolNode, event: &AgentToolCall) -> bool {
+pub fn symbol_matches_target(sym: &SymbolNode, event: &AgentToolCall) -> bool {
     if let Some(ref target_name) = event.target_symbol {
         // Match if the symbol's id ends with the target name path.
         // SymbolId format is "file_path::name_path", e.g. "src/app.rs::impl App/handle_key"
@@ -522,4 +522,189 @@ fn file_coverage_status(symbols: &[SymbolNode], ledger: &ContextLedger) -> FileC
     }
 }
 
+#[cfg(test)]
+#[path = "../tests/helpers/mod.rs"]
+#[allow(dead_code)]
+mod helpers;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::helpers::*;
+    use crate::symbols::FileSymbols;
+    use std::path::Path;
+
+    #[test]
+    fn normalize_tool_path_absolute() {
+        let result = normalize_tool_path(
+            Path::new("/project/src/main.rs"),
+            Path::new("/project"),
+        );
+        assert_eq!(result, PathBuf::from("src/main.rs"));
+    }
+
+    #[test]
+    fn normalize_tool_path_relative() {
+        let result = normalize_tool_path(
+            Path::new("src/main.rs"),
+            Path::new("/project"),
+        );
+        assert_eq!(result, PathBuf::from("src/main.rs"));
+    }
+
+    #[test]
+    fn mark_file_symbols_recursive() {
+        let child = sym("f::child", "child");
+        let parent = sym_with_children("f::parent", "parent", vec![child]);
+        let event = tool_call("Read", "f.rs", ReadDepth::FullBody);
+        let mut ledger = ContextLedger::new();
+
+        mark_file_symbols(&[parent], &event, &mut ledger);
+
+        assert_eq!(ledger.depth_of("f::parent"), ReadDepth::FullBody);
+        assert_eq!(ledger.depth_of("f::child"), ReadDepth::FullBody);
+    }
+
+    #[test]
+    fn mark_targeted_by_name() {
+        let s1 = sym("f::alpha", "alpha");
+        let s2 = sym("f::beta", "beta");
+        let event = tool_call_targeted("find_symbol", "f.rs", ReadDepth::FullBody, "beta");
+        let mut ledger = ContextLedger::new();
+
+        mark_targeted_symbols(&[s1, s2], &event, &mut ledger);
+
+        assert_eq!(ledger.depth_of("f::alpha"), ReadDepth::Unseen);
+        assert_eq!(ledger.depth_of("f::beta"), ReadDepth::FullBody);
+    }
+
+    #[test]
+    fn mark_targeted_by_lines() {
+        let s1 = sym_with_lines("f::a", "a", 1, 5);
+        let s2 = sym_with_lines("f::b", "b", 10, 20);
+        let event = tool_call_lines("Read", "f.rs", ReadDepth::FullBody, 12, 18);
+        let mut ledger = ContextLedger::new();
+
+        mark_targeted_symbols(&[s1, s2], &event, &mut ledger);
+
+        assert_eq!(ledger.depth_of("f::a"), ReadDepth::Unseen);
+        assert_eq!(ledger.depth_of("f::b"), ReadDepth::FullBody);
+    }
+
+    #[test]
+    fn file_coverage_status_variants() {
+        let mut ledger = ContextLedger::new();
+        let syms = vec![sym("s1", "s1"), sym("s2", "s2")];
+
+        // No coverage.
+        assert_eq!(file_coverage_status(&syms, &ledger), FileCoverageStatus::NotCovered);
+
+        // Partial: one FullBody.
+        ledger.record("s1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+        assert_eq!(file_coverage_status(&syms, &ledger), FileCoverageStatus::PartiallyCovered);
+
+        // Full: both FullBody.
+        ledger.record("s2".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+        assert_eq!(file_coverage_status(&syms, &ledger), FileCoverageStatus::FullyCovered);
+    }
+
+    #[test]
+    fn symbol_matches_target_formats() {
+        // Plain name match.
+        let s = sym("src/app.rs::App/handle_key", "handle_key");
+        let event = tool_call_targeted("find_symbol", "src/app.rs", ReadDepth::FullBody, "handle_key");
+        assert!(symbol_matches_target(&s, &event));
+
+        // Name path suffix match.
+        let event2 = tool_call_targeted("find_symbol", "src/app.rs", ReadDepth::FullBody, "App/handle_key");
+        assert!(symbol_matches_target(&s, &event2));
+
+        // Non-match.
+        let event3 = tool_call_targeted("find_symbol", "src/app.rs", ReadDepth::FullBody, "other_fn");
+        assert!(!symbol_matches_target(&s, &event3));
+    }
+
+    // --- App method tests ---
+
+    fn test_app(files: Vec<FileSymbols>) -> App {
+        let tree = project(files);
+        App::new(tree, PathBuf::from("/test/project"), None)
+    }
+
+    #[test]
+    fn process_agent_event_updates_ledger() {
+        let syms = vec![sym("f.rs::alpha", "alpha"), sym("f.rs::beta", "beta")];
+        let mut app = test_app(vec![file("f.rs", syms)]);
+
+        let event = tool_call("Read", "/test/project/f.rs", ReadDepth::FullBody);
+        app.process_agent_event(event);
+
+        assert_eq!(app.ledger.depth_of("f.rs::alpha"), ReadDepth::FullBody);
+        assert_eq!(app.ledger.depth_of("f.rs::beta"), ReadDepth::FullBody);
+    }
+
+    #[test]
+    fn process_agent_event_targeted() {
+        let syms = vec![sym("f.rs::alpha", "alpha"), sym("f.rs::beta", "beta")];
+        let mut app = test_app(vec![file("f.rs", syms)]);
+
+        let event = tool_call_targeted("find_symbol", "/test/project/f.rs", ReadDepth::FullBody, "beta");
+        app.process_agent_event(event);
+
+        assert_eq!(app.ledger.depth_of("f.rs::alpha"), ReadDepth::Unseen);
+        assert_eq!(app.ledger.depth_of("f.rs::beta"), ReadDepth::FullBody);
+    }
+
+    #[test]
+    fn process_agent_event_tracks_agents() {
+        let mut app = test_app(vec![file("f.rs", vec![sym("f.rs::a", "a")])]);
+
+        let mut e1 = tool_call("Read", "/test/project/f.rs", ReadDepth::FullBody);
+        e1.agent_id = "agent-1".into();
+        let mut e2 = tool_call("Read", "/test/project/f.rs", ReadDepth::FullBody);
+        e2.agent_id = "agent-2".into();
+
+        app.process_agent_event(e1);
+        app.process_agent_event(e2);
+
+        assert_eq!(app.agents_seen.len(), 2);
+        assert!(app.agents_seen.contains(&"agent-1".to_string()));
+        assert!(app.agents_seen.contains(&"agent-2".to_string()));
+    }
+
+    #[test]
+    fn rebuild_tree_rows_alphabetical() {
+        let app = test_app(vec![
+            file("a.rs", vec![sym("a.rs::a", "a")]),
+            file("z.rs", vec![sym("z.rs::z", "z")]),
+        ]);
+        // Alphabetical mode preserves the file insertion order.
+        let file_rows: Vec<&str> = app.tree_rows.iter()
+            .filter(|r| r.is_file)
+            .map(|r| r.display_name.as_str())
+            .collect();
+        assert_eq!(file_rows, vec!["a.rs", "z.rs"]);
+    }
+
+    #[test]
+    fn rebuild_tree_rows_by_coverage() {
+        let syms_a = vec![sym("a.rs::x", "x")];
+        let syms_b = vec![sym("b.rs::y", "y")];
+        let mut app = test_app(vec![
+            file("a.rs", syms_a),
+            file("b.rs", syms_b),
+        ]);
+
+        // Mark a.rs as partially covered.
+        app.ledger.record("a.rs::x".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+        app.sort_mode = SortMode::ByCoverage;
+        app.rebuild_tree_rows();
+
+        let file_rows: Vec<&str> = app.tree_rows.iter()
+            .filter(|r| r.is_file)
+            .map(|r| r.display_name.as_str())
+            .collect();
+        // PartiallyCovered (a.rs) sorts before NotCovered (b.rs).
+        assert_eq!(file_rows, vec!["a.rs", "b.rs"]);
+    }
+}

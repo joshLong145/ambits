@@ -4,8 +4,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 
-use crate::app::{App, FileCoverageStatus, FocusPanel};
-use crate::tracking::ReadDepth;
+use ambits::app::{App, FileCoverageStatus, FocusPanel};
+use ambits::tracking::ReadDepth;
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let border_style = if app.focus == FocusPanel::Tree {
