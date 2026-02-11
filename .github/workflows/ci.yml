@@ -25,4 +25,4 @@ jobs:
       - name: Build
         run: cargo build --verbose
       - name: Run tests with coverage
-        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+        run: cargo llvm-cov --all-features --text
