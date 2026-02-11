@@ -231,3 +231,54 @@ fn child_by_kind<'a>(node: &'a Node<'a>, kind: &str) -> Option<Node<'a>> {
     let result = node.children(&mut cursor).find(|c| c.kind() == kind);
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::LanguageParser;
+    use std::path::Path;
+
+    fn parse(src: &str) -> Vec<SymbolNode> {
+        let parser = RustParser::new();
+        let file = parser.parse_file(Path::new("test.rs"), src).unwrap();
+        file.symbols
+    }
+
+    #[test]
+    fn parse_function() {
+        let syms = parse("fn foo() {}");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "foo");
+        assert_eq!(syms[0].category, SymbolCategory::Function);
+    }
+
+    #[test]
+    fn parse_struct_with_impl() {
+        let syms = parse(
+            "struct Point { x: i32 }\nimpl Point {\n    fn new() -> Self { Self { x: 0 } }\n}",
+        );
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "Point");
+        assert_eq!(syms[0].category, SymbolCategory::Type);
+        assert_eq!(syms[1].name, "Point");
+        assert_eq!(syms[1].category, SymbolCategory::Implementation);
+        assert_eq!(syms[1].children.len(), 1);
+        assert_eq!(syms[1].children[0].name, "new");
+    }
+
+    #[test]
+    fn parse_nested_module() {
+        let syms = parse("mod inner {\n    fn bar() {}\n}");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "inner");
+        assert_eq!(syms[0].category, SymbolCategory::Module);
+        assert_eq!(syms[0].children.len(), 1);
+        assert_eq!(syms[0].children[0].name, "bar");
+    }
+
+    #[test]
+    fn parse_empty_file() {
+        let syms = parse("");
+        assert!(syms.is_empty());
+    }
+}

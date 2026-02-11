@@ -234,3 +234,100 @@ impl CoverageFormatter for TextFormatter {
         output
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/helpers/mod.rs"]
+#[allow(dead_code)]
+mod helpers;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::helpers::*;
+    use crate::tracking::ContextLedger;
+
+    #[test]
+    fn seen_percent_basic() {
+        let fc = FileCoverage { path: "a.rs".into(), total_symbols: 10, seen_count: 3, full_count: 1 };
+        assert!((fc.seen_percent() - 30.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn seen_percent_zero_total() {
+        let fc = FileCoverage { path: "a.rs".into(), total_symbols: 0, seen_count: 0, full_count: 0 };
+        assert!((fc.seen_percent()).abs() < 0.01);
+    }
+
+    #[test]
+    fn full_percent_basic() {
+        let fc = FileCoverage { path: "a.rs".into(), total_symbols: 4, seen_count: 2, full_count: 2 };
+        assert!((fc.full_percent() - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn count_symbols_empty() {
+        let ledger = ContextLedger::new();
+        assert_eq!(count_symbols(&[], &ledger), (0, 0, 0));
+    }
+
+    #[test]
+    fn count_symbols_nested() {
+        let mut ledger = ContextLedger::new();
+        let child1 = sym("c1", "child1");
+        let child2 = sym("c2", "child2");
+        let parent = sym_with_children("p", "parent", vec![child1, child2]);
+
+        // Mark parent as FullBody, child1 as Overview.
+        ledger.record("p".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+        ledger.record("c1".into(), ReadDepth::Overview, [0; 32], "ag".into(), 10);
+
+        let (total, seen, full) = count_symbols(&[parent], &ledger);
+        assert_eq!(total, 3);
+        assert_eq!(seen, 2);
+        assert_eq!(full, 1);
+    }
+
+    #[test]
+    fn from_project_sorts_by_full_percent() {
+        let mut ledger = ContextLedger::new();
+        let tree = project(vec![
+            file("b.rs", vec![sym("b1", "b1")]),
+            file("a.rs", vec![sym("a1", "a1")]),
+        ]);
+        // Mark b1 as FullBody (100%), a1 unseen (0%).
+        ledger.record("b1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+
+        let report = CoverageReport::from_project(&tree, &ledger);
+        // Sorted ascending by full_percent: a.rs (0%) first, b.rs (100%) second.
+        assert_eq!(report.files[0].path, "a.rs");
+        assert_eq!(report.files[1].path, "b.rs");
+    }
+
+    #[test]
+    fn report_aggregates() {
+        let mut ledger = ContextLedger::new();
+        let tree = project(vec![
+            file("a.rs", vec![sym("a1", "a1"), sym("a2", "a2")]),
+            file("b.rs", vec![sym("b1", "b1")]),
+        ]);
+        ledger.record("a1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+        ledger.record("b1".into(), ReadDepth::Overview, [0; 32], "ag".into(), 10);
+
+        let report = CoverageReport::from_project(&tree, &ledger);
+        assert_eq!(report.total_symbols(), 3);
+        assert_eq!(report.total_seen(), 2);
+        assert_eq!(report.total_full(), 1);
+    }
+
+    #[test]
+    fn text_formatter_output() {
+        let report = CoverageReport { session_id: Some("abc-123".into()), files: vec![
+            FileCoverage { path: "src/main.rs".into(), total_symbols: 10, seen_count: 8, full_count: 5 },
+        ]};
+        let formatter = TextFormatter::default();
+        let output = formatter.format(&report);
+        assert!(output.contains("Coverage Report (session: abc-123)"));
+        assert!(output.contains("src/main.rs"));
+        assert!(output.contains("TOTAL"));
+    }
+}
