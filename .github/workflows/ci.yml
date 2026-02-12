@@ -25,4 +25,8 @@ jobs:
       - name: Build
         run: cargo build --verbose
       - name: Run tests with coverage
-        run: cargo llvm-cov --all-features
+        run: cargo llvm-cov --all-features --coverage
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+            token: ${{ secrets.CODECOV_TOKEN }}
