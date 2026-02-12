@@ -12,6 +12,7 @@ It's a real-time TUI that watches Claude Code session logs and paints every func
 - **Depth-aware coverage** — Every symbol is color-coded by read depth: unseen, name-only, overview, signature, or full body
 - **Staleness detection** — When source files change on disk, previously-read symbols are automatically marked stale so you know what needs a re-read
 - **Coverage reports** — Generate tabular per-file coverage summaries for CI or quick audits
+- **Per-file coverage counts** — Each file shows a `seen/total` symbol count so you can tell at a glance how much of it the agent has inspected
 - **Sortable tree view** — Toggle between alphabetical and coverage-grouped ordering to surface partially-covered files first
 - **Multiple parsing backends** — Tree-sitter for fast local parsing, or [Serena MCP](https://github.com/oraios/serena) for richer LSP-based symbol data across more languages
 
@@ -154,6 +155,7 @@ Claude will run the appropriate `ambits` commands and interpret the coverage res
 
 | Color | Meaning |
 |---|---|
-| White | No symbols read at full body depth |
-| Amber | Partially covered (some symbols read fully) |
+| White | No symbols seen |
+| Amber | Partially covered (some symbols seen) |
+| Yellow-green | All seen (every symbol seen, but not all at full body depth) |
 | Green | Fully covered (all symbols read at full body depth) |

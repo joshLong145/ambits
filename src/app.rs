@@ -17,11 +17,12 @@ pub enum SortMode {
     ByCoverage,
 }
 
-/// Three-state coverage classification for files.
-/// Variant order gives the desired sort: Partially → Fully → Not Covered.
+/// Four-state coverage classification for files.
+/// Variant order gives the desired sort: Partially → AllSeen → Fully → Not Covered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FileCoverageStatus {
     PartiallyCovered,
+    AllSeen,
     FullyCovered,
     NotCovered,
 }
@@ -40,6 +41,8 @@ pub struct TreeRow {
     pub token_count: usize,
     pub read_depth: ReadDepth,
     pub coverage_status: Option<FileCoverageStatus>,
+    pub file_coverage_seen: usize,
+    pub file_coverage_total: usize,
 }
 
 /// Which panel is focused.
@@ -130,8 +133,9 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(i, f)| {
+                    let (total, seen, full) = count_symbols(&f.symbols, &self.ledger);
                     (
-                        file_coverage_status(&f.symbols, &self.ledger),
+                        coverage_status_from_counts(total, seen, full),
                         f.file_path.as_path(),
                         i,
                     )
@@ -149,7 +153,8 @@ impl App {
             let file_id = file_path.clone();
             let is_expanded = !self.collapsed.contains(&file_id);
 
-            let status = file_coverage_status(&file.symbols, &self.ledger);
+            let (total, seen, full) = count_symbols(&file.symbols, &self.ledger);
+            let status = coverage_status_from_counts(total, seen, full);
             let file_read_depth = if status != FileCoverageStatus::NotCovered {
                 ReadDepth::NameOnly // Use NameOnly to indicate "has coverage"
             } else {
@@ -168,6 +173,8 @@ impl App {
                 token_count: 0,
                 read_depth: file_read_depth,
                 coverage_status: Some(status),
+                file_coverage_seen: seen,
+                file_coverage_total: total,
             });
 
             if is_expanded {
@@ -420,6 +427,8 @@ fn flatten_symbol(
         token_count: sym.estimated_tokens,
         read_depth,
         coverage_status: None,
+        file_coverage_seen: 0,
+        file_coverage_total: 0,
     });
 
     if is_expanded {
@@ -509,14 +518,22 @@ pub fn symbol_matches_target(sym: &SymbolNode, event: &AgentToolCall) -> bool {
     false
 }
 
-/// Classify a file's coverage as fully covered, partially covered, or not covered.
+/// Classify a file's coverage as fully covered, all seen, partially covered, or not covered.
 /// "Fully covered" means every symbol has been read at FullBody depth.
-fn file_coverage_status(symbols: &[SymbolNode], ledger: &ContextLedger) -> FileCoverageStatus {
-    let (total, _seen, full) = count_symbols(symbols, ledger);
+/// "All seen" means every symbol has been seen (depth > Unseen) but not all at FullBody.
+fn coverage_status_from_counts(total: usize, seen: usize, full: usize) -> FileCoverageStatus {
     if total == 0 || full == 0 {
-        FileCoverageStatus::NotCovered
+        if seen > 0 && seen == total {
+            FileCoverageStatus::AllSeen
+        } else if seen > 0 {
+            FileCoverageStatus::PartiallyCovered
+        } else {
+            FileCoverageStatus::NotCovered
+        }
     } else if full == total {
         FileCoverageStatus::FullyCovered
+    } else if seen == total {
+        FileCoverageStatus::AllSeen
     } else {
         FileCoverageStatus::PartiallyCovered
     }
@@ -554,73 +571,89 @@ mod tests {
 
     #[test]
     fn mark_file_symbols_recursive() {
-        let child = sym("f::child", "child");
-        let parent = sym_with_children("f::parent", "parent", vec![child]);
-        let event = tool_call("Read", "f.rs", ReadDepth::FullBody);
+        let child = sym("mock/f.rs::child", "child");
+        let parent = sym_with_children("mock/f.rs::parent", "parent", vec![child]);
+        let event = tool_call("Read", "mock/f.rs", ReadDepth::FullBody);
         let mut ledger = ContextLedger::new();
 
         mark_file_symbols(&[parent], &event, &mut ledger);
 
-        assert_eq!(ledger.depth_of("f::parent"), ReadDepth::FullBody);
-        assert_eq!(ledger.depth_of("f::child"), ReadDepth::FullBody);
+        assert_eq!(ledger.depth_of("mock/f.rs::parent"), ReadDepth::FullBody);
+        assert_eq!(ledger.depth_of("mock/f.rs::child"), ReadDepth::FullBody);
     }
 
     #[test]
     fn mark_targeted_by_name() {
-        let s1 = sym("f::alpha", "alpha");
-        let s2 = sym("f::beta", "beta");
-        let event = tool_call_targeted("find_symbol", "f.rs", ReadDepth::FullBody, "beta");
+        let s1 = sym("mock/f.rs::alpha", "alpha");
+        let s2 = sym("mock/f.rs::beta", "beta");
+        let event = tool_call_targeted("find_symbol", "mock/f.rs", ReadDepth::FullBody, "beta");
         let mut ledger = ContextLedger::new();
 
         mark_targeted_symbols(&[s1, s2], &event, &mut ledger);
 
-        assert_eq!(ledger.depth_of("f::alpha"), ReadDepth::Unseen);
-        assert_eq!(ledger.depth_of("f::beta"), ReadDepth::FullBody);
+        assert_eq!(ledger.depth_of("mock/f.rs::alpha"), ReadDepth::Unseen);
+        assert_eq!(ledger.depth_of("mock/f.rs::beta"), ReadDepth::FullBody);
     }
 
     #[test]
     fn mark_targeted_by_lines() {
-        let s1 = sym_with_lines("f::a", "a", 1, 5);
-        let s2 = sym_with_lines("f::b", "b", 10, 20);
-        let event = tool_call_lines("Read", "f.rs", ReadDepth::FullBody, 12, 18);
+        let s1 = sym_with_lines("mock/f.rs::a", "a", 1, 5);
+        let s2 = sym_with_lines("mock/f.rs::b", "b", 10, 20);
+        let event = tool_call_lines("Read", "mock/f.rs", ReadDepth::FullBody, 12, 18);
         let mut ledger = ContextLedger::new();
 
         mark_targeted_symbols(&[s1, s2], &event, &mut ledger);
 
-        assert_eq!(ledger.depth_of("f::a"), ReadDepth::Unseen);
-        assert_eq!(ledger.depth_of("f::b"), ReadDepth::FullBody);
+        assert_eq!(ledger.depth_of("mock/f.rs::a"), ReadDepth::Unseen);
+        assert_eq!(ledger.depth_of("mock/f.rs::b"), ReadDepth::FullBody);
     }
 
     #[test]
-    fn file_coverage_status_variants() {
+    fn coverage_status_from_counts_variants() {
         let mut ledger = ContextLedger::new();
         let syms = vec![sym("s1", "s1"), sym("s2", "s2")];
 
         // No coverage.
-        assert_eq!(file_coverage_status(&syms, &ledger), FileCoverageStatus::NotCovered);
+        let (total, seen, full) = count_symbols(&syms, &ledger);
+        assert_eq!(coverage_status_from_counts(total, seen, full), FileCoverageStatus::NotCovered);
 
-        // Partial: one FullBody.
+        // Partial: one seen, one unseen → PartiallyCovered.
+        ledger.record("s1".into(), ReadDepth::NameOnly, [0; 32], "ag".into(), 10);
+        let (total, seen, full) = count_symbols(&syms, &ledger);
+        assert_eq!(coverage_status_from_counts(total, seen, full), FileCoverageStatus::PartiallyCovered);
+
+        // All seen (both NameOnly) but none FullBody → AllSeen.
+        ledger.record("s2".into(), ReadDepth::NameOnly, [0; 32], "ag".into(), 10);
+        let (total, seen, full) = count_symbols(&syms, &ledger);
+        assert_eq!(coverage_status_from_counts(total, seen, full), FileCoverageStatus::AllSeen);
+
+        // One FullBody, one NameOnly → AllSeen (all seen, not all full).
         ledger.record("s1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
-        assert_eq!(file_coverage_status(&syms, &ledger), FileCoverageStatus::PartiallyCovered);
+        let (total, seen, full) = count_symbols(&syms, &ledger);
+        assert_eq!(coverage_status_from_counts(total, seen, full), FileCoverageStatus::AllSeen);
 
         // Full: both FullBody.
         ledger.record("s2".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
-        assert_eq!(file_coverage_status(&syms, &ledger), FileCoverageStatus::FullyCovered);
+        let (total, seen, full) = count_symbols(&syms, &ledger);
+        assert_eq!(coverage_status_from_counts(total, seen, full), FileCoverageStatus::FullyCovered);
+
+        // Direct FullBody with unseen siblings → PartiallyCovered (full > 0, seen < total).
+        assert_eq!(coverage_status_from_counts(3, 1, 1), FileCoverageStatus::PartiallyCovered);
     }
 
     #[test]
     fn symbol_matches_target_formats() {
         // Plain name match.
-        let s = sym("src/app.rs::App/handle_key", "handle_key");
-        let event = tool_call_targeted("find_symbol", "src/app.rs", ReadDepth::FullBody, "handle_key");
+        let s = sym("mock/app.rs::App/handle_key", "handle_key");
+        let event = tool_call_targeted("find_symbol", "mock/app.rs", ReadDepth::FullBody, "handle_key");
         assert!(symbol_matches_target(&s, &event));
 
         // Name path suffix match.
-        let event2 = tool_call_targeted("find_symbol", "src/app.rs", ReadDepth::FullBody, "App/handle_key");
+        let event2 = tool_call_targeted("find_symbol", "mock/app.rs", ReadDepth::FullBody, "App/handle_key");
         assert!(symbol_matches_target(&s, &event2));
 
         // Non-match.
-        let event3 = tool_call_targeted("find_symbol", "src/app.rs", ReadDepth::FullBody, "other_fn");
+        let event3 = tool_call_targeted("find_symbol", "mock/app.rs", ReadDepth::FullBody, "other_fn");
         assert!(!symbol_matches_target(&s, &event3));
     }
 
@@ -633,35 +666,35 @@ mod tests {
 
     #[test]
     fn process_agent_event_updates_ledger() {
-        let syms = vec![sym("f.rs::alpha", "alpha"), sym("f.rs::beta", "beta")];
-        let mut app = test_app(vec![file("f.rs", syms)]);
+        let syms = vec![sym("mock/f.rs::alpha", "alpha"), sym("mock/f.rs::beta", "beta")];
+        let mut app = test_app(vec![file("mock/f.rs", syms)]);
 
-        let event = tool_call("Read", "/test/project/f.rs", ReadDepth::FullBody);
+        let event = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::FullBody);
         app.process_agent_event(event);
 
-        assert_eq!(app.ledger.depth_of("f.rs::alpha"), ReadDepth::FullBody);
-        assert_eq!(app.ledger.depth_of("f.rs::beta"), ReadDepth::FullBody);
+        assert_eq!(app.ledger.depth_of("mock/f.rs::alpha"), ReadDepth::FullBody);
+        assert_eq!(app.ledger.depth_of("mock/f.rs::beta"), ReadDepth::FullBody);
     }
 
     #[test]
     fn process_agent_event_targeted() {
-        let syms = vec![sym("f.rs::alpha", "alpha"), sym("f.rs::beta", "beta")];
-        let mut app = test_app(vec![file("f.rs", syms)]);
+        let syms = vec![sym("mock/f.rs::alpha", "alpha"), sym("mock/f.rs::beta", "beta")];
+        let mut app = test_app(vec![file("mock/f.rs", syms)]);
 
-        let event = tool_call_targeted("find_symbol", "/test/project/f.rs", ReadDepth::FullBody, "beta");
+        let event = tool_call_targeted("find_symbol", "/test/project/mock/f.rs", ReadDepth::FullBody, "beta");
         app.process_agent_event(event);
 
-        assert_eq!(app.ledger.depth_of("f.rs::alpha"), ReadDepth::Unseen);
-        assert_eq!(app.ledger.depth_of("f.rs::beta"), ReadDepth::FullBody);
+        assert_eq!(app.ledger.depth_of("mock/f.rs::alpha"), ReadDepth::Unseen);
+        assert_eq!(app.ledger.depth_of("mock/f.rs::beta"), ReadDepth::FullBody);
     }
 
     #[test]
     fn process_agent_event_tracks_agents() {
-        let mut app = test_app(vec![file("f.rs", vec![sym("f.rs::a", "a")])]);
+        let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::a", "a")])]);
 
-        let mut e1 = tool_call("Read", "/test/project/f.rs", ReadDepth::FullBody);
+        let mut e1 = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::FullBody);
         e1.agent_id = "agent-1".into();
-        let mut e2 = tool_call("Read", "/test/project/f.rs", ReadDepth::FullBody);
+        let mut e2 = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::FullBody);
         e2.agent_id = "agent-2".into();
 
         app.process_agent_event(e1);
@@ -675,28 +708,28 @@ mod tests {
     #[test]
     fn rebuild_tree_rows_alphabetical() {
         let app = test_app(vec![
-            file("a.rs", vec![sym("a.rs::a", "a")]),
-            file("z.rs", vec![sym("z.rs::z", "z")]),
+            file("mock/a.rs", vec![sym("mock/a.rs::a", "a")]),
+            file("mock/z.rs", vec![sym("mock/z.rs::z", "z")]),
         ]);
         // Alphabetical mode preserves the file insertion order.
         let file_rows: Vec<&str> = app.tree_rows.iter()
             .filter(|r| r.is_file)
             .map(|r| r.display_name.as_str())
             .collect();
-        assert_eq!(file_rows, vec!["a.rs", "z.rs"]);
+        assert_eq!(file_rows, vec!["mock/a.rs", "mock/z.rs"]);
     }
 
     #[test]
     fn rebuild_tree_rows_by_coverage() {
-        let syms_a = vec![sym("a.rs::x", "x")];
-        let syms_b = vec![sym("b.rs::y", "y")];
+        let syms_a = vec![sym("mock/a.rs::x", "x")];
+        let syms_b = vec![sym("mock/b.rs::y", "y")];
         let mut app = test_app(vec![
-            file("a.rs", syms_a),
-            file("b.rs", syms_b),
+            file("mock/a.rs", syms_a),
+            file("mock/b.rs", syms_b),
         ]);
 
-        // Mark a.rs as partially covered.
-        app.ledger.record("a.rs::x".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+        // Mark mock/a.rs as partially covered.
+        app.ledger.record("mock/a.rs::x".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
         app.sort_mode = SortMode::ByCoverage;
         app.rebuild_tree_rows();
 
@@ -704,7 +737,7 @@ mod tests {
             .filter(|r| r.is_file)
             .map(|r| r.display_name.as_str())
             .collect();
-        // PartiallyCovered (a.rs) sorts before NotCovered (b.rs).
-        assert_eq!(file_rows, vec!["a.rs", "b.rs"]);
+        // PartiallyCovered (mock/a.rs) sorts before NotCovered (mock/b.rs).
+        assert_eq!(file_rows, vec!["mock/a.rs", "mock/b.rs"]);
     }
 }

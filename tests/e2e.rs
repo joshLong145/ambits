@@ -25,7 +25,7 @@ fn sym(id: &str, name: &str) -> SymbolNode {
         name: name.to_string(),
         category: SymbolCategory::Function,
         label: "fn".to_string(),
-        file_path: PathBuf::from("test.rs"),
+        file_path: PathBuf::new(),
         byte_range: 0..100,
         line_range: 1..10,
         content_hash: hash,
@@ -36,8 +36,16 @@ fn sym(id: &str, name: &str) -> SymbolNode {
 }
 
 fn file(path: &str, symbols: Vec<SymbolNode>) -> FileSymbols {
+    let file_path = PathBuf::from(path);
+    let symbols = symbols
+        .into_iter()
+        .map(|mut s| {
+            s.file_path = file_path.clone();
+            s
+        })
+        .collect();
     FileSymbols {
-        file_path: PathBuf::from(path),
+        file_path,
         symbols,
         total_lines: 100,
     }
@@ -90,13 +98,13 @@ fn make_app(files: Vec<FileSymbols>) -> App {
 #[test]
 fn full_pipeline_read() {
     let files = vec![
-        file("file_a.rs", vec![sym("file_a.rs::foo", "foo"), sym("file_a.rs::bar", "bar")]),
-        file("file_b.rs", vec![sym("file_b.rs::baz", "baz")]),
+        file("mock/file_a.rs", vec![sym("mock/file_a.rs::foo", "foo"), sym("mock/file_a.rs::bar", "bar")]),
+        file("mock/file_b.rs", vec![sym("mock/file_b.rs::baz", "baz")]),
     ];
     let mut app = make_app(files);
 
     // Parse a Read event for file_a (absolute path gets normalized).
-    let tmp = write_jsonl(&[jsonl_read("/test/project/file_a.rs")]);
+    let tmp = write_jsonl(&[jsonl_read("/test/project/mock/file_a.rs")]);
     let events = parse_log_file(tmp.path());
     assert_eq!(events.len(), 1);
 
@@ -105,12 +113,12 @@ fn full_pipeline_read() {
     }
 
     let report = CoverageReport::from_project(&app.project_tree, &app.ledger);
-    // file_a: 2 symbols, all FullBody → 100%. file_b: 0%.
-    let fa = report.files.iter().find(|f| f.path == "file_a.rs").unwrap();
+    // mock/file_a: 2 symbols, all FullBody → 100%. mock/file_b: 0%.
+    let fa = report.files.iter().find(|f| f.path == "mock/file_a.rs").unwrap();
     assert_eq!(fa.full_count, 2);
     assert_eq!(fa.full_percent(), 100.0);
 
-    let fb = report.files.iter().find(|f| f.path == "file_b.rs").unwrap();
+    let fb = report.files.iter().find(|f| f.path == "mock/file_b.rs").unwrap();
     assert_eq!(fb.full_count, 0);
     assert_eq!(fb.full_percent(), 0.0);
 }
@@ -119,21 +127,21 @@ fn full_pipeline_read() {
 #[test]
 fn targeted_symbol_partial() {
     let files = vec![
-        file("f.rs", vec![sym("f.rs::alpha", "alpha"), sym("f.rs::beta", "beta")]),
+        file("mock/f.rs", vec![sym("mock/f.rs::alpha", "alpha"), sym("mock/f.rs::beta", "beta")]),
     ];
     let mut app = make_app(files);
 
-    let tmp = write_jsonl(&[jsonl_find_symbol("f.rs", "beta", true)]);
+    let tmp = write_jsonl(&[jsonl_find_symbol("mock/f.rs", "beta", true)]);
     let events = parse_log_file(tmp.path());
     for event in events {
         app.process_agent_event(event);
     }
 
-    assert_eq!(app.ledger.depth_of("f.rs::alpha"), ReadDepth::Unseen);
-    assert_eq!(app.ledger.depth_of("f.rs::beta"), ReadDepth::FullBody);
+    assert_eq!(app.ledger.depth_of("mock/f.rs::alpha"), ReadDepth::Unseen);
+    assert_eq!(app.ledger.depth_of("mock/f.rs::beta"), ReadDepth::FullBody);
 
     let report = CoverageReport::from_project(&app.project_tree, &app.ledger);
-    let f = report.files.iter().find(|f| f.path == "f.rs").unwrap();
+    let f = report.files.iter().find(|f| f.path == "mock/f.rs").unwrap();
     assert_eq!(f.seen_count, 1);
     assert_eq!(f.full_count, 1);
     assert_eq!(f.total_symbols, 2);
@@ -143,14 +151,14 @@ fn targeted_symbol_partial() {
 #[test]
 fn depth_upgrade_invariant() {
     let files = vec![
-        file("f.rs", vec![sym("f.rs::x", "x")]),
+        file("mock/f.rs", vec![sym("mock/f.rs::x", "x")]),
     ];
     let mut app = make_app(files);
 
     let lines = vec![
-        jsonl_grep("pattern"),              // NameOnly, no file targeting
-        jsonl_read("/test/project/f.rs"),    // FullBody
-        jsonl_grep("pattern"),              // NameOnly again — must NOT downgrade
+        jsonl_grep("pattern"),                      // NameOnly, no file targeting
+        jsonl_read("/test/project/mock/f.rs"),       // FullBody
+        jsonl_grep("pattern"),                      // NameOnly again — must NOT downgrade
     ];
     let tmp = write_jsonl(&lines);
     let events = parse_log_file(tmp.path());
@@ -159,19 +167,19 @@ fn depth_upgrade_invariant() {
     }
 
     // Grep doesn't target a file, so only the Read sets depth.
-    assert_eq!(app.ledger.depth_of("f.rs::x"), ReadDepth::FullBody);
+    assert_eq!(app.ledger.depth_of("mock/f.rs::x"), ReadDepth::FullBody);
 }
 
 /// Events from two different agents → both tracked in agents_seen.
 #[test]
 fn multi_agent_session() {
-    let files = vec![file("f.rs", vec![sym("f.rs::a", "a")])];
+    let files = vec![file("mock/f.rs", vec![sym("mock/f.rs::a", "a")])];
     let mut app = make_app(files);
 
     // Simulate two agents by modifying the agent_id after parsing.
     let tmp = write_jsonl(&[
-        jsonl_read("/test/project/f.rs"),
-        jsonl_read("/test/project/f.rs"),
+        jsonl_read("/test/project/mock/f.rs"),
+        jsonl_read("/test/project/mock/f.rs"),
     ]);
     let mut events: Vec<AgentToolCall> = parse_log_file(tmp.path());
     events[0].agent_id = "agent-alpha".into();
@@ -206,23 +214,23 @@ fn parse_log_file_e2e() {
 #[test]
 fn coverage_sort_order() {
     let files = vec![
-        file("a.rs", vec![sym("a.rs::a1", "a1"), sym("a.rs::a2", "a2")]),
-        file("b.rs", vec![sym("b.rs::b1", "b1"), sym("b.rs::b2", "b2")]),
-        file("c.rs", vec![sym("c.rs::c1", "c1")]),
+        file("mock/a.rs", vec![sym("mock/a.rs::a1", "a1"), sym("mock/a.rs::a2", "a2")]),
+        file("mock/b.rs", vec![sym("mock/b.rs::b1", "b1"), sym("mock/b.rs::b2", "b2")]),
+        file("mock/c.rs", vec![sym("mock/c.rs::c1", "c1")]),
     ];
     let tree = project(files);
     let mut ledger = ContextLedger::new();
 
-    // b.rs: 50% (1 of 2 full).
-    ledger.record("b.rs::b1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
-    // c.rs: 100%.
-    ledger.record("c.rs::c1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
-    // a.rs: 0%.
+    // mock/b.rs: 50% (1 of 2 full).
+    ledger.record("mock/b.rs::b1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+    // mock/c.rs: 100%.
+    ledger.record("mock/c.rs::c1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+    // mock/a.rs: 0%.
 
     let report = CoverageReport::from_project(&tree, &ledger);
     let paths: Vec<&str> = report.files.iter().map(|f| f.path.as_str()).collect();
     // Sorted ascending by full_percent: 0%, 50%, 100%.
-    assert_eq!(paths, vec!["a.rs", "b.rs", "c.rs"]);
+    assert_eq!(paths, vec!["mock/a.rs", "mock/b.rs", "mock/c.rs"]);
 }
 
 /// Record a symbol → change its hash → mark_stale_if_changed → still counts as "seen" but stale.
@@ -251,11 +259,11 @@ fn stale_detection() {
 #[test]
 fn text_formatter_structure() {
     let files = vec![
-        file("src/main.rs", vec![sym("src/main.rs::main", "main")]),
+        file("mock/main.rs", vec![sym("mock/main.rs::main", "main")]),
     ];
     let tree = project(files);
     let mut ledger = ContextLedger::new();
-    ledger.record("src/main.rs::main".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+    ledger.record("mock/main.rs::main".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
 
     let mut report = CoverageReport::from_project(&tree, &ledger);
     report.session_id = Some("test-session-123".into());
@@ -266,7 +274,7 @@ fn text_formatter_structure() {
     assert!(output.contains("test-session-123"), "should contain session id");
     assert!(output.contains("File"), "should contain header");
     assert!(output.contains("Symbols"), "should contain header");
-    assert!(output.contains("src/main.rs"), "should contain file path");
+    assert!(output.contains("mock/main.rs"), "should contain file path");
     assert!(output.contains("TOTAL"), "should contain total row");
     assert!(output.contains("100%"), "should show 100% for full coverage");
 }

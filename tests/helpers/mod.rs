@@ -4,7 +4,8 @@ use crate::ingest::AgentToolCall;
 use crate::symbols::{FileSymbols, ProjectTree, SymbolCategory, SymbolNode};
 use crate::tracking::ReadDepth;
 
-/// Create a minimal SymbolNode with sensible defaults.
+/// Create a mock SymbolNode for testing.
+/// The `file_path` is left empty; `file()` sets it to match the parent `FileSymbols`.
 pub fn sym(id: &str, name: &str) -> SymbolNode {
     let hash = crate::symbols::merkle::content_hash(name);
     SymbolNode {
@@ -12,7 +13,7 @@ pub fn sym(id: &str, name: &str) -> SymbolNode {
         name: name.to_string(),
         category: SymbolCategory::Function,
         label: "fn".to_string(),
-        file_path: PathBuf::from("test.rs"),
+        file_path: PathBuf::new(),
         byte_range: 0..100,
         line_range: 1..10,
         content_hash: hash,
@@ -36,10 +37,18 @@ pub fn sym_with_lines(id: &str, name: &str, start: usize, end: usize) -> SymbolN
     s
 }
 
-/// Create a FileSymbols entry.
+/// Create a FileSymbols entry, setting each symbol's `file_path` to match.
 pub fn file(path: &str, symbols: Vec<SymbolNode>) -> FileSymbols {
+    let file_path = PathBuf::from(path);
+    let symbols = symbols
+        .into_iter()
+        .map(|mut s| {
+            s.file_path = file_path.clone();
+            s
+        })
+        .collect();
     FileSymbols {
-        file_path: PathBuf::from(path),
+        file_path,
         symbols,
         total_lines: 100,
     }

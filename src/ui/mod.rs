@@ -1,3 +1,4 @@
+pub mod colors;
 pub mod tree_view;
 pub mod stats;
 pub mod activity;
