@@ -32,7 +32,7 @@ use ratatui::Terminal;
 use ambits::app::App;
 use events::AppEvent;
 use ambits::parser::ParserRegistry;
-use ambits::symbols::{FileSymbols, ProjectTree};
+use ambits::symbols::ProjectTree;
 
 #[derive(ClapParser, Debug)]
 #[command(name = "ambits", about = "Visualize LLM agent context coverage")]
@@ -243,12 +243,15 @@ fn run_tui(
 
     // Set up file watcher for project source changes.
     let tx_file = tx.clone();
+    let watched_extensions = registry.supported_extensions();
     let mut _project_watcher = notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
         if let Ok(event) = res {
             if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
                 for path in event.paths {
-                    if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                        let _ = tx_file.send(AppEvent::FileChanged(path));
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                        if watched_extensions.contains(ext) {
+                            let _ = tx_file.send(AppEvent::FileChanged(path));
+                        }
                     }
                 }
             }
@@ -515,44 +518,31 @@ fn print_symbol(sym: &symbols::SymbolNode, indent: usize) {
 }
 
 fn scan_project(root: &Path, registry: &ParserRegistry) -> Result<ProjectTree> {
+    use ignore::WalkBuilder;
+
     let mut files = Vec::new();
-    walk_dir(root, root, registry, &mut files)?;
-    files.sort_by(|a, b| a.file_path.cmp(&b.file_path));
 
-    Ok(ProjectTree {
-        root: root.to_path_buf(),
-        files,
-    })
-}
+    // Ignore dot files and files in .gitignore
+    for result in WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .build()
+    {
+        let entry = match result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
 
-fn walk_dir(
-    dir: &Path,
-    root: &Path,
-    registry: &ParserRegistry,
-    out: &mut Vec<FileSymbols>,
-) -> Result<()> {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(()),
-    };
-
-    for entry in entries {
-        let entry = entry?;
         let path = entry.path();
-
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with('.') || name == "target" || name == "node_modules" {
-                continue;
-            }
+        if path.is_dir() {
+            continue;
         }
 
-        if path.is_dir() {
-            walk_dir(&path, root, registry, out)?;
-        } else if let Some(parser) = registry.parser_for(&path) {
-            let source = fs::read_to_string(&path)?;
-            let rel_path = path.strip_prefix(root).unwrap_or(&path);
+        if let Some(parser) = registry.parser_for(path) {
+            let source = fs::read_to_string(path)?;
+            let rel_path = path.strip_prefix(root).unwrap_or(path);
             match parser.parse_file(rel_path, &source) {
-                Ok(file_symbols) => out.push(file_symbols),
+                Ok(file_symbols) => files.push(file_symbols),
                 Err(e) => {
                     eprintln!("Warning: failed to parse {}: {}", path.display(), e);
                 }
@@ -560,5 +550,10 @@ fn walk_dir(
         }
     }
 
-    Ok(())
+    files.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+
+    Ok(ProjectTree {
+        root: root.to_path_buf(),
+        files,
+    })
 }

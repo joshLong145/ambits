@@ -1,5 +1,6 @@
 pub mod python;
 pub mod rust;
+pub mod typescript;
 
 use std::path::Path;
 
@@ -27,11 +28,20 @@ impl ParserRegistry {
         };
         registry.register(Box::new(rust::RustParser::new()));
         registry.register(Box::new(python::PythonParser::new()));
+        registry.register(Box::new(typescript::TypescriptParser::new()));
         registry
     }
 
     pub fn register(&mut self, parser: Box<dyn LanguageParser>) {
         self.parsers.push(parser);
+    }
+
+    /// Return all file extensions supported by registered parsers.
+    pub fn supported_extensions(&self) -> std::collections::HashSet<String> {
+        self.parsers
+            .iter()
+            .flat_map(|p| p.extensions().iter().map(|e| (*e).to_string()))
+            .collect()
     }
 
     /// Find the appropriate parser for a given file path based on extension.

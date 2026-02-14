@@ -20,7 +20,7 @@ It's a real-time TUI that watches Claude Code session logs and paints every func
 
 | Backend | Languages |
 |---|---|
-| Tree-sitter | Rust, Python |
+| Tree-sitter | Rust, Python, TypeScript |
 | Serena MCP | Any language Serena supports |
 
 ## Roadmap
