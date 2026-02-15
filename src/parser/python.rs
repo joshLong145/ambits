@@ -1,3 +1,34 @@
+//! Python symbol extractor using tree-sitter.
+//!
+//! This module parses `.py` files into a hierarchical [`SymbolNode`] tree that the
+//! ambits coverage system uses to track which parts of a codebase have been reviewed.
+//!
+//! ## How it works
+//!
+//! 1. The source is fed to tree-sitter-python which produces a concrete syntax
+//!    tree (CST).
+//! 2. [`extract_symbols`] walks the top-level children of each node, dispatching
+//!    recognized node kinds to helper functions that build [`SymbolNode`]s.
+//! 3. `decorated_definition` nodes are unwrapped so that `@decorator def foo()`
+//!    is treated the same as `def foo()`, with the byte range widened to include
+//!    the decorator(s).
+//! 4. Compound statements (`if`, `for`, `try`, etc.) are recursed into so that
+//!    definitions nested inside control flow are still discovered.
+//! 5. After the full tree is built, Merkle hashes are computed bottom-up so that
+//!    content changes propagate to parent symbols.
+//!
+//! ## Supported Python constructs
+//!
+//! | Construct                                  | Category | Label    |
+//! |--------------------------------------------|----------|----------|
+//! | `def`, `async def`                         | Function | `"def"`  |
+//! | `class`                                    | Type     | `"class"`|
+//! | `@decorator` on `def` / `class`            | (same)   | (same)   |
+//! | `type Alias = ...` (Python 3.12+)          | Type     | `"type"` |
+//! | `x: int = ...` (annotated assignment)      | Variable | `"var"`  |
+//! | `MAX_SIZE = ...` (UPPER_SNAKE_CASE)        | Variable | `"var"`  |
+//! | class methods                              | Function | `"def"`  |
+
 use std::path::Path;
 
 use color_eyre::eyre::eyre;
@@ -8,6 +39,10 @@ use crate::symbols::{FileSymbols, SymbolCategory, SymbolNode};
 
 use super::LanguageParser;
 
+/// Parser for Python (`.py`) source files.
+///
+/// Uses the tree-sitter-python grammar to produce a CST, then extracts
+/// a simplified symbol tree that ambits uses for coverage tracking.
 pub struct PythonParser {
     _private: (),
 }
@@ -55,16 +90,49 @@ impl LanguageParser for PythonParser {
     }
 }
 
-/// Symbol metadata: category and display label
+// ---------------------------------------------------------------------------
+// Symbol metadata constants
+// ---------------------------------------------------------------------------
+//
+// Each constant pairs a `SymbolCategory` (the semantic bucket - Function, Type,
+// Variable) with a human-readable `label` that appears in the UI.
+// These are referenced by the extraction functions below to avoid repeating the
+// mapping logic at every call site.
+
+/// Pairs a [`SymbolCategory`] with a display label for use in [`SymbolNode`].
 struct SymbolMeta {
     category: SymbolCategory,
     label: &'static str,
 }
 
+// -- Definitions ------------------------------------------------------------
 const CLASS: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "class" };
 const DEF: SymbolMeta = SymbolMeta { category: SymbolCategory::Function, label: "def" };
 
-/// Walk top-level children of a Python module node and extract symbols.
+// -- Variables & type aliases -----------------------------------------------
+const VAR: SymbolMeta = SymbolMeta { category: SymbolCategory::Variable, label: "var" };
+const TYPE_ALIAS: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "type" };
+
+// ---------------------------------------------------------------------------
+// Core symbol extraction
+// ---------------------------------------------------------------------------
+
+/// Recursively walk the children of `node` and extract recognized Python symbols.
+///
+/// This is the main dispatch loop. For each child it matches on the tree-sitter
+/// node kind and either:
+/// - Returns a `(name, SymbolMeta)` pair for leaf symbols (`def`, `class`,
+///   assignments, type aliases),
+/// - Delegates to a helper that pushes symbols directly into `out`
+///   (`decorated_definition`, compound statements), or
+/// - Skips the node entirely (imports, comments, plain expressions).
+///
+/// For class definitions, the function recurses into the class `body` to
+/// extract methods as child symbols.
+///
+/// The function is called at the top level (with `root_node`) and recursively
+/// by [`extract_from_compound_bodies`] to discover definitions inside control
+/// flow blocks, and by itself to find methods inside class bodies.
 fn extract_symbols(
     node: Node,
     src: &[u8],
@@ -83,6 +151,18 @@ fn extract_symbols(
             // Decorated definitions: unwrap the decorator to find the inner def/class.
             "decorated_definition" => {
                 extract_decorated(&child, src, file_path, path_prefix, parent_name_path, out);
+                None
+            }
+            // Module-level assignments: annotated or UPPER_SNAKE_CASE only.
+            "expression_statement" => extract_assignment(&child, src),
+            // Python 3.12+ type alias: `type Alias = int`
+            "type_alias_statement" => extract_type_alias(&child, src),
+            // Recurse into compound statement bodies for nested definitions.
+            "if_statement" | "for_statement" | "while_statement"
+            | "try_statement" | "with_statement" | "match_statement" => {
+                extract_from_compound_bodies(
+                    &child, src, file_path, path_prefix, parent_name_path, out,
+                );
                 None
             }
             _ => None,
@@ -127,7 +207,20 @@ fn extract_symbols(
     }
 }
 
-/// Handle decorated definitions (@decorator followed by def/class).
+// ---------------------------------------------------------------------------
+// Decorator unwrapping
+// ---------------------------------------------------------------------------
+
+/// Unwrap a `decorated_definition` node to extract the inner `def` or `class`.
+///
+/// Python decorators are represented in tree-sitter as a wrapper node
+/// (`decorated_definition`) whose children are one or more `decorator` nodes
+/// followed by a `function_definition` or `class_definition`. We walk the
+/// children to find the inner declaration, then build a [`SymbolNode`] whose
+/// byte range spans the *entire* decorated block (including the `@` lines)
+/// so that coverage tracking includes the decorators.
+///
+/// For decorated classes, we recurse into the class body to extract methods.
 fn extract_decorated(
     node: &Node,
     src: &[u8],
@@ -190,12 +283,199 @@ fn extract_decorated(
     }
 }
 
-/// Extract the name from a function_definition or class_definition node.
+// ---------------------------------------------------------------------------
+// Tree-sitter node helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the identifier name from a node via its `"name"` field.
+///
+/// Most Python declaration nodes (`function_definition`, `class_definition`)
+/// expose their identifier through a field called `"name"`. Returns `None`
+/// if the field is missing or the text cannot be decoded as UTF-8.
 fn child_name(node: &Node, src: &[u8]) -> Option<String> {
     node.child_by_field_name("name")?
         .utf8_text(src)
         .ok()
         .map(|s| s.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Variable & type-alias extraction
+// ---------------------------------------------------------------------------
+
+/// Check whether `name` follows `UPPER_SNAKE_CASE` convention.
+///
+/// Returns `true` when the name is non-empty, contains at least one uppercase
+/// ASCII letter, and every character is uppercase ASCII, a digit, or `_`.
+/// This intentionally rejects names like `_` or `__` (no uppercase letter)
+/// and mixed-case names like `Max_Size`.
+fn is_upper_snake_case(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().any(|c| c.is_ascii_uppercase())
+        && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Try to extract a variable symbol from an `expression_statement`.
+///
+/// In tree-sitter-python, assignments live inside `expression_statement` nodes.
+/// This function iterates the statement's children looking for an `assignment`
+/// node, then checks whether it qualifies:
+///
+/// 1. **Annotated assignment** - the `assignment` node has a `type` field
+///    (e.g. `x: int = 42` or the bare annotation `x: int`).
+/// 2. **UPPER_SNAKE_CASE constant** - the left-hand side identifier matches
+///    the `UPPER_SNAKE_CASE` convention (e.g. `MAX_SIZE = 100`).
+///
+/// Plain lowercase assignments (`x = 42`), tuple unpacking (`a, b = ...`),
+/// attribute assignments (`self.x = ...`), and augmented assignments (`x += 1`)
+/// are all intentionally ignored.
+fn extract_assignment(node: &Node, src: &[u8]) -> Option<(String, SymbolMeta)> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != "assignment" {
+            continue;
+        }
+
+        let left = child.child_by_field_name("left")?;
+        if left.kind() != "identifier" {
+            return None;
+        }
+
+        let name = left.utf8_text(src).ok()?.to_string();
+        let has_annotation = child.child_by_field_name("type").is_some();
+
+        if has_annotation || is_upper_snake_case(&name) {
+            return Some((name, VAR));
+        }
+
+        return None;
+    }
+    None
+}
+
+/// Extract a type alias from a `type_alias_statement` node (Python 3.12+).
+///
+/// Handles the `type Alias = int` syntax introduced in PEP 695. The grammar
+/// exposes the alias name via the `"left"` field and the target type via
+/// `"right"`. We only need the name to build a [`SymbolNode`].
+fn extract_type_alias(node: &Node, src: &[u8]) -> Option<(String, SymbolMeta)> {
+    let left = node.child_by_field_name("left")?;
+    let name = left.utf8_text(src).ok()?.to_string();
+    Some((name, TYPE_ALIAS))
+}
+
+// ---------------------------------------------------------------------------
+// Compound statement traversal
+// ---------------------------------------------------------------------------
+
+/// Recurse into a compound statement's body/bodies to find nested definitions.
+///
+/// Python allows `def` and `class` inside any block:
+/// ```python
+/// if __name__ == "__main__":
+///     def main(): ...
+/// ```
+///
+/// This function walks the various clause types of each compound statement and
+/// calls [`extract_symbols`] on each body block so that nested definitions are
+/// discovered. The compound statement itself is *not* emitted as a symbol.
+///
+/// Because `extract_symbols` is called (not a reduced variant), nested compound
+/// statements are handled transitively (e.g. `try` > `if` > `def`).
+///
+/// ## Grammar field names
+///
+/// | Statement        | Body field                                          |
+/// |------------------|-----------------------------------------------------|
+/// | `if_statement`   | `consequence`; children: `elif_clause`/`else_clause`|
+/// | `for_statement`  | `body`                                              |
+/// | `while_statement`| `body`                                              |
+/// | `with_statement` | `body`                                              |
+/// | `try_statement`  | `body`; children: `except_clause`/`finally_clause`  |
+/// | `match_statement`| `body` (block of `case_clause`s via `consequence`)  |
+fn extract_from_compound_bodies(
+    node: &Node,
+    src: &[u8],
+    file_path: &Path,
+    path_prefix: &str,
+    parent_name_path: &str,
+    out: &mut Vec<SymbolNode>,
+) {
+    match node.kind() {
+        "for_statement" | "while_statement" | "with_statement" => {
+            if let Some(body) = node.child_by_field_name("body") {
+                extract_symbols(body, src, file_path, path_prefix, parent_name_path, out);
+            }
+        }
+        "if_statement" => {
+            if let Some(body) = node.child_by_field_name("consequence") {
+                extract_symbols(body, src, file_path, path_prefix, parent_name_path, out);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                match child.kind() {
+                    "elif_clause" => {
+                        if let Some(body) = child.child_by_field_name("consequence") {
+                            extract_symbols(
+                                body, src, file_path, path_prefix, parent_name_path, out,
+                            );
+                        }
+                    }
+                    "else_clause" => {
+                        if let Some(body) = child.child_by_field_name("body") {
+                            extract_symbols(
+                                body, src, file_path, path_prefix, parent_name_path, out,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "try_statement" => {
+            if let Some(body) = node.child_by_field_name("body") {
+                extract_symbols(body, src, file_path, path_prefix, parent_name_path, out);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                match child.kind() {
+                    "except_clause" | "except_group_clause" | "finally_clause" => {
+                        let mut inner_cursor = child.walk();
+                        for inner in child.children(&mut inner_cursor) {
+                            if inner.kind() == "block" {
+                                extract_symbols(
+                                    inner, src, file_path, path_prefix, parent_name_path, out,
+                                );
+                            }
+                        }
+                    }
+                    "else_clause" => {
+                        if let Some(body) = child.child_by_field_name("body") {
+                            extract_symbols(
+                                body, src, file_path, path_prefix, parent_name_path, out,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "match_statement" => {
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut cursor = body.walk();
+                for child in body.children(&mut cursor) {
+                    if child.kind() == "case_clause" {
+                        if let Some(consequence) = child.child_by_field_name("consequence") {
+                            extract_symbols(
+                                consequence, src, file_path, path_prefix, parent_name_path, out,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -426,5 +706,219 @@ mod tests {
         let range = &syms[0].byte_range;
         assert!(range.start < range.end);
         assert!(range.end <= src.len());
+    }
+
+    // --- Variable extraction tests ---
+
+    #[test]
+    fn parse_annotated_variable() {
+        let syms = parse("x: int = 42\n");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "x");
+        assert_eq!(syms[0].category, SymbolCategory::Variable);
+        assert_eq!(syms[0].label, "var");
+        assert_eq!(syms[0].id, "test.py::x");
+        assert!(syms[0].children.is_empty());
+    }
+
+    #[test]
+    fn parse_annotated_variable_no_value() {
+        let syms = parse("x: int\n");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "x");
+        assert_eq!(syms[0].category, SymbolCategory::Variable);
+    }
+
+    #[test]
+    fn parse_upper_case_constant() {
+        let syms = parse("MAX_SIZE = 100\n");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "MAX_SIZE");
+        assert_eq!(syms[0].category, SymbolCategory::Variable);
+        assert_eq!(syms[0].label, "var");
+    }
+
+    #[test]
+    fn parse_upper_case_no_underscore() {
+        let syms = parse("DEBUG = True\n");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "DEBUG");
+        assert_eq!(syms[0].category, SymbolCategory::Variable);
+    }
+
+    #[test]
+    fn parse_lowercase_assignment_ignored() {
+        let syms = parse("x = 42\n");
+        assert!(syms.is_empty());
+    }
+
+    #[test]
+    fn parse_mixed_case_assignment_ignored() {
+        let syms = parse("myVar = 10\n");
+        assert!(syms.is_empty());
+    }
+
+    #[test]
+    fn parse_tuple_assignment_ignored() {
+        let syms = parse("A, B = 1, 2\n");
+        assert!(syms.is_empty());
+    }
+
+    #[test]
+    fn parse_attribute_assignment_ignored() {
+        let syms = parse("obj.MAX = 100\n");
+        assert!(syms.is_empty());
+    }
+
+    #[test]
+    fn parse_variables_mixed_with_functions() {
+        let syms = parse("MAX: int = 100\n\ndef foo():\n    pass\n\nDEBUG = True\n");
+        assert_eq!(syms.len(), 3);
+        assert_eq!(syms[0].name, "MAX");
+        assert_eq!(syms[0].category, SymbolCategory::Variable);
+        assert_eq!(syms[1].name, "foo");
+        assert_eq!(syms[1].category, SymbolCategory::Function);
+        assert_eq!(syms[2].name, "DEBUG");
+        assert_eq!(syms[2].category, SymbolCategory::Variable);
+    }
+
+    // --- Type alias tests ---
+
+    #[test]
+    fn parse_type_alias() {
+        let syms = parse("type Vector = list[float]\n");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "Vector");
+        assert_eq!(syms[0].category, SymbolCategory::Type);
+        assert_eq!(syms[0].label, "type");
+        assert_eq!(syms[0].id, "test.py::Vector");
+    }
+
+    #[test]
+    fn parse_type_alias_with_functions() {
+        let syms = parse("type ID = int\n\ndef process(x: ID) -> None:\n    pass\n");
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "ID");
+        assert_eq!(syms[0].category, SymbolCategory::Type);
+        assert_eq!(syms[1].name, "process");
+        assert_eq!(syms[1].category, SymbolCategory::Function);
+    }
+
+    // --- Control flow recursion tests ---
+
+    #[test]
+    fn parse_function_inside_if() {
+        let syms = parse("if True:\n    def foo():\n        pass\n");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "foo");
+        assert_eq!(syms[0].category, SymbolCategory::Function);
+    }
+
+    #[test]
+    fn parse_function_inside_if_else() {
+        let syms = parse(
+            "if sys.platform == 'win32':\n    def init():\n        pass\nelse:\n    def init():\n        pass\n",
+        );
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "init");
+        assert_eq!(syms[1].name, "init");
+    }
+
+    #[test]
+    fn parse_function_inside_elif() {
+        let syms = parse(
+            "if False:\n    pass\nelif True:\n    def handler():\n        pass\n",
+        );
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "handler");
+    }
+
+    #[test]
+    fn parse_class_inside_try() {
+        let syms = parse(
+            "try:\n    class Foo:\n        pass\nexcept Exception:\n    class FallbackFoo:\n        pass\n",
+        );
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "Foo");
+        assert_eq!(syms[0].category, SymbolCategory::Type);
+        assert_eq!(syms[1].name, "FallbackFoo");
+        assert_eq!(syms[1].category, SymbolCategory::Type);
+    }
+
+    #[test]
+    fn parse_function_inside_try_finally() {
+        let syms = parse(
+            "try:\n    def setup():\n        pass\nfinally:\n    def cleanup():\n        pass\n",
+        );
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "setup");
+        assert_eq!(syms[1].name, "cleanup");
+    }
+
+    #[test]
+    fn parse_function_inside_for() {
+        let syms = parse("for i in range(1):\n    def worker():\n        pass\n");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "worker");
+    }
+
+    #[test]
+    fn parse_function_inside_while() {
+        let syms = parse("while True:\n    def loop_body():\n        pass\n    break\n");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "loop_body");
+    }
+
+    #[test]
+    fn parse_function_inside_with() {
+        let syms = parse("with open('f') as f:\n    def process():\n        pass\n");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "process");
+    }
+
+    #[test]
+    fn parse_decorated_function_inside_if() {
+        let syms = parse("if True:\n    @decorator\n    def foo():\n        pass\n");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "foo");
+        assert_eq!(syms[0].category, SymbolCategory::Function);
+    }
+
+    #[test]
+    fn parse_nested_control_flow() {
+        let syms = parse(
+            "try:\n    if True:\n        def deeply_nested():\n            pass\nexcept:\n    pass\n",
+        );
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "deeply_nested");
+    }
+
+    #[test]
+    fn parse_class_with_methods_inside_if() {
+        let syms = parse(
+            "if True:\n    class Foo:\n        def method(self):\n            pass\n",
+        );
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "Foo");
+        assert_eq!(syms[0].category, SymbolCategory::Type);
+        assert_eq!(syms[0].children.len(), 1);
+        assert_eq!(syms[0].children[0].name, "method");
+    }
+
+    // --- is_upper_snake_case unit tests ---
+
+    #[test]
+    fn upper_snake_case_detection() {
+        assert!(is_upper_snake_case("MAX_SIZE"));
+        assert!(is_upper_snake_case("DEBUG"));
+        assert!(is_upper_snake_case("HTTP2_TIMEOUT"));
+        assert!(is_upper_snake_case("_PRIVATE"));
+        assert!(is_upper_snake_case("A"));
+        assert!(!is_upper_snake_case(""));
+        assert!(!is_upper_snake_case("_"));
+        assert!(!is_upper_snake_case("__"));
+        assert!(!is_upper_snake_case("myVar"));
+        assert!(!is_upper_snake_case("Max_Size"));
+        assert!(!is_upper_snake_case("123"));
     }
 }
