@@ -145,6 +145,58 @@ fn agent_belongs_to_session(path: &Path, session_id: &str) -> bool {
     false
 }
 
+/// Extract a human-readable label for an agent from its JSONL log file.
+///
+/// Reads the first line of the file and looks for:
+/// 1. The `message.content` field (the task prompt given to the agent) — truncated to 50 chars
+/// 2. Falls back to the filename stem (e.g., `agent-a9fe23c` → `a9fe23c`)
+pub fn extract_agent_label(path: &Path) -> String {
+    let fallback = path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .strip_prefix("agent-")
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+        })
+        .to_string();
+
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return fallback,
+    };
+    let mut reader = BufReader::new(file);
+    let mut first_line = String::new();
+    if reader.read_line(&mut first_line).is_err() {
+        return fallback;
+    }
+
+    let obj: Value = match serde_json::from_str(first_line.trim()) {
+        Ok(v) => v,
+        Err(_) => return fallback,
+    };
+
+    // Try to get the task prompt from the first user message content.
+    let content = obj
+        .pointer("/message/content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if content.is_empty() {
+        return fallback;
+    }
+
+    // Truncate to a short label: first line, max 50 chars.
+    let first_line_content = content.lines().next().unwrap_or(content);
+    if first_line_content.len() <= 50 {
+        first_line_content.to_string()
+    } else {
+        format!("{}...", &first_line_content[..47])
+    }
+}
+
 /// Parse all events from a JSONL log file.
 pub fn parse_log_file(path: &Path) -> Vec<AgentToolCall> {
     let mut events = Vec::new();
@@ -161,8 +213,15 @@ pub fn parse_log_file(path: &Path) -> Vec<AgentToolCall> {
         .unwrap_or("unknown")
         .to_string();
 
+    // Extract a human-readable label for this agent.
+    let label = extract_agent_label(path);
+
     for line in reader.lines().map_while(Result::ok) {
-        events.extend(parse_jsonl_line(&line, &default_id));
+        let mut line_events = parse_jsonl_line(&line, &default_id);
+        for ev in &mut line_events {
+            ev.label = label.clone();
+        }
+        events.extend(line_events);
     }
     events
 }
@@ -183,7 +242,8 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str) -> Vec<AgentToolCall
     }
 
     let agent_id = obj
-        .get("sessionId")
+        .get("agentId")
+        .or_else(|| obj.get("sessionId"))
         .and_then(|v| v.as_str())
         .unwrap_or(default_agent_id)
         .to_string();
@@ -221,6 +281,7 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str) -> Vec<AgentToolCall
                 timestamp_str: timestamp_str.clone(),
                 target_symbol: None,
                 target_lines: None,
+                label: agent_id.clone(),
             });
         events.push(event);
     }
@@ -491,6 +552,7 @@ fn map_tool_call(
         timestamp_str: timestamp_str.to_string(),
         target_symbol,
         target_lines,
+        label: agent_id.to_string(),
     })
 }
 
@@ -857,5 +919,104 @@ mod tests {
 
         let events = parse_log_file(&log);
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn extract_label_from_subagent_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("agent-abc1234.jsonl");
+        let content = r#"{"agentId":"abc1234","type":"user","message":{"role":"user","content":"Explore the parser module"},"sessionId":"sess-1","timestamp":"2025-01-01T00:00:00Z"}"#;
+        fs::write(&log, content).unwrap();
+
+        let label = extract_agent_label(&log);
+        assert_eq!(label, "Explore the parser module");
+    }
+
+    #[test]
+    fn extract_label_truncates_long_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("agent-abc1234.jsonl");
+        let long_prompt = "A".repeat(100);
+        let content = format!(
+            r#"{{"agentId":"abc1234","type":"user","message":{{"role":"user","content":"{long_prompt}"}},"sessionId":"sess-1","timestamp":"2025-01-01T00:00:00Z"}}"#
+        );
+        fs::write(&log, content).unwrap();
+
+        let label = extract_agent_label(&log);
+        assert_eq!(label.len(), 50); // "AAA...AAA..."
+        assert!(label.ends_with("..."));
+    }
+
+    #[test]
+    fn extract_label_falls_back_to_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("agent-def5678.jsonl");
+        // Empty content field → falls back to filename stem sans "agent-" prefix.
+        let content = r#"{"agentId":"def5678","type":"user","message":{"role":"user","content":""},"sessionId":"sess-1"}"#;
+        fs::write(&log, content).unwrap();
+
+        let label = extract_agent_label(&log);
+        assert_eq!(label, "def5678");
+    }
+
+    #[test]
+    fn extract_label_nonexistent_file() {
+        let label = extract_agent_label(Path::new("/nonexistent/agent-xyz.jsonl"));
+        assert_eq!(label, "xyz");
+    }
+
+    #[test]
+    fn extract_label_main_session_file() {
+        // Main session files don't have "agent-" prefix.
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("abcd1234-abcd-abcd-abcd-abcd12345678.jsonl");
+        let content = r#"{"type":"user","message":{"role":"user","content":"Hello"},"sessionId":"abcd1234"}"#;
+        fs::write(&log, content).unwrap();
+
+        let label = extract_agent_label(&log);
+        assert_eq!(label, "Hello");
+    }
+
+    #[test]
+    fn parse_log_file_sets_label_on_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("agent-test123.jsonl");
+        let mut f = fs::File::create(&log).unwrap();
+        // First line: user message with task prompt.
+        writeln!(f, r#"{{"agentId":"test123","type":"user","message":{{"role":"user","content":"Check the coverage"}},"sessionId":"sess-1","timestamp":"2025-01-01T00:00:00Z"}}"#).unwrap();
+        // Second line: assistant with a tool call.
+        writeln!(f, "{}", jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/a.rs"}"#)).unwrap();
+        drop(f);
+
+        let events = parse_log_file(&log);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].label, "Check the coverage");
+    }
+
+    #[test]
+    fn agent_id_prefers_agent_id_over_session_id() {
+        // Subagent lines have both agentId and sessionId; agentId should win.
+        let line = r#"{"type":"assistant","agentId":"a9fe23c","sessionId":"7842313b-63c5-49db-97d1-c78ba563278e","message":{"role":"assistant","content":[{"type":"tool_use","name":"mcp__acp__Read","input":{"file_path":"/foo/bar.rs"}}]}}"#;
+        let events = parse_jsonl_line(line, "fallback");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].agent_id, "a9fe23c");
+    }
+
+    #[test]
+    fn agent_id_falls_back_to_session_id() {
+        // Main session lines have sessionId but no agentId.
+        let line = r#"{"type":"assistant","sessionId":"7842313b","message":{"role":"assistant","content":[{"type":"tool_use","name":"mcp__acp__Read","input":{"file_path":"/foo/bar.rs"}}]}}"#;
+        let events = parse_jsonl_line(line, "fallback");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].agent_id, "7842313b");
+    }
+
+    #[test]
+    fn agent_id_falls_back_to_default() {
+        // No agentId or sessionId → uses default_agent_id.
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"mcp__acp__Read","input":{"file_path":"/foo/bar.rs"}}]}}"#;
+        let events = parse_jsonl_line(line, "my-default");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].agent_id, "my-default");
     }
 }

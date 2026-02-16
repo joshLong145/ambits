@@ -20,10 +20,16 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style);
 
+    // Filter events by agent when a filter is active.
+    let filtered: Vec<&crate::ingest::AgentToolCall> = match app.agent_filter.as_deref() {
+        Some(agent_id) => app.activity.iter().filter(|e| e.agent_id == agent_id).collect(),
+        None => app.activity.iter().collect(),
+    };
+
     // Show the most recent events that fit in the area.
     let max_lines = area.height.saturating_sub(2) as usize;
-    let start = app.activity.len().saturating_sub(max_lines);
-    let visible = &app.activity[start..];
+    let start = filtered.len().saturating_sub(max_lines);
+    let visible = &filtered[start..];
 
     let lines: Vec<Line> = visible
         .iter()
@@ -108,6 +114,7 @@ mod tests {
             timestamp_str: "2025-01-01T00:00:00Z".into(),
             target_symbol: None,
             target_lines: None,
+            label: "agent-abc123".into(),
         });
 
         let backend = TestBackend::new(60, 10);

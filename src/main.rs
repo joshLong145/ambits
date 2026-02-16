@@ -61,6 +61,10 @@ struct Cli {
     #[arg(long)]
     serena: bool,
 
+    /// Filter coverage to a specific agent ID (supports prefix matching).
+    #[arg(short, long)]
+    agent: Option<String>,
+
     /// Output directory for event logs. If set, writes processed events to <dir>/<session>.log.
     #[arg(long)]
     log_output: Option<PathBuf>,
@@ -123,27 +127,19 @@ fn main() -> Result<()> {
     }
 
     if cli.coverage {
-        return run_coverage_report(&project_path, &project_tree, &cli.log_dir, &cli.session);
+        return run_coverage_report(&project_path, &project_tree, &cli.log_dir, &cli.session, &cli.agent);
     }
 
     // Resolve log directory and session.
     let log_dir = cli
         .log_dir
         .or_else(|| ingest::claude::log_dir_for_project(&project_path));
-    
-    let _ = std::fs::write("/tmp/marker-debug.txt", format!("log_dir: {:?}\n", log_dir));
 
     let session_id = cli.session.or_else(|| {
         log_dir
             .as_ref()
             .and_then(|d| ingest::claude::find_latest_session(d))
     });
-    
-    let _ = std::fs::OpenOptions::new().append(true).open("/tmp/marker-debug.txt")
-        .and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, "session_id: {:?}", session_id)
-        });
 
     // Launch TUI.
     enable_raw_mode()?;
@@ -159,13 +155,9 @@ fn main() -> Result<()> {
             .as_deref()
             .unwrap_or("unknown-session");
         let log_path = log_output_dir.join(format!("{log_name}.log"));
-        let _ = std::fs::write("/tmp/marker-log-debug.txt", format!("Creating log file at {:?}\n", log_path));
         let file = fs::File::create(&log_path)?;
-        let _ = std::fs::OpenOptions::new().append(true).open("/tmp/marker-log-debug.txt")
-            .and_then(|mut f| { use std::io::Write; writeln!(f, "Log file created successfully") });
         Some(io::BufWriter::new(file))
     } else {
-        let _ = std::fs::write("/tmp/marker-log-debug.txt", "log_output is None\n");
         None
     };
 
@@ -174,46 +166,21 @@ fn main() -> Result<()> {
 
     // Pre-populate the ledger from existing session logs.
     if let (Some(ref log_dir), Some(ref session_id)) = (&log_dir, &session_id) {
-        use std::io::Write;
-        let mut debug_file = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/marker-debug.txt").unwrap();
-        writeln!(debug_file, "=== ENTERING PRE-POPULATION ===").unwrap();
         let log_files = ingest::claude::session_log_files(log_dir, session_id);
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/marker-debug.txt")
-            .and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, "Found {} log files for session {}", log_files.len(), session_id)
-            });
         for log_file in &log_files {
             let events = ingest::claude::parse_log_file(log_file);
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/marker-debug.txt")
-                .and_then(|mut f| {
-                    use std::io::Write;
-                    writeln!(f, "Parsed {} events from {:?}", events.len(), log_file.file_name())
-                });
             for event in events {
                 app.process_agent_event(event);
             }
         }
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/marker-debug.txt")
-            .and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, "Finished pre-population. Total events in activity: {}", app.activity.len())
-            });
     }
 
     let serena_mode = cli.serena;
     let result = run_tui(&mut terminal, &mut app, &project_path, &log_dir, &session_id, &registry, serena_mode);
 
     // Flush event log before exiting.
-    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/marker-log-debug.txt")
-        .and_then(|mut f| { 
-            use std::io::Write; 
-            writeln!(f, "About to flush. event_log is_some: {}", app.event_log.is_some())
-        });
     if let Some(ref mut writer) = app.event_log {
         let _ = writer.flush();
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/marker-log-debug.txt")
-            .and_then(|mut f| { use std::io::Write; writeln!(f, "Flushed event log") });
     }
 
     // Restore terminal.
@@ -432,6 +399,7 @@ fn run_coverage_report(
     project_tree: &ProjectTree,
     log_dir_opt: &Option<PathBuf>,
     session_opt: &Option<String>,
+    agent_opt: &Option<String>,
 ) -> Result<()> {
     use coverage::{CoverageFormatter, CoverageReport, TextFormatter};
     use tracking::ContextLedger;
@@ -450,11 +418,15 @@ fn run_coverage_report(
 
     // 3. Build ledger from session logs
     let mut ledger = ContextLedger::new();
+    let mut known_agents: Vec<String> = Vec::new();
     if let (Some(ref log_dir), Some(ref sid)) = (&log_dir, &session_id) {
         let log_files = ingest::claude::session_log_files(log_dir, sid);
         for log_file in &log_files {
             let events = ingest::claude::parse_log_file(log_file);
             for event in events {
+                if !known_agents.contains(&event.agent_id) {
+                    known_agents.push(event.agent_id.clone());
+                }
                 if let Some(ref file_path) = event.file_path {
                     // Normalize the tool call path
                     let tool_rel = app::normalize_tool_path(file_path, project_path);
@@ -473,11 +445,35 @@ fn run_coverage_report(
         }
     }
 
-    // 4. Generate report
-    let mut report = CoverageReport::from_project(project_tree, &ledger);
+    // 4. Resolve agent filter (supports prefix matching)
+    let resolved_agent = agent_opt.as_ref().map(|prefix| {
+        let matches: Vec<&String> = known_agents
+            .iter()
+            .filter(|id| id.starts_with(prefix.as_str()))
+            .collect();
+        match matches.len() {
+            1 => matches[0].clone(),
+            0 => {
+                eprintln!("Warning: no agent matching prefix '{}'", prefix);
+                prefix.clone()
+            }
+            _ => {
+                eprintln!(
+                    "Warning: multiple agents match prefix '{}': {:?}",
+                    prefix,
+                    matches.iter().take(5).collect::<Vec<_>>()
+                );
+                matches[0].clone()
+            }
+        }
+    });
+
+    // 5. Generate report
+    let mut report =
+        CoverageReport::from_project(project_tree, &ledger, resolved_agent.as_deref());
     report.session_id = session_id;
 
-    // 5. Format and print
+    // 6. Format and print
     let formatter = TextFormatter::default();
     print!("{}", formatter.format(&report));
 
