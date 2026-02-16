@@ -1,9 +1,9 @@
 [package]
 name = "ambits"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 description = "command line utility for symbols used by Claude agents"
-repository = "https://github.com/joshLong145/claude-marker"
+repository = "https://github.com/joshLong145/ambits"
 license = "MIT"
 keywords = ["claude", "claude-code", "serena"]
 categories = ["command-line-utilities"]
