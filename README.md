@@ -1,5 +1,8 @@
 # ambits
 
+[![e2e](https://github.com/joshLong145/ambits/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/joshLong145/ambits/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/joshLong145/ambits/graph/badge.svg?token=9Q8GWA8H6Y)](https://codecov.io/gh/joshLong145/ambits)
+
 When an AI coding agent works on your project, it reads files, greps for patterns, and inspects symbols — but you have no way to see what it actually looked at. **ambits** gives you that visibility.
 
 It's a real-time TUI that watches Claude Code session logs and paints every function, struct, and class in your codebase by how deeply the agent has read it. At a glance you can see blind spots the agent missed, stale reads that are out of date, and exactly how much of your project the agent actually understands.
@@ -14,6 +17,7 @@ It's a real-time TUI that watches Claude Code session logs and paints every func
 - **Coverage reports** — Generate tabular per-file coverage summaries for CI or quick audits
 - **Per-file coverage counts** — Each file shows a `seen/total` symbol count so you can tell at a glance how much of it the agent has inspected
 - **Sortable tree view** — Toggle between alphabetical and coverage-grouped ordering to surface partially-covered files first
+- **Multi-agent coverage** — When a session spawns sub-agents, ambits tracks each one independently. See which parts of your codebase each agent examined, filter the tree and activity feed by agent, and compare per-agent coverage side by side
 - **Multiple parsing backends** — Tree-sitter for fast local parsing, or [Serena MCP](https://github.com/oraios/serena) for richer LSP-based symbol data across more languages
 
 ## Supported Languages
@@ -25,7 +29,6 @@ It's a real-time TUI that watches Claude Code session logs and paints every func
 
 ## Roadmap
 
-- Multi-agent hierarchy visualization
 - Multi-session comparison
 
 ## Building from source
@@ -54,6 +57,7 @@ ambits --project <path>
 |---|---|
 | `--project`, `-p` | Path to the project root (required) |
 | `--session`, `-s` | Session ID to track (auto-detects latest) |
+| `--agent`, `-a` | Filter coverage to a specific agent ID (supports prefix matching) |
 | `--dump` | Print symbol tree to stdout and exit |
 | `--coverage` | Print coverage report to stdout and exit |
 | `--serena` | Use Serena's LSP symbol cache instead of tree-sitter |
@@ -71,6 +75,10 @@ ambits -p . --dump
 
 # Print coverage report
 ambits -p . --coverage
+
+# Filter coverage to a specific agent (supports prefix matching)
+ambits -p . --coverage --agent a9fe23c
+ambits -p . --coverage --agent a9fe    # prefix match
 
 # Use Serena's symbol cache (more languages, finer detail)
 ambits -p . --serena
@@ -151,13 +159,16 @@ Claude will run the appropriate `ambits` commands and interpret the coverage res
 
 | Key | Action |
 |---|---|
-| `j` / `k` | Navigate up/down |
-| `h` / `l` | Collapse/expand |
-| `Enter` | Toggle expand |
+| `j` / `k` | Navigate up/down (tree or agent list depending on focus) |
+| `h` / `l` | Collapse/expand tree nodes |
+| `Enter` | Expand tree node, or select agent when Stats panel is focused |
 | `/` | Search symbols |
 | `s` | Toggle sort (alphabetical / coverage) |
-| `a` | Cycle agent filter |
-| `Tab` | Switch panel focus |
+| `a` / `A` | Cycle agent filter forward / backward |
+| `Shift+Tab` | Cycle agent filter backward |
+| `Tab` | Switch panel focus (Tree / Stats / Activity) |
+| `g` / `G` | Jump to first / last item |
+| `PgUp` / `PgDn` | Scroll by page |
 | `q` | Quit |
 
 ### Color Legend

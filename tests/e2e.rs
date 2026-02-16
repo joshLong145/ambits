@@ -112,7 +112,7 @@ fn full_pipeline_read() {
         app.process_agent_event(event);
     }
 
-    let report = CoverageReport::from_project(&app.project_tree, &app.ledger);
+    let report = CoverageReport::from_project(&app.project_tree, &app.ledger, None);
     // mock/file_a: 2 symbols, all FullBody → 100%. mock/file_b: 0%.
     let fa = report.files.iter().find(|f| f.path == "mock/file_a.rs").unwrap();
     assert_eq!(fa.full_count, 2);
@@ -140,7 +140,7 @@ fn targeted_symbol_partial() {
     assert_eq!(app.ledger.depth_of("mock/f.rs::alpha"), ReadDepth::Unseen);
     assert_eq!(app.ledger.depth_of("mock/f.rs::beta"), ReadDepth::FullBody);
 
-    let report = CoverageReport::from_project(&app.project_tree, &app.ledger);
+    let report = CoverageReport::from_project(&app.project_tree, &app.ledger, None);
     let f = report.files.iter().find(|f| f.path == "mock/f.rs").unwrap();
     assert_eq!(f.seen_count, 1);
     assert_eq!(f.full_count, 1);
@@ -227,7 +227,7 @@ fn coverage_sort_order() {
     ledger.record("mock/c.rs::c1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
     // mock/a.rs: 0%.
 
-    let report = CoverageReport::from_project(&tree, &ledger);
+    let report = CoverageReport::from_project(&tree, &ledger, None);
     let paths: Vec<&str> = report.files.iter().map(|f| f.path.as_str()).collect();
     // Sorted ascending by full_percent: 0%, 50%, 100%.
     assert_eq!(paths, vec!["mock/a.rs", "mock/b.rs", "mock/c.rs"]);
@@ -249,7 +249,7 @@ fn stale_detection() {
 
     // Stale still counts as "seen" in coverage.
     let sym = sym("s1", "s1");
-    let (total, seen, full) = ambits::coverage::count_symbols(&[sym], &ledger);
+    let (total, seen, full) = ambits::coverage::count_symbols(&[sym], &ledger, None);
     assert_eq!(total, 1);
     assert_eq!(seen, 1); // Stale is still "seen"
     assert_eq!(full, 0); // But not "full"
@@ -265,7 +265,7 @@ fn text_formatter_structure() {
     let mut ledger = ContextLedger::new();
     ledger.record("mock/main.rs::main".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
 
-    let mut report = CoverageReport::from_project(&tree, &ledger);
+    let mut report = CoverageReport::from_project(&tree, &ledger, None);
     report.session_id = Some("test-session-123".into());
 
     let formatter = TextFormatter::default();
