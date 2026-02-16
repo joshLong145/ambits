@@ -1,5 +1,8 @@
 # ambits
 
+[![e2e](https://github.com/joshLong145/ambits/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/joshLong145/ambits/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/joshLong145/ambits/graph/badge.svg?token=9Q8GWA8H6Y)](https://codecov.io/gh/joshLong145/ambits)
+
 When an AI coding agent works on your project, it reads files, greps for patterns, and inspects symbols — but you have no way to see what it actually looked at. **ambits** gives you that visibility.
 
 It's a real-time TUI that watches Claude Code session logs and paints every function, struct, and class in your codebase by how deeply the agent has read it. At a glance you can see blind spots the agent missed, stale reads that are out of date, and exactly how much of your project the agent actually understands.

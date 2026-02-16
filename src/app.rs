@@ -8,6 +8,7 @@ use crate::coverage::count_symbols;
 use crate::symbols::{ProjectTree, SymbolNode};
 use crate::tracking::ReadDepth;
 use crate::tracking::ContextLedger;
+use crate::tracking::agents::{AgentTree, AgentNode};
 use crate::ingest::AgentToolCall;
 
 /// How files are sorted in the tree view.
@@ -70,8 +71,13 @@ pub struct App {
     // Agents seen.
     pub agents_seen: Vec<String>,
 
+    // Agent hierarchy.
+    pub agent_tree: AgentTree,
+
     // Agent filter: if Some, only show coverage from this agent.
     pub agent_filter: Option<String>,
+    /// Selection index in the agent list (0 = All, 1..N = specific agent).
+    pub agent_selection_index: usize,
 
     // Focus.
     pub focus: FocusPanel,
@@ -109,7 +115,9 @@ impl App {
             collapsed,
             activity: Vec::new(),
             agents_seen: Vec::new(),
+            agent_tree: AgentTree::new(),
             agent_filter: None,
+            agent_selection_index: 0,
             focus: FocusPanel::Tree,
             sort_mode: SortMode::Alphabetical,
             search_mode: false,
@@ -124,6 +132,7 @@ impl App {
     /// Rebuild the flattened tree rows from the project tree + collapsed state.
     pub fn rebuild_tree_rows(&mut self) {
         let mut rows = Vec::new();
+        let agent_filter = self.agent_filter.as_deref();
 
         // Build iteration order: sorted by coverage status if ByCoverage mode is active.
         let file_indices: Vec<usize> = if self.sort_mode == SortMode::ByCoverage {
@@ -133,7 +142,7 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(i, f)| {
-                    let (total, seen, full) = count_symbols(&f.symbols, &self.ledger);
+                    let (total, seen, full) = count_symbols(&f.symbols, &self.ledger, agent_filter);
                     (
                         coverage_status_from_counts(total, seen, full),
                         f.file_path.as_path(),
@@ -153,7 +162,7 @@ impl App {
             let file_id = file_path.clone();
             let is_expanded = !self.collapsed.contains(&file_id);
 
-            let (total, seen, full) = count_symbols(&file.symbols, &self.ledger);
+            let (total, seen, full) = count_symbols(&file.symbols, &self.ledger, agent_filter);
             let status = coverage_status_from_counts(total, seen, full);
             let file_read_depth = if status != FileCoverageStatus::NotCovered {
                 ReadDepth::NameOnly // Use NameOnly to indicate "has coverage"
@@ -179,7 +188,7 @@ impl App {
 
             if is_expanded {
                 for sym in &file.symbols {
-                    flatten_symbol(sym, 1, &self.collapsed, &self.ledger, &mut rows);
+                    flatten_symbol(sym, 1, &self.collapsed, &self.ledger, agent_filter, &mut rows);
                 }
             }
         }
@@ -198,9 +207,27 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
-            KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => self.toggle_expand(),
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.focus == FocusPanel::Stats {
+                    self.move_agent_selection(1);
+                } else {
+                    self.move_selection(1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.focus == FocusPanel::Stats {
+                    self.move_agent_selection(-1);
+                } else {
+                    self.move_selection(-1);
+                }
+            }
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+                if self.focus == FocusPanel::Stats {
+                    self.apply_agent_selection();
+                } else {
+                    self.toggle_expand();
+                }
+            }
             KeyCode::Char('h') | KeyCode::Left => self.collapse_current(),
             KeyCode::Char('G') => self.select_last(),
             KeyCode::Char('g') => self.select_first(),
@@ -216,7 +243,9 @@ impl App {
                 self.rebuild_tree_rows();
             }
             KeyCode::Char('a') => self.cycle_agent_filter(),
+            KeyCode::Char('A') => self.cycle_agent_filter_backward(),
             KeyCode::Tab => self.cycle_focus(),
+            KeyCode::BackTab => self.cycle_agent_filter_backward(),
             KeyCode::PageDown => self.move_selection(20),
             KeyCode::PageUp => self.move_selection(-20),
             _ => {}
@@ -296,25 +325,115 @@ impl App {
     fn cycle_agent_filter(&mut self) {
         if self.agents_seen.is_empty() {
             self.agent_filter = None;
+            self.agent_selection_index = 0;
             return;
         }
         match &self.agent_filter {
             None => {
                 self.agent_filter = Some(self.agents_seen[0].clone());
+                self.agent_selection_index = 1;
             }
             Some(current) => {
                 let idx = self.agents_seen.iter().position(|a| a == current);
                 match idx {
                     Some(i) if i + 1 < self.agents_seen.len() => {
                         self.agent_filter = Some(self.agents_seen[i + 1].clone());
+                        self.agent_selection_index = i + 2;
                     }
                     _ => {
                         self.agent_filter = None;
+                        self.agent_selection_index = 0;
                     }
                 }
             }
         }
         self.rebuild_tree_rows();
+    }
+
+    fn cycle_agent_filter_backward(&mut self) {
+        if self.agents_seen.is_empty() {
+            self.agent_filter = None;
+            self.agent_selection_index = 0;
+            return;
+        }
+        match &self.agent_filter {
+            None => {
+                let last = self.agents_seen.len() - 1;
+                self.agent_filter = Some(self.agents_seen[last].clone());
+                self.agent_selection_index = self.agents_seen.len();
+            }
+            Some(current) => {
+                let idx = self.agents_seen.iter().position(|a| a == current);
+                match idx {
+                    Some(0) => {
+                        self.agent_filter = None;
+                        self.agent_selection_index = 0;
+                    }
+                    Some(i) => {
+                        self.agent_filter = Some(self.agents_seen[i - 1].clone());
+                        self.agent_selection_index = i;
+                    }
+                    _ => {
+                        self.agent_filter = None;
+                        self.agent_selection_index = 0;
+                    }
+                }
+            }
+        }
+        self.rebuild_tree_rows();
+    }
+
+    fn move_agent_selection(&mut self, delta: i32) {
+        let total = self.agents_seen.len() + 1; // +1 for "All"
+        if total == 0 {
+            return;
+        }
+        let new_idx = if delta > 0 {
+            (self.agent_selection_index + delta as usize) % total
+        } else {
+            let back = (-delta) as usize;
+            (self.agent_selection_index + total - (back % total)) % total
+        };
+        self.agent_selection_index = new_idx;
+    }
+
+    fn apply_agent_selection(&mut self) {
+        if self.agent_selection_index == 0 {
+            self.agent_filter = None;
+        } else {
+            let flat = self.flattened_agents();
+            if let Some((agent_id, _)) = flat.get(self.agent_selection_index - 1) {
+                self.agent_filter = Some(agent_id.clone());
+            } else {
+                self.agent_filter = None;
+            }
+        }
+        self.rebuild_tree_rows();
+    }
+
+    /// Returns agent IDs in hierarchy order (DFS) with indent levels.
+    /// Each entry is `(agent_id, indent_level)`.
+    /// Agents not reachable from the root are appended at depth 0.
+    pub fn flattened_agents(&self) -> Vec<(String, usize)> {
+        let mut result = Vec::new();
+        if let Some(ref root_id) = self.agent_tree.root_id {
+            self.flatten_dfs(root_id, 0, &mut result);
+        }
+        // Append any agents not reached by DFS (orphans).
+        for agent_id in &self.agents_seen {
+            if !result.iter().any(|(id, _)| id == agent_id) {
+                self.flatten_dfs(agent_id, 0, &mut result);
+            }
+        }
+        result
+    }
+
+    fn flatten_dfs(&self, agent_id: &str, depth: usize, out: &mut Vec<(String, usize)>) {
+        out.push((agent_id.to_string(), depth));
+        let children = self.agent_tree.children_of(agent_id);
+        for child in children {
+            self.flatten_dfs(&child.id, depth + 1, out);
+        }
     }
 
     fn cycle_focus(&mut self) {
@@ -350,6 +469,20 @@ impl App {
         // Track unique agents.
         if !self.agents_seen.contains(&event.agent_id) {
             self.agents_seen.push(event.agent_id.clone());
+
+            // Register in the agent hierarchy tree.
+            // Subagent filenames start with "agent-"; their parent is the root session.
+            let parent_id = if event.agent_id.starts_with("agent-") {
+                self.agent_tree.root_id.clone()
+            } else {
+                None
+            };
+            self.agent_tree.add_agent(AgentNode {
+                id: event.agent_id.clone(),
+                parent_id,
+                session_file: PathBuf::new(),
+                label: event.label.clone(),
+            });
         }
 
         if let Some(ref file_path) = event.file_path {
@@ -410,10 +543,14 @@ fn flatten_symbol(
     depth: usize,
     collapsed: &std::collections::HashSet<String>,
     ledger: &ContextLedger,
+    agent_filter: Option<&str>,
     rows: &mut Vec<TreeRow>,
 ) {
     let is_expanded = !collapsed.contains(&sym.id);
-    let read_depth = ledger.depth_of(&sym.id);
+    let read_depth = match agent_filter {
+        Some(agent_id) => ledger.depth_of_for_agent(&sym.id, agent_id),
+        None => ledger.depth_of(&sym.id),
+    };
 
     rows.push(TreeRow {
         symbol_id: sym.id.clone(),
@@ -433,7 +570,7 @@ fn flatten_symbol(
 
     if is_expanded {
         for child in &sym.children {
-            flatten_symbol(child, depth + 1, collapsed, ledger, rows);
+            flatten_symbol(child, depth + 1, collapsed, ledger, agent_filter, rows);
         }
     }
 }
@@ -614,27 +751,27 @@ mod tests {
         let syms = vec![sym("s1", "s1"), sym("s2", "s2")];
 
         // No coverage.
-        let (total, seen, full) = count_symbols(&syms, &ledger);
+        let (total, seen, full) = count_symbols(&syms, &ledger, None);
         assert_eq!(coverage_status_from_counts(total, seen, full), FileCoverageStatus::NotCovered);
 
         // Partial: one seen, one unseen → PartiallyCovered.
         ledger.record("s1".into(), ReadDepth::NameOnly, [0; 32], "ag".into(), 10);
-        let (total, seen, full) = count_symbols(&syms, &ledger);
+        let (total, seen, full) = count_symbols(&syms, &ledger, None);
         assert_eq!(coverage_status_from_counts(total, seen, full), FileCoverageStatus::PartiallyCovered);
 
         // All seen (both NameOnly) but none FullBody → AllSeen.
         ledger.record("s2".into(), ReadDepth::NameOnly, [0; 32], "ag".into(), 10);
-        let (total, seen, full) = count_symbols(&syms, &ledger);
+        let (total, seen, full) = count_symbols(&syms, &ledger, None);
         assert_eq!(coverage_status_from_counts(total, seen, full), FileCoverageStatus::AllSeen);
 
         // One FullBody, one NameOnly → AllSeen (all seen, not all full).
         ledger.record("s1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
-        let (total, seen, full) = count_symbols(&syms, &ledger);
+        let (total, seen, full) = count_symbols(&syms, &ledger, None);
         assert_eq!(coverage_status_from_counts(total, seen, full), FileCoverageStatus::AllSeen);
 
         // Full: both FullBody.
         ledger.record("s2".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
-        let (total, seen, full) = count_symbols(&syms, &ledger);
+        let (total, seen, full) = count_symbols(&syms, &ledger, None);
         assert_eq!(coverage_status_from_counts(total, seen, full), FileCoverageStatus::FullyCovered);
 
         // Direct FullBody with unseen siblings → PartiallyCovered (full > 0, seen < total).
@@ -706,6 +843,69 @@ mod tests {
     }
 
     #[test]
+    fn cycle_agent_filter_backward_wraps() {
+        let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::a", "a")])]);
+
+        let mut e1 = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::FullBody);
+        e1.agent_id = "agent-1".into();
+        let mut e2 = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::FullBody);
+        e2.agent_id = "agent-2".into();
+
+        app.process_agent_event(e1);
+        app.process_agent_event(e2);
+
+        // Start at None (All), backward should go to last agent
+        assert_eq!(app.agent_filter, None);
+        app.cycle_agent_filter_backward();
+        assert_eq!(app.agent_filter, Some("agent-2".to_string()));
+        app.cycle_agent_filter_backward();
+        assert_eq!(app.agent_filter, Some("agent-1".to_string()));
+        app.cycle_agent_filter_backward();
+        assert_eq!(app.agent_filter, None); // wraps back to All
+    }
+
+    #[test]
+    fn agent_selection_index_navigates_and_applies() {
+        let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::a", "a")])]);
+
+        let mut e1 = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::FullBody);
+        e1.agent_id = "agent-1".into();
+        let mut e2 = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::FullBody);
+        e2.agent_id = "agent-2".into();
+
+        app.process_agent_event(e1);
+        app.process_agent_event(e2);
+        app.focus = FocusPanel::Stats;
+
+        // Start at 0 (All)
+        assert_eq!(app.agent_selection_index, 0);
+        assert_eq!(app.agent_filter, None);
+
+        // Move down to first agent
+        app.move_agent_selection(1);
+        assert_eq!(app.agent_selection_index, 1);
+        // Not applied yet
+        assert_eq!(app.agent_filter, None);
+
+        // Apply selection
+        app.apply_agent_selection();
+        assert_eq!(app.agent_filter, Some("agent-1".to_string()));
+        assert_eq!(app.agent_selection_index, 1);
+
+        // Move down again and apply
+        app.move_agent_selection(1);
+        assert_eq!(app.agent_selection_index, 2);
+        app.apply_agent_selection();
+        assert_eq!(app.agent_filter, Some("agent-2".to_string()));
+
+        // Move back to All and apply
+        app.move_agent_selection(-2);
+        assert_eq!(app.agent_selection_index, 0);
+        app.apply_agent_selection();
+        assert_eq!(app.agent_filter, None);
+    }
+
+    #[test]
     fn rebuild_tree_rows_alphabetical() {
         let app = test_app(vec![
             file("mock/a.rs", vec![sym("mock/a.rs::a", "a")]),
@@ -739,5 +939,64 @@ mod tests {
             .collect();
         // PartiallyCovered (mock/a.rs) sorts before NotCovered (mock/b.rs).
         assert_eq!(file_rows, vec!["mock/a.rs", "mock/b.rs"]);
+    }
+
+    #[test]
+    fn process_agent_event_populates_agent_tree() {
+        let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::a", "a")])]);
+
+        // Simulate main session event (no "agent-" prefix → becomes root).
+        let mut e1 = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::FullBody);
+        e1.agent_id = "session-main".into();
+        e1.label = "Main session".into();
+        app.process_agent_event(e1);
+
+        assert_eq!(app.agent_tree.root_id, Some("session-main".to_string()));
+        assert!(app.agent_tree.agents.contains_key("session-main"));
+        assert_eq!(app.agent_tree.agents["session-main"].label, "Main session");
+
+        // Simulate subagent event (starts with "agent-" → child of root).
+        let mut e2 = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::Overview);
+        e2.agent_id = "agent-abc123".into();
+        e2.label = "Explore parser module".into();
+        app.process_agent_event(e2);
+
+        assert_eq!(app.agent_tree.agents.len(), 2);
+        let sub = &app.agent_tree.agents["agent-abc123"];
+        assert_eq!(sub.parent_id, Some("session-main".to_string()));
+        assert_eq!(sub.label, "Explore parser module");
+    }
+
+    #[test]
+    fn flattened_agents_dfs_order() {
+        let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::a", "a")])]);
+
+        // Register root + two subagents.
+        let mut e1 = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::FullBody);
+        e1.agent_id = "session-main".into();
+        app.process_agent_event(e1);
+
+        let mut e2 = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::Overview);
+        e2.agent_id = "agent-aaa".into();
+        app.process_agent_event(e2);
+
+        let mut e3 = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::Overview);
+        e3.agent_id = "agent-bbb".into();
+        app.process_agent_event(e3);
+
+        let flat = app.flattened_agents();
+        assert_eq!(flat.len(), 3);
+        // Root at depth 0.
+        assert_eq!(flat[0].0, "session-main");
+        assert_eq!(flat[0].1, 0);
+        // Subagents at depth 1.
+        assert!(flat.iter().any(|(id, d)| id == "agent-aaa" && *d == 1));
+        assert!(flat.iter().any(|(id, d)| id == "agent-bbb" && *d == 1));
+    }
+
+    #[test]
+    fn flattened_agents_empty_when_no_agents() {
+        let app = test_app(vec![]);
+        assert!(app.flattened_agents().is_empty());
     }
 }

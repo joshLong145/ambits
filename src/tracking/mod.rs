@@ -38,11 +38,15 @@ impl std::fmt::Display for ReadDepth {
 #[derive(Debug, Clone)]
 pub struct ContextEntry {
     pub symbol_id: SymbolId,
+    /// Aggregate depth: the maximum depth across all agents.
     pub depth: ReadDepth,
     pub content_hash_at_read: [u8; 32],
     pub timestamp: Instant,
+    /// The last agent that touched this symbol.
     pub agent_id: String,
     pub token_count: usize,
+    /// Per-agent depth tracking: each agent's independent read depth for this symbol.
+    pub agent_depths: HashMap<String, ReadDepth>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,8 +61,11 @@ impl ContextLedger {
         }
     }
 
-    /// Record that a symbol was seen at the given depth.
-    /// Only upgrades depth (never downgrades, except to Stale).
+    /// Record that a symbol was seen at the given depth by a specific agent.
+    ///
+    /// Per-agent depths are tracked independently — agent A can have `FullBody`
+    /// while agent B has `Overview` for the same symbol. The aggregate `depth`
+    /// field is always the maximum across all agents.
     pub fn record(
         &mut self,
         symbol_id: SymbolId,
@@ -74,11 +81,25 @@ impl ContextLedger {
             timestamp: Instant::now(),
             agent_id: String::new(),
             token_count: 0,
+            agent_depths: HashMap::new(),
         });
 
-        // Only upgrade, never downgrade (except Stale overrides everything).
-        if depth == ReadDepth::Stale || depth > entry.depth {
-            entry.depth = depth;
+        // Update per-agent depth (only upgrade, never downgrade).
+        let agent_depth = entry.agent_depths.entry(agent_id.clone()).or_insert(ReadDepth::Unseen);
+        if depth == ReadDepth::Stale || depth > *agent_depth {
+            *agent_depth = depth;
+        }
+
+        // Recompute aggregate depth as max across all agents.
+        let max_depth = entry
+            .agent_depths
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(ReadDepth::Unseen);
+
+        if max_depth == ReadDepth::Stale || max_depth > entry.depth {
+            entry.depth = max_depth;
             entry.content_hash_at_read = content_hash;
             entry.timestamp = Instant::now();
             entry.agent_id = agent_id;
@@ -95,10 +116,14 @@ impl ContextLedger {
     }
 
     /// Mark all entries whose content hash no longer matches as Stale.
+    /// Propagates the stale marker to all per-agent depth entries as well.
     pub fn mark_stale_if_changed(&mut self, symbol_id: &str, current_hash: [u8; 32]) {
         if let Some(entry) = self.entries.get_mut(symbol_id) {
             if entry.depth != ReadDepth::Unseen && entry.content_hash_at_read != current_hash {
                 entry.depth = ReadDepth::Stale;
+                for depth in entry.agent_depths.values_mut() {
+                    *depth = ReadDepth::Stale;
+                }
             }
         }
     }
@@ -113,6 +138,52 @@ impl ContextLedger {
             *counts.entry(entry.depth).or_insert(0) += 1;
         }
         counts
+    }
+
+    /// Returns the read depth of a specific symbol for a specific agent.
+    /// Returns `ReadDepth::Unseen` if the symbol or agent is not tracked.
+    pub fn depth_of_for_agent(&self, symbol_id: &str, agent_id: &str) -> ReadDepth {
+        self.entries
+            .get(symbol_id)
+            .and_then(|e| e.agent_depths.get(agent_id))
+            .copied()
+            .unwrap_or(ReadDepth::Unseen)
+    }
+
+    /// Returns the list of agent IDs that have interacted with a given symbol.
+    pub fn agents_for_symbol(&self, symbol_id: &str) -> Vec<&str> {
+        self.entries
+            .get(symbol_id)
+            .map(|e| e.agent_depths.keys().map(|s| s.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Count entries by depth for a specific agent.
+    pub fn count_by_depth_for_agent(&self, agent_id: &str) -> HashMap<ReadDepth, usize> {
+        let mut counts = HashMap::new();
+        for entry in self.entries.values() {
+            let depth = entry
+                .agent_depths
+                .get(agent_id)
+                .copied()
+                .unwrap_or(ReadDepth::Unseen);
+            *counts.entry(depth).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    /// Count total seen symbols for a specific agent.
+    pub fn total_seen_for_agent(&self, agent_id: &str) -> usize {
+        self.entries
+            .values()
+            .filter(|e| {
+                e.agent_depths
+                    .get(agent_id)
+                    .copied()
+                    .unwrap_or(ReadDepth::Unseen)
+                    .is_seen()
+            })
+            .count()
     }
 }
 
@@ -175,5 +246,103 @@ mod tests {
     fn depth_of_defaults_unseen() {
         let ledger = ContextLedger::new();
         assert_eq!(ledger.depth_of("nonexistent"), ReadDepth::Unseen);
+    }
+
+    #[test]
+    fn per_agent_depth_tracking() {
+        let mut ledger = ContextLedger::new();
+        let h = hash("v1");
+
+        // Agent A reads at Overview, Agent B reads at FullBody.
+        ledger.record("s1".into(), ReadDepth::Overview, h, "agent_a".into(), 5);
+        ledger.record("s1".into(), ReadDepth::FullBody, h, "agent_b".into(), 10);
+
+        // Per-agent depths are independent.
+        assert_eq!(ledger.depth_of_for_agent("s1", "agent_a"), ReadDepth::Overview);
+        assert_eq!(ledger.depth_of_for_agent("s1", "agent_b"), ReadDepth::FullBody);
+
+        // Aggregate is max across agents.
+        assert_eq!(ledger.depth_of("s1"), ReadDepth::FullBody);
+    }
+
+    #[test]
+    fn per_agent_depth_never_downgrades() {
+        let mut ledger = ContextLedger::new();
+        let h = hash("v1");
+
+        ledger.record("s1".into(), ReadDepth::FullBody, h, "agent_a".into(), 10);
+        ledger.record("s1".into(), ReadDepth::Overview, h, "agent_a".into(), 5);
+
+        // Agent depth should not downgrade.
+        assert_eq!(ledger.depth_of_for_agent("s1", "agent_a"), ReadDepth::FullBody);
+    }
+
+    #[test]
+    fn depth_of_for_agent_defaults_unseen() {
+        let ledger = ContextLedger::new();
+        assert_eq!(ledger.depth_of_for_agent("nonexistent", "agent_a"), ReadDepth::Unseen);
+
+        // Symbol exists but agent doesn't.
+        let mut ledger = ContextLedger::new();
+        ledger.record("s1".into(), ReadDepth::Overview, hash("v1"), "agent_a".into(), 5);
+        assert_eq!(ledger.depth_of_for_agent("s1", "agent_b"), ReadDepth::Unseen);
+    }
+
+    #[test]
+    fn agents_for_symbol_returns_all_agents() {
+        let mut ledger = ContextLedger::new();
+        let h = hash("v1");
+
+        ledger.record("s1".into(), ReadDepth::Overview, h, "agent_a".into(), 5);
+        ledger.record("s1".into(), ReadDepth::FullBody, h, "agent_b".into(), 10);
+
+        let mut agents = ledger.agents_for_symbol("s1");
+        agents.sort();
+        assert_eq!(agents, vec!["agent_a", "agent_b"]);
+    }
+
+    #[test]
+    fn agents_for_symbol_empty_when_not_tracked() {
+        let ledger = ContextLedger::new();
+        assert!(ledger.agents_for_symbol("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn mark_stale_propagates_to_agent_depths() {
+        let mut ledger = ContextLedger::new();
+        let h1 = hash("v1");
+        let h2 = hash("v2");
+
+        ledger.record("s1".into(), ReadDepth::FullBody, h1, "agent_a".into(), 10);
+        ledger.record("s1".into(), ReadDepth::Overview, h1, "agent_b".into(), 5);
+
+        // Mark stale with changed hash.
+        ledger.mark_stale_if_changed("s1", h2);
+
+        // Both aggregate and per-agent depths should be stale.
+        assert_eq!(ledger.depth_of("s1"), ReadDepth::Stale);
+        assert_eq!(ledger.depth_of_for_agent("s1", "agent_a"), ReadDepth::Stale);
+        assert_eq!(ledger.depth_of_for_agent("s1", "agent_b"), ReadDepth::Stale);
+    }
+
+    #[test]
+    fn aggregate_depth_reflects_max_across_agents() {
+        let mut ledger = ContextLedger::new();
+        let h = hash("v1");
+
+        // Three agents with increasing depths.
+        ledger.record("s1".into(), ReadDepth::NameOnly, h, "a".into(), 1);
+        assert_eq!(ledger.depth_of("s1"), ReadDepth::NameOnly);
+
+        ledger.record("s1".into(), ReadDepth::Signature, h, "b".into(), 3);
+        assert_eq!(ledger.depth_of("s1"), ReadDepth::Signature);
+
+        ledger.record("s1".into(), ReadDepth::FullBody, h, "c".into(), 10);
+        assert_eq!(ledger.depth_of("s1"), ReadDepth::FullBody);
+
+        // Each agent retains its own depth.
+        assert_eq!(ledger.depth_of_for_agent("s1", "a"), ReadDepth::NameOnly);
+        assert_eq!(ledger.depth_of_for_agent("s1", "b"), ReadDepth::Signature);
+        assert_eq!(ledger.depth_of_for_agent("s1", "c"), ReadDepth::FullBody);
     }
 }

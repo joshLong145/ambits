@@ -44,7 +44,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             Span::styled("_", Style::default().fg(Color::Yellow)),
         ])
     } else {
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled(" [q]", Style::default().fg(Color::DarkGray)),
             Span::raw("uit "),
             Span::styled("[j/k]", Style::default().fg(Color::DarkGray)),
@@ -58,11 +58,26 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 SortMode::Alphabetical => "ort:A-Z ",
                 SortMode::ByCoverage => "ort:cov ",
             }),
-            Span::styled("[a]", Style::default().fg(Color::DarkGray)),
+            Span::styled("[a/A]", Style::default().fg(Color::DarkGray)),
             Span::raw("gents "),
             Span::styled("[tab]", Style::default().fg(Color::DarkGray)),
             Span::raw("focus "),
-        ])
+        ];
+
+        // Show current agent filter
+        if let Some(ref agent_id) = app.agent_filter {
+            let display = if agent_id.len() > 12 {
+                &agent_id[..12]
+            } else {
+                agent_id
+            };
+            spans.push(Span::styled(
+                format!(" Agent: {}", display),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+
+        Line::from(spans)
     };
 
     f.render_widget(

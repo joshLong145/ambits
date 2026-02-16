@@ -44,19 +44,26 @@ impl FileCoverage {
 pub struct CoverageReport {
     /// Session ID if available.
     pub session_id: Option<String>,
+    /// Agent ID if filtering by agent.
+    pub agent_id: Option<String>,
     /// Per-file coverage metrics.
     pub files: Vec<FileCoverage>,
 }
 
 impl CoverageReport {
     /// Build a coverage report from a project tree and context ledger.
-    pub fn from_project(project_tree: &ProjectTree, ledger: &ContextLedger) -> Self {
+    /// When `agent_filter` is `Some(id)`, only counts coverage from that agent.
+    pub fn from_project(
+        project_tree: &ProjectTree,
+        ledger: &ContextLedger,
+        agent_filter: Option<&str>,
+    ) -> Self {
         let mut files: Vec<FileCoverage> = project_tree
             .files
             .iter()
             .map(|file| {
                 let path = file.file_path.to_string_lossy().to_string();
-                let (total, seen, full) = count_symbols(&file.symbols, ledger);
+                let (total, seen, full) = count_symbols(&file.symbols, ledger, agent_filter);
                 FileCoverage {
                     path,
                     total_symbols: total,
@@ -75,6 +82,7 @@ impl CoverageReport {
 
         Self {
             session_id: None,
+            agent_id: agent_filter.map(|s| s.to_string()),
             files,
         }
     }
@@ -116,14 +124,22 @@ impl CoverageReport {
 }
 
 /// Count symbols recursively, returning (total, seen_count, full_count).
-pub fn count_symbols(symbols: &[SymbolNode], ledger: &ContextLedger) -> (usize, usize, usize) {
+/// When `agent_filter` is `Some(id)`, counts use per-agent depths instead of aggregate.
+pub fn count_symbols(
+    symbols: &[SymbolNode],
+    ledger: &ContextLedger,
+    agent_filter: Option<&str>,
+) -> (usize, usize, usize) {
     let mut total = 0;
     let mut seen = 0;
     let mut full = 0;
 
     for sym in symbols {
         total += 1;
-        let depth = ledger.depth_of(&sym.id);
+        let depth = match agent_filter {
+            Some(agent_id) => ledger.depth_of_for_agent(&sym.id, agent_id),
+            None => ledger.depth_of(&sym.id),
+        };
 
         if depth.is_seen() {
             seen += 1;
@@ -133,7 +149,8 @@ pub fn count_symbols(symbols: &[SymbolNode], ledger: &ContextLedger) -> (usize, 
         }
 
         // Recurse into children
-        let (child_total, child_seen, child_full) = count_symbols(&sym.children, ledger);
+        let (child_total, child_seen, child_full) =
+            count_symbols(&sym.children, ledger, agent_filter);
         total += child_total;
         seen += child_seen;
         full += child_full;
@@ -168,10 +185,14 @@ impl CoverageFormatter for TextFormatter {
         // Header
         let session_str = report
             .session_id
-            .as_ref()
-            .map(|s| s.as_str())
+            .as_deref()
             .unwrap_or("none");
-        output.push_str(&format!("Coverage Report (session: {})\n", session_str));
+        let agent_str = report
+            .agent_id
+            .as_deref()
+            .map(|a| format!(", agent: {}", a))
+            .unwrap_or_default();
+        output.push_str(&format!("Coverage Report (session: {}{})\n", session_str, agent_str));
 
         // Calculate path width based on longest path
         let max_path_len = report
@@ -267,7 +288,7 @@ mod tests {
     #[test]
     fn count_symbols_empty() {
         let ledger = ContextLedger::new();
-        assert_eq!(count_symbols(&[], &ledger), (0, 0, 0));
+        assert_eq!(count_symbols(&[], &ledger, None), (0, 0, 0));
     }
 
     #[test]
@@ -281,7 +302,7 @@ mod tests {
         ledger.record("p".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
         ledger.record("c1".into(), ReadDepth::Overview, [0; 32], "ag".into(), 10);
 
-        let (total, seen, full) = count_symbols(&[parent], &ledger);
+        let (total, seen, full) = count_symbols(&[parent], &ledger, None);
         assert_eq!(total, 3);
         assert_eq!(seen, 2);
         assert_eq!(full, 1);
@@ -297,7 +318,7 @@ mod tests {
         // Mark b1 as FullBody (100%), a1 unseen (0%).
         ledger.record("b1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
 
-        let report = CoverageReport::from_project(&tree, &ledger);
+        let report = CoverageReport::from_project(&tree, &ledger, None);
         // Sorted ascending by full_percent: a.rs (0%) first, b.rs (100%) second.
         assert_eq!(report.files[0].path, "a.rs");
         assert_eq!(report.files[1].path, "b.rs");
@@ -313,15 +334,71 @@ mod tests {
         ledger.record("a1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
         ledger.record("b1".into(), ReadDepth::Overview, [0; 32], "ag".into(), 10);
 
-        let report = CoverageReport::from_project(&tree, &ledger);
+        let report = CoverageReport::from_project(&tree, &ledger, None);
         assert_eq!(report.total_symbols(), 3);
         assert_eq!(report.total_seen(), 2);
         assert_eq!(report.total_full(), 1);
     }
 
     #[test]
+    fn count_symbols_with_agent_filter() {
+        let mut ledger = ContextLedger::new();
+        let syms = vec![sym("s1", "s1"), sym("s2", "s2")];
+
+        // Agent A reads s1 at FullBody, Agent B reads s2 at Overview.
+        ledger.record("s1".into(), ReadDepth::FullBody, [0; 32], "agent_a".into(), 10);
+        ledger.record("s2".into(), ReadDepth::Overview, [0; 32], "agent_b".into(), 5);
+
+        // Aggregate: both seen, 1 full.
+        let (total, seen, full) = count_symbols(&syms, &ledger, None);
+        assert_eq!((total, seen, full), (2, 2, 1));
+
+        // Agent A: only s1 seen (FullBody).
+        let (total, seen, full) = count_symbols(&syms, &ledger, Some("agent_a"));
+        assert_eq!((total, seen, full), (2, 1, 1));
+
+        // Agent B: only s2 seen (Overview).
+        let (total, seen, full) = count_symbols(&syms, &ledger, Some("agent_b"));
+        assert_eq!((total, seen, full), (2, 1, 0));
+
+        // Unknown agent: nothing seen.
+        let (total, seen, full) = count_symbols(&syms, &ledger, Some("agent_c"));
+        assert_eq!((total, seen, full), (2, 0, 0));
+    }
+
+    #[test]
+    fn from_project_with_agent_filter() {
+        let mut ledger = ContextLedger::new();
+        let tree = project(vec![
+            file("a.rs", vec![sym("a1", "a1")]),
+            file("b.rs", vec![sym("b1", "b1")]),
+        ]);
+
+        // Agent A reads a1, Agent B reads b1.
+        ledger.record("a1".into(), ReadDepth::FullBody, [0; 32], "agent_a".into(), 10);
+        ledger.record("b1".into(), ReadDepth::FullBody, [0; 32], "agent_b".into(), 10);
+
+        // Aggregate: both files covered.
+        let report = CoverageReport::from_project(&tree, &ledger, None);
+        assert_eq!(report.total_seen(), 2);
+
+        // Agent A: only a.rs covered.
+        let report = CoverageReport::from_project(&tree, &ledger, Some("agent_a"));
+        assert_eq!(report.total_seen(), 1);
+        assert_eq!(report.total_full(), 1);
+        let fa = report.files.iter().find(|f| f.path == "a.rs").unwrap();
+        assert_eq!(fa.seen_count, 1);
+
+        // Agent B: only b.rs covered.
+        let report = CoverageReport::from_project(&tree, &ledger, Some("agent_b"));
+        assert_eq!(report.total_seen(), 1);
+        let fb = report.files.iter().find(|f| f.path == "b.rs").unwrap();
+        assert_eq!(fb.seen_count, 1);
+    }
+
+    #[test]
     fn text_formatter_output() {
-        let report = CoverageReport { session_id: Some("abc-123".into()), files: vec![
+        let report = CoverageReport { session_id: Some("abc-123".into()), agent_id: None, files: vec![
             FileCoverage { path: "src/main.rs".into(), total_symbols: 10, seen_count: 8, full_count: 5 },
         ]};
         let formatter = TextFormatter::default();
