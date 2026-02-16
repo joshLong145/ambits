@@ -95,6 +95,28 @@ TOTAL                                         214     182     175     85%     82
 - **Seen%**: Symbols the agent has any awareness of (name, overview, signature, or full body)
 - **Full%**: Symbols the agent has read completely (full body)
 
+### Multi-Agent Coverage
+
+When a Claude Code session uses the Task tool to spawn sub-agents, ambits automatically detects each agent and tracks its coverage independently. The Coverage Stats panel shows a hierarchical agent tree with per-agent seen percentages:
+
+```
+Agents: 5
+  ▶ [All]              Seen: 95%
+  ├─ 7842313b          35%
+  │  ├─ a38e68c        20%
+  │  ├─ a9fe23c        41%
+  │  └─ a845182        15%
+  └─ compact-0aff      10%
+```
+
+Use `Tab` to focus the Stats panel, then `j`/`k` to navigate the agent list and `Enter` to filter. When an agent is selected, the tree view, activity feed, and depth breakdown all update to show only that agent's coverage. Press `a` from any panel to quickly cycle through agents.
+
+The `--agent` CLI flag lets you filter coverage reports by agent ID without launching the TUI:
+
+```bash
+ambits -p . --coverage --agent a9fe23c
+```
+
 ## Claude Code Skill
 
 ambits includes a [Claude Code skill](https://code.claude.com/docs/en/skills) so you can check coverage without leaving your editor. Type `/ambit` in any Claude Code session to get an instant coverage summary.

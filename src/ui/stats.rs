@@ -107,8 +107,13 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 "  \u{2502} "
             };
-            let color = if is_selected {
-                Color::Yellow
+
+            let display_name = short_id(agent_id);
+
+            // Per-agent seen%
+            let agent_seen = app.ledger.total_seen_for_agent(agent_id);
+            let agent_pct = if total > 0 {
+                (agent_seen as f64 / total as f64 * 100.0) as u32
             } else {
                 colors::ACCENT_MUTED
             };
