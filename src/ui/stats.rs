@@ -157,13 +157,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 "\u{251c}\u{2500} "
             };
 
-            // Display label if available, otherwise short_id
-            let display_name = match app.agent_tree.agents.get(agent_id) {
-                Some(node) if !node.label.is_empty() => {
-                    format!("{} ({})", node.label, short_id(agent_id))
-                }
-                _ => short_id(agent_id),
-            };
+            let display_name = short_id(agent_id);
 
             // Per-agent seen%
             let agent_seen = app.ledger.total_seen_for_agent(agent_id);
