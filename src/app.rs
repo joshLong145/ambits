@@ -67,6 +67,8 @@ pub struct App {
 
     // Activity feed.
     pub activity: Vec<AgentToolCall>,
+    /// How many lines the user has scrolled up from the bottom in the activity feed (0 = pinned to latest).
+    pub activity_scroll_offset: usize,
 
     // Agents seen.
     pub agents_seen: Vec<String>,
@@ -114,6 +116,7 @@ impl App {
             selected_index: 0,
             collapsed,
             activity: Vec::new(),
+            activity_scroll_offset: 0,
             agents_seen: Vec::new(),
             agent_tree: AgentTree::new(),
             agent_filter: None,
@@ -254,8 +257,20 @@ impl App {
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.move_selection(-3),
-            MouseEventKind::ScrollDown => self.move_selection(3),
+            MouseEventKind::ScrollUp => match self.focus {
+                FocusPanel::Activity => {
+                    self.activity_scroll_offset = self.activity_scroll_offset.saturating_add(3);
+                }
+                FocusPanel::Stats => self.move_agent_selection(-1),
+                FocusPanel::Tree => self.move_selection(-3),
+            },
+            MouseEventKind::ScrollDown => match self.focus {
+                FocusPanel::Activity => {
+                    self.activity_scroll_offset = self.activity_scroll_offset.saturating_sub(3);
+                }
+                FocusPanel::Stats => self.move_agent_selection(1),
+                FocusPanel::Tree => self.move_selection(3),
+            },
             _ => {}
         }
     }
@@ -530,6 +545,7 @@ impl App {
         // Only push tracked events to the activity feed.
         if event.read_depth != ReadDepth::Unseen {
             self.activity.push(event);
+            self.activity_scroll_offset = 0; // Auto-scroll to latest
             if self.activity.len() > 200 {
                 self.activity.drain(0..100);
             }
@@ -903,6 +919,57 @@ mod tests {
         assert_eq!(app.agent_selection_index, 0);
         app.apply_agent_selection();
         assert_eq!(app.agent_filter, None);
+    }
+
+    #[test]
+    fn activity_scroll_offset_resets_on_new_event() {
+        let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::a", "a")])]);
+        app.activity_scroll_offset = 10;
+
+        let e = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::FullBody);
+        app.process_agent_event(e);
+
+        assert_eq!(app.activity_scroll_offset, 0);
+    }
+
+    #[test]
+    fn handle_mouse_scroll_routes_by_focus() {
+        use crossterm::event::{MouseEvent, MouseEventKind, MouseButton};
+
+        let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::a", "a")])]);
+
+        // Add some activity so scroll offset can increase
+        for _ in 0..20 {
+            let e = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::FullBody);
+            app.process_agent_event(e);
+        }
+
+        // Focus activity panel and scroll up
+        app.focus = FocusPanel::Activity;
+        let scroll_up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+        app.handle_mouse(scroll_up);
+        assert_eq!(app.activity_scroll_offset, 3);
+
+        // Scroll down should decrease offset
+        let scroll_down = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+        app.handle_mouse(scroll_down);
+        assert_eq!(app.activity_scroll_offset, 0);
+
+        // Focus tree panel — scroll should move tree selection, not activity
+        app.focus = FocusPanel::Tree;
+        app.activity_scroll_offset = 5;
+        app.handle_mouse(scroll_up);
+        assert_eq!(app.activity_scroll_offset, 5); // unchanged
     }
 
     #[test]
