@@ -1,0 +1,57 @@
+name: Benchmarks
+
+# Run benchmarks when critical implementation files or the bench files themselves change.
+# On pushes to main: store results as the new baseline on gh-pages.
+# On pull_requests:  compare against the stored baseline and fail if any benchmark
+#                    regresses by more than 15% (alert-threshold: '115%').
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/symbols/**'
+      - 'src/parser/**'
+      - 'src/ingest/**'
+      - 'src/coverage.rs'
+      - 'src/tracking/**'
+      - 'benches/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/symbols/**'
+      - 'src/parser/**'
+      - 'src/ingest/**'
+      - 'src/coverage.rs'
+      - 'src/tracking/**'
+      - 'benches/**'
+
+env:
+  CARGO_TERM_COLOR: always
+  # Limit sample count in CI to keep runs under ~5 minutes.
+  # Override locally with: cargo bench -- --sample-count 100
+  DIVAN_SAMPLE_COUNT: "20"
+
+jobs:
+  benchmark:
+    name: Regression Benchmarks
+    runs-on: ubuntu-latest
+
+    # Required for github-action-benchmark to push to gh-pages.
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run benchmarks
+        run: cargo bench 2>&1 | tee bench-output.txt
+
+      - name: Parse divan output → JSON + check static thresholds
+        run: >-
+          python3 .github/scripts/parse_divan_bench.py bench-output.txt
+          --thresholds .github/bench-thresholds.json
+          > bench-results.json

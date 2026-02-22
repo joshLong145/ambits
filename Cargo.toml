@@ -30,6 +30,27 @@ serde-pickle = "1.2"
 
 [dev-dependencies]
 tempfile = "3"
+divan = "0.1.21"
+
+[[bench]]
+name = "merkle_hash"
+harness = false
+
+[[bench]]
+name = "parser"
+harness = false
+
+[[bench]]
+name = "ingest"
+harness = false
+
+[[bench]]
+name = "coverage"
+harness = false
+
+[[bench]]
+name = "tracking"
+harness = false
 
 [lib]
 name = "ambits"
