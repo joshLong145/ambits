@@ -129,6 +129,19 @@ impl App {
         app
     }
 
+    /// Reset all live session state (ledger, agents, activity) while preserving
+    /// the project tree and UI configuration. Called when a `/clear` is detected
+    /// in the session log.
+    pub fn reset_session(&mut self) {
+        self.ledger = ContextLedger::new();
+        self.activity.clear();
+        self.agents_seen.clear();
+        self.agent_tree = AgentTree::new();
+        self.agent_filter = None;
+        self.agent_selection_index = 0;
+        self.rebuild_tree_rows();
+    }
+
     /// Rebuild the flattened tree rows from the project tree + collapsed state.
     pub fn rebuild_tree_rows(&mut self) {
         let mut rows = Vec::new();
@@ -998,5 +1011,43 @@ mod tests {
     fn flattened_agents_empty_when_no_agents() {
         let app = test_app(vec![]);
         assert!(app.flattened_agents().is_empty());
+    }
+
+    #[test]
+    fn reset_session_clears_ledger_and_agents() {
+        use crate::ingest::AgentToolCall;
+        use crate::tracking::ReadDepth;
+        use std::path::PathBuf;
+
+        let mut app = test_app(vec![]);
+
+        // Populate session state via a fake event.
+        let event = AgentToolCall {
+            agent_id: "agent-abc".to_string(),
+            tool_name: "Read".to_string(),
+            file_path: None,
+            read_depth: ReadDepth::FullBody,
+            description: "Read something".to_string(),
+            timestamp_str: "2026-01-01T00:00:00Z".to_string(),
+            target_symbol: None,
+            target_lines: None,
+            label: "agent-abc".to_string(),
+        };
+        app.process_agent_event(event);
+
+        assert!(!app.agents_seen.is_empty());
+        assert!(!app.activity.is_empty());
+
+        // reset_session should clear all live state.
+        let original_files_count = app.project_tree.files.len();
+        app.reset_session();
+
+        assert!(app.ledger.entries.is_empty());
+        assert!(app.activity.is_empty());
+        assert!(app.agents_seen.is_empty());
+        assert!(app.agent_filter.is_none());
+        assert_eq!(app.agent_selection_index, 0);
+        // Project tree is preserved.
+        assert_eq!(app.project_tree.files.len(), original_files_count);
     }
 }

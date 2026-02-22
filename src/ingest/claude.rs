@@ -197,7 +197,16 @@ pub fn extract_agent_label(path: &Path) -> String {
     }
 }
 
+/// The result of parsing a single JSONL line.
+pub enum ParsedLine {
+    Events(Vec<AgentToolCall>),
+    SessionCleared,
+    Ignored,
+}
+
 /// Parse all events from a JSONL log file.
+/// SessionCleared signals are ignored in batch mode — dump/coverage modes show
+/// aggregate historical coverage, not live session state.
 pub fn parse_log_file(path: &Path) -> Vec<AgentToolCall> {
     let mut events = Vec::new();
     let file = match fs::File::open(path) {
@@ -217,28 +226,40 @@ pub fn parse_log_file(path: &Path) -> Vec<AgentToolCall> {
     let label = extract_agent_label(path);
 
     for line in reader.lines().map_while(Result::ok) {
-        let mut line_events = parse_jsonl_line(&line, &default_id);
-        for ev in &mut line_events {
-            ev.label = label.clone();
+        if let ParsedLine::Events(mut line_events) = parse_jsonl_line(&line, &default_id) {
+            for ev in &mut line_events {
+                ev.label = label.clone();
+            }
+            events.extend(line_events);
         }
-        events.extend(line_events);
     }
     events
 }
 
 /// Parse a single JSONL line from a Claude Code session log.
-/// Returns tool call events found in assistant messages.
-pub fn parse_jsonl_line(line: &str, default_agent_id: &str) -> Vec<AgentToolCall> {
-    let mut events = Vec::new();
-
+/// Returns a `ParsedLine` indicating tool call events, a session clear signal, or nothing.
+pub fn parse_jsonl_line(line: &str, default_agent_id: &str) -> ParsedLine {
     let obj: Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(_) => return events,
+        Err(_) => return ParsedLine::Ignored,
     };
 
     let msg_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Detect /clear command in user messages.
+    if msg_type == "user" {
+        let content = obj
+            .pointer("/message/content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if content.contains("<command-name>/clear</command-name>") {
+            return ParsedLine::SessionCleared;
+        }
+        return ParsedLine::Ignored;
+    }
+
     if msg_type != "assistant" {
-        return events;
+        return ParsedLine::Ignored;
     }
 
     let agent_id = obj
@@ -256,9 +277,10 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str) -> Vec<AgentToolCall
 
     let content = match obj.pointer("/message/content") {
         Some(Value::Array(arr)) => arr,
-        _ => return events,
+        _ => return ParsedLine::Ignored,
     };
 
+    let mut events = Vec::new();
     for block in content {
         if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
             continue;
@@ -286,7 +308,7 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str) -> Vec<AgentToolCall
         events.push(event);
     }
 
-    events
+    ParsedLine::Events(events)
 }
 
 /// Map a tool call to an AgentToolCall with appropriate ReadDepth.
@@ -574,6 +596,13 @@ pub struct LogTailer {
     positions: std::collections::HashMap<PathBuf, u64>,
 }
 
+/// Output from `LogTailer::read_new_events`, carrying both new tool call events
+/// and a flag indicating whether a `/clear` command was detected.
+pub struct TailerOutput {
+    pub events: Vec<AgentToolCall>,
+    pub session_cleared: bool,
+}
+
 impl LogTailer {
     /// Create a tailer for the given log files, starting from the end of each
     /// (i.e., only new lines will be read on subsequent calls).
@@ -599,9 +628,13 @@ impl LogTailer {
     }
 
     /// Read new lines from all tracked files since last read.
-    /// Returns any new agent tool call events.
-    pub fn read_new_events(&mut self) -> Vec<AgentToolCall> {
-        let mut events = Vec::new();
+    /// Returns a `TailerOutput` with any new agent tool call events and a
+    /// `session_cleared` flag set to `true` if a `/clear` command was detected.
+    pub fn read_new_events(&mut self) -> TailerOutput {
+        let mut output = TailerOutput {
+            events: Vec::new(),
+            session_cleared: false,
+        };
 
         for file_path in &self.files {
             let pos = self.positions.get(file_path).copied().unwrap_or(0);
@@ -628,9 +661,11 @@ impl LogTailer {
                         line.clear();
                         match reader.read_line(&mut line) {
                             Ok(0) => break,
-                            Ok(_) => {
-                                events.extend(parse_jsonl_line(line.trim(), &default_id));
-                            }
+                            Ok(_) => match parse_jsonl_line(line.trim(), &default_id) {
+                                ParsedLine::Events(events) => output.events.extend(events),
+                                ParsedLine::SessionCleared => output.session_cleared = true,
+                                ParsedLine::Ignored => {}
+                            },
                             Err(_) => break,
                         }
                     }
@@ -640,7 +675,7 @@ impl LogTailer {
             self.positions.insert(file_path.clone(), current_len);
         }
 
-        events
+        output
     }
 }
 
@@ -654,10 +689,18 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Convenience: unwrap `ParsedLine::Events` for tests that don't care about clear detection.
+    fn parse_events(line: &str, agent_id: &str) -> Vec<AgentToolCall> {
+        match parse_jsonl_line(line, agent_id) {
+            ParsedLine::Events(evs) => evs,
+            _ => vec![],
+        }
+    }
+
     #[test]
     fn test_parse_read_tool_call() {
         let line = r#"{"type":"assistant","sessionId":"abc-123","message":{"role":"assistant","content":[{"type":"tool_use","name":"mcp__acp__Read","input":{"file_path":"/foo/bar/src/main.rs"}}]}}"#;
-        let events = parse_jsonl_line(line, "default");
+        let events = parse_events(line, "default");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].read_depth, ReadDepth::FullBody);
         assert_eq!(
@@ -669,7 +712,7 @@ mod tests {
     #[test]
     fn test_parse_grep_tool_call() {
         let line = r#"{"type":"assistant","sessionId":"abc","message":{"role":"assistant","content":[{"type":"tool_use","name":"Grep","input":{"pattern":"AuthService"}}]}}"#;
-        let events = parse_jsonl_line(line, "default");
+        let events = parse_events(line, "default");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].read_depth, ReadDepth::Overview);
     }
@@ -677,7 +720,7 @@ mod tests {
     #[test]
     fn test_ignores_user_messages() {
         let line = r#"{"type":"user","message":{"role":"user","content":"hello"}}"#;
-        let events = parse_jsonl_line(line, "default");
+        let events = parse_events(line, "default");
         assert!(events.is_empty());
     }
 
@@ -685,7 +728,7 @@ mod tests {
     fn test_ignores_type_a() {
         // "type":"A" does not appear in real logs; only "assistant" should be accepted.
         let line = r#"{"type":"A","sessionId":"abc","message":{"role":"assistant","content":[{"type":"tool_use","name":"mcp__acp__Read","input":{"file_path":"/foo.rs"}}]}}"#;
-        let events = parse_jsonl_line(line, "default");
+        let events = parse_events(line, "default");
         assert!(events.is_empty());
     }
 
@@ -785,7 +828,7 @@ mod tests {
     #[test]
     fn map_edit_tool() {
         let line = jsonl_assistant("mcp__acp__Edit", r#"{"file_path":"/src/app.rs","old_string":"a","new_string":"b"}"#);
-        let events = parse_jsonl_line(&line, "d");
+        let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::FullBody);
         assert_eq!(events[0].file_path.as_ref().unwrap(), &PathBuf::from("/src/app.rs"));
     }
@@ -793,28 +836,28 @@ mod tests {
     #[test]
     fn map_write_tool() {
         let line = jsonl_assistant("mcp__acp__Write", r#"{"file_path":"/src/new.rs","content":"fn main(){}"}"#);
-        let events = parse_jsonl_line(&line, "d");
+        let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::FullBody);
     }
 
     #[test]
     fn map_glob_tool() {
         let line = jsonl_assistant("Glob", r#"{"pattern":"**/*.rs","path":"/src"}"#);
-        let events = parse_jsonl_line(&line, "d");
+        let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::NameOnly);
     }
 
     #[test]
     fn map_find_file() {
         let line = jsonl_assistant("mcp__serena__find_file", r#"{"file_mask":"*.rs","relative_path":"src"}"#);
-        let events = parse_jsonl_line(&line, "d");
+        let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::NameOnly);
     }
 
     #[test]
     fn map_symbols_overview() {
         let line = jsonl_assistant("mcp__serena__get_symbols_overview", r#"{"relative_path":"src/app.rs"}"#);
-        let events = parse_jsonl_line(&line, "d");
+        let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::Overview);
         assert_eq!(events[0].file_path.as_ref().unwrap(), &PathBuf::from("src/app.rs"));
     }
@@ -822,7 +865,7 @@ mod tests {
     #[test]
     fn map_find_symbol_no_body() {
         let line = jsonl_assistant("mcp__serena__find_symbol", r#"{"name_path_pattern":"App","relative_path":"src/app.rs","include_body":false}"#);
-        let events = parse_jsonl_line(&line, "d");
+        let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::Signature);
         assert_eq!(events[0].target_symbol.as_deref(), Some("App"));
     }
@@ -830,7 +873,7 @@ mod tests {
     #[test]
     fn map_find_symbol_with_body() {
         let line = jsonl_assistant("mcp__serena__find_symbol", r#"{"name_path_pattern":"App/new","relative_path":"src/app.rs","include_body":true}"#);
-        let events = parse_jsonl_line(&line, "d");
+        let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::FullBody);
         assert_eq!(events[0].target_symbol.as_deref(), Some("App/new"));
     }
@@ -838,7 +881,7 @@ mod tests {
     #[test]
     fn map_find_referencing() {
         let line = jsonl_assistant("mcp__serena__find_referencing_symbols", r#"{"name_path":"ProjectTree","relative_path":"src/symbols/mod.rs"}"#);
-        let events = parse_jsonl_line(&line, "d");
+        let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::Overview);
         assert_eq!(events[0].target_symbol.as_deref(), Some("ProjectTree"));
     }
@@ -846,7 +889,7 @@ mod tests {
     #[test]
     fn map_replace_symbol() {
         let line = jsonl_assistant("mcp__serena__replace_symbol_body", r#"{"name_path":"App/new","relative_path":"src/app.rs","body":"pub fn new() {}"}"#);
-        let events = parse_jsonl_line(&line, "d");
+        let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::FullBody);
         assert_eq!(events[0].target_symbol.as_deref(), Some("App/new"));
     }
@@ -854,7 +897,7 @@ mod tests {
     #[test]
     fn map_insert_after() {
         let line = jsonl_assistant("mcp__serena__insert_after_symbol", r#"{"name_path":"App","relative_path":"src/app.rs","body":"fn foo() {}"}"#);
-        let events = parse_jsonl_line(&line, "d");
+        let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::FullBody);
         assert_eq!(events[0].target_symbol.as_deref(), Some("App"));
     }
@@ -862,7 +905,7 @@ mod tests {
     #[test]
     fn map_rename_symbol() {
         let line = jsonl_assistant("mcp__serena__rename_symbol", r#"{"name_path":"old_fn","relative_path":"src/app.rs","new_name":"new_fn"}"#);
-        let events = parse_jsonl_line(&line, "d");
+        let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::FullBody);
         assert_eq!(events[0].target_symbol.as_deref(), Some("old_fn"));
     }
@@ -870,7 +913,7 @@ mod tests {
     #[test]
     fn map_notebook_edit() {
         let line = jsonl_assistant("NotebookEdit", r#"{"notebook_path":"/nb/analysis.ipynb","new_source":"print(1)"}"#);
-        let events = parse_jsonl_line(&line, "d");
+        let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::FullBody);
         assert_eq!(events[0].file_path.as_ref().unwrap(), &PathBuf::from("/nb/analysis.ipynb"));
     }
@@ -878,7 +921,7 @@ mod tests {
     #[test]
     fn map_unknown_tool() {
         let line = jsonl_assistant("SomeRandomTool", r#"{"data":"value"}"#);
-        let events = parse_jsonl_line(&line, "d");
+        let events = parse_events(&line, "d");
         // Unknown tools still produce an event, but with Unseen depth.
         assert_eq!(events[0].read_depth, ReadDepth::Unseen);
     }
@@ -886,21 +929,21 @@ mod tests {
     #[test]
     fn read_with_offset_limit() {
         let line = jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/src/main.rs","offset":10,"limit":20}"#);
-        let events = parse_jsonl_line(&line, "d");
+        let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::FullBody);
         assert_eq!(events[0].target_lines, Some(10..30));
     }
 
     #[test]
     fn parse_malformed_json() {
-        let events = parse_jsonl_line("not valid json {{{", "d");
+        let events = parse_events("not valid json {{{", "d");
         assert!(events.is_empty());
     }
 
     #[test]
     fn parse_multi_tool_message() {
         let line = r#"{"type":"assistant","sessionId":"s","message":{"role":"assistant","content":[{"type":"tool_use","name":"mcp__acp__Read","input":{"file_path":"/a.rs"}},{"type":"tool_use","name":"Grep","input":{"pattern":"foo"}}]}}"#;
-        let events = parse_jsonl_line(line, "d");
+        let events = parse_events(line, "d");
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].read_depth, ReadDepth::FullBody);
         assert_eq!(events[1].read_depth, ReadDepth::Overview);
@@ -997,7 +1040,7 @@ mod tests {
     fn agent_id_prefers_agent_id_over_session_id() {
         // Subagent lines have both agentId and sessionId; agentId should win.
         let line = r#"{"type":"assistant","agentId":"a9fe23c","sessionId":"7842313b-63c5-49db-97d1-c78ba563278e","message":{"role":"assistant","content":[{"type":"tool_use","name":"mcp__acp__Read","input":{"file_path":"/foo/bar.rs"}}]}}"#;
-        let events = parse_jsonl_line(line, "fallback");
+        let events = parse_events(line, "fallback");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].agent_id, "a9fe23c");
     }
@@ -1006,7 +1049,7 @@ mod tests {
     fn agent_id_falls_back_to_session_id() {
         // Main session lines have sessionId but no agentId.
         let line = r#"{"type":"assistant","sessionId":"7842313b","message":{"role":"assistant","content":[{"type":"tool_use","name":"mcp__acp__Read","input":{"file_path":"/foo/bar.rs"}}]}}"#;
-        let events = parse_jsonl_line(line, "fallback");
+        let events = parse_events(line, "fallback");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].agent_id, "7842313b");
     }
@@ -1015,8 +1058,69 @@ mod tests {
     fn agent_id_falls_back_to_default() {
         // No agentId or sessionId → uses default_agent_id.
         let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"mcp__acp__Read","input":{"file_path":"/foo/bar.rs"}}]}}"#;
-        let events = parse_jsonl_line(line, "my-default");
+        let events = parse_events(line, "my-default");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].agent_id, "my-default");
+    }
+
+    // --- /clear detection tests ---
+
+    #[test]
+    fn parse_clear_command_returns_session_cleared() {
+        // Exact JSONL shape observed in the wild (empty command-args).
+        let line = r#"{"type":"user","sessionId":"abc","message":{"role":"user","content":"<command-name>/clear</command-name>\n            <command-message>clear</command-message>\n            <command-args></command-args>"}}"#;
+        assert!(matches!(parse_jsonl_line(line, "d"), ParsedLine::SessionCleared));
+    }
+
+    #[test]
+    fn parse_clear_with_nonempty_args() {
+        // /clear invoked with explicit args (as seen in some sessions: command-args=clear).
+        let line = r#"{"type":"user","sessionId":"abc","message":{"role":"user","content":"<command-name>/clear</command-name>\n            <command-message>clear</command-message>\n            <command-args>clear</command-args>"}}"#;
+        assert!(matches!(parse_jsonl_line(line, "d"), ParsedLine::SessionCleared));
+    }
+
+    #[test]
+    fn parse_compact_command_returns_ignored() {
+        // /compact must NOT trigger SessionCleared.
+        let line = r#"{"type":"user","sessionId":"abc","message":{"role":"user","content":"<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>"}}"#;
+        assert!(matches!(parse_jsonl_line(line, "d"), ParsedLine::Ignored));
+    }
+
+    #[test]
+    fn tailer_sets_session_cleared_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("session.jsonl");
+
+        // Create an empty file first so the tailer starts at position 0.
+        fs::write(&log, "").unwrap();
+        let mut tailer = LogTailer::new(vec![log.clone()]);
+
+        // Now append the /clear line as "new" content.
+        let clear_line = r#"{"type":"user","sessionId":"abc","message":{"role":"user","content":"<command-name>/clear</command-name>\n<command-message>clear</command-message>\n<command-args></command-args>"}}"#;
+        fs::write(&log, format!("{clear_line}\n")).unwrap();
+
+        let output = tailer.read_new_events();
+        assert!(output.session_cleared);
+        assert!(output.events.is_empty());
+    }
+
+    #[test]
+    fn tailer_emits_events_after_clear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("session.jsonl");
+
+        // Create an empty file first so the tailer starts at position 0.
+        fs::write(&log, "").unwrap();
+        let mut tailer = LogTailer::new(vec![log.clone()]);
+
+        // Append a /clear line followed by a tool use as "new" content.
+        let clear_line = r#"{"type":"user","sessionId":"abc","message":{"role":"user","content":"<command-name>/clear</command-name>\n<command-message>clear</command-message>\n<command-args></command-args>"}}"#;
+        let tool_line = jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/src/main.rs"}"#);
+        fs::write(&log, format!("{clear_line}\n{tool_line}\n")).unwrap();
+
+        let output = tailer.read_new_events();
+        assert!(output.session_cleared);
+        assert_eq!(output.events.len(), 1);
+        assert_eq!(output.events[0].read_depth, ReadDepth::FullBody);
     }
 }

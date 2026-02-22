@@ -176,7 +176,7 @@ fn main() -> Result<()> {
     }
 
     let serena_mode = cli.serena;
-    let result = run_tui(&mut terminal, &mut app, &project_path, &log_dir, &session_id, &registry, serena_mode);
+    let result = run_tui(&mut terminal, &mut app, &project_path, &log_dir, session_id, &registry, serena_mode);
 
     // Flush event log before exiting.
     if let Some(ref mut writer) = app.event_log {
@@ -196,10 +196,14 @@ fn run_tui(
     app: &mut App,
     project_path: &Path,
     log_dir: &Option<PathBuf>,
-    session_id: &Option<String>,
+    session_id: Option<String>,
     registry: &ParserRegistry,
     serena_mode: bool,
 ) -> Result<()> {
+    let mut current_session_id = session_id;
+    // Record when the TUI started so we can ignore session files that already
+    // existed at launch — we only switch to sessions created after this point.
+    let started_at = std::time::SystemTime::now();
     let (tx, rx) = mpsc::channel::<AppEvent>();
 
     // Spawn key reader thread.
@@ -227,7 +231,7 @@ fn run_tui(
     _project_watcher.watch(project_path, RecursiveMode::Recursive)?;
 
     // Set up log file tailer.
-    let mut log_tailer = if let (Some(ref ld), Some(ref sid)) = (log_dir, session_id) {
+    let mut log_tailer = if let (Some(ref ld), Some(ref sid)) = (log_dir, &current_session_id) {
         let files = ingest::claude::session_log_files(ld, sid);
         Some(ingest::claude::LogTailer::new(files))
     } else {
@@ -299,19 +303,59 @@ fn run_tui(
             Ok(AppEvent::AgentEvent(event)) => {
                 app.process_agent_event(event);
             }
+            Ok(AppEvent::SessionCleared) => {
+                app.reset_session();
+            }
             Ok(AppEvent::Tick) => {
+                // Check if Claude Code has started a new session (e.g. after /clear).
+                // /clear creates a brand-new UUID JSONL file — it writes no sentinel into
+                // the old file — so we detect it by comparing find_latest_session() against
+                // the session we are currently tailing.
+                if let Some(ref ld) = log_dir {
+                    if let Some(latest) = ingest::claude::find_latest_session(ld) {
+                        let is_new_session = current_session_id.as_deref() != Some(latest.as_str());
+                        // Only accept the new session if its file was created after the TUI
+                        // launched — this prevents switching to a session that already existed
+                        // when ambit started.
+                        let created_after_start = ld
+                            .join(format!("{latest}.jsonl"))
+                            .metadata()
+                            .and_then(|m| m.modified())
+                            .map(|mtime| mtime > started_at)
+                            .unwrap_or(false);
+                        if is_new_session && created_after_start {
+                            // New session detected — reset app state and switch tailer.
+                            app.reset_session();
+                            current_session_id = Some(latest.clone());
+                            app.session_id = current_session_id.clone();
+
+                            // Pre-populate from lines already written before this tick.
+                            let new_files = ingest::claude::session_log_files(ld, &latest);
+                            for log_file in &new_files {
+                                for event in ingest::claude::parse_log_file(log_file) {
+                                    app.process_agent_event(event);
+                                }
+                            }
+
+                            // Replace the tailer, starting from end-of-file so we only
+                            // pick up lines written after pre-population.
+                            log_tailer = Some(ingest::claude::LogTailer::new(new_files));
+                        }
+                    }
+                }
+
                 // Poll log tailer for new events.
                 if let Some(ref mut tailer) = log_tailer {
                     // Check for new agent files in the log directory.
-                    if let (Some(ref ld), Some(ref sid)) = (log_dir, session_id) {
+                    if let (Some(ref ld), Some(ref sid)) = (log_dir, &current_session_id) {
                         let current_files = ingest::claude::session_log_files(ld, sid);
                         for f in current_files {
                             tailer.add_file(f);
                         }
                     }
 
-                    let new_events = tailer.read_new_events();
-                    for event in new_events {
+                    let output = tailer.read_new_events();
+                    for event in output.events {
                         app.process_agent_event(event);
                     }
                 }
