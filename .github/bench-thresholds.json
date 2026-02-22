@@ -1,0 +1,77 @@
+{
+  "merkle_hash/bench_content_hash/tiny":     5000,
+  "merkle_hash/bench_content_hash/small":    10000,
+  "merkle_hash/bench_content_hash/medium":   50000,
+  "merkle_hash/bench_content_hash/large":    300000,
+
+  "merkle_hash/bench_estimate_tokens/tiny":  2000,
+  "merkle_hash/bench_estimate_tokens/small": 2000,
+  "merkle_hash/bench_estimate_tokens/medium":5000,
+  "merkle_hash/bench_estimate_tokens/large": 10000,
+
+  "merkle_hash/bench_compute_merkle_hash/1":    5000,
+  "merkle_hash/bench_compute_merkle_hash/10":   50000,
+  "merkle_hash/bench_compute_merkle_hash/100":  500000,
+  "merkle_hash/bench_compute_merkle_hash/1000": 5000000,
+
+  "parser/rust_parse_file/tiny":   1000000,
+  "parser/rust_parse_file/small":  2000000,
+  "parser/rust_parse_file/medium": 5000000,
+  "parser/rust_parse_file/large":  20000000,
+
+  "parser/typescript_parse_file/tiny":     1000000,
+  "parser/typescript_parse_file/small":    2000000,
+  "parser/typescript_parse_file/medium":   5000000,
+  "parser/typescript_parse_file/large":    20000000,
+  "parser/typescript_parse_file/js_module":5000000,
+
+  "parser/python_parse_file/tiny":   1000000,
+  "parser/python_parse_file/small":  2000000,
+  "parser/python_parse_file/medium": 5000000,
+  "parser/python_parse_file/large":  20000000,
+
+  "parser/typescript_parse_and_coverage/tiny":   2000000,
+  "parser/typescript_parse_and_coverage/small":  5000000,
+  "parser/typescript_parse_and_coverage/medium": 15000000,
+  "parser/typescript_parse_and_coverage/large":  50000000,
+
+  "ingest/parse_jsonl_line_read":      100000,
+  "ingest/parse_jsonl_line_multi_tool":500000,
+  "ingest/parse_jsonl_line_malformed": 10000,
+
+  "ingest/parse_log_file_n_lines/10":    5000000,
+  "ingest/parse_log_file_n_lines/100":   50000000,
+  "ingest/parse_log_file_n_lines/1000":  500000000,
+  "ingest/parse_log_file_n_lines/10000": 5000000000,
+
+  "coverage/from_project_n_symbols/10":    50000,
+  "coverage/from_project_n_symbols/100":   500000,
+  "coverage/from_project_n_symbols/1000":  5000000,
+  "coverage/from_project_n_symbols/10000": 50000000,
+
+  "coverage/count_symbols_flat/10":  20000,
+  "coverage/count_symbols_flat/100": 200000,
+  "coverage/count_symbols_flat/1000":2000000,
+
+  "coverage/count_symbols_nested_depth/2": 20000,
+  "coverage/count_symbols_nested_depth/3": 100000,
+  "coverage/count_symbols_nested_depth/5": 2000000,
+
+  "tracking/record_n_symbols/10":    10000,
+  "tracking/record_n_symbols/100":   100000,
+  "tracking/record_n_symbols/1000":  1000000,
+  "tracking/record_n_symbols/10000": 10000000,
+
+  "tracking/record_upgrade_n_symbols/10":  30000,
+  "tracking/record_upgrade_n_symbols/100": 300000,
+  "tracking/record_upgrade_n_symbols/1000":3000000,
+
+  "tracking/depth_of_n_symbols/10":    5000,
+  "tracking/depth_of_n_symbols/100":   50000,
+  "tracking/depth_of_n_symbols/1000":  500000,
+  "tracking/depth_of_n_symbols/10000": 5000000,
+
+  "tracking/mark_stale_n_symbols/10":  10000,
+  "tracking/mark_stale_n_symbols/100": 100000,
+  "tracking/mark_stale_n_symbols/1000":1000000
+}
