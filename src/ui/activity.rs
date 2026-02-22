@@ -26,10 +26,15 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         None => app.activity.iter().collect(),
     };
 
-    // Show the most recent events that fit in the area.
+    // Window the visible events using the scroll offset.
     let max_lines = area.height.saturating_sub(2) as usize;
-    let start = filtered.len().saturating_sub(max_lines);
-    let visible = &filtered[start..];
+    let total = filtered.len();
+    // Clamp scroll offset so we can't scroll past the top.
+    let max_offset = total.saturating_sub(max_lines);
+    let offset = app.activity_scroll_offset.min(max_offset);
+    let end = total.saturating_sub(offset);
+    let start = end.saturating_sub(max_lines);
+    let visible = &filtered[start..end];
 
     let lines: Vec<Line> = visible
         .iter()
