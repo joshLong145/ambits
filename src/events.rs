@@ -13,6 +13,7 @@ pub enum AppEvent {
     Mouse(MouseEvent),
     FileChanged(PathBuf),
     AgentEvent(AgentToolCall),
+    SessionCleared,
     Tick,
 }
 
