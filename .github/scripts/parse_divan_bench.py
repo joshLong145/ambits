@@ -17,8 +17,13 @@ and writes a JSON array suitable for github-action-benchmark's customSmallerIsBe
 Usage:
     cargo bench 2>&1 | tee bench-output.txt
     python3 .github/scripts/parse_divan_bench.py bench-output.txt > bench-results.json
+
+    # With static threshold checking (fails with exit code 1 if any threshold exceeded):
+    python3 .github/scripts/parse_divan_bench.py bench-output.txt \\
+        --thresholds .github/bench-thresholds.json > bench-results.json
 """
 
+import argparse
 import json
 import re
 import sys
@@ -74,8 +79,6 @@ def parse_bench_output(text: str) -> list[dict]:
     results = []
     # Stack tracks (indent, name) pairs for hierarchy reconstruction
     bench_file = None   # top-level name (e.g. "merkle_hash")
-    fn_name = None      # second level (e.g. "content_hash")
-    last_indent = -1
 
     # We track a simple path stack: [(indent, label), ...]
     path_stack: list[tuple[int, str]] = []
@@ -130,12 +133,58 @@ def parse_bench_output(text: str) -> list[dict]:
     return results
 
 
-def main() -> None:
-    if len(sys.argv) < 2:
-        print("Usage: parse_divan_bench.py <bench-output.txt>", file=sys.stderr)
-        sys.exit(1)
+def check_thresholds(results: list[dict], thresholds: dict) -> int:
+    """
+    Compare benchmark results against static thresholds.
 
-    with open(sys.argv[1], encoding="utf-8") as f:
+    Prints a pass/fail table to stderr. Returns the number of failures.
+    Only benchmarks that appear in the thresholds dict are checked;
+    extras are silently ignored.
+    """
+    failures = 0
+    checked = [(r, thresholds[r["name"]]) for r in results if r["name"] in thresholds]
+
+    if not checked:
+        print("Warning: no benchmark names matched the threshold file", file=sys.stderr)
+        return 0
+
+    col_w = max(len(r["name"]) for r, _ in checked)
+    sep = "─" * (col_w + 44)
+
+    print(f"── Static Threshold Check {sep[26:]}", file=sys.stderr)
+    for result, limit_ns in checked:
+        actual = result["value"]
+        status = "PASS" if actual <= limit_ns else "FAIL"
+        if status == "FAIL":
+            failures += 1
+        print(
+            f"  {status}  {result['name']:<{col_w}}  {actual:>12,} ns / {limit_ns:>12,} ns",
+            file=sys.stderr,
+        )
+    print(sep, file=sys.stderr)
+
+    if failures:
+        print(f"{failures} benchmark(s) exceeded their threshold.", file=sys.stderr)
+    else:
+        print("All benchmarks within threshold.", file=sys.stderr)
+
+    return failures
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Parse divan bench output → customSmallerIsBetter JSON"
+    )
+    parser.add_argument("input_file", help="Path to captured divan stdout (bench-output.txt)")
+    parser.add_argument(
+        "--thresholds",
+        metavar="FILE",
+        default=None,
+        help="JSON file mapping benchmark names to ns limits; fails with exit 1 if exceeded",
+    )
+    args = parser.parse_args()
+
+    with open(args.input_file, encoding="utf-8") as f:
         text = f.read()
 
     results = parse_bench_output(text)
@@ -143,7 +192,16 @@ def main() -> None:
     if not results:
         print("Warning: no benchmark results found in output", file=sys.stderr)
 
+    # Always emit JSON to stdout (piped to bench-results.json in CI)
     print(json.dumps(results, indent=2))
+
+    # Optional static threshold check — runs after JSON is emitted
+    if args.thresholds:
+        with open(args.thresholds, encoding="utf-8") as f:
+            thresholds = json.load(f)
+        failures = check_thresholds(results, thresholds)
+        if failures:
+            sys.exit(1)
 
 
 if __name__ == "__main__":

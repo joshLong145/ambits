@@ -50,26 +50,8 @@ jobs:
       - name: Run benchmarks
         run: cargo bench 2>&1 | tee bench-output.txt
 
-      - name: Parse divan output → customSmallerIsBetter JSON
-        run: python3 .github/scripts/parse_divan_bench.py bench-output.txt > bench-results.json
-
-      - name: Show parsed results
-        run: cat bench-results.json
-
-      - name: Store / compare benchmark results
-        uses: benchmark-action/github-action-benchmark@v1
-        with:
-          name: ambit benchmarks
-          tool: customSmallerIsBetter
-          output-file-path: bench-results.json
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Only push new baseline when merging to main.
-          auto-push: ${{ github.ref == 'refs/heads/main' }}
-          # Post an alert comment on PR if regression detected.
-          comment-on-alert: true
-          # Fail the workflow if any benchmark is >15% slower than baseline.
-          alert-threshold: '115%'
-          fail-on-alert: true
-          alert-comment-cc-users: '@joshLong145'
-          # Store history in gh-pages branch under this path.
-          benchmark-data-dir-path: dev/bench
+      - name: Parse divan output → JSON + check static thresholds
+        run: >-
+          python3 .github/scripts/parse_divan_bench.py bench-output.txt
+          --thresholds .github/bench-thresholds.json
+          > bench-results.json
