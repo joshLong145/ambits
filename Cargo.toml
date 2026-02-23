@@ -19,7 +19,6 @@ tree-sitter-rust = "0.23"
 tree-sitter-python = "0.23"
 tree-sitter-typescript = "0.23"
 ignore = "0.4"
-tokio = { version = "1", features = ["full"] }
 notify = "7"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

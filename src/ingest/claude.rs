@@ -3,9 +3,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-
 use crate::tracking::ReadDepth;
-
 use super::AgentToolCall;
 
 /// Derive the Claude Code log directory for a given project path.

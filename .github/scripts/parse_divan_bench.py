@@ -109,8 +109,12 @@ def parse_bench_output(text: str) -> list[dict]:
         # Does this line have timing data?
         median_ns = extract_median(clean)
 
-        # Extract the label (the part before any │)
-        label_part = clean.split("│")[0].strip() if "│" in clean else clean.strip()
+        # Extract the label (the part before any │, then strip any appended timing value).
+        # Divan puts both the arg name and the first timing column before the first │, e.g.:
+        #   tiny       1.23 µs │ 2.3 µs │ 1.5 µs │ ...
+        # so we must remove the "1.23 µs" suffix to get just "tiny".
+        first_col = clean.split("│")[0] if "│" in clean else clean
+        label_part = re.split(r"\s+[\d.]+\s*(?:ns|µs|us|ms|s)\b", first_col)[0].strip().strip("\"'")
 
         if not label_part:
             continue
