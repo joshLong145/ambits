@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::mpsc;
+use flume;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyEvent, MouseEvent};
@@ -18,7 +18,7 @@ pub enum AppEvent {
 }
 
 /// Spawn a thread that polls crossterm key events and sends them to the channel.
-pub fn spawn_key_reader(tx: mpsc::Sender<AppEvent>) {
+pub fn spawn_key_reader(tx: flume::Sender<AppEvent>) {
     std::thread::spawn(move || loop {
         if event::poll(Duration::from_millis(50)).unwrap_or(false) {
             match event::read() {
@@ -39,7 +39,7 @@ pub fn spawn_key_reader(tx: mpsc::Sender<AppEvent>) {
 }
 
 /// Spawn a tick timer that sends Tick events at the given interval.
-pub fn spawn_tick_timer(tx: mpsc::Sender<AppEvent>, interval: Duration) {
+pub fn spawn_tick_timer(tx: flume::Sender<AppEvent>, interval: Duration) {
     std::thread::spawn(move || loop {
         std::thread::sleep(interval);
         if tx.send(AppEvent::Tick).is_err() {

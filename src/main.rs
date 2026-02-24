@@ -15,7 +15,6 @@ use std::fs;
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::time::Duration;
 
 use clap::{Parser as ClapParser, Subcommand};
@@ -204,7 +203,7 @@ fn run_tui(
     // Record when the TUI started so we can ignore session files that already
     // existed at launch — we only switch to sessions created after this point.
     let started_at = std::time::SystemTime::now();
-    let (tx, rx) = mpsc::channel::<AppEvent>();
+    let (tx, rx) = flume::bounded::<AppEvent>(512);
 
     // Spawn key reader thread.
     events::spawn_key_reader(tx.clone());
@@ -221,7 +220,7 @@ fn run_tui(
                 for path in event.paths {
                     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                         if watched_extensions.contains(ext) {
-                            let _ = tx_file.send(AppEvent::FileChanged(path));
+                            let _ = tx_file.try_send(AppEvent::FileChanged(path));
                         }
                     }
                 }
@@ -248,7 +247,7 @@ fn run_tui(
                     for path in event.paths {
                         if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
                             // Signal that log files changed — we'll poll in the tick handler.
-                            let _ = tx_log.send(AppEvent::Tick);
+                            let _ = tx_log.try_send(AppEvent::Tick);
                         }
                     }
                 }
@@ -387,8 +386,8 @@ fn run_tui(
                     }
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(flume::RecvTimeoutError::Timeout) => {}
+            Err(flume::RecvTimeoutError::Disconnected) => break,
         }
 
         if app.should_quit {
