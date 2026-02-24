@@ -26,6 +26,7 @@ serde_json = "1"
 sha2 = "0.10"
 color-eyre = "0.6"
 serde-pickle = "1.2"
+flume = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
