@@ -232,7 +232,7 @@ impl App {
 
             if is_expanded {
                 for sym in &file.symbols {
-                    flatten_symbol(sym, 1, &self.collapsed, &self.ledger, &sym_attributions, &mut rows);
+                    flatten_symbol(sym, 1, &self.collapsed, &self.ledger, agent_filter, &sym_attributions, &mut rows);
                 }
             }
         }
@@ -603,11 +603,15 @@ fn flatten_symbol(
     depth: usize,
     collapsed: &std::collections::HashSet<String>,
     ledger: &ContextLedger,
+    agent_filter: Option<&str>,
     sym_attributions: &HashMap<String, Attribution>,
     rows: &mut Vec<TreeRow>,
 ) {
     let is_expanded = !collapsed.contains(&sym.id);
-    let read_depth = ledger.depth_of(&sym.id);
+    let read_depth = match agent_filter {
+        Some(agent_id) => ledger.depth_of_for_agent(&sym.id, agent_id),
+        None => ledger.depth_of(&sym.id),
+    };
 
     let attribution = sym_attributions.get(&sym.name).cloned();
 
@@ -630,7 +634,7 @@ fn flatten_symbol(
 
     if is_expanded {
         for child in &sym.children {
-            flatten_symbol(child, depth + 1, collapsed, ledger, sym_attributions, rows);
+            flatten_symbol(child, depth + 1, collapsed, ledger, agent_filter, sym_attributions, rows);
         }
     }
 }
