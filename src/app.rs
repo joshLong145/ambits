@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use vibecheck_core::report::{Attribution, Report};
 
 use crate::coverage::count_symbols;
 use crate::symbols::{ProjectTree, SymbolNode};
@@ -44,6 +46,8 @@ pub struct TreeRow {
     pub coverage_status: Option<FileCoverageStatus>,
     pub file_coverage_seen: usize,
     pub file_coverage_total: usize,
+    /// Model attribution for this row, populated from vibecheck analysis.
+    pub attribution: Option<Attribution>,
 }
 
 /// Which panel is focused.
@@ -87,6 +91,9 @@ pub struct App {
     // Sort mode for tree view.
     pub sort_mode: SortMode,
 
+    // Whether to show the vibecheck attribution panel (experimental).
+    pub show_attribution: bool,
+
     // Search.
     pub search_mode: bool,
     pub search_query: String,
@@ -96,6 +103,9 @@ pub struct App {
 
     // Optional event log writer.
     pub event_log: Option<BufWriter<File>>,
+
+    /// Model attribution data per file: absolute path → Report.
+    pub attributions: HashMap<PathBuf, Report>,
 }
 
 impl App {
@@ -123,10 +133,12 @@ impl App {
             agent_selection_index: 0,
             focus: FocusPanel::Tree,
             sort_mode: SortMode::Alphabetical,
+            show_attribution: false,
             search_mode: false,
             search_query: String::new(),
             session_id: None,
             event_log,
+            attributions: HashMap::new(),
         };
         app.rebuild_tree_rows();
         app
@@ -186,6 +198,21 @@ impl App {
                 ReadDepth::Unseen
             };
 
+            // Look up model attribution for this file.
+            let abs_path = self.project_root.join(&file.file_path);
+            let report = self.attributions.get(&abs_path);
+            let file_vibecheck = report.map(|r| r.attribution.clone());
+
+            // Build a name → Attribution lookup for symbols within this file.
+            let sym_attributions: HashMap<String, Attribution> = report
+                .and_then(|r| r.symbol_reports.as_ref())
+                .map(|syms| {
+                    syms.iter()
+                        .map(|sr| (sr.metadata.name.clone(), sr.attribution.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
             rows.push(TreeRow {
                 symbol_id: file_id.clone(),
                 display_name: file_path.clone(),
@@ -200,11 +227,12 @@ impl App {
                 coverage_status: Some(status),
                 file_coverage_seen: seen,
                 file_coverage_total: total,
+                attribution: file_vibecheck,
             });
 
             if is_expanded {
                 for sym in &file.symbols {
-                    flatten_symbol(sym, 1, &self.collapsed, &self.ledger, agent_filter, &mut rows);
+                    flatten_symbol(sym, 1, &self.collapsed, &self.ledger, &sym_attributions, &mut rows);
                 }
             }
         }
@@ -257,6 +285,9 @@ impl App {
                     SortMode::ByCoverage => SortMode::Alphabetical,
                 };
                 self.rebuild_tree_rows();
+            }
+            KeyCode::Char('v') => {
+                self.show_attribution = !self.show_attribution;
             }
             KeyCode::Char('a') => self.cycle_agent_filter(),
             KeyCode::Char('A') => self.cycle_agent_filter_backward(),
@@ -572,14 +603,13 @@ fn flatten_symbol(
     depth: usize,
     collapsed: &std::collections::HashSet<String>,
     ledger: &ContextLedger,
-    agent_filter: Option<&str>,
+    sym_attributions: &HashMap<String, Attribution>,
     rows: &mut Vec<TreeRow>,
 ) {
     let is_expanded = !collapsed.contains(&sym.id);
-    let read_depth = match agent_filter {
-        Some(agent_id) => ledger.depth_of_for_agent(&sym.id, agent_id),
-        None => ledger.depth_of(&sym.id),
-    };
+    let read_depth = ledger.depth_of(&sym.id);
+
+    let attribution = sym_attributions.get(&sym.name).cloned();
 
     rows.push(TreeRow {
         symbol_id: sym.id.clone(),
@@ -595,11 +625,12 @@ fn flatten_symbol(
         coverage_status: None,
         file_coverage_seen: 0,
         file_coverage_total: 0,
+        attribution,
     });
 
     if is_expanded {
         for child in &sym.children {
-            flatten_symbol(child, depth + 1, collapsed, ledger, agent_filter, rows);
+            flatten_symbol(child, depth + 1, collapsed, ledger, sym_attributions, rows);
         }
     }
 }
