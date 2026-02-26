@@ -60,6 +60,8 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             }),
             Span::styled("[a/A]", Style::default().fg(Color::DarkGray)),
             Span::raw("gents "),
+            Span::styled("[v]", Style::default().fg(Color::DarkGray)),
+            Span::raw("ibecheck "),
             Span::styled("[tab]", Style::default().fg(Color::DarkGray)),
             Span::raw("focus "),
         ];

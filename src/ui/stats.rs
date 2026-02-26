@@ -4,6 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use vibecheck_core::report::{Attribution, ModelFamily};
 use ambits::app::{App, FocusPanel};
 use ambits::tracking::ReadDepth;
 
@@ -17,7 +18,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let block = Block::default()
-        .title(" Coverage Stats ")
+        .title(panel_title(app))
         .borders(Borders::ALL)
         .border_style(border_style);
 
@@ -181,9 +182,15 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    if app.show_attribution {
+        let selected = app.tree_rows.get(app.selected_index).and_then(|r| r.attribution.as_ref());
+        lines.push(Line::from(""));
+        lines.extend(attribution_lines(selected));
+    }
+
     // Scroll to keep the selected agent visible when the panel is focused.
     let visible_height = area.height.saturating_sub(2) as usize; // -2 for borders
-    let scroll_offset = if app.focus == FocusPanel::Stats && !app.agents_seen.is_empty() {
+    let scroll_offset = if !app.show_attribution && app.focus == FocusPanel::Stats && !app.agents_seen.is_empty() {
         // The agent list starts after the fixed header lines.
         // "All" entry is at header_lines, agents start at header_lines + 1.
         let header_lines = lines.len().saturating_sub(app.flattened_agents().len() + 1); // +1 for "All"
@@ -219,6 +226,78 @@ fn short_id(id: &str) -> String {
     } else {
         id.to_string()
     }
+}
+
+/// Build the stats panel title, appending the name of each active overlay.
+/// Add a new segment here whenever a new toggle is introduced.
+fn panel_title(app: &App) -> String {
+    let mut title = String::from(" Coverage Stats");
+    if app.show_attribution {
+        title.push_str(" · Attribution");
+    }
+    title.push_str(" [v] ");
+    title
+}
+
+fn family_color(family: ModelFamily) -> Color {
+    let (r, g, b) = family.rgb();
+    Color::Rgb(r, g, b)
+}
+
+fn attribution_lines(attribution: Option<&Attribution>) -> Vec<Line<'static>> {
+    let Some(attr) = attribution else {
+        return vec![
+            Line::from(vec![Span::styled(
+                "  Attribution",
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(vec![Span::styled(
+                "  No data for selection",
+                Style::default().fg(Color::DarkGray),
+            )]),
+        ];
+    };
+
+    let primary_color = family_color(attr.primary);
+    let mut lines = vec![
+        Line::from(vec![Span::styled(
+            "  Attribution",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("{}", attr.primary),
+                Style::default().fg(primary_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {:.0}% confident", attr.confidence * 100.0),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    let mut scores: Vec<(ModelFamily, f64)> =
+        attr.scores.iter().map(|(&f, &s)| (f, s)).collect();
+    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    for (family, score) in scores {
+        let pct = (score * 100.0).round() as u32;
+        let bar_len = (score * 12.0).round() as usize;
+        let bar = "█".repeat(bar_len);
+        let color = family_color(family);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<8}", format!("{family}")),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(format!("{bar:<12}"), Style::default().fg(color)),
+            Span::styled(format!("{pct:>3}%"), Style::default().fg(color)),
+        ]));
+    }
+
+    lines
 }
 
 fn coverage_color(pct: u32) -> Color {

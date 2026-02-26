@@ -32,6 +32,7 @@ use ambits::app::App;
 use events::AppEvent;
 use ambits::parser::ParserRegistry;
 use ambits::symbols::ProjectTree;
+use vibecheck_core::report::Report;
 
 #[derive(ClapParser, Debug)]
 #[command(name = "ambits", about = "Visualize LLM agent context coverage")]
@@ -120,6 +121,18 @@ fn main() -> Result<()> {
         scan_project(&project_path, &registry)?
     };
 
+    // Analyze each file for model attribution. Results are keyed by absolute path.
+    // vibecheck uses a content-addressed on-disk cache (SHA-256 → Report stored in redb),
+    // so only files that changed since the last run incur analysis cost.
+    let attributions: std::collections::HashMap<PathBuf, Report> = project_tree
+        .files
+        .iter()
+        .filter_map(|f| {
+            let abs = project_path.join(&f.file_path);
+            vibecheck_core::analyze_file_symbols(&abs).ok().map(|r| (abs, r))
+        })
+        .collect();
+
     if cli.dump {
         dump_tree(&project_path, &project_tree);
         return Ok(());
@@ -162,6 +175,8 @@ fn main() -> Result<()> {
 
     let mut app = App::new(project_tree, project_path.clone(), event_log);
     app.session_id = session_id.clone();
+    app.attributions = attributions;
+    app.rebuild_tree_rows();
 
     // Pre-populate the ledger from existing session logs.
     if let (Some(ref log_dir), Some(ref session_id)) = (&log_dir, &session_id) {
