@@ -1,0 +1,109 @@
+version = 1
+
+[[tool]]
+names        = ["Read", "mcp__acp__Read", "mcp__plugin_serena_serena__read_file"]
+path_keys    = ["file_path", "relative_path"]
+pattern_keys = []
+depth        = { type = "fixed", value = "FullBody" }
+description  = "Read {file_path|short}"
+target_lines = { offset_key = "offset", limit_key = "limit" }
+
+[[tool]]
+names        = ["Edit", "mcp__acp__Edit", "mcp__plugin_serena_serena__replace_content"]
+path_keys    = ["file_path", "relative_path"]
+pattern_keys = []
+depth        = { type = "fixed", value = "FullBody" }
+description  = "Edit {file_path|short}"
+
+[[tool]]
+names        = ["Write", "mcp__acp__Write", "mcp__plugin_serena_serena__create_text_file"]
+path_keys    = ["file_path", "relative_path"]
+pattern_keys = []
+depth        = { type = "fixed", value = "FullBody" }
+description  = "Write {file_path|short}"
+
+[[tool]]
+names         = ["Glob", "mcp__serena__find_file", "mcp__serena__list_dir",
+                 "mcp__plugin_serena_serena__find_file", "mcp__plugin_serena_serena__list_dir"]
+path_keys     = ["path", "relative_path"]
+pattern_keys  = ["pattern", "file_mask"]
+path_required = false
+depth         = { type = "fixed", value = "NameOnly" }
+description   = "Glob {pattern}"
+
+[[tool]]
+names         = ["Grep", "mcp__serena__search_for_pattern",
+                 "mcp__plugin_serena_serena__search_for_pattern"]
+path_keys     = ["path", "relative_path"]
+pattern_keys  = ["pattern", "substring_pattern"]
+path_required = false
+depth         = { type = "fixed", value = "Overview" }
+description   = "Search \"{pattern}\""
+
+[[tool]]
+names         = ["mcp__serena__get_symbols_overview",
+                 "mcp__plugin_serena_serena__get_symbols_overview"]
+path_keys     = ["relative_path"]
+pattern_keys  = []
+path_required = false
+depth         = { type = "fixed", value = "Overview" }
+description   = "Overview {relative_path|short}"
+
+[[tool]]
+names        = ["mcp__serena__find_symbol", "mcp__plugin_serena_serena__find_symbol"]
+path_keys    = ["relative_path"]
+pattern_keys = []
+depth        = { type = "conditional", condition_key = "include_body", if_true = "FullBody", if_false = "Signature", default = "Signature" }
+description  = "Symbol {name_path_pattern}"
+target_symbol = { key = "name_path_pattern" }
+
+[[tool]]
+names        = ["mcp__serena__find_referencing_symbols",
+                "mcp__plugin_serena_serena__find_referencing_symbols"]
+path_keys    = ["relative_path"]
+pattern_keys = []
+depth        = { type = "fixed", value = "Overview" }
+description  = "FindRefs {name_path}"
+target_symbol = { key = "name_path" }
+
+[[tool]]
+names        = ["mcp__serena__replace_symbol_body",
+                "mcp__plugin_serena_serena__replace_symbol_body"]
+path_keys    = ["relative_path"]
+pattern_keys = []
+depth        = { type = "fixed", value = "FullBody" }
+description  = "ReplaceSymbol {name_path}"
+target_symbol = { key = "name_path" }
+
+[[tool]]
+names        = ["mcp__serena__insert_after_symbol",
+                "mcp__plugin_serena_serena__insert_after_symbol"]
+path_keys    = ["relative_path"]
+pattern_keys = []
+depth        = { type = "fixed", value = "FullBody" }
+description  = "InsertAfter {name_path}"
+target_symbol = { key = "name_path" }
+
+[[tool]]
+names        = ["mcp__serena__insert_before_symbol",
+                "mcp__plugin_serena_serena__insert_before_symbol"]
+path_keys    = ["relative_path"]
+pattern_keys = []
+depth        = { type = "fixed", value = "FullBody" }
+description  = "InsertBefore {name_path}"
+target_symbol = { key = "name_path" }
+
+[[tool]]
+names        = ["mcp__serena__rename_symbol", "mcp__plugin_serena_serena__rename_symbol"]
+path_keys    = ["relative_path"]
+pattern_keys = []
+depth        = { type = "fixed", value = "FullBody" }
+description  = "Rename {name_path}"
+target_symbol = { key = "name_path" }
+
+[[tool]]
+names        = ["NotebookEdit"]
+path_keys    = ["notebook_path"]
+pattern_keys = []
+depth        = { type = "fixed", value = "FullBody" }
+description  = "NotebookEdit {notebook_path|short}"

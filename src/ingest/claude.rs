@@ -1,10 +1,12 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::Value;
 use crate::tracking::ReadDepth;
 use super::AgentToolCall;
+use super::tool_config::{DepthSpec, ToolMappingConfig};
 
 /// Derive the Claude Code log directory for a given project path.
 /// Claude stores logs at ~/.claude/projects/<slug>/ where slug is the
@@ -205,7 +207,7 @@ pub enum ParsedLine {
 /// Parse all events from a JSONL log file.
 /// SessionCleared signals are ignored in batch mode — dump/coverage modes show
 /// aggregate historical coverage, not live session state.
-pub fn parse_log_file(path: &Path) -> Vec<AgentToolCall> {
+pub fn parse_log_file(path: &Path, config: &ToolMappingConfig) -> Vec<AgentToolCall> {
     let mut events = Vec::new();
     let file = match fs::File::open(path) {
         Ok(f) => f,
@@ -224,7 +226,7 @@ pub fn parse_log_file(path: &Path) -> Vec<AgentToolCall> {
     let label = extract_agent_label(path);
 
     for line in reader.lines().map_while(Result::ok) {
-        if let ParsedLine::Events(mut line_events) = parse_jsonl_line(&line, &default_id) {
+        if let ParsedLine::Events(mut line_events) = parse_jsonl_line(&line, &default_id, config) {
             for ev in &mut line_events {
                 ev.label = label.clone();
             }
@@ -236,7 +238,7 @@ pub fn parse_log_file(path: &Path) -> Vec<AgentToolCall> {
 
 /// Parse a single JSONL line from a Claude Code session log.
 /// Returns a `ParsedLine` indicating tool call events, a session clear signal, or nothing.
-pub fn parse_jsonl_line(line: &str, default_agent_id: &str) -> ParsedLine {
+pub fn parse_jsonl_line(line: &str, default_agent_id: &str, config: &ToolMappingConfig) -> ParsedLine {
     let obj: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return ParsedLine::Ignored,
@@ -291,7 +293,7 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str) -> ParsedLine {
 
         let input = block.get("input").cloned().unwrap_or(Value::Null);
 
-        let event = map_tool_call(tool_name, &input, &agent_id, &timestamp_str)
+        let event = map_tool_call(config, tool_name, &input, &agent_id, &timestamp_str)
             .unwrap_or_else(|| AgentToolCall {
                 agent_id: agent_id.clone(),
                 tool_name: tool_name.to_string(),
@@ -309,266 +311,144 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str) -> ParsedLine {
     ParsedLine::Events(events)
 }
 
-/// Map a tool call to an AgentToolCall with appropriate ReadDepth.
-fn map_tool_call(
+/// Render a description template by substituting `{key}` and `{key|short}` placeholders.
+/// Uses a manual byte-scan — no regex, allocates exactly one String per call.
+fn render_description(
+    template: &str,
+    input: &Value,
+    short_path_fn: impl Fn(&str) -> String,
+) -> String {
+    let bytes = template.as_bytes();
+    let mut out = String::with_capacity(template.len() + 16);
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        // Scan for the closing `}`.
+        let start = i + 1;
+        let mut j = start;
+        while j < bytes.len() && bytes[j] != b'}' {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            // Unclosed brace — emit literal `{` and resume.
+            out.push('{');
+            i += 1;
+            continue;
+        }
+        let inner = &template[start..j]; // content between braces
+        // Split on `|` to detect `|short` modifier.
+        let (key, short) = if let Some(k) = inner.strip_suffix("|short") {
+            (k, true)
+        } else {
+            (inner, false)
+        };
+        // Validate key is a legal identifier: [a-zA-Z_][a-zA-Z0-9_]*
+        let valid = !key.is_empty() && {
+            let mut chars = key.chars();
+            let first = chars.next().unwrap();
+            (first.is_ascii_alphabetic() || first == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        };
+        if !valid {
+            // Not a valid placeholder — emit literal `{` and resume.
+            out.push('{');
+            i += 1;
+            continue;
+        }
+        let value = input.get(key).and_then(|v| v.as_str()).unwrap_or("?");
+        if short {
+            out.push_str(&short_path_fn(value));
+        } else {
+            out.push_str(value);
+        }
+        i = j + 1; // skip past `}`
+    }
+    out
+}
+
+/// Map a tool call to an `AgentToolCall` using config-driven dispatch.
+pub fn map_tool_call(
+    config: &ToolMappingConfig,
     tool_name: &str,
     input: &Value,
     agent_id: &str,
     timestamp_str: &str,
 ) -> Option<AgentToolCall> {
-    let (file_path, depth, desc, target_symbol, target_lines) = match tool_name {
-        // Full file reads.
-        "mcp__acp__Read" | "Read" | "mcp__plugin_serena_serena__read_file" => {
-            let path = input.get("file_path")
-                .or_else(|| input.get("relative_path"))
-                .and_then(|v| v.as_str())?;
-            // If offset and limit are present, compute a target line range.
-            let target_lines = match (
-                input.get("offset").and_then(|v| v.as_u64()),
-                input.get("limit").and_then(|v| v.as_u64()),
-            ) {
-                (Some(offset), Some(limit)) => {
-                    Some(offset as usize..(offset as usize + limit as usize))
-                }
-                _ => None,
-            };
-            (
-                Some(PathBuf::from(path)),
-                ReadDepth::FullBody,
-                format!("Read {}", short_path(path)),
-                None,
-                target_lines,
-            )
-        }
+    // O(1) lookup via pre-built index.
+    let &idx = config.index.get(tool_name)?;
+    let mapping = &config.tools[idx];
 
-        // Edits imply the file was read.
-        "mcp__acp__Edit" | "Edit"
-        | "mcp__plugin_serena_serena__replace_content" => {
-            let path = input.get("file_path")
-                .or_else(|| input.get("relative_path"))
-                .and_then(|v| v.as_str())?;
-            (
-                Some(PathBuf::from(path)),
-                ReadDepth::FullBody,
-                format!("Edit {}", short_path(path)),
-                None,
-                None,
-            )
-        }
+    // Extract file_path from the first matching path_key.
+    let file_path_str: Option<&str> = mapping
+        .path_keys
+        .iter()
+        .find_map(|k| input.get(k).and_then(|v| v.as_str()));
 
-        // Write implies full knowledge.
-        "mcp__acp__Write" | "Write" | "mcp__plugin_serena_serena__create_text_file" => {
-            let path = input.get("file_path")
-                .or_else(|| input.get("relative_path"))
-                .and_then(|v| v.as_str())?;
-            (
-                Some(PathBuf::from(path)),
-                ReadDepth::FullBody,
-                format!("Write {}", short_path(path)),
-                None,
-                None,
-            )
-        }
-
-        // Glob/find: name-level awareness.
-        "Glob" | "mcp__serena__find_file" | "mcp__serena__list_dir"
-        | "mcp__plugin_serena_serena__find_file" | "mcp__plugin_serena_serena__list_dir" => {
-            let pattern = input
-                .get("pattern")
-                .or_else(|| input.get("file_mask"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("*");
-            let path = input
-                .get("path")
-                .or_else(|| input.get("relative_path"))
-                .and_then(|v| v.as_str());
-            (path.map(PathBuf::from), ReadDepth::NameOnly, format!("Glob {pattern}"), None, None)
-        }
-
-        // Grep/search: overview-level.
-        "Grep" | "mcp__serena__search_for_pattern"
-        | "mcp__plugin_serena_serena__search_for_pattern" => {
-            let pattern = input
-                .get("pattern")
-                .or_else(|| input.get("substring_pattern"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            let path = input
-                .get("path")
-                .or_else(|| input.get("relative_path"))
-                .and_then(|v| v.as_str());
-            (path.map(PathBuf::from), ReadDepth::Overview, format!("Search \"{pattern}\""), None, None)
-        }
-
-        // Serena symbol overview.
-        "mcp__serena__get_symbols_overview"
-        | "mcp__plugin_serena_serena__get_symbols_overview" => {
-            let path = input.get("relative_path").and_then(|v| v.as_str());
-            (
-                path.map(PathBuf::from),
-                ReadDepth::Overview,
-                format!("Overview {}", path.unwrap_or("?")),
-                None,
-                None,
-            )
-        }
-
-        // Serena find_symbol: depth depends on include_body.
-        "mcp__serena__find_symbol"
-        | "mcp__plugin_serena_serena__find_symbol" => {
-            let include_body = input
-                .get("include_body")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let name = input
-                .get("name_path_pattern")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            let path = input.get("relative_path").and_then(|v| v.as_str());
-            let depth = if include_body {
-                ReadDepth::FullBody
-            } else {
-                ReadDepth::Signature
-            };
-            let target = input
-                .get("name_path_pattern")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            (
-                path.map(PathBuf::from),
-                depth,
-                format!("Symbol {name}"),
-                target,
-                None,
-            )
-        }
-
-        // Serena find_referencing_symbols: overview-level.
-        "mcp__serena__find_referencing_symbols"
-        | "mcp__plugin_serena_serena__find_referencing_symbols" => {
-            let name = input
-                .get("name_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            let path = input.get("relative_path").and_then(|v| v.as_str());
-            let target = input
-                .get("name_path")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            (
-                path.map(PathBuf::from),
-                ReadDepth::Overview,
-                format!("FindRefs {name}"),
-                target,
-                None,
-            )
-        }
-
-        // Serena replace_symbol_body: full body read.
-        "mcp__serena__replace_symbol_body"
-        | "mcp__plugin_serena_serena__replace_symbol_body" => {
-            let name = input
-                .get("name_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            let path = input.get("relative_path").and_then(|v| v.as_str());
-            let target = input
-                .get("name_path")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            (
-                path.map(PathBuf::from),
-                ReadDepth::FullBody,
-                format!("ReplaceSymbol {name}"),
-                target,
-                None,
-            )
-        }
-
-        // Serena insert_after_symbol: full body read.
-        "mcp__serena__insert_after_symbol"
-        | "mcp__plugin_serena_serena__insert_after_symbol" => {
-            let name = input
-                .get("name_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            let path = input.get("relative_path").and_then(|v| v.as_str());
-            let target = input
-                .get("name_path")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            (
-                path.map(PathBuf::from),
-                ReadDepth::FullBody,
-                format!("InsertAfter {name}"),
-                target,
-                None,
-            )
-        }
-
-        // Serena insert_before_symbol: full body read.
-        "mcp__serena__insert_before_symbol"
-        | "mcp__plugin_serena_serena__insert_before_symbol" => {
-            let name = input
-                .get("name_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            let path = input.get("relative_path").and_then(|v| v.as_str());
-            let target = input
-                .get("name_path")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            (
-                path.map(PathBuf::from),
-                ReadDepth::FullBody,
-                format!("InsertBefore {name}"),
-                target,
-                None,
-            )
-        }
-
-        // Serena rename_symbol: full body read.
-        "mcp__serena__rename_symbol"
-        | "mcp__plugin_serena_serena__rename_symbol" => {
-            let name = input
-                .get("name_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            let path = input.get("relative_path").and_then(|v| v.as_str());
-            let target = input
-                .get("name_path")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            (
-                path.map(PathBuf::from),
-                ReadDepth::FullBody,
-                format!("Rename {name}"),
-                target,
-                None,
-            )
-        }
-
-        // Notebook edits.
-        "NotebookEdit" => {
-            let path = input.get("notebook_path").and_then(|v| v.as_str())?;
-            (
-                Some(PathBuf::from(path)),
-                ReadDepth::FullBody,
-                format!("NotebookEdit {}", short_path(path)),
-                None,
-                None,
-            )
-        }
-
-        _ => return None,
+    let file_path: Option<PathBuf> = match file_path_str {
+        Some(s) => Some(PathBuf::from(s)),
+        None if mapping.path_required => return None,
+        None => None,
     };
+
+    // Resolve pattern from pattern_keys (first hit).
+    let pattern_val: Option<&str> = mapping
+        .pattern_keys
+        .iter()
+        .find_map(|k| input.get(k).and_then(|v| v.as_str()));
+
+    // Resolve read depth.
+    let depth_spec = mapping.depth.as_ref()
+        .expect("depth must be Some after load/merge — MissingDepth stanzas are dropped");
+    let read_depth = match depth_spec {
+        DepthSpec::Fixed { value } => ReadDepth::from(value.clone()),
+        DepthSpec::Conditional { condition_key, if_true, if_false, default } => {
+            match input.get(condition_key) {
+                Some(Value::Bool(true))  => ReadDepth::from(if_true.clone()),
+                Some(Value::Bool(false)) => ReadDepth::from(if_false.clone()),
+                _                        => ReadDepth::from(default.clone()),
+            }
+        }
+    };
+
+    // Build an augmented input that exposes the resolved pattern under the canonical
+    // key "pattern", so that description templates like `{pattern}` work regardless
+    // of which `pattern_key` (e.g. "file_mask", "substring_pattern") held the value.
+    // When no pattern key is present (e.g. list_dir with only a path), fall back to
+    // the resolved file_path_str so the description still shows something meaningful.
+    let display_val = pattern_val.or(file_path_str);
+    let description = if let Some(dv) = display_val {
+        let mut aug = input.clone();
+        if let Some(obj) = aug.as_object_mut() {
+            obj.insert("pattern".to_string(), Value::String(dv.to_string()));
+        }
+        render_description(&mapping.description, &aug, short_path)
+    } else {
+        render_description(&mapping.description, input, short_path)
+    };
+
+    // Extract target_symbol.
+    let target_symbol = mapping
+        .target_symbol
+        .as_ref()
+        .and_then(|spec| input.get(&spec.key)?.as_str().map(String::from));
+
+    // Extract target_lines.
+    let target_lines = mapping.target_lines.as_ref().and_then(|spec| {
+        let offset = input.get(&spec.offset_key)?.as_u64()? as usize;
+        let limit  = input.get(&spec.limit_key)?.as_u64()? as usize;
+        Some(offset..offset + limit)
+    });
 
     Some(AgentToolCall {
         agent_id: agent_id.to_string(),
         tool_name: tool_name.to_string(),
         file_path,
-        read_depth: depth,
-        description: desc,
+        read_depth,
+        description,
         timestamp_str: timestamp_str.to_string(),
         target_symbol,
         target_lines,
@@ -592,6 +472,7 @@ fn short_path(path: &str) -> String {
 pub struct LogTailer {
     files: Vec<PathBuf>,
     positions: std::collections::HashMap<PathBuf, u64>,
+    config: Arc<ToolMappingConfig>,
 }
 
 /// Output from `LogTailer::read_new_events`, carrying both new tool call events
@@ -604,7 +485,7 @@ pub struct TailerOutput {
 impl LogTailer {
     /// Create a tailer for the given log files, starting from the end of each
     /// (i.e., only new lines will be read on subsequent calls).
-    pub fn new(files: Vec<PathBuf>) -> Self {
+    pub fn new(files: Vec<PathBuf>, config: Arc<ToolMappingConfig>) -> Self {
         let mut positions = std::collections::HashMap::new();
         for f in &files {
             // Start at the current end of file so we only get new events.
@@ -612,7 +493,7 @@ impl LogTailer {
                 positions.insert(f.clone(), meta.len());
             }
         }
-        Self { files, positions }
+        Self { files, positions, config }
     }
 
 
@@ -659,7 +540,7 @@ impl LogTailer {
                         line.clear();
                         match reader.read_line(&mut line) {
                             Ok(0) => break,
-                            Ok(_) => match parse_jsonl_line(line.trim(), &default_id) {
+                            Ok(_) => match parse_jsonl_line(line.trim(), &default_id, &self.config) {
                                 ParsedLine::Events(events) => output.events.extend(events),
                                 ParsedLine::SessionCleared => output.session_cleared = true,
                                 ParsedLine::Ignored => {}
@@ -689,7 +570,8 @@ mod tests {
 
     /// Convenience: unwrap `ParsedLine::Events` for tests that don't care about clear detection.
     fn parse_events(line: &str, agent_id: &str) -> Vec<AgentToolCall> {
-        match parse_jsonl_line(line, agent_id) {
+        let config = ToolMappingConfig::builtin().expect("builtin config");
+        match parse_jsonl_line(line, agent_id, &config) {
             ParsedLine::Events(evs) => evs,
             _ => vec![],
         }
@@ -843,6 +725,11 @@ mod tests {
         let line = jsonl_assistant("Glob", r#"{"pattern":"**/*.rs","path":"/src"}"#);
         let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::NameOnly);
+        assert!(
+            events[0].description.contains("**/*.rs"),
+            "Glob description should contain pattern, got: {:?}",
+            events[0].description
+        );
     }
 
     #[test]
@@ -850,6 +737,29 @@ mod tests {
         let line = jsonl_assistant("mcp__serena__find_file", r#"{"file_mask":"*.rs","relative_path":"src"}"#);
         let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::NameOnly);
+        assert!(
+            events[0].description.contains("*.rs"),
+            "find_file description should contain file_mask pattern, got: {:?}",
+            events[0].description
+        );
+    }
+
+    #[test]
+    fn map_list_dir_shows_path_not_question_mark() {
+        // list_dir has no pattern key — description should fall back to the path.
+        let line = jsonl_assistant("mcp__serena__list_dir", r#"{"relative_path":"src/ingest","recursive":false}"#);
+        let events = parse_events(&line, "d");
+        assert_eq!(events[0].read_depth, ReadDepth::NameOnly);
+        assert!(
+            !events[0].description.contains('?'),
+            "list_dir description should not show '?', got: {:?}",
+            events[0].description
+        );
+        assert!(
+            events[0].description.contains("src/ingest"),
+            "list_dir description should show the path, got: {:?}",
+            events[0].description
+        );
     }
 
     #[test]
@@ -958,7 +868,8 @@ mod tests {
         writeln!(f, "{}", jsonl_assistant("Grep", r#"{"pattern":"x"}"#)).unwrap();
         drop(f);
 
-        let events = parse_log_file(&log);
+        let config = ToolMappingConfig::builtin().expect("builtin config");
+        let events = parse_log_file(&log, &config);
         assert_eq!(events.len(), 2);
     }
 
@@ -1029,7 +940,8 @@ mod tests {
         writeln!(f, "{}", jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/a.rs"}"#)).unwrap();
         drop(f);
 
-        let events = parse_log_file(&log);
+        let config = ToolMappingConfig::builtin().unwrap();
+        let events = parse_log_file(&log, &config);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].label, "Check the coverage");
     }
@@ -1067,21 +979,24 @@ mod tests {
     fn parse_clear_command_returns_session_cleared() {
         // Exact JSONL shape observed in the wild (empty command-args).
         let line = r#"{"type":"user","sessionId":"abc","message":{"role":"user","content":"<command-name>/clear</command-name>\n            <command-message>clear</command-message>\n            <command-args></command-args>"}}"#;
-        assert!(matches!(parse_jsonl_line(line, "d"), ParsedLine::SessionCleared));
+        let config = ToolMappingConfig::builtin().expect("builtin config");
+        assert!(matches!(parse_jsonl_line(line, "d", &config), ParsedLine::SessionCleared));
     }
 
     #[test]
     fn parse_clear_with_nonempty_args() {
         // /clear invoked with explicit args (as seen in some sessions: command-args=clear).
         let line = r#"{"type":"user","sessionId":"abc","message":{"role":"user","content":"<command-name>/clear</command-name>\n            <command-message>clear</command-message>\n            <command-args>clear</command-args>"}}"#;
-        assert!(matches!(parse_jsonl_line(line, "d"), ParsedLine::SessionCleared));
+        let config = ToolMappingConfig::builtin().expect("builtin config");
+        assert!(matches!(parse_jsonl_line(line, "d", &config), ParsedLine::SessionCleared));
     }
 
     #[test]
     fn parse_compact_command_returns_ignored() {
         // /compact must NOT trigger SessionCleared.
         let line = r#"{"type":"user","sessionId":"abc","message":{"role":"user","content":"<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>"}}"#;
-        assert!(matches!(parse_jsonl_line(line, "d"), ParsedLine::Ignored));
+        let config = ToolMappingConfig::builtin().expect("builtin config");
+        assert!(matches!(parse_jsonl_line(line, "d", &config), ParsedLine::Ignored));
     }
 
     #[test]
@@ -1091,7 +1006,8 @@ mod tests {
 
         // Create an empty file first so the tailer starts at position 0.
         fs::write(&log, "").unwrap();
-        let mut tailer = LogTailer::new(vec![log.clone()]);
+        let config = Arc::new(ToolMappingConfig::builtin().expect("builtin config"));
+        let mut tailer = LogTailer::new(vec![log.clone()], config);
 
         // Now append the /clear line as "new" content.
         let clear_line = r#"{"type":"user","sessionId":"abc","message":{"role":"user","content":"<command-name>/clear</command-name>\n<command-message>clear</command-message>\n<command-args></command-args>"}}"#;
@@ -1109,7 +1025,8 @@ mod tests {
 
         // Create an empty file first so the tailer starts at position 0.
         fs::write(&log, "").unwrap();
-        let mut tailer = LogTailer::new(vec![log.clone()]);
+        let config = Arc::new(ToolMappingConfig::builtin().expect("builtin config"));
+        let mut tailer = LogTailer::new(vec![log.clone()], config);
 
         // Append a /clear line followed by a tool use as "new" content.
         let clear_line = r#"{"type":"user","sessionId":"abc","message":{"role":"user","content":"<command-name>/clear</command-name>\n<command-message>clear</command-message>\n<command-args></command-args>"}}"#;
@@ -1120,5 +1037,81 @@ mod tests {
         assert!(output.session_cleared);
         assert_eq!(output.events.len(), 1);
         assert_eq!(output.events[0].read_depth, ReadDepth::FullBody);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 9: Dispatch tests — merged config
+    // -----------------------------------------------------------------------
+
+    /// A merged config where "Read" is replaced by a user stanza dispatches
+    /// correctly for the new input key and rejects the old key.
+    #[test]
+    fn merged_config_dispatches_replaced_builtin() {
+        use std::io::Write as IoWrite;
+
+        let builtin = ToolMappingConfig::builtin().unwrap();
+
+        // Write user config to a temp file so load() builds the index.
+        let user_toml = r#"
+version = 1
+[[tool]]
+names        = ["Read"]
+path_keys    = ["custom_file"]
+pattern_keys = []
+depth        = { type = "fixed", value = "NameOnly" }
+description  = "CustomRead {custom_file}"
+"#;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(user_toml.as_bytes()).unwrap();
+        let (user_opt, _) = ToolMappingConfig::load(tmp.path());
+        let user = user_opt.expect("user config must parse");
+
+        let mut warnings = Vec::new();
+        let merged = ToolMappingConfig::merge(builtin, user, &mut warnings);
+
+        // Dispatch with the new input key.
+        let input = serde_json::json!({ "custom_file": "/foo/bar.rs" });
+        let result = map_tool_call(&merged, "Read", &input, "agent1", "2025-01-01");
+        assert!(result.is_some(), "Read should dispatch via merged config");
+        let call = result.unwrap();
+        assert_eq!(call.read_depth, ReadDepth::NameOnly);
+        assert!(call.description.contains("CustomRead"));
+
+        // The old key "file_path" should now be unknown → None (path_required = true by default).
+        let old_input = serde_json::json!({ "file_path": "/foo/bar.rs" });
+        let missing = map_tool_call(&merged, "Read", &old_input, "agent1", "2025-01-01");
+        assert!(missing.is_none(), "Read with old key should return None after override");
+    }
+
+    /// A merged config with a novel user tool should dispatch it end-to-end.
+    #[test]
+    fn merged_config_dispatches_user_tool() {
+        use std::io::Write as IoWrite;
+
+        let builtin = ToolMappingConfig::builtin().unwrap();
+        let user_toml = r#"
+version = 1
+[[tool]]
+names        = ["UserTool"]
+path_keys    = ["target"]
+pattern_keys = []
+depth        = { type = "fixed", value = "Overview" }
+description  = "UserTool {target}"
+"#;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(user_toml.as_bytes()).unwrap();
+        let (user_opt, _) = ToolMappingConfig::load(tmp.path());
+        let user = user_opt.expect("user config must parse");
+
+        let mut warnings = Vec::new();
+        let merged = ToolMappingConfig::merge(builtin, user, &mut warnings);
+
+        let input = serde_json::json!({ "target": "/some/path.rs" });
+        let result = map_tool_call(&merged, "UserTool", &input, "agentX", "ts");
+        assert!(result.is_some());
+        let call = result.unwrap();
+        assert_eq!(call.read_depth, ReadDepth::Overview);
+        assert_eq!(call.tool_name, "UserTool");
+        assert!(call.file_path.is_some());
     }
 }

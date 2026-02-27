@@ -8,11 +8,16 @@ use std::path::PathBuf;
 use ambits::app::App;
 use ambits::coverage::{CoverageFormatter, CoverageReport, TextFormatter};
 use ambits::ingest::claude::parse_log_file;
+use ambits::ingest::tool_config::ToolMappingConfig;
 use ambits::ingest::AgentToolCall;
 use ambits::symbols::merkle::content_hash;
 use ambits::symbols::{FileSymbols, ProjectTree, SymbolCategory, SymbolNode};
 use ambits::tracking::{ContextLedger, ReadDepth};
 use tempfile::NamedTempFile;
+
+fn builtin_cfg() -> ToolMappingConfig {
+    ToolMappingConfig::builtin().expect("built-in config must parse")
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -105,7 +110,7 @@ fn full_pipeline_read() {
 
     // Parse a Read event for file_a (absolute path gets normalized).
     let tmp = write_jsonl(&[jsonl_read("/test/project/mock/file_a.rs")]);
-    let events = parse_log_file(tmp.path());
+    let events = parse_log_file(tmp.path(), &builtin_cfg());
     assert_eq!(events.len(), 1);
 
     for event in events {
@@ -132,7 +137,7 @@ fn targeted_symbol_partial() {
     let mut app = make_app(files);
 
     let tmp = write_jsonl(&[jsonl_find_symbol("mock/f.rs", "beta", true)]);
-    let events = parse_log_file(tmp.path());
+    let events = parse_log_file(tmp.path(), &builtin_cfg());
     for event in events {
         app.process_agent_event(event);
     }
@@ -161,7 +166,7 @@ fn depth_upgrade_invariant() {
         jsonl_grep("pattern"),                      // NameOnly again — must NOT downgrade
     ];
     let tmp = write_jsonl(&lines);
-    let events = parse_log_file(tmp.path());
+    let events = parse_log_file(tmp.path(), &builtin_cfg());
     for event in events {
         app.process_agent_event(event);
     }
@@ -181,7 +186,7 @@ fn multi_agent_session() {
         jsonl_read("/test/project/mock/f.rs"),
         jsonl_read("/test/project/mock/f.rs"),
     ]);
-    let mut events: Vec<AgentToolCall> = parse_log_file(tmp.path());
+    let mut events: Vec<AgentToolCall> = parse_log_file(tmp.path(), &builtin_cfg());
     events[0].agent_id = "agent-alpha".into();
     events[1].agent_id = "agent-beta".into();
 
@@ -205,7 +210,7 @@ fn parse_log_file_e2e() {
         jsonl_find_symbol("bar.rs", "baz", false),
     ];
     let tmp = write_jsonl(&lines);
-    let events = parse_log_file(tmp.path());
+    let events = parse_log_file(tmp.path(), &builtin_cfg());
     // User message is ignored; the other 3 produce events.
     assert_eq!(events.len(), 3);
 }

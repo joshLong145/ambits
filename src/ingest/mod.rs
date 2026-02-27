@@ -1,5 +1,6 @@
 use std::ops::Range;
 pub mod claude;
+pub mod tool_config;
 
 use std::path::PathBuf;
 

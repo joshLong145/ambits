@@ -27,6 +27,7 @@ sha2 = "0.10"
 color-eyre = "0.6"
 serde-pickle = "1.2"
 flume = "0.12"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 
 [dev-dependencies]
 tempfile = "3"

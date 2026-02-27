@@ -28,7 +28,10 @@ use notify::{Event as NotifyEvent, EventKind, RecursiveMode, Watcher};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
+use std::sync::Arc;
+
 use ambits::app::App;
+use ambits::ingest::tool_config::ToolMappingConfig;
 use events::AppEvent;
 use ambits::parser::ParserRegistry;
 use ambits::symbols::ProjectTree;
@@ -67,6 +70,11 @@ struct Cli {
     /// Output directory for event logs. If set, writes processed events to <dir>/<session>.log.
     #[arg(long)]
     log_output: Option<PathBuf>,
+
+    /// Path to a custom tool call mapping config (TOML).
+    /// Overrides project-local (.ambit/tools.toml) and user-global configs.
+    #[arg(long)]
+    tools_config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -108,6 +116,10 @@ fn main() -> Result<()> {
         };
     }
 
+    // Resolve tool call mapping config. Warnings are displayed to stdout before TUI launch.
+    let (tool_config, config_warnings) =
+        ToolMappingConfig::resolve(cli.tools_config.as_deref());
+
     // Original behavior — require --project for all other modes.
     let project = cli.project.ok_or_else(|| {
         color_eyre::eyre::eyre!("--project is required (use `ambits --project <path>`)")
@@ -121,12 +133,18 @@ fn main() -> Result<()> {
     };
 
     if cli.dump {
+        for w in &config_warnings {
+            println!("[ambit warning] {w}");
+        }
         dump_tree(&project_path, &project_tree);
         return Ok(());
     }
 
     if cli.coverage {
-        return run_coverage_report(&project_path, &project_tree, &cli.log_dir, &cli.session, &cli.agent);
+        for w in &config_warnings {
+            println!("[ambit warning] {w}");
+        }
+        return run_coverage_report(&project_path, &project_tree, &cli.log_dir, &cli.session, &cli.agent, &tool_config);
     }
 
     // Resolve log directory and session.
@@ -167,7 +185,7 @@ fn main() -> Result<()> {
     if let (Some(ref log_dir), Some(ref session_id)) = (&log_dir, &session_id) {
         let log_files = ingest::claude::session_log_files(log_dir, session_id);
         for log_file in &log_files {
-            let events = ingest::claude::parse_log_file(log_file);
+            let events = ingest::claude::parse_log_file(log_file, &tool_config);
             for event in events {
                 app.process_agent_event(event);
             }
@@ -175,7 +193,7 @@ fn main() -> Result<()> {
     }
 
     let serena_mode = cli.serena;
-    let result = run_tui(&mut terminal, &mut app, &project_path, &log_dir, session_id, &registry, serena_mode);
+    let result = run_tui(&mut terminal, &mut app, &project_path, &log_dir, session_id, &registry, serena_mode, &tool_config);
 
     // Flush event log before exiting.
     if let Some(ref mut writer) = app.event_log {
@@ -198,6 +216,7 @@ fn run_tui(
     session_id: Option<String>,
     registry: &ParserRegistry,
     serena_mode: bool,
+    tool_config: &Arc<ToolMappingConfig>,
 ) -> Result<()> {
     let mut current_session_id = session_id;
     // Record when the TUI started so we can ignore session files that already
@@ -232,7 +251,7 @@ fn run_tui(
     // Set up log file tailer.
     let mut log_tailer = if let (Some(ref ld), Some(ref sid)) = (log_dir, &current_session_id) {
         let files = ingest::claude::session_log_files(ld, sid);
-        Some(ingest::claude::LogTailer::new(files))
+        Some(ingest::claude::LogTailer::new(files, Arc::clone(tool_config)))
     } else {
         None
     };
@@ -307,15 +326,9 @@ fn run_tui(
             }
             Ok(AppEvent::Tick) => {
                 // Check if Claude Code has started a new session (e.g. after /clear).
-                // /clear creates a brand-new UUID JSONL file — it writes no sentinel into
-                // the old file — so we detect it by comparing find_latest_session() against
-                // the session we are currently tailing.
                 if let Some(ref ld) = log_dir {
                     if let Some(latest) = ingest::claude::find_latest_session(ld) {
                         let is_new_session = current_session_id.as_deref() != Some(latest.as_str());
-                        // Only accept the new session if its file was created after the TUI
-                        // launched — this prevents switching to a session that already existed
-                        // when ambit started.
                         let created_after_start = ld
                             .join(format!("{latest}.jsonl"))
                             .metadata()
@@ -331,14 +344,13 @@ fn run_tui(
                             // Pre-populate from lines already written before this tick.
                             let new_files = ingest::claude::session_log_files(ld, &latest);
                             for log_file in &new_files {
-                                for event in ingest::claude::parse_log_file(log_file) {
+                                for event in ingest::claude::parse_log_file(log_file, tool_config) {
                                     app.process_agent_event(event);
                                 }
                             }
 
-                            // Replace the tailer, starting from end-of-file so we only
-                            // pick up lines written after pre-population.
-                            log_tailer = Some(ingest::claude::LogTailer::new(new_files));
+                            // Replace the tailer — clone the existing Arc (no re-resolve).
+                            log_tailer = Some(ingest::claude::LogTailer::new(new_files, Arc::clone(tool_config)));
                         }
                     }
                 }
@@ -443,6 +455,7 @@ fn run_coverage_report(
     log_dir_opt: &Option<PathBuf>,
     session_opt: &Option<String>,
     agent_opt: &Option<String>,
+    tool_config: &ToolMappingConfig,
 ) -> Result<()> {
     use coverage::{CoverageFormatter, CoverageReport, TextFormatter};
     use tracking::ContextLedger;
@@ -465,7 +478,7 @@ fn run_coverage_report(
     if let (Some(ref log_dir), Some(ref sid)) = (&log_dir, &session_id) {
         let log_files = ingest::claude::session_log_files(log_dir, sid);
         for log_file in &log_files {
-            let events = ingest::claude::parse_log_file(log_file);
+            let events = ingest::claude::parse_log_file(log_file, tool_config);
             for event in events {
                 if !known_agents.contains(&event.agent_id) {
                     known_agents.push(event.agent_id.clone());
