@@ -253,7 +253,89 @@ fn mcp_acp_edit_alias() {
 }
 
 // ---------------------------------------------------------------------------
-// parse_log_file end-to-end: all 13 tool stanzas produce events
+// 14. Bash — pattern from "command" key, truncated with |cmd
+// ---------------------------------------------------------------------------
+#[test]
+fn tool_bash_short_command() {
+    let cfg = builtin();
+    let input = serde_json::json!({ "command": "cargo build" });
+    let call = map_tool_call(&cfg, "Bash", &input, "a", "ts").unwrap();
+    assert_eq!(call.read_depth, ReadDepth::NameOnly);
+    assert!(call.file_path.is_none());
+    assert!(call.description.contains("cargo build"), "description was: {}", call.description);
+}
+
+#[test]
+fn tool_bash_long_command_truncated() {
+    let cfg = builtin();
+    // Command longer than 200 chars should be truncated with "…"
+    let long_cmd = "cargo test --all-features -- --nocapture 2>&1 | tee output.log && \
+        echo 'done' && cargo clippy --all-targets --all-features -- -D warnings && \
+        cargo fmt --check && echo 'all checks passed' && cargo build --release";
+    assert!(long_cmd.len() > 200, "test command must exceed 200 chars, got {}", long_cmd.len());
+    let input = serde_json::json!({ "command": long_cmd });
+    let call = map_tool_call(&cfg, "Bash", &input, "a", "ts").unwrap();
+    assert!(call.description.contains('…'), "expected truncation ellipsis, got: {}", call.description);
+    // The description body (excluding "Bash " prefix) should be at most 200 chars + "…"
+    let body = call.description.strip_prefix("Bash ").unwrap_or(&call.description);
+    // 200 chars + "…" (3 bytes) = 203 bytes max
+    assert!(body.len() <= 204, "truncated body too long: {}", body);
+}
+
+#[test]
+fn tool_bash_description_key_fallback() {
+    let cfg = builtin();
+    // When "command" is absent, fall back to "description" pattern_key.
+    let input = serde_json::json!({ "description": "List files" });
+    let call = map_tool_call(&cfg, "Bash", &input, "a", "ts").unwrap();
+    assert!(call.description.contains("List files"), "description was: {}", call.description);
+}
+
+// ---------------------------------------------------------------------------
+// 15. TodoWrite — first todo's content shown truncated
+// ---------------------------------------------------------------------------
+#[test]
+fn tool_todo_write_shows_first_todo() {
+    let cfg = builtin();
+    let input = serde_json::json!({
+        "todos": [
+            { "content": "Run tests", "status": "pending", "activeForm": "Running tests" },
+            { "content": "Deploy to prod", "status": "pending", "activeForm": "Deploying" }
+        ]
+    });
+    let call = map_tool_call(&cfg, "TodoWrite", &input, "a", "ts").unwrap();
+    assert_eq!(call.read_depth, ReadDepth::NameOnly);
+    assert!(call.file_path.is_none());
+    assert!(call.description.contains("Run tests"), "description was: {}", call.description);
+}
+
+#[test]
+fn tool_todo_write_long_content_truncated() {
+    let cfg = builtin();
+    let long_content = "Implement the full authentication system with OAuth2 support and refresh tokens, \
+        including token storage, silent renewal, logout flow, PKCE challenge, and integration \
+        with the existing user profile service and role-based access control middleware";
+    let input = serde_json::json!({
+        "todos": [
+            { "content": long_content, "status": "pending", "activeForm": "Implementing" }
+        ]
+    });
+    let call = map_tool_call(&cfg, "TodoWrite", &input, "a", "ts").unwrap();
+    assert!(call.description.contains('…'), "expected truncation, got: {}", call.description);
+}
+
+#[test]
+fn tool_todo_write_empty_todos() {
+    let cfg = builtin();
+    // Empty todos array — description falls back to static "TodoWrite ?"
+    let input = serde_json::json!({ "todos": [] });
+    let call = map_tool_call(&cfg, "TodoWrite", &input, "a", "ts").unwrap();
+    // No panic, description contains "TodoWrite"
+    assert!(call.description.starts_with("TodoWrite"), "description was: {}", call.description);
+}
+
+// ---------------------------------------------------------------------------
+// parse_log_file end-to-end: all 15 tool stanzas produce events
 // ---------------------------------------------------------------------------
 #[test]
 fn parse_log_file_all_tool_stanzas() {
@@ -277,6 +359,8 @@ fn parse_log_file_all_tool_stanzas() {
         assistant_line("mcp__serena__insert_before_symbol",      r#"{"relative_path":"src/lib.rs","name_path":"Foo"}"#),
         assistant_line("mcp__serena__rename_symbol",             r#"{"relative_path":"src/lib.rs","name_path":"Foo"}"#),
         assistant_line("NotebookEdit",    r#"{"notebook_path":"/nb.ipynb"}"#),
+        assistant_line("Bash",            r#"{"command":"cargo build"}"#),
+        assistant_line("TodoWrite",       r#"{"todos":[{"content":"Run tests","status":"pending","activeForm":"Running tests"}]}"#),
     ];
 
     for line in &lines {
@@ -284,6 +368,6 @@ fn parse_log_file_all_tool_stanzas() {
     }
 
     let events = parse_log_file(tmp.path(), &cfg);
-    assert_eq!(events.len(), 13, "expected 13 events, got {}: {:?}", events.len(),
+    assert_eq!(events.len(), 15, "expected 15 events, got {}: {:?}", events.len(),
         events.iter().map(|e| &e.tool_name).collect::<Vec<_>>());
 }

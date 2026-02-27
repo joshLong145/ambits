@@ -107,3 +107,19 @@ path_keys    = ["notebook_path"]
 pattern_keys = []
 depth        = { type = "fixed", value = "FullBody" }
 description  = "NotebookEdit {notebook_path|short}"
+
+[[tool]]
+names         = ["Bash"]
+path_keys     = []
+path_required = false
+pattern_keys  = ["command", "description"]
+depth         = { type = "fixed", value = "NameOnly" }
+description   = "Bash {pattern|cmd}"
+
+[[tool]]
+names         = ["TodoWrite"]
+path_keys     = []
+path_required = false
+pattern_keys  = []
+depth         = { type = "fixed", value = "NameOnly" }
+description   = "TodoWrite {pattern|cmd}"

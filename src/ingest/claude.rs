@@ -311,11 +311,20 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, config: &ToolMapping
     ParsedLine::Events(events)
 }
 
-/// Render a description template by substituting `{key}` and `{key|short}` placeholders.
-/// Uses a manual byte-scan — no regex, allocates exactly one String per call.
+/// Render a description template by substituting `{key}`, `{key|short}`, and `{key|cmd}`
+/// placeholders. Uses a manual byte-scan — no regex, allocates exactly one String per call.
+///
+/// `display_override`: when `Some((key, value))`, that key resolves to `value` before
+/// falling back to `input.get(key)`. Used to inject the resolved pattern/display value
+/// without cloning the entire input `Value`.
+///
+/// Modifiers:
+/// - `|short` — passes value through `short_path_fn` (last 2 path components)
+/// - `|cmd`   — truncates to first 40 chars, appending "…" if longer
 fn render_description(
     template: &str,
     input: &Value,
+    display_override: Option<(&str, &str)>,
     short_path_fn: impl Fn(&str) -> String,
 ) -> String {
     let bytes = template.as_bytes();
@@ -340,11 +349,13 @@ fn render_description(
             continue;
         }
         let inner = &template[start..j]; // content between braces
-        // Split on `|` to detect `|short` modifier.
-        let (key, short) = if let Some(k) = inner.strip_suffix("|short") {
-            (k, true)
+        // Split on `|` to detect modifiers.
+        let (key, modifier) = if let Some(k) = inner.strip_suffix("|short") {
+            (k, "short")
+        } else if let Some(k) = inner.strip_suffix("|cmd") {
+            (k, "cmd")
         } else {
-            (inner, false)
+            (inner, "")
         };
         // Validate key is a legal identifier: [a-zA-Z_][a-zA-Z0-9_]*
         let valid = !key.is_empty() && {
@@ -359,11 +370,29 @@ fn render_description(
             i += 1;
             continue;
         }
-        let value = input.get(key).and_then(|v| v.as_str()).unwrap_or("?");
-        if short {
-            out.push_str(&short_path_fn(value));
-        } else {
-            out.push_str(value);
+        // Resolve value: check override first, then input JSON.
+        let value = display_override
+            .and_then(|(ok, ov)| if ok == key { Some(ov) } else { None })
+            .or_else(|| input.get(key).and_then(|v| v.as_str()))
+            .unwrap_or("?");
+        match modifier {
+            "short" => out.push_str(&short_path_fn(value)),
+            "cmd" => {
+                const CMD_MAX: usize = 200;
+                if value.len() <= CMD_MAX {
+                    out.push_str(value);
+                } else {
+                    // Truncate at a char boundary within the limit.
+                    let truncated = value.char_indices()
+                        .take_while(|(i, _)| *i < CMD_MAX)
+                        .last()
+                        .map(|(i, c)| &value[..i + c.len_utf8()])
+                        .unwrap_or(&value[..CMD_MAX]);
+                    out.push_str(truncated);
+                    out.push('…');
+                }
+            }
+            _ => out.push_str(value),
         }
         i = j + 1; // skip past `}`
     }
@@ -414,21 +443,32 @@ pub fn map_tool_call(
         }
     };
 
-    // Build an augmented input that exposes the resolved pattern under the canonical
-    // key "pattern", so that description templates like `{pattern}` work regardless
-    // of which `pattern_key` (e.g. "file_mask", "substring_pattern") held the value.
-    // When no pattern key is present (e.g. list_dir with only a path), fall back to
-    // the resolved file_path_str so the description still shows something meaningful.
-    let display_val = pattern_val.or(file_path_str);
-    let description = if let Some(dv) = display_val {
-        let mut aug = input.clone();
-        if let Some(obj) = aug.as_object_mut() {
-            obj.insert("pattern".to_string(), Value::String(dv.to_string()));
-        }
-        render_description(&mapping.description, &aug, short_path)
+    // For TodoWrite-style tools: if no pattern_keys matched, try to extract the
+    // first todo item's "content" field as a display label.
+    let first_todo_content: Option<&str> = if pattern_val.is_none() {
+        input.get("todos")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|t| t.get("content"))
+            .and_then(|c| c.as_str())
     } else {
-        render_description(&mapping.description, input, short_path)
+        None
     };
+
+    // Build the display value injected under the canonical "pattern" key:
+    //   1. Resolved pattern_keys value (e.g. "command", "file_mask")
+    //   2. First todo content (TodoWrite)
+    //   3. file_path_str fallback (e.g. list_dir with no pattern key)
+    let display_val: Option<&str> = pattern_val
+        .or(first_todo_content)
+        .or(file_path_str);
+
+    let description = render_description(
+        &mapping.description,
+        input,
+        display_val.map(|dv| ("pattern", dv)),
+        short_path,
+    );
 
     // Extract target_symbol.
     let target_symbol = mapping
