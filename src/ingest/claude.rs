@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use crate::tracking::ReadDepth;
 use super::AgentToolCall;
-use super::tool_config::{DepthSpec, ToolMappingConfig};
+use super::tool_config::ToolMappingConfig;
 
 /// Derive the Claude Code log directory for a given project path.
 /// Claude stores logs at ~/.claude/projects/<slug>/ where slug is the
@@ -65,15 +65,19 @@ fn find_session_from_files(log_dir: &Path) -> Option<String> {
         .map(|(session_id, _)| session_id)
 }
 
-/// Check if a string looks like a UUID (8-4-4-4-12 hex chars).
+/// Check if a string looks like a UUID (8-4-4-4-12 hex chars, exactly 36 bytes).
+/// Uses direct byte-position checks — no allocation.
 fn is_uuid(s: &str) -> bool {
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 5 {
+    let b = s.as_bytes();
+    if b.len() != 36 {
         return false;
     }
-    let expected_lens = [8, 4, 4, 4, 12];
-    parts.iter().zip(expected_lens.iter()).all(|(part, &len)| {
-        part.len() == len && part.chars().all(|c| c.is_ascii_hexdigit())
+    // Dashes must sit at positions 8, 13, 18, 23.
+    if b[8] != b'-' || b[13] != b'-' || b[18] != b'-' || b[23] != b'-' {
+        return false;
+    }
+    b.iter().enumerate().all(|(i, &c)| {
+        matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit()
     })
 }
 
@@ -312,7 +316,7 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, config: &ToolMapping
 }
 
 /// Render a description template by substituting `{key}`, `{key|short}`, and `{key|cmd}`
-/// placeholders. Uses a manual byte-scan — no regex, allocates exactly one String per call.
+/// placeholders. Uses `str::find` for scanning — correct UTF-8, no per-byte dispatch.
 ///
 /// `display_override`: when `Some((key, value))`, that key resolves to `value` before
 /// falling back to `input.get(key)`. Used to inject the resolved pattern/display value
@@ -320,35 +324,31 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, config: &ToolMapping
 ///
 /// Modifiers:
 /// - `|short` — passes value through `short_path_fn` (last 2 path components)
-/// - `|cmd`   — truncates to first 40 chars, appending "…" if longer
+/// - `|cmd`   — truncates to first 200 chars, appending "…" if longer
 fn render_description(
     template: &str,
     input: &Value,
     display_override: Option<(&str, &str)>,
     short_path_fn: impl Fn(&str) -> String,
 ) -> String {
-    let bytes = template.as_bytes();
     let mut out = String::with_capacity(template.len() + 16);
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'{' {
-            out.push(bytes[i] as char);
-            i += 1;
-            continue;
-        }
-        // Scan for the closing `}`.
-        let start = i + 1;
-        let mut j = start;
-        while j < bytes.len() && bytes[j] != b'}' {
-            j += 1;
-        }
-        if j >= bytes.len() {
-            // Unclosed brace — emit literal `{` and resume.
+    let mut rest = template;
+    loop {
+        let Some(brace) = rest.find('{') else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..brace]);
+        rest = &rest[brace + 1..]; // advance past '{'
+
+        let Some(close) = rest.find('}') else {
+            // Unclosed brace — emit literal '{' then the rest verbatim.
             out.push('{');
-            i += 1;
-            continue;
-        }
-        let inner = &template[start..j]; // content between braces
+            out.push_str(rest);
+            break;
+        };
+        let inner = &rest[..close];
+
         // Split on `|` to detect modifiers.
         let (key, modifier) = if let Some(k) = inner.strip_suffix("|short") {
             (k, "short")
@@ -357,7 +357,8 @@ fn render_description(
         } else {
             (inner, "")
         };
-        // Validate key is a legal identifier: [a-zA-Z_][a-zA-Z0-9_]*
+
+        // Validate key: [a-zA-Z_][a-zA-Z0-9_]*
         let valid = !key.is_empty() && {
             let mut chars = key.chars();
             let first = chars.next().unwrap();
@@ -365,16 +366,18 @@ fn render_description(
                 && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
         };
         if !valid {
-            // Not a valid placeholder — emit literal `{` and resume.
+            // Not a valid placeholder — emit literal '{' and re-scan from `inner`.
+            // (`rest` already points to `inner`, so the loop naturally re-scans it.)
             out.push('{');
-            i += 1;
             continue;
         }
+
         // Resolve value: check override first, then input JSON.
         let value = display_override
             .and_then(|(ok, ov)| if ok == key { Some(ov) } else { None })
             .or_else(|| input.get(key).and_then(|v| v.as_str()))
             .unwrap_or("?");
+
         match modifier {
             "short" => out.push_str(&short_path_fn(value)),
             "cmd" => {
@@ -394,7 +397,7 @@ fn render_description(
             }
             _ => out.push_str(value),
         }
-        i = j + 1; // skip past `}`
+        rest = &rest[close + 1..]; // advance past '}'
     }
     out
 }
@@ -429,19 +432,12 @@ pub fn map_tool_call(
         .iter()
         .find_map(|k| input.get(k).and_then(|v| v.as_str()));
 
-    // Resolve read depth.
-    let depth_spec = mapping.depth.as_ref()
-        .expect("depth must be Some after load/merge — MissingDepth stanzas are dropped");
-    let read_depth = match depth_spec {
-        DepthSpec::Fixed { value } => ReadDepth::from(value.clone()),
-        DepthSpec::Conditional { condition_key, if_true, if_false, default } => {
-            match input.get(condition_key) {
-                Some(Value::Bool(true))  => ReadDepth::from(if_true.clone()),
-                Some(Value::Bool(false)) => ReadDepth::from(if_false.clone()),
-                _                        => ReadDepth::from(default.clone()),
-            }
-        }
-    };
+    // Resolve read depth via centralised DepthSpec logic.
+    let read_depth = mapping
+        .depth
+        .as_ref()
+        .expect("depth must be Some after load/merge — MissingDepth stanzas are dropped")
+        .resolve(input);
 
     // For TodoWrite-style tools: if no pattern_keys matched, try to extract the
     // first todo item's "content" field as a display label.
@@ -496,16 +492,20 @@ pub fn map_tool_call(
     })
 }
 
-/// Shorten a file path for display (last 2 components).
+/// Shorten a file path for display: returns the last 2 path components joined by `/`.
+/// Uses `str::rfind` — no Vec allocation.
 fn short_path(path: &str) -> String {
-    let p = Path::new(path);
-    let components: Vec<_> = p.components().rev().take(2).collect();
-    components
-        .into_iter()
-        .rev()
-        .map(|c| c.as_os_str().to_string_lossy().to_string())
-        .collect::<Vec<_>>()
-        .join("/")
+    let trimmed = path.trim_end_matches('/');
+    let Some(last_sep) = trimmed.rfind('/') else {
+        return trimmed.to_string();
+    };
+    let last = &trimmed[last_sep + 1..];
+    let before = &trimmed[..last_sep];
+    let second = match before.rfind('/') {
+        Some(p) => &before[p + 1..],
+        None    => before,
+    };
+    format!("{second}/{last}")
 }
 
 /// Incrementally tails a set of JSONL log files, tracking read positions.
@@ -555,9 +555,11 @@ impl LogTailer {
             session_cleared: false,
         };
 
-        for file_path in &self.files {
-            let pos = self.positions.get(file_path).copied().unwrap_or(0);
-            let current_len = fs::metadata(file_path)
+        // Index-based loop so we can update `positions` via `get_mut` without
+        // cloning the `PathBuf` key on every iteration.
+        for i in 0..self.files.len() {
+            let pos = self.positions.get(&self.files[i]).copied().unwrap_or(0);
+            let current_len = fs::metadata(&self.files[i])
                 .map(|m| m.len())
                 .unwrap_or(0);
 
@@ -565,13 +567,13 @@ impl LogTailer {
                 continue;
             }
 
-            let default_id = file_path
+            let default_id = self.files[i]
                 .file_stem()
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown")
                 .to_string();
 
-            if let Ok(file) = fs::File::open(file_path) {
+            if let Ok(file) = fs::File::open(&self.files[i]) {
                 use std::io::{Seek, SeekFrom};
                 let mut reader = BufReader::new(file);
                 if reader.seek(SeekFrom::Start(pos)).is_ok() {
@@ -591,7 +593,10 @@ impl LogTailer {
                 }
             }
 
-            self.positions.insert(file_path.clone(), current_len);
+            // Update position in-place — key is already present from `new()` or `add_file()`.
+            if let Some(p) = self.positions.get_mut(&self.files[i]) {
+                *p = current_len;
+            }
         }
 
         output
@@ -1153,5 +1158,54 @@ description  = "UserTool {target}"
         assert_eq!(call.read_depth, ReadDepth::Overview);
         assert_eq!(call.tool_name, "UserTool");
         assert!(call.file_path.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Bash per-command depth dispatch
+    // -----------------------------------------------------------------------
+
+    fn bash_event(command: &str) -> AgentToolCall {
+        let config = ToolMappingConfig::builtin().expect("builtin config");
+        let input = serde_json::json!({ "command": command });
+        map_tool_call(&config, "Bash", &input, "agent", "ts")
+            .expect("Bash must always produce an event")
+    }
+
+    #[test]
+    fn bash_cat_gets_full_body() {
+        assert_eq!(bash_event("cat src/main.rs").read_depth, ReadDepth::FullBody);
+    }
+
+    #[test]
+    fn bash_head_gets_signature() {
+        assert_eq!(bash_event("head -n 20 src/lib.rs").read_depth, ReadDepth::Signature);
+    }
+
+    #[test]
+    fn bash_tail_gets_signature() {
+        assert_eq!(bash_event("tail -n 50 logs/output.log").read_depth, ReadDepth::Signature);
+    }
+
+    #[test]
+    fn bash_grep_gets_overview() {
+        assert_eq!(bash_event("grep 'fn main' src/").read_depth, ReadDepth::Overview);
+    }
+
+    #[test]
+    fn bash_rg_gets_overview() {
+        assert_eq!(bash_event("rg 'ReadDepth' --type rust").read_depth, ReadDepth::Overview);
+    }
+
+    #[test]
+    fn bash_git_gets_unseen() {
+        assert_eq!(bash_event("git status").read_depth, ReadDepth::Unseen);
+        assert_eq!(bash_event("git log --oneline -10").read_depth, ReadDepth::Unseen);
+    }
+
+    #[test]
+    fn bash_unknown_command_gets_name_only() {
+        // Unrecognised commands fall back to the PatternMatch default (NameOnly).
+        assert_eq!(bash_event("cargo build --release").read_depth, ReadDepth::NameOnly);
+        assert_eq!(bash_event("npm install").read_depth, ReadDepth::NameOnly);
     }
 }

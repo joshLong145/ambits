@@ -68,12 +68,79 @@ pub enum DepthSpec {
         if_false: ReadDepthDe,
         default: ReadDepthDe,
     },
+    /// Match the string value of `key` in the tool input against an ordered
+    /// list of patterns. The first matching pattern wins; unmatched falls back
+    /// to `default`. Currently supports `prefix` (starts_with) matching.
+    PatternMatch {
+        /// The input JSON key whose string value is tested (e.g. `"command"`).
+        key: String,
+        /// Ordered list of patterns; first match wins.
+        patterns: Vec<CommandPattern>,
+        /// Depth assigned when no pattern matches (or key is absent).
+        default: ReadDepthDe,
+    },
+}
+
+impl DepthSpec {
+    /// Resolve the read depth for the given tool input JSON.
+    ///
+    /// Centralises the dispatch logic so callers don't duplicate `match` arms.
+    pub fn resolve(&self, input: &serde_json::Value) -> crate::tracking::ReadDepth {
+        use crate::tracking::ReadDepth;
+        match self {
+            DepthSpec::Fixed { value } => ReadDepth::from(*value),
+            DepthSpec::Conditional { condition_key, if_true, if_false, default } => {
+                match input.get(condition_key) {
+                    Some(serde_json::Value::Bool(true))  => ReadDepth::from(*if_true),
+                    Some(serde_json::Value::Bool(false)) => ReadDepth::from(*if_false),
+                    _                                    => ReadDepth::from(*default),
+                }
+            }
+            DepthSpec::PatternMatch { key, patterns, default } => {
+                let cmd = input.get(key).and_then(|v| v.as_str()).unwrap_or("");
+                patterns
+                    .iter()
+                    .find(|p| match p.match_type {
+                        MatchType::Prefix   => cmd.starts_with(p.prefix.as_str()),
+                        MatchType::Contains => cmd.contains(p.prefix.as_str()),
+                        MatchType::Exact    => cmd == p.prefix.as_str(),
+                    })
+                    .map(|p| ReadDepth::from(p.depth))
+                    .unwrap_or_else(|| ReadDepth::from(*default))
+            }
+        }
+    }
+}
+
+/// How the `prefix` field of a [`CommandPattern`] is compared against the input value.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchType {
+    /// `value.starts_with(prefix)` — the default; backward-compatible with existing configs.
+    #[default]
+    Prefix,
+    /// `value.contains(prefix)` — useful for piped or compound commands.
+    Contains,
+    /// `value == prefix` — exact equality.
+    Exact,
+}
+
+/// A single pattern entry in a `PatternMatch` depth spec.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommandPattern {
+    /// The literal to compare against the input value (field name kept for TOML compatibility).
+    pub prefix: String,
+    /// How to compare `prefix` against the input value. Defaults to `Prefix` (starts_with).
+    #[serde(default)]
+    pub match_type: MatchType,
+    pub depth: ReadDepthDe,
 }
 
 /// String-deserializable mirror of `ReadDepth`.
 /// Kept separate so `tracking::ReadDepth` stays free of serde.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 pub enum ReadDepthDe {
+    Unseen,
     NameOnly,
     Overview,
     Signature,
@@ -83,6 +150,7 @@ pub enum ReadDepthDe {
 impl From<ReadDepthDe> for ReadDepth {
     fn from(d: ReadDepthDe) -> Self {
         match d {
+            ReadDepthDe::Unseen    => ReadDepth::Unseen,
             ReadDepthDe::NameOnly  => ReadDepth::NameOnly,
             ReadDepthDe::Overview  => ReadDepth::Overview,
             ReadDepthDe::Signature => ReadDepth::Signature,
@@ -117,6 +185,7 @@ pub enum ConfigWarning {
     EmptyNames             { stanza_index: usize },
     DuplicateName          { name: String, kept_index: usize, dropped_index: usize },
     ConditionalKeyNonBoolean { tool_name: String, key: String },
+    EmptyPatterns          { tool_name: String },
     MissingDepth           { stanza_index: usize },
 }
 
@@ -136,6 +205,9 @@ impl std::fmt::Display for ConfigWarning {
             ConfigWarning::ConditionalKeyNonBoolean { tool_name, key } =>
                 write!(f, "tool '{}': conditional depth key '{}' is not boolean; using default",
                     tool_name, key),
+            ConfigWarning::EmptyPatterns { tool_name } =>
+                write!(f, "tool '{}': pattern_match depth has an empty 'patterns' list; will always use default",
+                    tool_name),
             ConfigWarning::MissingDepth { stanza_index } =>
                 write!(f, "tool config stanza {} has no 'depth' and no 'extends'; skipping",
                     stanza_index),
@@ -600,9 +672,6 @@ extends      = "mcp__serena__find_symbol"
         assert!(matches!(mapping.depth, Some(DepthSpec::Conditional { .. })));
     }
 
-    // -----------------------------------------------------------------------
-    // 9. conditional_depth_with_body_true
-    // -----------------------------------------------------------------------
     #[test]
     fn conditional_depth_with_body_true() {
         let spec = DepthSpec::Conditional {
@@ -612,22 +681,9 @@ extends      = "mcp__serena__find_symbol"
             default: ReadDepthDe::Signature,
         };
         let input = serde_json::json!({ "include_body": true });
-        let depth = match &spec {
-            DepthSpec::Conditional { condition_key, if_true, if_false, default } => {
-                match input.get(condition_key) {
-                    Some(serde_json::Value::Bool(true))  => ReadDepth::from(if_true.clone()),
-                    Some(serde_json::Value::Bool(false)) => ReadDepth::from(if_false.clone()),
-                    _                                    => ReadDepth::from(default.clone()),
-                }
-            }
-            DepthSpec::Fixed { value } => ReadDepth::from(value.clone()),
-        };
-        assert_eq!(depth, ReadDepth::FullBody);
+        assert_eq!(spec.resolve(&input), ReadDepth::FullBody);
     }
 
-    // -----------------------------------------------------------------------
-    // 10. conditional_depth_with_body_false
-    // -----------------------------------------------------------------------
     #[test]
     fn conditional_depth_with_body_false() {
         let spec = DepthSpec::Conditional {
@@ -637,22 +693,9 @@ extends      = "mcp__serena__find_symbol"
             default: ReadDepthDe::Signature,
         };
         let input = serde_json::json!({ "include_body": false });
-        let depth = match &spec {
-            DepthSpec::Conditional { condition_key, if_true, if_false, default } => {
-                match input.get(condition_key) {
-                    Some(serde_json::Value::Bool(true))  => ReadDepth::from(if_true.clone()),
-                    Some(serde_json::Value::Bool(false)) => ReadDepth::from(if_false.clone()),
-                    _                                    => ReadDepth::from(default.clone()),
-                }
-            }
-            DepthSpec::Fixed { value } => ReadDepth::from(value.clone()),
-        };
-        assert_eq!(depth, ReadDepth::Signature);
+        assert_eq!(spec.resolve(&input), ReadDepth::Signature);
     }
 
-    // -----------------------------------------------------------------------
-    // 11. conditional_depth_absent_key
-    // -----------------------------------------------------------------------
     #[test]
     fn conditional_depth_absent_key() {
         let spec = DepthSpec::Conditional {
@@ -662,17 +705,7 @@ extends      = "mcp__serena__find_symbol"
             default: ReadDepthDe::Signature,
         };
         let input = serde_json::json!({ "name_path_pattern": "Foo" }); // no include_body
-        let depth = match &spec {
-            DepthSpec::Conditional { condition_key, if_true, if_false, default } => {
-                match input.get(condition_key) {
-                    Some(serde_json::Value::Bool(true))  => ReadDepth::from(if_true.clone()),
-                    Some(serde_json::Value::Bool(false)) => ReadDepth::from(if_false.clone()),
-                    _                                    => ReadDepth::from(default.clone()),
-                }
-            }
-            DepthSpec::Fixed { value } => ReadDepth::from(value.clone()),
-        };
-        assert_eq!(depth, ReadDepth::Signature);
+        assert_eq!(spec.resolve(&input), ReadDepth::Signature);
     }
 
     // -----------------------------------------------------------------------
@@ -835,6 +868,98 @@ description  = "empty names"
         let mapping = &cfg.tools[idx];
         assert!(mapping.pattern_keys.contains(&"pattern".to_string()));
         assert!(mapping.pattern_keys.contains(&"substring_pattern".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // 23. bash_tool_has_pattern_match_depth
+    // -----------------------------------------------------------------------
+    #[test]
+    fn bash_tool_has_pattern_match_depth() {
+        let cfg = ToolMappingConfig::builtin().unwrap();
+        let idx = *cfg.index.get("Bash").unwrap();
+        assert!(
+            matches!(cfg.tools[idx].depth, Some(DepthSpec::PatternMatch { .. })),
+            "Bash must use pattern_match depth"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 24. command_pattern_default_match_type_is_prefix
+    // -----------------------------------------------------------------------
+    #[test]
+    fn command_pattern_default_match_type_is_prefix() {
+        // Omitting match_type must deserialize as Prefix (backward compat).
+        let toml = r#"
+version = 1
+[[tool]]
+names         = ["T"]
+path_keys     = []
+path_required = false
+pattern_keys  = ["command"]
+depth         = { type = "pattern_match", key = "command", default = "NameOnly", patterns = [
+    { prefix = "cat ", depth = "FullBody" },
+] }
+description = "T {pattern}"
+"#;
+        let cfg: ToolMappingConfig = toml::from_str(toml).unwrap();
+        let mapping = cfg.tools.first().unwrap();
+        let patterns = match mapping.depth.as_ref().unwrap() {
+            DepthSpec::PatternMatch { patterns, .. } => patterns,
+            _ => panic!("expected PatternMatch"),
+        };
+        assert!(matches!(patterns[0].match_type, MatchType::Prefix));
+    }
+
+    // -----------------------------------------------------------------------
+    // 25. command_pattern_contains_match_type_deserializes
+    // -----------------------------------------------------------------------
+    #[test]
+    fn command_pattern_contains_match_type_deserializes() {
+        let toml = r#"
+version = 1
+[[tool]]
+names         = ["T"]
+path_keys     = []
+path_required = false
+pattern_keys  = ["command"]
+depth         = { type = "pattern_match", key = "command", default = "NameOnly", patterns = [
+    { prefix = "| grep", match_type = "contains", depth = "Overview" },
+] }
+description = "T {pattern}"
+"#;
+        let cfg: ToolMappingConfig = toml::from_str(toml).unwrap();
+        let mapping = cfg.tools.first().unwrap();
+        let patterns = match mapping.depth.as_ref().unwrap() {
+            DepthSpec::PatternMatch { patterns, .. } => patterns,
+            _ => panic!("expected PatternMatch"),
+        };
+        assert!(matches!(patterns[0].match_type, MatchType::Contains));
+    }
+
+    // -----------------------------------------------------------------------
+    // 26. command_pattern_exact_match_type_deserializes
+    // -----------------------------------------------------------------------
+    #[test]
+    fn command_pattern_exact_match_type_deserializes() {
+        let toml = r#"
+version = 1
+[[tool]]
+names         = ["T"]
+path_keys     = []
+path_required = false
+pattern_keys  = ["command"]
+depth         = { type = "pattern_match", key = "command", default = "NameOnly", patterns = [
+    { prefix = "cargo test", match_type = "exact", depth = "NameOnly" },
+] }
+description = "T {pattern}"
+"#;
+        let cfg: ToolMappingConfig = toml::from_str(toml).unwrap();
+        let mapping = cfg.tools.first().unwrap();
+        let patterns = match mapping.depth.as_ref().unwrap() {
+            DepthSpec::PatternMatch { patterns, .. } => patterns,
+            _ => panic!("expected PatternMatch"),
+        };
+        assert!(matches!(patterns[0].match_type, MatchType::Exact));
     }
 
     // -----------------------------------------------------------------------

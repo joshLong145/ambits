@@ -113,7 +113,19 @@ names         = ["Bash"]
 path_keys     = []
 path_required = false
 pattern_keys  = ["command", "description"]
-depth         = { type = "fixed", value = "NameOnly" }
+depth         = { type = "pattern_match", key = "command", default = "NameOnly", patterns = [
+    { prefix = "cat ",  depth = "FullBody" },
+    { prefix = "bat ",  depth = "FullBody" },
+    { prefix = "less ", depth = "FullBody" },
+    { prefix = "more ", depth = "FullBody" },
+    { prefix = "head ", depth = "Signature" },
+    { prefix = "tail ", depth = "Signature" },
+    { prefix = "grep ", depth = "Overview" },
+    { prefix = "rg ",   depth = "Overview" },
+    { prefix = "awk ",  depth = "Overview" },
+    { prefix = "sed ",  depth = "Overview" },
+    { prefix = "git ",  depth = "Unseen" },
+] }
 description   = "Bash {pattern|cmd}"
 
 [[tool]]
