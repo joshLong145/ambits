@@ -22,7 +22,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
     // Filter events by agent when a filter is active.
     let filtered: Vec<&crate::ingest::AgentToolCall> = match app.agent_filter.as_deref() {
-        Some(agent_id) => app.activity.iter().filter(|e| e.agent_id == agent_id).collect(),
+        Some(agent_id) => app.activity.iter().filter(|e| &*e.agent_id == agent_id).collect(),
         None => app.activity.iter().collect(),
     };
 

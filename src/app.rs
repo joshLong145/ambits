@@ -495,8 +495,8 @@ impl App {
     /// Process an agent tool call event and update the ledger.
     pub fn process_agent_event(&mut self, event: AgentToolCall) {
         // Track unique agents.
-        if !self.agents_seen.contains(&event.agent_id) {
-            self.agents_seen.push(event.agent_id.clone());
+        if !self.agents_seen.iter().any(|a| a.as_str() == &*event.agent_id) {
+            self.agents_seen.push(event.agent_id.to_string());
 
             // Register in the agent hierarchy tree.
             // Subagent filenames start with "agent-"; their parent is the root session.
@@ -506,10 +506,10 @@ impl App {
                 None
             };
             self.agent_tree.add_agent(AgentNode {
-                id: event.agent_id.clone(),
+                id: event.agent_id.to_string(),
                 parent_id,
                 session_file: PathBuf::new(),
-                label: event.label.clone(),
+                label: event.label.to_string(),
             });
         }
 
@@ -627,7 +627,7 @@ pub fn mark_file_symbols(
             sym.id.clone(),
             event.read_depth,
             sym.content_hash,
-            event.agent_id.clone(),
+            event.agent_id.to_string(),
             sym.estimated_tokens,
         );
         mark_file_symbols(&sym.children, event, ledger);
@@ -647,7 +647,7 @@ pub fn mark_targeted_symbols(
                 sym.id.clone(),
                 event.read_depth,
                 sym.content_hash,
-                event.agent_id.clone(),
+                event.agent_id.to_string(),
                 sym.estimated_tokens,
             );
             // If we matched a parent (e.g. an impl block), also mark children
@@ -1090,15 +1090,15 @@ mod tests {
 
         // Populate session state via a fake event.
         let event = AgentToolCall {
-            agent_id: "agent-abc".to_string(),
-            tool_name: "Read".to_string(),
+            agent_id: "agent-abc".into(),
+            tool_name: "Read".into(),
             file_path: None,
             read_depth: ReadDepth::FullBody,
             description: "Read something".to_string(),
             timestamp_str: "2026-01-01T00:00:00Z".to_string(),
             target_symbol: None,
             target_lines: None,
-            label: "agent-abc".to_string(),
+            label: "agent-abc".into(),
         };
         app.process_agent_event(event);
 

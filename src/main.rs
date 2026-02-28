@@ -480,8 +480,8 @@ fn run_coverage_report(
         for log_file in &log_files {
             let events = ingest::claude::parse_log_file(log_file, tool_config);
             for event in events {
-                if !known_agents.contains(&event.agent_id) {
-                    known_agents.push(event.agent_id.clone());
+                if !known_agents.iter().any(|a: &String| a.as_str() == &*event.agent_id) {
+                    known_agents.push(event.agent_id.to_string());
                 }
                 if let Some(ref file_path) = event.file_path {
                     // Normalize the tool call path

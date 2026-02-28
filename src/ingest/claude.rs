@@ -226,8 +226,8 @@ pub fn parse_log_file(path: &Path, config: &ToolMappingConfig) -> Vec<AgentToolC
         .unwrap_or("unknown")
         .to_string();
 
-    // Extract a human-readable label for this agent.
-    let label = extract_agent_label(path);
+    // Extract a human-readable label for this agent (Arc so each clone is free).
+    let label: Arc<str> = extract_agent_label(path).into();
 
     for line in reader.lines().map_while(Result::ok) {
         if let ParsedLine::Events(mut line_events) = parse_jsonl_line(&line, &default_id, config) {
@@ -266,12 +266,13 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, config: &ToolMapping
         return ParsedLine::Ignored;
     }
 
-    let agent_id = obj
-        .get("agentId")
-        .or_else(|| obj.get("sessionId"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(default_agent_id)
-        .to_string();
+    // Intern agent_id once per line so per-event clones are free.
+    let agent_id: Arc<str> = Arc::from(
+        obj.get("agentId")
+            .or_else(|| obj.get("sessionId"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(default_agent_id),
+    );
 
     let timestamp_str = obj
         .get("timestamp")
@@ -300,7 +301,7 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, config: &ToolMapping
         let event = map_tool_call(config, tool_name, &input, &agent_id, &timestamp_str)
             .unwrap_or_else(|| AgentToolCall {
                 agent_id: agent_id.clone(),
-                tool_name: tool_name.to_string(),
+                tool_name: Arc::from(tool_name),
                 file_path: None,
                 read_depth: ReadDepth::Unseen,
                 description: format!("{tool_name} (untracked)"),
@@ -479,16 +480,19 @@ pub fn map_tool_call(
         Some(offset..offset + limit)
     });
 
+    // Intern agent_id once and share between agent_id and label fields.
+    let agent_arc: Arc<str> = Arc::from(agent_id);
+
     Some(AgentToolCall {
-        agent_id: agent_id.to_string(),
-        tool_name: tool_name.to_string(),
+        agent_id: agent_arc.clone(),
+        tool_name: Arc::from(tool_name),
         file_path,
         read_depth,
         description,
         timestamp_str: timestamp_str.to_string(),
         target_symbol,
         target_lines,
-        label: agent_id.to_string(),
+        label: agent_arc,
     })
 }
 
@@ -988,7 +992,7 @@ mod tests {
         let config = ToolMappingConfig::builtin().unwrap();
         let events = parse_log_file(&log, &config);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].label, "Check the coverage");
+        assert_eq!(&*events[0].label, "Check the coverage");
     }
 
     #[test]
@@ -997,7 +1001,7 @@ mod tests {
         let line = r#"{"type":"assistant","agentId":"a9fe23c","sessionId":"7842313b-63c5-49db-97d1-c78ba563278e","message":{"role":"assistant","content":[{"type":"tool_use","name":"mcp__acp__Read","input":{"file_path":"/foo/bar.rs"}}]}}"#;
         let events = parse_events(line, "fallback");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].agent_id, "a9fe23c");
+        assert_eq!(&*events[0].agent_id, "a9fe23c");
     }
 
     #[test]
@@ -1006,7 +1010,7 @@ mod tests {
         let line = r#"{"type":"assistant","sessionId":"7842313b","message":{"role":"assistant","content":[{"type":"tool_use","name":"mcp__acp__Read","input":{"file_path":"/foo/bar.rs"}}]}}"#;
         let events = parse_events(line, "fallback");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].agent_id, "7842313b");
+        assert_eq!(&*events[0].agent_id, "7842313b");
     }
 
     #[test]
@@ -1015,7 +1019,7 @@ mod tests {
         let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"mcp__acp__Read","input":{"file_path":"/foo/bar.rs"}}]}}"#;
         let events = parse_events(line, "my-default");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].agent_id, "my-default");
+        assert_eq!(&*events[0].agent_id, "my-default");
     }
 
     // --- /clear detection tests ---
@@ -1156,7 +1160,7 @@ description  = "UserTool {target}"
         assert!(result.is_some());
         let call = result.unwrap();
         assert_eq!(call.read_depth, ReadDepth::Overview);
-        assert_eq!(call.tool_name, "UserTool");
+        assert_eq!(&*call.tool_name, "UserTool");
         assert!(call.file_path.is_some());
     }
 

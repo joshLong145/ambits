@@ -65,15 +65,15 @@ pub fn project(files: Vec<FileSymbols>) -> ProjectTree {
 /// Create a basic AgentToolCall.
 pub fn tool_call(tool: &str, path: &str, depth: ReadDepth) -> AgentToolCall {
     AgentToolCall {
-        agent_id: "agent-1".to_string(),
-        tool_name: tool.to_string(),
+        agent_id: "agent-1".into(),
+        tool_name: tool.into(),
         file_path: Some(PathBuf::from(path)),
         read_depth: depth,
         description: format!("{tool} {path}"),
         timestamp_str: "2025-01-01T00:00:00Z".to_string(),
         target_symbol: None,
         target_lines: None,
-        label: "agent-1".to_string(),
+        label: "agent-1".into(),
     }
 }
 

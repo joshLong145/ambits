@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::sync::Arc;
 pub mod claude;
 pub mod tool_config;
 
@@ -9,8 +10,8 @@ use crate::tracking::ReadDepth;
 /// A parsed agent tool call event.
 #[derive(Debug, Clone)]
 pub struct AgentToolCall {
-    pub agent_id: String,
-    pub tool_name: String,
+    pub agent_id: Arc<str>,
+    pub tool_name: Arc<str>,
     pub file_path: Option<PathBuf>,
     pub read_depth: ReadDepth,
     pub description: String,
@@ -21,7 +22,7 @@ pub struct AgentToolCall {
     pub target_lines: Option<Range<usize>>,
     /// Human-readable label for the agent (e.g. "Explore parser and symbol types").
     /// Falls back to agent_id if no label could be extracted from the session log.
-    pub label: String,
+    pub label: Arc<str>,
 }
 
 /// Trait for agent event sources.
