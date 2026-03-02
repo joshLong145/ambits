@@ -33,7 +33,7 @@ pub enum FileCoverageStatus {
 pub struct TreeRow {
     pub symbol_id: String,
     pub display_name: String,
-    pub label: String,        // Language-specific label (e.g., "class", "def", "fn")
+    pub label: &'static str,  // Language-specific label (e.g., "class", "def", "fn")
     pub depth: usize,         // nesting depth for indentation
     pub is_file: bool,        // true for file headers
     pub is_expanded: bool,
@@ -189,7 +189,7 @@ impl App {
             rows.push(TreeRow {
                 symbol_id: file_id.clone(),
                 display_name: file_path.clone(),
-                label: String::new(),
+                label: "",
                 depth: 0,
                 is_file: true,
                 is_expanded,
@@ -584,7 +584,7 @@ fn flatten_symbol(
     rows.push(TreeRow {
         symbol_id: sym.id.clone(),
         display_name: sym.name.clone(),
-        label: sym.label.clone(),
+        label: sym.label,
         depth,
         is_file: false,
         is_expanded,

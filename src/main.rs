@@ -1,14 +1,12 @@
 // Shared modules live in the library crate (src/lib.rs).
-use ambits::app;
 use ambits::coverage;
 use ambits::ingest;
-use ambits::symbols;
-use ambits::tracking;
 
 // Binary-only modules.
 mod events;
 mod serena;
 mod skill;
+mod tui;
 mod ui;
 
 use std::fs;
@@ -24,7 +22,6 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use notify::{Event as NotifyEvent, EventKind, RecursiveMode, Watcher};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
@@ -34,7 +31,6 @@ use ambits::app::App;
 use ambits::ingest::tool_config::ToolMappingConfig;
 use events::AppEvent;
 use ambits::parser::ParserRegistry;
-use ambits::symbols::ProjectTree;
 
 #[derive(ClapParser, Debug)]
 #[command(name = "ambits", about = "Visualize LLM agent context coverage")]
@@ -129,14 +125,14 @@ fn main() -> Result<()> {
     let project_tree = if cli.serena {
         serena::scan_project_serena(&project_path)?
     } else {
-        scan_project(&project_path, &registry)?
+        registry.scan_project(&project_path)?
     };
 
     if cli.dump {
         for w in &config_warnings {
             println!("[ambit warning] {w}");
         }
-        dump_tree(&project_path, &project_tree);
+        coverage::dump_tree(&project_path, &project_tree);
         return Ok(());
     }
 
@@ -144,7 +140,7 @@ fn main() -> Result<()> {
         for w in &config_warnings {
             println!("[ambit warning] {w}");
         }
-        return run_coverage_report(&project_path, &project_tree, &cli.log_dir, &cli.session, &cli.agent, &tool_config);
+        return coverage::run_report(&project_path, &project_tree, &cli.log_dir, &cli.session, &cli.agent, &tool_config);
     }
 
     // Resolve log directory and session.
@@ -218,75 +214,20 @@ fn run_tui(
     serena_mode: bool,
     tool_config: &Arc<ToolMappingConfig>,
 ) -> Result<()> {
-    let mut current_session_id = session_id;
-    // Record when the TUI started so we can ignore session files that already
-    // existed at launch — we only switch to sessions created after this point.
-    let started_at = std::time::SystemTime::now();
     let (tx, rx) = flume::bounded::<AppEvent>(512);
 
-    // Spawn key reader thread.
     events::spawn_key_reader(tx.clone());
-
-    // Spawn tick timer (250ms).
     events::spawn_tick_timer(tx.clone(), Duration::from_millis(250));
 
-    // Set up file watcher for project source changes.
-    let tx_file = tx.clone();
-    let watched_extensions = registry.supported_extensions();
-    let mut _project_watcher = notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
-        if let Ok(event) = res {
-            if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
-                for path in event.paths {
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        if watched_extensions.contains(ext) {
-                            let _ = tx_file.try_send(AppEvent::FileChanged(path));
-                        }
-                    }
-                }
-            }
-        }
-    })?;
-    _project_watcher.watch(project_path, RecursiveMode::Recursive)?;
-
-    // Set up log file tailer.
-    let mut log_tailer = if let (Some(ref ld), Some(ref sid)) = (log_dir, &current_session_id) {
-        let files = ingest::claude::session_log_files(ld, sid);
-        Some(ingest::claude::LogTailer::new(files, Arc::clone(tool_config)))
-    } else {
-        None
-    };
-
-    // Set up file watcher for log directory (to detect new agent files).
-    let tx_log = tx.clone();
-    let mut _log_watcher = if let Some(ref ld) = log_dir {
-        let ld_clone = ld.clone();
-        let mut watcher = notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
-            if let Ok(event) = res {
-                if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
-                    for path in event.paths {
-                        if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                            // Signal that log files changed — we'll poll in the tick handler.
-                            let _ = tx_log.try_send(AppEvent::Tick);
-                        }
-                    }
-                }
-            }
-        })?;
-        watcher.watch(&ld_clone, RecursiveMode::NonRecursive)?;
-        Some(watcher)
-    } else {
-        None
-    };
-
-    // Track Serena .pkl file modification times for live cache rebuilds.
-    let mut pkl_mtimes: Vec<(PathBuf, std::time::SystemTime)> = if serena_mode {
-        serena::find_serena_caches(project_path)
-            .into_iter()
-            .filter_map(|p| fs::metadata(&p).ok()?.modified().ok().map(|t| (p, t)))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let mut session = tui::TuiSession::new(
+        project_path,
+        log_dir,
+        session_id,
+        registry.supported_extensions(),
+        tool_config,
+        serena_mode,
+        &tx,
+    )?;
 
     loop {
         terminal.draw(|f| ui::render(f, app))?;
@@ -295,108 +236,12 @@ fn run_tui(
             Ok(AppEvent::Key(key)) => app.handle_key(key),
             Ok(AppEvent::Mouse(mouse)) => app.handle_mouse(mouse),
             Ok(AppEvent::FileChanged(path)) => {
-                // Re-parse the changed file and update the project tree.
-                if let Ok(rel) = path.strip_prefix(project_path) {
-                    if let Some(parser) = registry.parser_for(&path) {
-                        if let Ok(source) = fs::read_to_string(&path) {
-                            if let Ok(new_file) = parser.parse_file(rel, &source) {
-                                // Replace the file in the project tree.
-                                let rel_str = rel.to_string_lossy().to_string();
-                                if let Some(existing) = app.project_tree.files.iter_mut().find(|f| {
-                                    f.file_path.to_string_lossy() == rel_str
-                                }) {
-                                    // Mark symbols as stale if their hashes changed.
-                                    mark_stale_symbols(&existing.symbols, &new_file.symbols, &mut app.ledger);
-                                    *existing = new_file;
-                                } else {
-                                    app.project_tree.files.push(new_file);
-                                    app.project_tree.files.sort_by(|a, b| a.file_path.cmp(&b.file_path));
-                                }
-                                app.rebuild_tree_rows();
-                            }
-                        }
-                    }
-                }
+                tui::TuiSession::handle_file_changed(path, project_path, registry, app);
             }
-            Ok(AppEvent::AgentEvent(event)) => {
-                app.process_agent_event(event);
-            }
-            Ok(AppEvent::SessionCleared) => {
-                app.reset_session();
-            }
+            Ok(AppEvent::AgentEvent(event)) => app.process_agent_event(event),
+            Ok(AppEvent::SessionCleared) => app.reset_session(),
             Ok(AppEvent::Tick) => {
-                // Check if Claude Code has started a new session (e.g. after /clear).
-                if let Some(ref ld) = log_dir {
-                    if let Some(latest) = ingest::claude::find_latest_session(ld) {
-                        let is_new_session = current_session_id.as_deref() != Some(latest.as_str());
-                        let created_after_start = ld
-                            .join(format!("{latest}.jsonl"))
-                            .metadata()
-                            .and_then(|m| m.modified())
-                            .map(|mtime| mtime > started_at)
-                            .unwrap_or(false);
-                        if is_new_session && created_after_start {
-                            // New session detected — reset app state and switch tailer.
-                            app.reset_session();
-                            current_session_id = Some(latest.clone());
-                            app.session_id = current_session_id.clone();
-
-                            // Pre-populate from lines already written before this tick.
-                            let new_files = ingest::claude::session_log_files(ld, &latest);
-                            for log_file in &new_files {
-                                for event in ingest::claude::parse_log_file(log_file, tool_config) {
-                                    app.process_agent_event(event);
-                                }
-                            }
-
-                            // Replace the tailer — clone the existing Arc (no re-resolve).
-                            log_tailer = Some(ingest::claude::LogTailer::new(new_files, Arc::clone(tool_config)));
-                        }
-                    }
-                }
-
-                // Poll log tailer for new events.
-                if let Some(ref mut tailer) = log_tailer {
-                    // Check for new agent files in the log directory.
-                    if let (Some(ref ld), Some(ref sid)) = (log_dir, &current_session_id) {
-                        let current_files = ingest::claude::session_log_files(ld, sid);
-                        for f in current_files {
-                            tailer.add_file(f);
-                        }
-                    }
-
-                    let output = tailer.read_new_events();
-                    for event in output.events {
-                        app.process_agent_event(event);
-                    }
-                }
-
-                // Check if Serena cache files changed.
-                if serena_mode {
-                    let mut changed = false;
-                    for (path, mtime) in pkl_mtimes.iter_mut() {
-                        if let Ok(new_mtime) = fs::metadata(&*path).and_then(|m| m.modified()) {
-                            if new_mtime != *mtime {
-                                *mtime = new_mtime;
-                                changed = true;
-                            }
-                        }
-                    }
-                    if changed {
-                        if let Ok(new_tree) = serena::scan_project_serena(project_path) {
-                            // Collect old hashes, then check staleness against new tree.
-                            let mut old_map = std::collections::HashMap::new();
-                            for file in &app.project_tree.files {
-                                collect_symbol_hashes(&file.symbols, &mut old_map);
-                            }
-                            app.project_tree = new_tree;
-                            for file in &app.project_tree.files {
-                                check_staleness(&file.symbols, &old_map, &mut app.ledger);
-                            }
-                            app.rebuild_tree_rows();
-                        }
-                    }
-                }
+                session.handle_tick(log_dir, app, tool_config, serena_mode, project_path);
             }
             Err(flume::RecvTimeoutError::Timeout) => {}
             Err(flume::RecvTimeoutError::Disconnected) => break,
@@ -410,202 +255,3 @@ fn run_tui(
     Ok(())
 }
 
-/// Compare old and new symbols and mark changed ones as stale in the ledger.
-fn mark_stale_symbols(
-    old_symbols: &[symbols::SymbolNode],
-    new_symbols: &[symbols::SymbolNode],
-    ledger: &mut tracking::ContextLedger,
-) {
-    // Build a map of old symbol IDs to their hashes.
-    let mut old_map = std::collections::HashMap::new();
-    collect_symbol_hashes(old_symbols, &mut old_map);
-
-    // Check new symbols against old hashes.
-    check_staleness(new_symbols, &old_map, ledger);
-}
-
-fn collect_symbol_hashes(
-    symbols: &[symbols::SymbolNode],
-    map: &mut std::collections::HashMap<String, [u8; 32]>,
-) {
-    for sym in symbols {
-        map.insert(sym.id.clone(), sym.content_hash);
-        collect_symbol_hashes(&sym.children, map);
-    }
-}
-
-fn check_staleness(
-    symbols: &[symbols::SymbolNode],
-    old_map: &std::collections::HashMap<String, [u8; 32]>,
-    ledger: &mut tracking::ContextLedger,
-) {
-    for sym in symbols {
-        if let Some(old_hash) = old_map.get(&sym.id) {
-            if *old_hash != sym.content_hash {
-                ledger.mark_stale_if_changed(&sym.id, sym.content_hash);
-            }
-        }
-        check_staleness(&sym.children, old_map, ledger);
-    }
-}
-
-fn run_coverage_report(
-    project_path: &Path,
-    project_tree: &ProjectTree,
-    log_dir_opt: &Option<PathBuf>,
-    session_opt: &Option<String>,
-    agent_opt: &Option<String>,
-    tool_config: &ToolMappingConfig,
-) -> Result<()> {
-    use coverage::{CoverageFormatter, CoverageReport, TextFormatter};
-    use tracking::ContextLedger;
-
-    // 1. Resolve log directory
-    let log_dir = log_dir_opt
-        .clone()
-        .or_else(|| ingest::claude::log_dir_for_project(project_path));
-
-    // 2. Find session (auto-detect if not provided)
-    let session_id = session_opt.clone().or_else(|| {
-        log_dir
-            .as_ref()
-            .and_then(|d| ingest::claude::find_latest_session(d))
-    });
-
-    // 3. Build ledger from session logs
-    let mut ledger = ContextLedger::new();
-    let mut known_agents: Vec<String> = Vec::new();
-    if let (Some(ref log_dir), Some(ref sid)) = (&log_dir, &session_id) {
-        let log_files = ingest::claude::session_log_files(log_dir, sid);
-        for log_file in &log_files {
-            let events = ingest::claude::parse_log_file(log_file, tool_config);
-            for event in events {
-                if !known_agents.iter().any(|a: &String| a.as_str() == &*event.agent_id) {
-                    known_agents.push(event.agent_id.to_string());
-                }
-                if let Some(ref file_path) = event.file_path {
-                    // Normalize the tool call path
-                    let tool_rel = app::normalize_tool_path(file_path, project_path);
-
-                    for file in &project_tree.files {
-                        if file.file_path == tool_rel {
-                            if event.target_symbol.is_some() || event.target_lines.is_some() {
-                                app::mark_targeted_symbols(&file.symbols, &event, &mut ledger);
-                            } else {
-                                app::mark_file_symbols(&file.symbols, &event, &mut ledger);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 4. Resolve agent filter (supports prefix matching)
-    let resolved_agent = agent_opt.as_ref().map(|prefix| {
-        let matches: Vec<&String> = known_agents
-            .iter()
-            .filter(|id| id.starts_with(prefix.as_str()))
-            .collect();
-        match matches.len() {
-            1 => matches[0].clone(),
-            0 => {
-                eprintln!("Warning: no agent matching prefix '{}'", prefix);
-                prefix.clone()
-            }
-            _ => {
-                eprintln!(
-                    "Warning: multiple agents match prefix '{}': {:?}",
-                    prefix,
-                    matches.iter().take(5).collect::<Vec<_>>()
-                );
-                matches[0].clone()
-            }
-        }
-    });
-
-    // 5. Generate report
-    let mut report =
-        CoverageReport::from_project(project_tree, &ledger, resolved_agent.as_deref());
-    report.session_id = session_id;
-
-    // 6. Format and print
-    let formatter = TextFormatter::default();
-    print!("{}", formatter.format(&report));
-
-    Ok(())
-}
-
-fn dump_tree(root: &Path, project_tree: &ProjectTree) {
-    println!(
-        "Project: {} ({} files, {} symbols)",
-        root.display(),
-        project_tree.total_files(),
-        project_tree.total_symbols(),
-    );
-    println!();
-
-    for file in &project_tree.files {
-        println!("  {} ({} lines)", file.file_path.display(), file.total_lines);
-        for sym in &file.symbols {
-            print_symbol(sym, 4);
-        }
-    }
-}
-
-fn print_symbol(sym: &symbols::SymbolNode, indent: usize) {
-    let pad = " ".repeat(indent);
-    println!(
-        "{}{} {} [L{}-{}] (~{} tokens)",
-        pad,
-        sym.label,
-        sym.name,
-        sym.line_range.start,
-        sym.line_range.end,
-        sym.estimated_tokens,
-    );
-    for child in &sym.children {
-        print_symbol(child, indent + 2);
-    }
-}
-
-fn scan_project(root: &Path, registry: &ParserRegistry) -> Result<ProjectTree> {
-    use ignore::WalkBuilder;
-
-    let mut files = Vec::new();
-
-    // Ignore dot files and files in .gitignore
-    for result in WalkBuilder::new(root)
-        .hidden(true)
-        .git_ignore(true)
-        .build()
-    {
-        let entry = match result {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        let path = entry.path();
-        if path.is_dir() {
-            continue;
-        }
-
-        if let Some(parser) = registry.parser_for(path) {
-            let source = fs::read_to_string(path)?;
-            let rel_path = path.strip_prefix(root).unwrap_or(path);
-            match parser.parse_file(rel_path, &source) {
-                Ok(file_symbols) => files.push(file_symbols),
-                Err(e) => {
-                    eprintln!("Warning: failed to parse {}: {}", path.display(), e);
-                }
-            }
-        }
-    }
-
-    files.sort_by(|a, b| a.file_path.cmp(&b.file_path));
-
-    Ok(ProjectTree {
-        root: root.to_path_buf(),
-        files,
-    })
-}

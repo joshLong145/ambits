@@ -45,7 +45,7 @@ pub struct SymbolNode {
     pub id: SymbolId,
     pub name: String,
     pub category: SymbolCategory,
-    pub label: String, // Language-specific label (e.g., "class", "struct", "def")
+    pub label: &'static str, // Language-specific label (e.g., "class", "struct", "def")
     pub file_path: PathBuf,
     pub byte_range: Range<usize>,
     pub line_range: Range<usize>,

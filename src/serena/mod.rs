@@ -249,25 +249,25 @@ fn estimate_total_lines(symbols: &[SymbolNode]) -> usize {
         .unwrap_or(0)
 }
 
-fn lsp_kind_to_category_and_label(kind: i64) -> (SymbolCategory, String) {
+fn lsp_kind_to_category_and_label(kind: i64) -> (SymbolCategory, &'static str) {
     match kind {
-        2 => (SymbolCategory::Module, "module".to_string()),
-        3 => (SymbolCategory::Module, "namespace".to_string()),
-        5 => (SymbolCategory::Type, "class".to_string()),
-        6 => (SymbolCategory::Function, "method".to_string()),
-        7 => (SymbolCategory::Variable, "property".to_string()),
-        8 => (SymbolCategory::Variable, "field".to_string()),
-        9 => (SymbolCategory::Function, "constructor".to_string()),
-        10 => (SymbolCategory::Type, "enum".to_string()),
-        11 => (SymbolCategory::Type, "interface".to_string()),
-        12 => (SymbolCategory::Function, "function".to_string()),
-        13 => (SymbolCategory::Variable, "variable".to_string()),
-        14 => (SymbolCategory::Variable, "constant".to_string()),
-        19 => (SymbolCategory::Implementation, "impl".to_string()),
-        22 => (SymbolCategory::Variable, "enum_member".to_string()),
-        23 => (SymbolCategory::Type, "struct".to_string()),
-        26 => (SymbolCategory::Type, "type_param".to_string()),
-        _ => (SymbolCategory::Unknown, "unknown".to_string()),
+        2 => (SymbolCategory::Module, "module"),
+        3 => (SymbolCategory::Module, "namespace"),
+        5 => (SymbolCategory::Type, "class"),
+        6 => (SymbolCategory::Function, "method"),
+        7 => (SymbolCategory::Variable, "property"),
+        8 => (SymbolCategory::Variable, "field"),
+        9 => (SymbolCategory::Function, "constructor"),
+        10 => (SymbolCategory::Type, "enum"),
+        11 => (SymbolCategory::Type, "interface"),
+        12 => (SymbolCategory::Function, "function"),
+        13 => (SymbolCategory::Variable, "variable"),
+        14 => (SymbolCategory::Variable, "constant"),
+        19 => (SymbolCategory::Implementation, "impl"),
+        22 => (SymbolCategory::Variable, "enum_member"),
+        23 => (SymbolCategory::Type, "struct"),
+        26 => (SymbolCategory::Type, "type_param"),
+        _ => (SymbolCategory::Unknown, "unknown"),
     }
 }
 

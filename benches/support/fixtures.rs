@@ -961,7 +961,7 @@ pub fn make_sym(id: &str, name: &str) -> SymbolNode {
         id: id.to_string(),
         name: name.to_string(),
         category: SymbolCategory::Function,
-        label: "fn".to_string(),
+        label: "fn",
         file_path: PathBuf::from("src/bench.rs"),
         byte_range: 0..100,
         line_range: 1..10,

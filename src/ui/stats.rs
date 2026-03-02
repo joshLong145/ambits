@@ -242,7 +242,7 @@ mod tests {
         let hash = ambits::symbols::merkle::content_hash(name);
         SymbolNode {
             id: id.into(), name: name.into(), category: SymbolCategory::Function,
-            label: "fn".into(), file_path: PathBuf::new(),
+            label: "fn", file_path: PathBuf::new(),
             byte_range: 0..100, line_range: 1..10, content_hash: hash,
             merkle_hash: hash, children: Vec::new(), estimated_tokens: 30,
         }

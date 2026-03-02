@@ -3,6 +3,10 @@
 //! This module provides structures and formatters for generating coverage reports
 //! that show how much of a project's symbols have been seen by an LLM agent.
 
+use std::path::{Path, PathBuf};
+
+use color_eyre::eyre::Result;
+
 use crate::symbols::{ProjectTree, SymbolNode};
 use crate::tracking::{ContextLedger, ReadDepth};
 
@@ -253,6 +257,127 @@ impl CoverageFormatter for TextFormatter {
         ));
 
         output
+    }
+}
+
+/// Run a coverage report for a project and print it to stdout.
+///
+/// Resolves the log directory and session automatically when not provided.
+/// Supports optional agent-prefix filtering.
+pub fn run_report(
+    project_path: &Path,
+    project_tree: &ProjectTree,
+    log_dir_opt: &Option<PathBuf>,
+    session_opt: &Option<String>,
+    agent_opt: &Option<String>,
+    tool_config: &crate::ingest::tool_config::ToolMappingConfig,
+) -> Result<()> {
+    use crate::tracking::ContextLedger;
+
+    // 1. Resolve log directory.
+    let log_dir = log_dir_opt
+        .clone()
+        .or_else(|| crate::ingest::claude::log_dir_for_project(project_path));
+
+    // 2. Find session (auto-detect if not provided).
+    let session_id = session_opt.clone().or_else(|| {
+        log_dir
+            .as_ref()
+            .and_then(|d| crate::ingest::claude::find_latest_session(d))
+    });
+
+    // 3. Build ledger from session logs.
+    let mut ledger = ContextLedger::new();
+    let mut known_agents: Vec<String> = Vec::new();
+    if let (Some(ref log_dir), Some(ref sid)) = (&log_dir, &session_id) {
+        let log_files = crate::ingest::claude::session_log_files(log_dir, sid);
+        for log_file in &log_files {
+            let events = crate::ingest::claude::parse_log_file(log_file, tool_config);
+            for event in events {
+                if !known_agents.iter().any(|a: &String| a.as_str() == &*event.agent_id) {
+                    known_agents.push(event.agent_id.to_string());
+                }
+                if let Some(ref file_path) = event.file_path {
+                    let tool_rel = crate::app::normalize_tool_path(file_path, project_path);
+                    for file in &project_tree.files {
+                        if file.file_path == tool_rel {
+                            if event.target_symbol.is_some() || event.target_lines.is_some() {
+                                crate::app::mark_targeted_symbols(&file.symbols, &event, &mut ledger);
+                            } else {
+                                crate::app::mark_file_symbols(&file.symbols, &event, &mut ledger);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Resolve agent filter (supports prefix matching).
+    let resolved_agent = agent_opt.as_ref().map(|prefix| {
+        let matches: Vec<&String> = known_agents
+            .iter()
+            .filter(|id| id.starts_with(prefix.as_str()))
+            .collect();
+        match matches.len() {
+            1 => matches[0].clone(),
+            0 => {
+                eprintln!("Warning: no agent matching prefix '{}'", prefix);
+                prefix.clone()
+            }
+            _ => {
+                eprintln!(
+                    "Warning: multiple agents match prefix '{}': {:?}",
+                    prefix,
+                    matches.iter().take(5).collect::<Vec<_>>()
+                );
+                matches[0].clone()
+            }
+        }
+    });
+
+    // 5. Generate and print report.
+    let mut report = CoverageReport::from_project(project_tree, &ledger, resolved_agent.as_deref());
+    report.session_id = session_id;
+
+    let formatter = TextFormatter::default();
+    print!("{}", formatter.format(&report));
+
+    Ok(())
+}
+
+/// Print a project's symbol tree to stdout.
+pub fn dump_tree(root: &Path, project_tree: &ProjectTree) {
+    println!(
+        "Project: {} ({} files, {} symbols)",
+        root.display(),
+        project_tree.total_files(),
+        project_tree.total_symbols(),
+    );
+    println!();
+
+    for file in &project_tree.files {
+        println!("  {} ({} lines)", file.file_path.display(), file.total_lines);
+        for sym in &file.symbols {
+            print_symbol(sym, 4);
+        }
+    }
+}
+
+/// Print a single symbol and its children recursively with indentation.
+pub fn print_symbol(sym: &SymbolNode, indent: usize) {
+    let pad = " ".repeat(indent);
+    println!(
+        "{}{} {} [L{}-{}] (~{} tokens)",
+        pad,
+        sym.label,
+        sym.name,
+        sym.line_range.start,
+        sym.line_range.end,
+        sym.estimated_tokens,
+    );
+    for child in &sym.children {
+        print_symbol(child, indent + 2);
     }
 }
 

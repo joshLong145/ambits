@@ -3,7 +3,7 @@ pub mod agents;
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::symbols::SymbolId;
+use crate::symbols::{SymbolId, SymbolNode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReadDepth {
@@ -185,6 +185,44 @@ impl ContextLedger {
             })
             .count()
     }
+}
+
+/// Collect all symbol IDs and their content hashes into `map` (recursive).
+pub fn collect_symbol_hashes(
+    symbols: &[SymbolNode],
+    map: &mut HashMap<String, [u8; 32]>,
+) {
+    for sym in symbols {
+        map.insert(sym.id.clone(), sym.content_hash);
+        collect_symbol_hashes(&sym.children, map);
+    }
+}
+
+/// Mark symbols whose content hash changed as stale in `ledger` (recursive).
+pub fn check_staleness(
+    symbols: &[SymbolNode],
+    old_map: &HashMap<String, [u8; 32]>,
+    ledger: &mut ContextLedger,
+) {
+    for sym in symbols {
+        if let Some(old_hash) = old_map.get(&sym.id) {
+            if *old_hash != sym.content_hash {
+                ledger.mark_stale_if_changed(&sym.id, sym.content_hash);
+            }
+        }
+        check_staleness(&sym.children, old_map, ledger);
+    }
+}
+
+/// Compare old and new symbol trees; mark changed symbols as stale in `ledger`.
+pub fn mark_stale_symbols(
+    old_symbols: &[SymbolNode],
+    new_symbols: &[SymbolNode],
+    ledger: &mut ContextLedger,
+) {
+    let mut old_map = HashMap::new();
+    collect_symbol_hashes(old_symbols, &mut old_map);
+    check_staleness(new_symbols, &old_map, ledger);
 }
 
 #[cfg(test)]

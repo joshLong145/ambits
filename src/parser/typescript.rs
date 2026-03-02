@@ -549,7 +549,7 @@ fn make_symbol(
         id,
         name,
         category: meta.category,
-        label: meta.label.to_string(),
+        label: meta.label,
         file_path: file_path.to_path_buf(),
         byte_range,
         line_range: start_line..end_line,

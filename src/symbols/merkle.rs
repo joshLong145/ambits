@@ -32,10 +32,11 @@ pub fn compute_merkle_hash(node: &mut SymbolNode) {
 /// trim leading/trailing whitespace. This makes the hash resilient to formatting changes
 /// while still detecting meaningful code changes.
 fn normalize_source(source: &str) -> String {
-    let mut result = String::with_capacity(source.len());
+    let trimmed = source.trim();
+    let mut result = String::with_capacity(trimmed.len());
     let mut prev_was_space = false;
 
-    for ch in source.chars() {
+    for ch in trimmed.chars() {
         if ch.is_whitespace() {
             if !prev_was_space {
                 result.push(' ');
@@ -47,13 +48,60 @@ fn normalize_source(source: &str) -> String {
         }
     }
 
-    result.trim().to_string()
+    result
 }
 
-/// Estimate the number of tokens a source string would consume.
-/// Rough approximation: ~3.5 characters per token for code.
+/// Estimate the number of LLM tokens a source string would consume.
+///
+/// # Why word-boundary counting instead of a flat characters-per-token ratio
+///
+/// Most LLMs (including Claude and GPT-4) use Byte Pair Encoding (BPE) tokenisation.
+/// BPE builds a vocabulary of frequently occurring byte sequences by iteratively merging
+/// the most common adjacent pairs. For source code this produces two well-studied patterns:
+///
+/// 1. **Identifiers and keywords are split into subwords of ~4 characters on average.**
+///    Short tokens like `fn`, `let`, `if`, `i32` map to a single vocabulary entry.
+///    Longer names like `calculate_result` (16 chars) are split into roughly 4 subwords.
+///    The `ceil(len / 4)` formula approximates this without a full vocabulary lookup.
+///
+/// 2. **Punctuation and operators are almost always single tokens.**
+///    Characters like `{`, `}`, `(`, `)`, `;`, `->`, `<`, `>` each occupy one token
+///    regardless of their role. Code is punctuation-dense, so a flat char-ratio formula
+///    systematically undercounts by folding punctuation into the word budget.
+///
+/// # Why not a flat ratio (e.g. 3.5 chars/token)?
+///
+/// A flat ratio is accurate for natural-language prose where punctuation is sparse.
+/// For code the ratio varies widely by language style: Rust/TypeScript signatures with
+/// `->`, `::`, `<>`, and `()` produce far more punctuation tokens than the ratio
+/// predicts. The word-boundary model handles both ends of the spectrum correctly.
+///
+/// # Limitations
+///
+/// This is still an approximation — the true count depends on the specific model's
+/// vocabulary. It will be most accurate for English-identifier code (Rust, Python,
+/// TypeScript) and less accurate for heavily symbolic code (e.g. APL, dense regex).
 pub fn estimate_tokens(source: &str) -> usize {
-    (source.len() as f64 / 3.5).ceil() as usize
+    let mut count = 0usize;
+    let mut word_len = 0usize;
+
+    for ch in source.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            word_len += 1;
+        } else {
+            if word_len > 0 {
+                count += (word_len + 3) / 4;
+                word_len = 0;
+            }
+            if !ch.is_whitespace() {
+                count += 1; // operator, bracket, punctuation — each ~1 token
+            }
+        }
+    }
+    if word_len > 0 {
+        count += (word_len + 3) / 4;
+    }
+    count
 }
 
 #[cfg(test)]
@@ -90,7 +138,20 @@ mod tests {
 
     #[test]
     fn test_estimate_tokens() {
-        // "fn foo() {}" is 11 chars → ceil(11/3.5) = 4
-        assert_eq!(estimate_tokens("fn foo() {}"), 4);
+        // Short keywords are 1 token each; punctuation is 1 token each.
+        // "fn foo() {}" → "fn"(1) + "foo"(1) + '('(1) + ')'(1) + '{'(1) + '}'(1) = 6
+        assert_eq!(estimate_tokens("fn foo() {}"), 6);
+
+        // Long identifier splits into subwords: "calculate_result" = 16 chars → ceil(16/4) = 4
+        assert_eq!(estimate_tokens("calculate_result"), 4);
+
+        // Short identifier stays as one token: "x" = 1 char → ceil(1/4) = 1
+        assert_eq!(estimate_tokens("x"), 1);
+
+        // Empty input → 0
+        assert_eq!(estimate_tokens(""), 0);
+
+        // Only whitespace → 0
+        assert_eq!(estimate_tokens("   \n\t  "), 0);
     }
 }
