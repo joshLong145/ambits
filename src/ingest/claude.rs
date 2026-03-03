@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use crate::tracking::ReadDepth;
-use super::AgentToolCall;
+use super::{AgentToolCall, EventTailer, SessionIngester, TailerOutput, ToolCallMapper};
 use super::tool_config::ToolMappingConfig;
 
 /// Derive the Claude Code log directory for a given project path.
@@ -212,6 +212,10 @@ pub enum ParsedLine {
 /// SessionCleared signals are ignored in batch mode — dump/coverage modes show
 /// aggregate historical coverage, not live session state.
 pub fn parse_log_file(path: &Path, config: &ToolMappingConfig) -> Vec<AgentToolCall> {
+    parse_log_file_with_mapper(path, config)
+}
+
+fn parse_log_file_with_mapper(path: &Path, mapper: &dyn ToolCallMapper) -> Vec<AgentToolCall> {
     let mut events = Vec::new();
     let file = match fs::File::open(path) {
         Ok(f) => f,
@@ -230,7 +234,7 @@ pub fn parse_log_file(path: &Path, config: &ToolMappingConfig) -> Vec<AgentToolC
     let label: Arc<str> = extract_agent_label(path).into();
 
     for line in reader.lines().map_while(Result::ok) {
-        if let ParsedLine::Events(mut line_events) = parse_jsonl_line(&line, &default_id, config) {
+        if let ParsedLine::Events(mut line_events) = parse_jsonl_line(&line, &default_id, mapper) {
             for ev in &mut line_events {
                 ev.label = label.clone();
             }
@@ -242,7 +246,7 @@ pub fn parse_log_file(path: &Path, config: &ToolMappingConfig) -> Vec<AgentToolC
 
 /// Parse a single JSONL line from a Claude Code session log.
 /// Returns a `ParsedLine` indicating tool call events, a session clear signal, or nothing.
-pub fn parse_jsonl_line(line: &str, default_agent_id: &str, config: &ToolMappingConfig) -> ParsedLine {
+pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCallMapper) -> ParsedLine {
     let obj: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return ParsedLine::Ignored,
@@ -298,7 +302,7 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, config: &ToolMapping
 
         let input = block.get("input").cloned().unwrap_or(Value::Null);
 
-        let event = map_tool_call(config, tool_name, &input, &agent_id, &timestamp_str)
+        let event = mapper.map_tool_call(tool_name, &input, &agent_id, &timestamp_str)
             .unwrap_or_else(|| AgentToolCall {
                 agent_id: agent_id.clone(),
                 tool_name: Arc::from(tool_name),
@@ -516,20 +520,13 @@ fn short_path(path: &str) -> String {
 pub struct LogTailer {
     files: Vec<PathBuf>,
     positions: std::collections::HashMap<PathBuf, u64>,
-    config: Arc<ToolMappingConfig>,
-}
-
-/// Output from `LogTailer::read_new_events`, carrying both new tool call events
-/// and a flag indicating whether a `/clear` command was detected.
-pub struct TailerOutput {
-    pub events: Vec<AgentToolCall>,
-    pub session_cleared: bool,
+    mapper: Arc<dyn ToolCallMapper>,
 }
 
 impl LogTailer {
     /// Create a tailer for the given log files, starting from the end of each
     /// (i.e., only new lines will be read on subsequent calls).
-    pub fn new(files: Vec<PathBuf>, config: Arc<ToolMappingConfig>) -> Self {
+    pub fn new(files: Vec<PathBuf>, mapper: Arc<dyn ToolCallMapper>) -> Self {
         let mut positions = std::collections::HashMap::new();
         for f in &files {
             // Start at the current end of file so we only get new events.
@@ -537,7 +534,7 @@ impl LogTailer {
                 positions.insert(f.clone(), meta.len());
             }
         }
-        Self { files, positions, config }
+        Self { files, positions, mapper }
     }
 
 
@@ -586,7 +583,7 @@ impl LogTailer {
                         line.clear();
                         match reader.read_line(&mut line) {
                             Ok(0) => break,
-                            Ok(_) => match parse_jsonl_line(line.trim(), &default_id, &self.config) {
+                            Ok(_) => match parse_jsonl_line(line.trim(), &default_id, &*self.mapper) {
                                 ParsedLine::Events(events) => output.events.extend(events),
                                 ParsedLine::SessionCleared => output.session_cleared = true,
                                 ParsedLine::Ignored => {}
@@ -604,6 +601,48 @@ impl LogTailer {
         }
 
         output
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ClaudeIngester — implements SessionIngester for Claude Code .jsonl logs
+// ---------------------------------------------------------------------------
+
+/// A `SessionIngester` that understands Claude Code's `.jsonl` log format.
+pub struct ClaudeIngester {
+    mapper: Arc<dyn ToolCallMapper>,
+}
+
+impl ClaudeIngester {
+    pub fn new(mapper: Arc<dyn ToolCallMapper>) -> Self {
+        Self { mapper }
+    }
+}
+
+impl SessionIngester for ClaudeIngester {
+    fn log_dir_for_project(&self, project_path: &Path) -> Option<PathBuf> {
+        log_dir_for_project(project_path)
+    }
+    fn find_latest_session(&self, log_dir: &Path) -> Option<String> {
+        find_latest_session(log_dir)
+    }
+    fn session_log_files(&self, log_dir: &Path, session_id: &str) -> Vec<PathBuf> {
+        session_log_files(log_dir, session_id)
+    }
+    fn parse_log_file(&self, path: &Path) -> Vec<AgentToolCall> {
+        parse_log_file_with_mapper(path, &*self.mapper)
+    }
+    fn new_tailer(&self, files: Vec<PathBuf>) -> Box<dyn EventTailer> {
+        Box::new(LogTailer::new(files, Arc::clone(&self.mapper)))
+    }
+}
+
+impl EventTailer for LogTailer {
+    fn add_file(&mut self, path: PathBuf) {
+        LogTailer::add_file(self, path);
+    }
+    fn read_new_events(&mut self) -> TailerOutput {
+        LogTailer::read_new_events(self)
     }
 }
 
@@ -1055,7 +1094,7 @@ mod tests {
 
         // Create an empty file first so the tailer starts at position 0.
         fs::write(&log, "").unwrap();
-        let config = Arc::new(ToolMappingConfig::builtin().expect("builtin config"));
+        let config: Arc<dyn ToolCallMapper> = Arc::new(ToolMappingConfig::builtin().expect("builtin config"));
         let mut tailer = LogTailer::new(vec![log.clone()], config);
 
         // Now append the /clear line as "new" content.
@@ -1074,7 +1113,7 @@ mod tests {
 
         // Create an empty file first so the tailer starts at position 0.
         fs::write(&log, "").unwrap();
-        let config = Arc::new(ToolMappingConfig::builtin().expect("builtin config"));
+        let config: Arc<dyn ToolCallMapper> = Arc::new(ToolMappingConfig::builtin().expect("builtin config"));
         let mut tailer = LogTailer::new(vec![log.clone()], config);
 
         // Append a /clear line followed by a tool use as "new" content.

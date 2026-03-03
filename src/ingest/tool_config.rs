@@ -450,6 +450,22 @@ impl ToolMappingConfig {
 }
 
 // ---------------------------------------------------------------------------
+// ToolCallMapper impl
+// ---------------------------------------------------------------------------
+
+impl super::ToolCallMapper for ToolMappingConfig {
+    fn map_tool_call(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+        agent_id: &str,
+        timestamp_str: &str,
+    ) -> Option<super::AgentToolCall> {
+        crate::ingest::claude::map_tool_call(self, tool_name, input, agent_id, timestamp_str)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

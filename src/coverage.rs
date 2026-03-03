@@ -270,29 +270,29 @@ pub fn run_report(
     log_dir_opt: &Option<PathBuf>,
     session_opt: &Option<String>,
     agent_opt: &Option<String>,
-    tool_config: &crate::ingest::tool_config::ToolMappingConfig,
+    ingester: &dyn crate::ingest::SessionIngester,
 ) -> Result<()> {
     use crate::tracking::ContextLedger;
 
     // 1. Resolve log directory.
     let log_dir = log_dir_opt
         .clone()
-        .or_else(|| crate::ingest::claude::log_dir_for_project(project_path));
+        .or_else(|| ingester.log_dir_for_project(project_path));
 
     // 2. Find session (auto-detect if not provided).
     let session_id = session_opt.clone().or_else(|| {
         log_dir
             .as_ref()
-            .and_then(|d| crate::ingest::claude::find_latest_session(d))
+            .and_then(|d| ingester.find_latest_session(d))
     });
 
     // 3. Build ledger from session logs.
     let mut ledger = ContextLedger::new();
     let mut known_agents: Vec<String> = Vec::new();
     if let (Some(ref log_dir), Some(ref sid)) = (&log_dir, &session_id) {
-        let log_files = crate::ingest::claude::session_log_files(log_dir, sid);
+        let log_files = ingester.session_log_files(log_dir, sid);
         for log_file in &log_files {
-            let events = crate::ingest::claude::parse_log_file(log_file, tool_config);
+            let events = ingester.parse_log_file(log_file);
             for event in events {
                 if !known_agents.iter().any(|a: &String| a.as_str() == &*event.agent_id) {
                     known_agents.push(event.agent_id.to_string());

@@ -1,9 +1,8 @@
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 pub mod claude;
 pub mod tool_config;
-
-use std::path::PathBuf;
 
 use crate::tracking::ReadDepth;
 
@@ -25,9 +24,41 @@ pub struct AgentToolCall {
     pub label: Arc<str>,
 }
 
-/// Trait for agent event sources.
-/// Implement this to support different agent frameworks.
-pub trait AgentEventSource {
-    /// Parse all events from existing log files.
-    fn parse_existing(&self) -> color_eyre::Result<Vec<AgentToolCall>>;
+/// Output from a single incremental poll of an event tailer.
+pub struct TailerOutput {
+    pub events: Vec<AgentToolCall>,
+    pub session_cleared: bool,
+}
+
+/// Maps a raw tool call (name + JSON input) to an `AgentToolCall`.
+/// Implement this to plug in alternative tool-name conventions.
+pub trait ToolCallMapper: Send + Sync {
+    fn map_tool_call(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+        agent_id: &str,
+        timestamp_str: &str,
+    ) -> Option<AgentToolCall>;
+}
+
+/// Stateless session-format operations: discovery, listing, batch parsing.
+/// Implement this to add support for a new LLM session format.
+pub trait SessionIngester: Send + Sync {
+    /// Derive the log directory from a project root path.
+    fn log_dir_for_project(&self, project_path: &Path) -> Option<PathBuf>;
+    /// Find the ID of the most recently active session in `log_dir`.
+    fn find_latest_session(&self, log_dir: &Path) -> Option<String>;
+    /// List all log files belonging to `session_id` within `log_dir`.
+    fn session_log_files(&self, log_dir: &Path, session_id: &str) -> Vec<PathBuf>;
+    /// Parse all events from a single log file in batch.
+    fn parse_log_file(&self, path: &Path) -> Vec<AgentToolCall>;
+    /// Create a new incremental event tailer for the given set of files.
+    fn new_tailer(&self, files: Vec<PathBuf>) -> Box<dyn EventTailer>;
+}
+
+/// Stateful incremental reader. Created via `SessionIngester::new_tailer`.
+pub trait EventTailer: Send {
+    fn add_file(&mut self, path: PathBuf);
+    fn read_new_events(&mut self) -> TailerOutput;
 }

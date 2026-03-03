@@ -7,7 +7,7 @@ use color_eyre::eyre::Result;
 use notify::{Event as NotifyEvent, EventKind, RecursiveMode, Watcher};
 
 use ambits::app::App;
-use ambits::ingest::tool_config::ToolMappingConfig;
+use ambits::ingest::{EventTailer, SessionIngester};
 
 use crate::events::AppEvent;
 
@@ -21,7 +21,9 @@ pub struct TuiSession {
     /// The moment the TUI was launched — used to ignore pre-existing session files.
     started_at: SystemTime,
     /// Tails new log lines from the active session.
-    log_tailer: Option<ambits::ingest::claude::LogTailer>,
+    log_tailer: Option<Box<dyn EventTailer>>,
+    /// Session format + tool mapper strategy.
+    ingester: Arc<dyn SessionIngester>,
     /// (path, mtime) pairs for Serena .pkl cache files — used to detect live rebuilds.
     pkl_mtimes: Vec<(PathBuf, SystemTime)>,
     /// Holds the project-source watcher alive.
@@ -37,7 +39,7 @@ impl TuiSession {
         log_dir: &Option<PathBuf>,
         session_id: Option<String>,
         watched_extensions: std::collections::HashSet<String>,
-        tool_config: &Arc<ToolMappingConfig>,
+        ingester: Arc<dyn SessionIngester>,
         serena_mode: bool,
         tx: &flume::Sender<AppEvent>,
     ) -> Result<Self> {
@@ -60,13 +62,10 @@ impl TuiSession {
         project_watcher.watch(project_path, RecursiveMode::Recursive)?;
 
         // Log tailer — follows the current session's .jsonl files.
-        let log_tailer =
+        let log_tailer: Option<Box<dyn EventTailer>> =
             if let (Some(ref ld), Some(ref sid)) = (log_dir, &session_id) {
-                let files = ambits::ingest::claude::session_log_files(ld, sid);
-                Some(ambits::ingest::claude::LogTailer::new(
-                    files,
-                    Arc::clone(tool_config),
-                ))
+                let files = ingester.session_log_files(ld, sid);
+                Some(ingester.new_tailer(files))
             } else {
                 None
             };
@@ -109,6 +108,7 @@ impl TuiSession {
             current_session_id: session_id,
             started_at: SystemTime::now(),
             log_tailer,
+            ingester,
             pkl_mtimes,
             _project_watcher: project_watcher,
             _log_watcher: log_watcher,
@@ -120,13 +120,12 @@ impl TuiSession {
         &mut self,
         log_dir: &Option<PathBuf>,
         app: &mut App,
-        tool_config: &Arc<ToolMappingConfig>,
         serena_mode: bool,
         project_path: &Path,
     ) {
         // Check if Claude Code has started a new session (e.g. after /clear).
         if let Some(ref ld) = log_dir {
-            if let Some(latest) = ambits::ingest::claude::find_latest_session(ld) {
+            if let Some(latest) = self.ingester.find_latest_session(ld) {
                 let is_new_session =
                     self.current_session_id.as_deref() != Some(latest.as_str());
                 let created_after_start = ld
@@ -143,18 +142,15 @@ impl TuiSession {
                     app.session_id = self.current_session_id.clone();
 
                     // Pre-populate from lines already written before this tick.
-                    let new_files = ambits::ingest::claude::session_log_files(ld, &latest);
+                    let new_files = self.ingester.session_log_files(ld, &latest);
                     for log_file in &new_files {
-                        for event in ambits::ingest::claude::parse_log_file(log_file, tool_config) {
+                        for event in self.ingester.parse_log_file(log_file) {
                             app.process_agent_event(event);
                         }
                     }
 
-                    // Replace the tailer — clone the existing Arc (no re-resolve).
-                    self.log_tailer = Some(ambits::ingest::claude::LogTailer::new(
-                        new_files,
-                        Arc::clone(tool_config),
-                    ));
+                    // Replace the tailer.
+                    self.log_tailer = Some(self.ingester.new_tailer(new_files));
                 }
             }
         }
@@ -163,7 +159,7 @@ impl TuiSession {
         if let Some(ref mut tailer) = self.log_tailer {
             // Check for new agent files in the log directory.
             if let (Some(ref ld), Some(ref sid)) = (log_dir, &self.current_session_id) {
-                let current_files = ambits::ingest::claude::session_log_files(ld, sid);
+                let current_files = self.ingester.session_log_files(ld, sid);
                 for f in current_files {
                     tailer.add_file(f);
                 }

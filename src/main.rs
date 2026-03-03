@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use ambits::app::App;
 use ambits::ingest::tool_config::ToolMappingConfig;
+use ambits::ingest::{SessionIngester, ToolCallMapper};
 use events::AppEvent;
 use ambits::parser::ParserRegistry;
 
@@ -116,6 +117,11 @@ fn main() -> Result<()> {
     let (tool_config, config_warnings) =
         ToolMappingConfig::resolve(cli.tools_config.as_deref());
 
+    // Build the session ingester — coerce ToolMappingConfig to Arc<dyn ToolCallMapper>.
+    let mapper: Arc<dyn ToolCallMapper> = tool_config;
+    let ingester: Arc<dyn SessionIngester> =
+        Arc::new(ingest::claude::ClaudeIngester::new(Arc::clone(&mapper)));
+
     // Original behavior — require --project for all other modes.
     let project = cli.project.ok_or_else(|| {
         color_eyre::eyre::eyre!("--project is required (use `ambits --project <path>`)")
@@ -140,18 +146,18 @@ fn main() -> Result<()> {
         for w in &config_warnings {
             println!("[ambit warning] {w}");
         }
-        return coverage::run_report(&project_path, &project_tree, &cli.log_dir, &cli.session, &cli.agent, &tool_config);
+        return coverage::run_report(&project_path, &project_tree, &cli.log_dir, &cli.session, &cli.agent, &*ingester);
     }
 
     // Resolve log directory and session.
     let log_dir = cli
         .log_dir
-        .or_else(|| ingest::claude::log_dir_for_project(&project_path));
+        .or_else(|| ingester.log_dir_for_project(&project_path));
 
     let session_id = cli.session.or_else(|| {
         log_dir
             .as_ref()
-            .and_then(|d| ingest::claude::find_latest_session(d))
+            .and_then(|d| ingester.find_latest_session(d))
     });
 
     // Launch TUI.
@@ -179,17 +185,16 @@ fn main() -> Result<()> {
 
     // Pre-populate the ledger from existing session logs.
     if let (Some(ref log_dir), Some(ref session_id)) = (&log_dir, &session_id) {
-        let log_files = ingest::claude::session_log_files(log_dir, session_id);
+        let log_files = ingester.session_log_files(log_dir, session_id);
         for log_file in &log_files {
-            let events = ingest::claude::parse_log_file(log_file, &tool_config);
-            for event in events {
+            for event in ingester.parse_log_file(log_file) {
                 app.process_agent_event(event);
             }
         }
     }
 
     let serena_mode = cli.serena;
-    let result = run_tui(&mut terminal, &mut app, &project_path, &log_dir, session_id, &registry, serena_mode, &tool_config);
+    let result = run_tui(&mut terminal, &mut app, &project_path, &log_dir, session_id, &registry, serena_mode, &ingester);
 
     // Flush event log before exiting.
     if let Some(ref mut writer) = app.event_log {
@@ -212,7 +217,7 @@ fn run_tui(
     session_id: Option<String>,
     registry: &ParserRegistry,
     serena_mode: bool,
-    tool_config: &Arc<ToolMappingConfig>,
+    ingester: &Arc<dyn SessionIngester>,
 ) -> Result<()> {
     let (tx, rx) = flume::bounded::<AppEvent>(512);
 
@@ -224,7 +229,7 @@ fn run_tui(
         log_dir,
         session_id,
         registry.supported_extensions(),
-        tool_config,
+        Arc::clone(ingester),
         serena_mode,
         &tx,
     )?;
@@ -241,7 +246,7 @@ fn run_tui(
             Ok(AppEvent::AgentEvent(event)) => app.process_agent_event(event),
             Ok(AppEvent::SessionCleared) => app.reset_session(),
             Ok(AppEvent::Tick) => {
-                session.handle_tick(log_dir, app, tool_config, serena_mode, project_path);
+                session.handle_tick(log_dir, app, serena_mode, project_path);
             }
             Err(flume::RecvTimeoutError::Timeout) => {}
             Err(flume::RecvTimeoutError::Disconnected) => break,
@@ -254,4 +259,3 @@ fn run_tui(
 
     Ok(())
 }
-
