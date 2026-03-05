@@ -260,37 +260,24 @@ impl CoverageFormatter for TextFormatter {
     }
 }
 
-/// Run a coverage report for a project and print it to stdout.
+/// Build a `CoverageReport` from a project tree and session logs.
 ///
-/// Resolves the log directory and session automatically when not provided.
-/// Supports optional agent-prefix filtering.
-pub fn run_report(
+/// Returns the raw report without printing. Used by both `run_report` (CLI)
+/// and the MCP `coverage` tool.
+pub fn build_report(
     project_path: &Path,
     project_tree: &ProjectTree,
-    log_dir_opt: &Option<PathBuf>,
-    session_opt: &Option<String>,
-    agent_opt: &Option<String>,
+    log_dir: &Option<PathBuf>,
+    session_id: &Option<String>,
+    agent_opt: Option<&str>,
     ingester: &dyn crate::ingest::SessionIngester,
-) -> Result<()> {
+) -> CoverageReport {
     use crate::tracking::ContextLedger;
 
-    // 1. Resolve log directory.
-    let log_dir = log_dir_opt
-        .clone()
-        .or_else(|| ingester.log_dir_for_project(project_path));
-
-    // 2. Find session (auto-detect if not provided).
-    let session_id = session_opt.clone().or_else(|| {
-        log_dir
-            .as_ref()
-            .and_then(|d| ingester.find_latest_session(d))
-    });
-
-    // 3. Build ledger from session logs.
     let mut ledger = ContextLedger::new();
     let mut known_agents: Vec<String> = Vec::new();
-    if let (Some(ref log_dir), Some(ref sid)) = (&log_dir, &session_id) {
-        let log_files = ingester.session_log_files(log_dir, sid);
+    if let (Some(ref ld), Some(ref sid)) = (log_dir, session_id) {
+        let log_files = ingester.session_log_files(ld, sid);
         for log_file in &log_files {
             let events = ingester.parse_log_file(log_file);
             for event in events {
@@ -313,7 +300,50 @@ pub fn run_report(
         }
     }
 
-    // 4. Resolve agent filter (supports prefix matching).
+    // Resolve agent filter (prefix matching).
+    let resolved_agent = agent_opt.map(|prefix| {
+        let matches: Vec<&String> = known_agents
+            .iter()
+            .filter(|id| id.starts_with(prefix))
+            .collect();
+        match matches.len() {
+            1 => matches[0].clone(),
+            _ => prefix.to_string(),
+        }
+    });
+
+    let mut report =
+        CoverageReport::from_project(project_tree, &ledger, resolved_agent.as_deref());
+    report.session_id = session_id.clone();
+    report
+}
+
+/// Run a coverage report for a project and print it to stdout.
+///
+/// Resolves the log directory and session automatically when not provided.
+/// Supports optional agent-prefix filtering.
+pub fn run_report(
+    project_path: &Path,
+    project_tree: &ProjectTree,
+    log_dir_opt: &Option<PathBuf>,
+    session_opt: &Option<String>,
+    agent_opt: &Option<String>,
+    ingester: &dyn crate::ingest::SessionIngester,
+) -> Result<()> {
+    // 1. Resolve log directory.
+    let log_dir = log_dir_opt
+        .clone()
+        .or_else(|| ingester.log_dir_for_project(project_path));
+
+    // 2. Find session (auto-detect if not provided).
+    let session_id = session_opt.clone().or_else(|| {
+        log_dir
+            .as_ref()
+            .and_then(|d| ingester.find_latest_session(d))
+    });
+
+    // 3. Build report (delegates ledger construction to build_report).
+    let known_agents = collect_known_agents(&log_dir, &session_id, ingester);
     let resolved_agent = agent_opt.as_ref().map(|prefix| {
         let matches: Vec<&String> = known_agents
             .iter()
@@ -336,14 +366,39 @@ pub fn run_report(
         }
     });
 
-    // 5. Generate and print report.
-    let mut report = CoverageReport::from_project(project_tree, &ledger, resolved_agent.as_deref());
-    report.session_id = session_id;
+    let report = build_report(
+        project_path,
+        project_tree,
+        &log_dir,
+        &session_id,
+        resolved_agent.as_deref(),
+        ingester,
+    );
 
     let formatter = TextFormatter::default();
     print!("{}", formatter.format(&report));
 
     Ok(())
+}
+
+/// Collect known agent IDs from session logs (for agent-filter prefix resolution).
+fn collect_known_agents(
+    log_dir: &Option<PathBuf>,
+    session_id: &Option<String>,
+    ingester: &dyn crate::ingest::SessionIngester,
+) -> Vec<String> {
+    let mut agents: Vec<String> = Vec::new();
+    if let (Some(ref ld), Some(ref sid)) = (log_dir, session_id) {
+        let log_files = ingester.session_log_files(ld, sid);
+        for log_file in &log_files {
+            for event in ingester.parse_log_file(log_file) {
+                if !agents.iter().any(|a: &String| a.as_str() == &*event.agent_id) {
+                    agents.push(event.agent_id.to_string());
+                }
+            }
+        }
+    }
+    agents
 }
 
 /// Print a project's symbol tree to stdout.

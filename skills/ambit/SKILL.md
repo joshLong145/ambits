@@ -103,6 +103,34 @@ ambits -p . --serena --coverage
 
 **Session not loading**: Verify the session ID matches a `.jsonl` file in the projects directory. Check file permissions.
 
+## MCP Server (Preferred Integration)
+
+For richer context, live updates, and AI-generated interpretation, use the MCP server
+instead of the Bash-based commands:
+
+```bash
+# Add to Claude Code once (run in your terminal):
+claude mcp add ambit -- ambits mcp
+
+# Optional: pass a fixed log-dir if auto-detection doesn't work
+claude mcp add ambit -- ambits mcp --log-dir ~/.claude/projects
+```
+
+Once registered, these MCP tools are available directly in conversation:
+
+| Tool | Description |
+|---|---|
+| `coverage` | Project-wide coverage report + AI interpretation |
+| `coverage_file` | Per-file symbol coverage + AI interpretation |
+| `symbol_tree` | Full project symbol hierarchy |
+| `list_sessions` | Enumerate recorded sessions |
+
+The `coverage_analysis` prompt template is also available via `prompts/get`.
+
+The MCP server discovers the project path from Claude Code's MCP Roots automatically —
+no `--project` flag needed. The Bash commands below remain available as a fallback for
+environments without MCP support.
+
 ## Reference Documentation
 
 For detailed guidance, see:

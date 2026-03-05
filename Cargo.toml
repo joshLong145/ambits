@@ -11,7 +11,14 @@ exclude = [
     "images/*"
 ]
 
+[features]
+mcp = ["dep:rmcp", "dep:tokio", "dep:schemars", "dep:urlencoding"]
+
 [dependencies]
+rmcp        = { version = "0.1",  features = ["server", "transport-io", "macros"], optional = true }
+tokio       = { version = "1",    features = ["rt-multi-thread", "macros", "time", "sync"], optional = true }
+schemars    = { version = "0.8",                                                   optional = true }
+urlencoding = { version = "2",                                                     optional = true }
 ratatui = "0.29"
 crossterm = "0.28"
 tree-sitter = "0.24"

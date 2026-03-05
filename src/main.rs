@@ -4,6 +4,8 @@ use ambits::ingest;
 
 // Binary-only modules.
 mod events;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod serena;
 mod skill;
 mod tui;
@@ -84,6 +86,16 @@ enum Commands {
         #[command(subcommand)]
         command: SkillCommands,
     },
+    /// Start the ambit MCP server on stdio
+    #[cfg(feature = "mcp")]
+    Mcp {
+        /// Override log directory (auto-derived from project root if omitted)
+        #[arg(long)]
+        log_dir: Option<PathBuf>,
+        /// Path to a custom tool call mapping config (TOML)
+        #[arg(long)]
+        tools_config: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -110,6 +122,8 @@ fn main() -> Result<()> {
             Commands::Skill { command } => match command {
                 SkillCommands::Install { global, project } => skill::install(global, project),
             },
+            #[cfg(feature = "mcp")]
+            Commands::Mcp { log_dir, tools_config } => mcp::serve(log_dir, tools_config),
         };
     }
 
