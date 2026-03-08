@@ -2,9 +2,10 @@
 
 use std::time::Duration;
 
-use rmcp::model::{Content, CreateMessageRequestParam, Role, SamplingMessage};
+use rmcp::model::{CallToolResult, Content, CreateMessageRequestParam, Role, SamplingMessage};
 use rmcp::service::{Peer, RoleServer};
 
+use ambits::coverage::FileCoverage;
 use ambits::symbols::SymbolNode;
 
 // ── error helpers ────────────────────────────────────────────────────────────
@@ -58,6 +59,38 @@ pub(super) fn is_uuid(s: &str) -> bool {
     b.iter()
         .enumerate()
         .all(|(i, &c)| matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit())
+}
+
+// ── coverage JSON helpers ─────────────────────────────────────────────────────
+
+/// Serialise a single `FileCoverage` entry to the canonical JSON shape.
+pub(super) fn file_coverage_to_json(f: &FileCoverage) -> serde_json::Value {
+    serde_json::json!({
+        "path":          f.path,
+        "total_symbols": f.total_symbols,
+        "seen_count":    f.seen_count,
+        "full_count":    f.full_count,
+        "seen_percent":  format!("{:.1}", f.seen_percent()),
+        "full_percent":  format!("{:.1}", f.full_percent()),
+    })
+}
+
+/// Build a `CallToolResult` containing a raw coverage JSON payload plus, if
+/// MCP sampling is available, an AI-generated interpretation of the report.
+pub(super) async fn coverage_response(
+    peer: &Peer<RoleServer>,
+    raw_json: serde_json::Value,
+) -> Result<CallToolResult, rmcp::Error> {
+    let raw_str = serde_json::to_string_pretty(&raw_json).map_err(mcp_err)?;
+    let interpretation = try_interpret_coverage(peer, &raw_str).await;
+
+    let mut response = serde_json::json!({ "raw_report": raw_json });
+    if let Some(text) = interpretation {
+        response["interpretation"] = serde_json::Value::String(text);
+    }
+
+    let out = serde_json::to_string_pretty(&response).map_err(mcp_err)?;
+    Ok(CallToolResult::success(vec![Content::text(out)]))
 }
 
 // ── sampling helper ───────────────────────────────────────────────────────────

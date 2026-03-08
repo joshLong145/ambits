@@ -59,13 +59,7 @@ impl ProjectContext {
         let project_tree = registry.scan_project(&project_path)?;
 
         // 3. Resolve log dir and latest session.
-        let log_dir = server
-            .log_dir_override
-            .clone()
-            .or_else(|| server.ingester.log_dir_for_project(&project_path));
-        let session_id = log_dir
-            .as_ref()
-            .and_then(|d| server.ingester.find_latest_session(d));
+        let (log_dir, session_id) = server.latest_session_for(&project_path);
 
         Ok(Self { project_path, project_tree, session_id, log_dir })
     }

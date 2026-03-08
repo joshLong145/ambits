@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rmcp::ServerHandler;
@@ -18,7 +18,9 @@ use ambits::ingest::SessionIngester;
 use crate::mcp::context::ProjectContext;
 use crate::mcp::prompts::{get_coverage_analysis, COVERAGE_ANALYSIS};
 use crate::mcp::resources::{parse_resource_path, resource_uri, WatcherRegistry};
-use crate::mcp::tools::{is_uuid, mcp_err, project_tree_to_json, try_interpret_coverage};
+use crate::mcp::tools::{
+    coverage_response, file_coverage_to_json, is_uuid, mcp_err, project_tree_to_json,
+};
 
 /// Shared server state — one instance per `ambits mcp` process.
 /// Must be `Clone + Send + Sync + 'static` to satisfy `ServerHandler`.
@@ -49,6 +51,32 @@ impl AmbitServer {
             peer: None,
         }
     }
+
+    /// Extract the active MCP peer, returning an error if not yet connected.
+    fn peer(&self) -> Result<Peer<RoleServer>, rmcp::Error> {
+        self.peer
+            .clone()
+            .ok_or_else(|| rmcp::Error::internal_error("no MCP peer connected", None))
+    }
+
+    /// Resolve the log directory for `project_path`, preferring the override flag.
+    pub(crate) fn log_dir_for(&self, project_path: &Path) -> Option<PathBuf> {
+        self.log_dir_override
+            .clone()
+            .or_else(|| self.ingester.log_dir_for_project(project_path))
+    }
+
+    /// Resolve the log directory and latest session ID for `project_path`.
+    pub(crate) fn latest_session_for(
+        &self,
+        project_path: &Path,
+    ) -> (Option<PathBuf>, Option<String>) {
+        let log_dir = self.log_dir_for(project_path);
+        let session_id = log_dir
+            .as_ref()
+            .and_then(|d| self.ingester.find_latest_session(d));
+        (log_dir, session_id)
+    }
 }
 
 // ── tool implementations ──────────────────────────────────────────────────────
@@ -70,10 +98,7 @@ impl AmbitServer {
             (omit to use the MCP client root)")]
         project: Option<String>,
     ) -> Result<CallToolResult, rmcp::Error> {
-        let peer = self
-            .peer
-            .clone()
-            .ok_or_else(|| rmcp::Error::internal_error("no MCP peer connected", None))?;
+        let peer = self.peer()?;
         let ctx = ProjectContext::resolve(self, &peer, project.map(PathBuf::from))
             .await
             .map_err(mcp_err)?;
@@ -94,10 +119,7 @@ impl AmbitServer {
             (omit to use the MCP client root)")]
         project: Option<String>,
     ) -> Result<CallToolResult, rmcp::Error> {
-        let peer = self
-            .peer
-            .clone()
-            .ok_or_else(|| rmcp::Error::internal_error("no MCP peer connected", None))?;
+        let peer = self.peer()?;
         let ctx = ProjectContext::resolve(self, &peer, project.map(PathBuf::from))
             .await
             .map_err(mcp_err)?;
@@ -163,16 +185,13 @@ impl AmbitServer {
         #[schemars(description = "Agent ID prefix for filtering (omit to include all agents)")]
         agent: Option<String>,
     ) -> Result<CallToolResult, rmcp::Error> {
-        let peer = self
-            .peer
-            .clone()
-            .ok_or_else(|| rmcp::Error::internal_error("no MCP peer connected", None))?;
+        let peer = self.peer()?;
         let mut ctx = ProjectContext::resolve(self, &peer, project.map(PathBuf::from))
             .await
             .map_err(mcp_err)?;
 
-        if session.is_some() {
-            ctx.session_id = session;
+        if let Some(s) = session {
+            ctx.session_id = Some(s);
         }
 
         let report = coverage::build_report(
@@ -187,26 +206,10 @@ impl AmbitServer {
         let raw_json = serde_json::json!({
             "session_id": report.session_id,
             "agent_id":   report.agent_id,
-            "files": report.files.iter().map(|f| serde_json::json!({
-                "path":          f.path,
-                "total_symbols": f.total_symbols,
-                "seen_count":    f.seen_count,
-                "full_count":    f.full_count,
-                "seen_percent":  format!("{:.1}", f.seen_percent()),
-                "full_percent":  format!("{:.1}", f.full_percent()),
-            })).collect::<Vec<_>>(),
+            "files": report.files.iter().map(file_coverage_to_json).collect::<Vec<_>>(),
         });
 
-        let raw_str = serde_json::to_string_pretty(&raw_json).map_err(mcp_err)?;
-        let interpretation = try_interpret_coverage(&peer, &raw_str).await;
-
-        let mut response = serde_json::json!({ "raw_report": raw_json });
-        if let Some(text) = interpretation {
-            response["interpretation"] = serde_json::Value::String(text);
-        }
-
-        let out = serde_json::to_string_pretty(&response).map_err(mcp_err)?;
-        Ok(CallToolResult::success(vec![Content::text(out)]))
+        coverage_response(&peer, raw_json).await
     }
 
     /// Get symbol-level coverage for a single source file.
@@ -230,16 +233,13 @@ impl AmbitServer {
         #[schemars(description = "Agent ID prefix for filtering (omit to include all agents)")]
         agent: Option<String>,
     ) -> Result<CallToolResult, rmcp::Error> {
-        let peer = self
-            .peer
-            .clone()
-            .ok_or_else(|| rmcp::Error::internal_error("no MCP peer connected", None))?;
+        let peer = self.peer()?;
         let mut ctx = ProjectContext::resolve(self, &peer, project.map(PathBuf::from))
             .await
             .map_err(mcp_err)?;
 
-        if session.is_some() {
-            ctx.session_id = session;
+        if let Some(s) = session {
+            ctx.session_id = Some(s);
         }
 
         let report = coverage::build_report(
@@ -261,25 +261,7 @@ impl AmbitServer {
             ))]));
         };
 
-        let raw_json = serde_json::json!({
-            "path":          fc.path,
-            "total_symbols": fc.total_symbols,
-            "seen_count":    fc.seen_count,
-            "full_count":    fc.full_count,
-            "seen_percent":  format!("{:.1}", fc.seen_percent()),
-            "full_percent":  format!("{:.1}", fc.full_percent()),
-        });
-
-        let raw_str = serde_json::to_string_pretty(&raw_json).map_err(mcp_err)?;
-        let interpretation = try_interpret_coverage(&peer, &raw_str).await;
-
-        let mut response = serde_json::json!({ "raw_report": raw_json });
-        if let Some(text) = interpretation {
-            response["interpretation"] = serde_json::Value::String(text);
-        }
-
-        let out = serde_json::to_string_pretty(&response).map_err(mcp_err)?;
-        Ok(CallToolResult::success(vec![Content::text(out)]))
+        coverage_response(&peer, file_coverage_to_json(fc)).await
     }
 }
 
@@ -402,13 +384,7 @@ impl ServerHandler for AmbitServer {
             .scan_project(&project_path)
             .map_err(mcp_err)?;
 
-        let log_dir = self
-            .log_dir_override
-            .clone()
-            .or_else(|| self.ingester.log_dir_for_project(&project_path));
-        let session_id = log_dir
-            .as_ref()
-            .and_then(|d| self.ingester.find_latest_session(d));
+        let (log_dir, session_id) = self.latest_session_for(&project_path);
 
         let report = coverage::build_report(
             &project_path,
@@ -421,14 +397,7 @@ impl ServerHandler for AmbitServer {
 
         let json = serde_json::json!({
             "session_id": report.session_id,
-            "files": report.files.iter().map(|f| serde_json::json!({
-                "path":          f.path,
-                "total_symbols": f.total_symbols,
-                "seen_count":    f.seen_count,
-                "full_count":    f.full_count,
-                "seen_percent":  format!("{:.1}", f.seen_percent()),
-                "full_percent":  format!("{:.1}", f.full_percent()),
-            })).collect::<Vec<_>>(),
+            "files": report.files.iter().map(file_coverage_to_json).collect::<Vec<_>>(),
         });
 
         let text = serde_json::to_string_pretty(&json).map_err(mcp_err)?;
@@ -446,15 +415,10 @@ impl ServerHandler for AmbitServer {
             .ok_or_else(|| rmcp::Error::invalid_params("unrecognised resource URI", None))?;
 
         let log_dir = self
-            .log_dir_override
-            .clone()
-            .or_else(|| self.ingester.log_dir_for_project(&project_path))
+            .log_dir_for(&project_path)
             .unwrap_or_else(|| project_path.clone());
 
-        let peer = self
-            .peer
-            .clone()
-            .ok_or_else(|| rmcp::Error::internal_error("no MCP peer connected", None))?;
+        let peer = self.peer()?;
 
         self.watcher_registry
             .subscribe(log_dir, project_path, peer);
