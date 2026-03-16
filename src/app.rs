@@ -617,6 +617,12 @@ pub fn normalize_tool_path(tool_path: &Path, project_root: &Path) -> PathBuf {
     }
 }
 
+/// Unconditionally record every symbol in `symbols` (and all their descendants)
+/// at the event's `read_depth`. Used when the entire file — or the entire body of
+/// a named symbol — was present in the tool response.
+///
+/// Contrast with [`mark_targeted_symbols`], which narrows recording to only the
+/// symbols that match the event's `target_symbol` or `target_lines`.
 pub fn mark_file_symbols(
     symbols: &[SymbolNode],
     event: &AgentToolCall,
@@ -635,53 +641,144 @@ pub fn mark_file_symbols(
 }
 
 /// Mark only the symbols that match the tool call's targeting info.
+///
+/// Name-targeted matches (via `target_symbol`) bulk-mark all descendants because
+/// the tool response included the entire named symbol's body. Line-range matches
+/// (via `target_lines`) recurse precisely so that only overlapping child symbols
+/// are promoted — preventing unread siblings from being over-credited.
 pub fn mark_targeted_symbols(
     symbols: &[SymbolNode],
     event: &AgentToolCall,
     ledger: &mut ContextLedger,
 ) {
     for sym in symbols {
-        let matches = symbol_matches_target(sym, event);
-        if matches {
-            ledger.record(
-                sym.id.clone(),
-                event.read_depth,
-                sym.content_hash,
-                event.agent_id.to_string(),
-                sym.estimated_tokens,
-            );
-            // If we matched a parent (e.g. an impl block), also mark children
-            mark_file_symbols(&sym.children, event, ledger);
-        } else {
-            // Recurse — the target might be a child symbol
-            mark_targeted_symbols(&sym.children, event, ledger);
+        match classify_symbol_match(sym, event) {
+            MatchKind::ByName => {
+                ledger.record(
+                    sym.id.clone(),
+                    event.read_depth,
+                    sym.content_hash,
+                    event.agent_id.to_string(),
+                    sym.estimated_tokens,
+                );
+                // Full body was in the response — bulk-mark all descendants.
+                mark_file_symbols(&sym.children, event, ledger);
+            }
+            MatchKind::ByLineOverlap => {
+                ledger.record(
+                    sym.id.clone(),
+                    event.read_depth,
+                    sym.content_hash,
+                    event.agent_id.to_string(),
+                    sym.estimated_tokens,
+                );
+                // Parent container overlaps the read range — recurse precisely so
+                // only children whose ranges also overlap get promoted.
+                mark_targeted_symbols(&sym.children, event, ledger);
+            }
+            MatchKind::None => {
+                // No match at this level — keep searching in children.
+                mark_targeted_symbols(&sym.children, event, ledger);
+            }
         }
     }
 }
 
-/// Check if a symbol matches the tool call's target_symbol or target_lines.
-pub fn symbol_matches_target(sym: &SymbolNode, event: &AgentToolCall) -> bool {
-    if let Some(ref target_name) = event.target_symbol {
-        // Match if the symbol's id ends with the target name path.
-        // SymbolId format is "file_path::name_path", e.g. "src/app.rs::impl App/handle_key"
-        // target_name is a Serena name_path like "App/handle_key" or just "handle_key"
-        if let Some(name_part) = sym.id.split("::").last() {
-            if name_part == target_name || name_part.ends_with(&format!("/{target_name}")) {
+/// Normalize a `/`-separated name path by stripping leading lowercase-only keyword
+/// tokens from each segment.
+///
+/// Different tools and language servers qualify symbol names with language keywords:
+/// Serena uses `"impl App/method"`, `"async def foo"`, `"class Bar/baz"` etc., while
+/// ambit's tree-sitter parsers emit just the type/identifier portion: `"App/method"`,
+/// `"foo"`, `"Bar/baz"`. Normalising both sides before comparison makes matching
+/// language-agnostic without special-casing individual keywords.
+///
+/// A leading token is considered a keyword if it is one or more ASCII lowercase
+/// letters only (no digits, underscores, or colons), followed by a space. The
+/// stripping repeats so that multi-word prefixes like `"async def"` are fully
+/// removed.
+pub fn normalize_name_path(path: &str) -> String {
+    path.split('/')
+        .map(strip_leading_keywords)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn strip_leading_keywords(mut s: &str) -> &str {
+    loop {
+        let keyword_len = s.bytes().take_while(|b| b.is_ascii_lowercase()).count();
+        if keyword_len > 0 && s.len() > keyword_len && s.as_bytes()[keyword_len] == b' ' {
+            s = &s[keyword_len + 1..];
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+/// Check if a symbol's name path matches the tool call's `target_symbol`.
+///
+/// Compares both the raw target and the normalised form (see [`normalize_name_path`])
+/// so that tool-qualified paths like `"impl App/method"` match ambit's tree path
+/// `"App/method"` without special-casing individual languages or keywords.
+pub fn symbol_name_matches(sym: &SymbolNode, event: &AgentToolCall) -> bool {
+    let Some(ref target_name) = event.target_symbol else { return false };
+
+    let norm_target = normalize_name_path(target_name);
+
+    if let Some(name_part) = sym.id.split("::").last() {
+        let norm_name_part = normalize_name_path(name_part);
+        // Try both raw and normalised forms: exact match or suffix match.
+        for (t, np) in [
+            (target_name.as_str(), name_part),
+            (norm_target.as_str(), norm_name_part.as_str()),
+        ] {
+            if np == t || (np.len() > t.len() && np.as_bytes()[np.len() - t.len() - 1] == b'/' && np.ends_with(t)) {
                 return true;
             }
         }
-        // Also check plain name match for simple names
-        if sym.name == *target_name {
-            return true;
-        }
     }
-    if let Some(ref target_range) = event.target_lines {
-        // Check if symbol's line range overlaps with the target line range
-        if sym.line_range.start < target_range.end && target_range.start < sym.line_range.end {
-            return true;
-        }
+    // Plain name match (e.g. target = "handle_key", sym.name = "handle_key").
+    let norm_sym_name = normalize_name_path(&sym.name);
+    sym.name == *target_name || norm_sym_name == norm_target
+}
+
+/// Check if a symbol's line range overlaps with the tool call's `target_lines`.
+pub fn symbol_lines_match(sym: &SymbolNode, event: &AgentToolCall) -> bool {
+    let Some(ref target_range) = event.target_lines else { return false };
+    sym.line_range.start < target_range.end && target_range.start < sym.line_range.end
+}
+
+/// Check if a symbol matches the tool call's target_symbol or target_lines.
+pub fn symbol_matches_target(sym: &SymbolNode, event: &AgentToolCall) -> bool {
+    symbol_name_matches(sym, event) || symbol_lines_match(sym, event)
+}
+
+/// How a symbol matched a tool call's targeting info.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchKind {
+    /// The symbol was named explicitly via `target_symbol`.
+    /// The full body was in the response — mark this symbol and all descendants.
+    ByName,
+    /// The symbol's line range overlaps `target_lines`.
+    /// Only this symbol and overlapping children should be promoted.
+    ByLineOverlap,
+    /// No match.
+    None,
+}
+
+/// Classify how `sym` matches the tool call's targeting info.
+///
+/// Name targeting takes priority over line-range targeting. Returns [`MatchKind::None`]
+/// when the event carries no targeting info or neither predicate fires.
+pub fn classify_symbol_match(sym: &SymbolNode, event: &AgentToolCall) -> MatchKind {
+    if event.target_symbol.is_some() && symbol_name_matches(sym, event) {
+        MatchKind::ByName
+    } else if event.target_lines.is_some() && symbol_lines_match(sym, event) {
+        MatchKind::ByLineOverlap
+    } else {
+        MatchKind::None
     }
-    false
 }
 
 /// Classify a file's coverage as fully covered, all seen, partially covered, or not covered.
@@ -821,6 +918,108 @@ mod tests {
         // Non-match.
         let event3 = tool_call_targeted("find_symbol", "mock/app.rs", ReadDepth::FullBody, "other_fn");
         assert!(!symbol_matches_target(&s, &event3));
+    }
+
+    // --- normalize_name_path ---
+
+    #[test]
+    fn normalize_name_path_strips_impl_prefix() {
+        assert_eq!(normalize_name_path("impl App"), "App");
+        assert_eq!(normalize_name_path("impl App/handle_key"), "App/handle_key");
+        assert_eq!(normalize_name_path("impl Trait for App"), "Trait for App");
+    }
+
+    #[test]
+    fn normalize_name_path_strips_multi_word_prefix() {
+        // "async def" prefix (Python-style)
+        assert_eq!(normalize_name_path("async def foo"), "foo");
+        // "class" prefix
+        assert_eq!(normalize_name_path("class Foo/bar"), "Foo/bar");
+    }
+
+    #[test]
+    fn normalize_name_path_leaves_plain_names_unchanged() {
+        assert_eq!(normalize_name_path("App/handle_key"), "App/handle_key");
+        assert_eq!(normalize_name_path("handle_key"), "handle_key");
+        // Starts with uppercase — not a keyword.
+        assert_eq!(normalize_name_path("Display for App"), "Display for App");
+        // Has colons — not a simple keyword token.
+        assert_eq!(normalize_name_path("std::fmt::Display for App"), "std::fmt::Display for App");
+    }
+
+    #[test]
+    fn normalize_name_path_per_segment() {
+        // Each `/`-separated segment is normalised independently.
+        assert_eq!(normalize_name_path("impl App/fn handle_key"), "App/handle_key");
+    }
+
+    // --- symbol_name_matches with keyword-qualified paths ---
+
+    #[test]
+    fn symbol_name_matches_impl_qualified_method() {
+        // Serena emits "impl App/handle_key"; ambit's tree has id "mock/app.rs::App/handle_key".
+        let s = sym("mock/app.rs::App/handle_key", "handle_key");
+        let event = tool_call_targeted("find_symbol", "mock/app.rs", ReadDepth::FullBody, "impl App/handle_key");
+        assert!(symbol_name_matches(&s, &event));
+    }
+
+    #[test]
+    fn symbol_name_matches_impl_block_itself() {
+        // Serena emits "impl App"; ambit's tree has id "mock/app.rs::App" (impl block).
+        let s = sym("mock/app.rs::App", "App");
+        let event = tool_call_targeted("find_symbol", "mock/app.rs", ReadDepth::Signature, "impl App");
+        assert!(symbol_name_matches(&s, &event));
+    }
+
+    #[test]
+    fn symbol_name_matches_trait_impl() {
+        // "impl Display for App" → normalised "Display for App"
+        let s = sym("mock/app.rs::Display for App", "Display for App");
+        let event = tool_call_targeted("find_symbol", "mock/app.rs", ReadDepth::FullBody, "impl Display for App");
+        assert!(symbol_name_matches(&s, &event));
+    }
+
+    // --- line-range precision: siblings not over-marked ---
+
+    #[test]
+    fn mark_targeted_by_lines_does_not_mark_siblings() {
+        // Parent impl block spans lines 1..100; two sibling methods inside.
+        let method_a = sym_with_lines("f.rs::Foo/method_a", "method_a", 5, 20);
+        let method_b = sym_with_lines("f.rs::Foo/method_b", "method_b", 50, 70);
+        let impl_block = sym_with_children_and_lines(
+            "f.rs::Foo", "Foo", vec![method_a, method_b], 1, 100,
+        );
+
+        // Read only covers method_b's range.
+        let event = tool_call_lines("Read", "f.rs", ReadDepth::FullBody, 50, 70);
+        let mut ledger = ContextLedger::new();
+
+        mark_targeted_symbols(&[impl_block], &event, &mut ledger);
+
+        // The parent is marked (it overlaps), but method_a is NOT.
+        assert_eq!(ledger.depth_of("f.rs::Foo"), ReadDepth::FullBody);
+        assert_eq!(ledger.depth_of("f.rs::Foo/method_b"), ReadDepth::FullBody);
+        assert_eq!(ledger.depth_of("f.rs::Foo/method_a"), ReadDepth::Unseen);
+    }
+
+    #[test]
+    fn mark_targeted_by_name_still_marks_all_children() {
+        // Name-based match on the impl block should still bulk-mark all children.
+        let method_a = sym_with_lines("f.rs::Foo/method_a", "method_a", 5, 20);
+        let method_b = sym_with_lines("f.rs::Foo/method_b", "method_b", 50, 70);
+        let impl_block = sym_with_children_and_lines(
+            "f.rs::Foo", "Foo", vec![method_a, method_b], 1, 100,
+        );
+
+        // find_symbol("impl Foo", include_body=true) — all children embedded in response.
+        let event = tool_call_targeted("find_symbol", "f.rs", ReadDepth::FullBody, "impl Foo");
+        let mut ledger = ContextLedger::new();
+
+        mark_targeted_symbols(&[impl_block], &event, &mut ledger);
+
+        assert_eq!(ledger.depth_of("f.rs::Foo"), ReadDepth::FullBody);
+        assert_eq!(ledger.depth_of("f.rs::Foo/method_a"), ReadDepth::FullBody);
+        assert_eq!(ledger.depth_of("f.rs::Foo/method_b"), ReadDepth::FullBody);
     }
 
     // --- App method tests ---

@@ -37,6 +37,20 @@ pub fn sym_with_lines(id: &str, name: &str, start: usize, end: usize) -> SymbolN
     s
 }
 
+/// Create a SymbolNode with children and a custom line range.
+pub fn sym_with_children_and_lines(
+    id: &str,
+    name: &str,
+    children: Vec<SymbolNode>,
+    start: usize,
+    end: usize,
+) -> SymbolNode {
+    let mut s = sym(id, name);
+    s.children = children;
+    s.line_range = start..end;
+    s
+}
+
 /// Create a FileSymbols entry, setting each symbol's `file_path` to match.
 pub fn file(path: &str, symbols: Vec<SymbolNode>) -> FileSymbols {
     let file_path = PathBuf::from(path);
