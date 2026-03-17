@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "ambit",
+  "project_id": "66d97a45-22c6-431c-bc1b-5336565d39c1"
+}
