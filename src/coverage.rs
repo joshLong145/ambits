@@ -6,12 +6,13 @@
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::Result;
+use serde::Serialize;
 
 use crate::symbols::{ProjectTree, SymbolNode};
 use crate::tracking::{ContextLedger, ReadDepth};
 
 /// Per-file coverage metrics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FileCoverage {
     /// Full relative path to the file.
     pub path: String,
@@ -44,7 +45,7 @@ impl FileCoverage {
 }
 
 /// Complete coverage report for a project.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CoverageReport {
     /// Session ID if available.
     pub session_id: Option<String>,
@@ -260,6 +261,76 @@ impl CoverageFormatter for TextFormatter {
     }
 }
 
+/// Compact JSON formatter for machine-readable output.
+///
+/// Emits a single-line, schema-versioned JSON object terminated by a newline.
+/// The wire format is intentionally decoupled from `CoverageReport`'s internal
+/// shape via a private DTO so percentages can be precomputed and field
+/// ordering (schema_version first) is guaranteed.
+#[derive(Debug, Clone, Default)]
+pub struct JsonFormatter;
+
+impl CoverageFormatter for JsonFormatter {
+    fn format(&self, report: &CoverageReport) -> String {
+        #[derive(Serialize)]
+        struct Totals {
+            symbols: usize,
+            seen: usize,
+            full: usize,
+            seen_percent: f64,
+            full_percent: f64,
+        }
+
+        #[derive(Serialize)]
+        struct FileDto<'a> {
+            path: &'a str,
+            total_symbols: usize,
+            seen_count: usize,
+            full_count: usize,
+            seen_percent: f64,
+            full_percent: f64,
+        }
+
+        #[derive(Serialize)]
+        struct ReportDto<'a> {
+            schema_version: u32,
+            session_id: Option<&'a str>,
+            agent_id: Option<&'a str>,
+            totals: Totals,
+            files: Vec<FileDto<'a>>,
+        }
+
+        let dto = ReportDto {
+            schema_version: 1,
+            session_id: report.session_id.as_deref(),
+            agent_id: report.agent_id.as_deref(),
+            totals: Totals {
+                symbols: report.total_symbols(),
+                seen: report.total_seen(),
+                full: report.total_full(),
+                seen_percent: report.total_seen_percent(),
+                full_percent: report.total_full_percent(),
+            },
+            files: report
+                .files
+                .iter()
+                .map(|f| FileDto {
+                    path: &f.path,
+                    total_symbols: f.total_symbols,
+                    seen_count: f.seen_count,
+                    full_count: f.full_count,
+                    seen_percent: f.seen_percent(),
+                    full_percent: f.full_percent(),
+                })
+                .collect(),
+        };
+
+        let mut out = serde_json::to_string(&dto).expect("CoverageReport DTO must serialize");
+        out.push('\n');
+        out
+    }
+}
+
 /// Run a coverage report for a project and print it to stdout.
 ///
 /// Resolves the log directory and session automatically when not provided.
@@ -271,6 +342,7 @@ pub fn run_report(
     session_opt: &Option<String>,
     agent_opt: &Option<String>,
     ingester: &dyn crate::ingest::SessionIngester,
+    formatter: &dyn CoverageFormatter,
 ) -> Result<()> {
     use crate::tracking::ContextLedger;
 
@@ -340,7 +412,6 @@ pub fn run_report(
     let mut report = CoverageReport::from_project(project_tree, &ledger, resolved_agent.as_deref());
     report.session_id = session_id;
 
-    let formatter = TextFormatter::default();
     print!("{}", formatter.format(&report));
 
     Ok(())
@@ -531,5 +602,36 @@ mod tests {
         assert!(output.contains("Coverage Report (session: abc-123)"));
         assert!(output.contains("src/main.rs"));
         assert!(output.contains("TOTAL"));
+    }
+
+    #[test]
+    fn json_formatter_includes_schema_version() {
+        let report = CoverageReport {
+            session_id: Some("s".into()),
+            agent_id: None,
+            files: vec![],
+        };
+        let output = JsonFormatter.format(&report);
+        let value: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("output must be valid JSON");
+        assert_eq!(value["schema_version"], 1);
+    }
+
+    #[test]
+    fn json_formatter_compact_no_internal_newlines() {
+        let report = CoverageReport {
+            session_id: Some("s".into()),
+            agent_id: None,
+            files: vec![FileCoverage {
+                path: "a.rs".into(),
+                total_symbols: 1,
+                seen_count: 1,
+                full_count: 1,
+            }],
+        };
+        let output = JsonFormatter.format(&report);
+        assert!(output.ends_with('\n'), "output must end with a trailing newline");
+        let body = output.trim_end_matches('\n');
+        assert!(!body.contains('\n'), "JSON body must be a single line");
     }
 }

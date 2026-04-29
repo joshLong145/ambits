@@ -60,6 +60,7 @@ ambits --project <path>
 | `--agent`, `-a` | Filter coverage to a specific agent ID (supports prefix matching) |
 | `--dump` | Print symbol tree to stdout and exit |
 | `--coverage` | Print coverage report to stdout and exit |
+| `--format` | Coverage output format: `table` (default) or `json` |
 | `--serena` | Use Serena's LSP symbol cache instead of tree-sitter |
 | `--log-dir` | Path to Claude Code log directory (auto-derived) |
 | `--log-output` | Output directory for event logs |
@@ -102,6 +103,12 @@ TOTAL                                         214     182     175     85%     82
 
 - **Seen%**: Symbols the agent has any awareness of (name, overview, signature, or full body)
 - **Full%**: Symbols the agent has read completely (full body)
+
+For machine-readable output, pass `--format json` to emit a single-line, schema-versioned JSON object suitable for `jq` or other tooling:
+
+```bash
+ambits -p . --coverage --format json | jq '.totals.full_percent'
+```
 
 ### Multi-Agent Coverage
 

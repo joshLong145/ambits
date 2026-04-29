@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use ambits::app::App;
-use ambits::coverage::{CoverageFormatter, CoverageReport, TextFormatter};
+use ambits::coverage::{CoverageFormatter, CoverageReport, JsonFormatter, TextFormatter};
 use ambits::ingest::claude::parse_log_file;
 use ambits::ingest::tool_config::ToolMappingConfig;
 use ambits::ingest::AgentToolCall;
@@ -282,4 +282,81 @@ fn text_formatter_structure() {
     assert!(output.contains("mock/main.rs"), "should contain file path");
     assert!(output.contains("TOTAL"), "should contain total row");
     assert!(output.contains("100%"), "should show 100% for full coverage");
+}
+
+/// JsonFormatter emits the documented schema with totals, files, and schema_version.
+#[test]
+fn json_formatter_structure() {
+    let files = vec![
+        file("mock/main.rs", vec![sym("mock/main.rs::main", "main")]),
+    ];
+    let tree = project(files);
+    let mut ledger = ContextLedger::new();
+    ledger.record(
+        "mock/main.rs::main".into(),
+        ReadDepth::FullBody,
+        [0; 32],
+        "ag".into(),
+        10,
+    );
+
+    let mut report = CoverageReport::from_project(&tree, &ledger, None);
+    report.session_id = Some("test-session-456".into());
+
+    let output = JsonFormatter.format(&report);
+    let v: serde_json::Value =
+        serde_json::from_str(output.trim()).expect("output must be valid JSON");
+
+    assert_eq!(v["schema_version"], 1);
+    assert_eq!(v["session_id"], "test-session-456");
+    assert!(v["agent_id"].is_null());
+    assert_eq!(v["totals"]["symbols"], 1);
+    assert_eq!(v["totals"]["seen"], 1);
+    assert_eq!(v["totals"]["full"], 1);
+    assert_eq!(v["totals"]["seen_percent"], 100.0);
+    assert_eq!(v["totals"]["full_percent"], 100.0);
+
+    let files = v["files"].as_array().expect("files must be an array");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"], "mock/main.rs");
+    assert_eq!(files[0]["total_symbols"], 1);
+    assert_eq!(files[0]["seen_count"], 1);
+    assert_eq!(files[0]["full_count"], 1);
+    assert_eq!(files[0]["full_percent"], 100.0);
+}
+
+/// agent_id is null without a filter and the resolved id when filtered.
+#[test]
+fn json_formatter_agent_filter() {
+    let files = vec![file("a.rs", vec![sym("a.rs::x", "x")])];
+    let tree = project(files);
+    let mut ledger = ContextLedger::new();
+    ledger.record("a.rs::x".into(), ReadDepth::FullBody, [0; 32], "agent-foo".into(), 10);
+
+    let report_no_filter = CoverageReport::from_project(&tree, &ledger, None);
+    let v: serde_json::Value =
+        serde_json::from_str(JsonFormatter.format(&report_no_filter).trim()).unwrap();
+    assert!(v["agent_id"].is_null());
+
+    let report_filtered = CoverageReport::from_project(&tree, &ledger, Some("agent-foo"));
+    let v: serde_json::Value =
+        serde_json::from_str(JsonFormatter.format(&report_filtered).trim()).unwrap();
+    assert_eq!(v["agent_id"], "agent-foo");
+}
+
+/// Empty project serializes with zero totals and an empty files array.
+#[test]
+fn json_formatter_empty_project() {
+    let tree = project(vec![]);
+    let ledger = ContextLedger::new();
+    let report = CoverageReport::from_project(&tree, &ledger, None);
+
+    let output = JsonFormatter.format(&report);
+    let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+
+    assert_eq!(v["schema_version"], 1);
+    assert_eq!(v["totals"]["symbols"], 0);
+    assert_eq!(v["totals"]["seen"], 0);
+    assert_eq!(v["totals"]["full"], 0);
+    assert_eq!(v["files"].as_array().unwrap().len(), 0);
 }

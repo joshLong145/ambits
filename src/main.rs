@@ -15,7 +15,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clap::{Parser as ClapParser, Subcommand};
+use clap::{Parser as ClapParser, Subcommand, ValueEnum};
 use color_eyre::eyre::Result;
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
@@ -73,8 +73,20 @@ struct Cli {
     #[arg(long)]
     tools_config: Option<PathBuf>,
 
+    /// Output format for --coverage. Ignored when --coverage is not set.
+    #[arg(long, value_enum, default_value = "table")]
+    format: CoverageFormat,
+
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum CoverageFormat {
+    /// Human-readable ASCII table (default).
+    Table,
+    /// Compact, schema-versioned JSON on a single line.
+    Json,
 }
 
 #[derive(Subcommand, Debug)]
@@ -146,7 +158,19 @@ fn main() -> Result<()> {
         for w in &config_warnings {
             println!("[ambit warning] {w}");
         }
-        return coverage::run_report(&project_path, &project_tree, &cli.log_dir, &cli.session, &cli.agent, &*ingester);
+        let formatter: Box<dyn coverage::CoverageFormatter> = match cli.format {
+            CoverageFormat::Table => Box::new(coverage::TextFormatter::default()),
+            CoverageFormat::Json => Box::new(coverage::JsonFormatter),
+        };
+        return coverage::run_report(
+            &project_path,
+            &project_tree,
+            &cli.log_dir,
+            &cli.session,
+            &cli.agent,
+            &*ingester,
+            &*formatter,
+        );
     }
 
     // Resolve log directory and session.
