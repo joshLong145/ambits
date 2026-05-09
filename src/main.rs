@@ -206,12 +206,15 @@ fn main() -> Result<()> {
 
     let mut app = App::new(project_tree, project_path.clone(), event_log);
     app.session_id = session_id.clone();
+    app.session_slug = log_dir.as_ref()
+        .zip(session_id.as_ref())
+        .and_then(|(ld, sid)| ingester.session_slug(ld, sid));
 
     // Pre-populate the ledger from existing session logs.
     if let (Some(ref log_dir), Some(ref session_id)) = (&log_dir, &session_id) {
         let log_files = ingester.session_log_files(log_dir, session_id);
         for log_file in &log_files {
-            for event in ingester.parse_log_file(log_file) {
+            for event in ingester.parse_log_file_with_root(log_file, &project_path) {
                 app.process_agent_event(event);
             }
         }

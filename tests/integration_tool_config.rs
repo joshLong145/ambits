@@ -224,6 +224,97 @@ fn tool_notebook_edit() {
 }
 
 // ---------------------------------------------------------------------------
+// 16. Agent
+// ---------------------------------------------------------------------------
+#[test]
+fn tool_agent_maps_with_description() {
+    let cfg = builtin();
+    let input = serde_json::json!({ "description": "Explore parser", "subagent_type": "Explore", "prompt": "..." });
+    let call = map_tool_call(&cfg, "Agent", &input, "a", "ts").unwrap();
+    assert_eq!(call.read_depth, ReadDepth::Unseen);
+    assert!(call.description.contains("Explore parser"), "description was: {}", call.description);
+}
+
+// ---------------------------------------------------------------------------
+// 17. ToolSearch
+// ---------------------------------------------------------------------------
+#[test]
+fn tool_search_gets_unseen() {
+    let cfg = builtin();
+    let input = serde_json::json!({ "query": "select:Read,Edit" });
+    let call = map_tool_call(&cfg, "ToolSearch", &input, "a", "ts").unwrap();
+    assert_eq!(call.read_depth, ReadDepth::Unseen);
+    assert!(call.description.contains("select:Read,Edit"), "description was: {}", call.description);
+}
+
+// ---------------------------------------------------------------------------
+// 18. Skill
+// ---------------------------------------------------------------------------
+#[test]
+fn tool_skill_gets_name_only() {
+    let cfg = builtin();
+    let input = serde_json::json!({ "skill": "rust-skills:m01-ownership" });
+    let call = map_tool_call(&cfg, "Skill", &input, "a", "ts").unwrap();
+    assert_eq!(call.read_depth, ReadDepth::NameOnly);
+    assert!(call.description.contains("rust-skills:m01-ownership"), "description was: {}", call.description);
+}
+
+// ---------------------------------------------------------------------------
+// 19. SendMessage
+// ---------------------------------------------------------------------------
+#[test]
+fn tool_send_message_gets_unseen() {
+    let cfg = builtin();
+    let input = serde_json::json!({ "to": "agent-abc", "message": "hi" });
+    let call = map_tool_call(&cfg, "SendMessage", &input, "a", "ts").unwrap();
+    assert_eq!(call.read_depth, ReadDepth::Unseen);
+    assert!(call.description.contains("agent-abc"), "description was: {}", call.description);
+}
+
+// ---------------------------------------------------------------------------
+// 20. TaskList
+// ---------------------------------------------------------------------------
+#[test]
+fn tool_task_list_gets_unseen() {
+    let cfg = builtin();
+    let input = serde_json::json!({});
+    let call = map_tool_call(&cfg, "TaskList", &input, "a", "ts").unwrap();
+    assert_eq!(call.read_depth, ReadDepth::Unseen);
+}
+
+// ---------------------------------------------------------------------------
+// 21. AskUserQuestion
+// ---------------------------------------------------------------------------
+#[test]
+fn tool_ask_user_question_gets_unseen() {
+    let cfg = builtin();
+    let input = serde_json::json!({ "question": "Proceed?", "options": ["Yes", "No"] });
+    let call = map_tool_call(&cfg, "AskUserQuestion", &input, "a", "ts").unwrap();
+    assert_eq!(call.read_depth, ReadDepth::Unseen);
+}
+
+// ---------------------------------------------------------------------------
+// 22. WebFetch / WebSearch
+// ---------------------------------------------------------------------------
+#[test]
+fn tool_web_fetch_gets_unseen() {
+    let cfg = builtin();
+    let input = serde_json::json!({ "url": "https://example.com" });
+    let call = map_tool_call(&cfg, "WebFetch", &input, "a", "ts").unwrap();
+    assert_eq!(call.read_depth, ReadDepth::Unseen);
+    assert!(call.description.contains("https://example.com"), "description was: {}", call.description);
+}
+
+#[test]
+fn tool_web_search_gets_unseen() {
+    let cfg = builtin();
+    let input = serde_json::json!({ "query": "rust error handling" });
+    let call = map_tool_call(&cfg, "WebSearch", &input, "a", "ts").unwrap();
+    assert_eq!(call.read_depth, ReadDepth::Unseen);
+    assert!(call.description.contains("rust error handling"), "description was: {}", call.description);
+}
+
+// ---------------------------------------------------------------------------
 // Unknown tool — returns None
 // ---------------------------------------------------------------------------
 #[test]

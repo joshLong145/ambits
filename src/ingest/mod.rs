@@ -55,6 +55,21 @@ pub trait SessionIngester: Send + Sync {
     fn parse_log_file(&self, path: &Path) -> Vec<AgentToolCall>;
     /// Create a new incremental event tailer for the given set of files.
     fn new_tailer(&self, files: Vec<PathBuf>) -> Box<dyn EventTailer>;
+
+    /// Return the human-readable slug for a session (e.g. "crispy-crunching-nova").
+    /// Default returns None; implementations override this for slug-carrying formats.
+    fn session_slug(&self, log_dir: &Path, session_id: &str) -> Option<String> {
+        let _ = (log_dir, session_id);
+        None
+    }
+
+    /// Parse all events from a log file, remapping paths when the agent ran in a
+    /// worktree whose cwd differs from `project_root`.
+    /// Default delegates to `parse_log_file` (no remapping).
+    fn parse_log_file_with_root(&self, path: &Path, project_root: &Path) -> Vec<AgentToolCall> {
+        let _ = project_root;
+        self.parse_log_file(path)
+    }
 }
 
 /// Stateful incremental reader. Created via `SessionIngester::new_tailer`.

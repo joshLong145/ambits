@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn builtin_config_parses() {
         let cfg = ToolMappingConfig::builtin().expect("built-in config must parse");
-        assert_eq!(cfg.tools.len(), 15);
+        assert_eq!(cfg.tools.len(), 22);
         assert!(!cfg.index.is_empty());
     }
 
@@ -763,7 +763,7 @@ description  = "Foo"
     fn resolve_falls_back_to_builtin() {
         // Pass a non-existent path — resolve() should silently fall back.
         let (cfg, warnings) = ToolMappingConfig::resolve(Some(std::path::Path::new("/nonexistent/tools.toml")));
-        assert_eq!(cfg.tools.len(), 15, "should have 15 built-in tools");
+        assert_eq!(cfg.tools.len(), 22, "should have 22 built-in tools");
         // No warnings since the file simply doesn't exist (no ParseError).
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
     }
