@@ -93,6 +93,7 @@ pub struct App {
 
     // Session info for display.
     pub session_id: Option<String>,
+    pub session_slug: Option<String>,
 
     // Optional event log writer.
     pub event_log: Option<BufWriter<File>>,
@@ -126,6 +127,7 @@ impl App {
             search_mode: false,
             search_query: String::new(),
             session_id: None,
+            session_slug: None,
             event_log,
         };
         app.rebuild_tree_rows();
@@ -142,6 +144,7 @@ impl App {
         self.agent_tree = AgentTree::new();
         self.agent_filter = None;
         self.agent_selection_index = 0;
+        self.session_slug = None;
         self.rebuild_tree_rows();
     }
 
@@ -166,7 +169,7 @@ impl App {
                     )
                 })
                 .collect();
-            indices.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            indices.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
             indices.into_iter().map(|(_, _, i)| i).collect()
         } else {
             (0..self.project_tree.files.len()).collect()

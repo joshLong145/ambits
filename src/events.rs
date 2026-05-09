@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use flume;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyEvent, MouseEvent};

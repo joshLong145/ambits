@@ -79,12 +79,18 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         ]),
     ];
 
-    // Session info.
-    if let Some(ref sid) = app.session_id {
-        let short = if sid.len() > 12 { &sid[..12] } else { sid };
+    // Session info: prefer human-readable slug; fall back to first 12 chars of UUID.
+    let session_label: Option<&str> = if let Some(slug) = app.session_slug.as_deref() {
+        Some(slug)
+    } else if let Some(sid) = app.session_id.as_deref() {
+        Some(if sid.len() > 12 { &sid[..12] } else { sid })
+    } else {
+        None
+    };
+    if let Some(label) = session_label {
         lines.push(Line::from(vec![
             Span::raw("  Session: "),
-            Span::styled(short, Style::default().fg(colors::ACCENT_MUTED)),
+            Span::styled(label, Style::default().fg(colors::ACCENT_MUTED)),
         ]));
     }
 
@@ -129,7 +135,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             // Determine if this is the last sibling at its indent level.
             let is_last_sibling = flat[i + 1..]
                 .iter()
-                .all(|(_, d)| *d > *indent || *d < *indent)
+                .all(|(_, d)| *d != *indent)
                 || flat[i + 1..]
                     .iter()
                     .take_while(|(_, d)| *d >= *indent)
