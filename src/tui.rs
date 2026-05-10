@@ -140,11 +140,14 @@ impl TuiSession {
                     app.reset_session();
                     self.current_session_id = Some(latest.clone());
                     app.session_id = self.current_session_id.clone();
+                    app.session_slug = log_dir.as_ref()
+                        .zip(self.current_session_id.as_ref())
+                        .and_then(|(ld2, sid)| self.ingester.session_slug(ld2, sid));
 
                     // Pre-populate from lines already written before this tick.
                     let new_files = self.ingester.session_log_files(ld, &latest);
                     for log_file in &new_files {
-                        for event in self.ingester.parse_log_file(log_file) {
+                        for event in self.ingester.parse_log_file_with_root(log_file, project_path) {
                             app.process_agent_event(event);
                         }
                     }

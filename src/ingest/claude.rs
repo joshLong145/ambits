@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -9,21 +9,29 @@ use super::{AgentToolCall, EventTailer, SessionIngester, TailerOutput, ToolCallM
 use super::tool_config::ToolMappingConfig;
 
 /// Derive the Claude Code log directory for a given project path.
-/// Claude stores logs at ~/.claude/projects/<slug>/ where slug is the
-/// absolute path with `/` replaced by `-` and leading `-`.
+/// Probes two slug variants to stay resilient across Claude Code versions:
+///   1. Primary: replace '/' and '.' with '-' (observed current behavior)
+///   2. Fallback: replace only '/' — older builds may not replace dots
 pub fn log_dir_for_project(project_path: &Path) -> Option<PathBuf> {
     let canonical = project_path.canonicalize().ok()?;
-    let slug = canonical
-        .to_string_lossy()
-        .replace('/', "-")
-        .replace('.', "-");  // Claude Code also replaces dots with hyphens
     let home = dirs_home()?;
-    let dir = home.join(".claude").join("projects").join(&slug);
-    if dir.is_dir() {
-        Some(dir)
-    } else {
-        None
+    let base = home.join(".claude").join("projects");
+
+    let slug_primary = canonical
+        .to_string_lossy()
+        .replace(['/', '.'], "-");
+    let dir_primary = base.join(&slug_primary);
+    if dir_primary.is_dir() {
+        return Some(dir_primary);
     }
+
+    let slug_fallback = canonical.to_string_lossy().replace('/', "-");
+    let dir_fallback = base.join(&slug_fallback);
+    if dir_fallback.is_dir() {
+        return Some(dir_fallback);
+    }
+
+    None
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -105,7 +113,10 @@ pub fn session_log_files(log_dir: &Path, session_id: &str) -> Vec<PathBuf> {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("");
-                if name.starts_with("agent-") && name.ends_with(".jsonl") {
+                if name.starts_with("agent-")
+                    && name.ends_with(".jsonl")
+                    && !name.starts_with("agent-acompact-")
+                {
                     files.push(path);
                 }
             }
@@ -122,6 +133,7 @@ pub fn session_log_files(log_dir: &Path, session_id: &str) -> Vec<PathBuf> {
                 .unwrap_or("");
             if name.starts_with("agent-")
                 && name.ends_with(".jsonl")
+                && !name.starts_with("agent-acompact-")
                 && agent_belongs_to_session(&path, session_id)
             {
                 files.push(path);
@@ -149,23 +161,65 @@ fn agent_belongs_to_session(path: &Path, session_id: &str) -> bool {
     false
 }
 
+/// Return the fallback label for an agent log: the filename stem with "agent-" prefix stripped.
+fn default_label(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+    stem.strip_prefix("agent-").unwrap_or(stem).to_string()
+}
+
+/// Scan a JSONL file line by line and return the first value found for `key`
+/// in any top-level JSON object. Lines that are not valid JSON are skipped.
+fn extract_jsonl_string_field(path: &Path, key: &str) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(obj) = serde_json::from_str::<Value>(trimmed) {
+            if let Some(val) = obj.get(key).and_then(|v| v.as_str()) {
+                return Some(val.to_string());
+            }
+        }
+    }
+}
+
+/// Extract the `slug` field from the first matching JSONL record in a session log file.
+pub fn extract_session_slug(path: &Path) -> Option<String> {
+    extract_jsonl_string_field(path, "slug")
+}
+
+/// Extract the `cwd` field from the first matching JSONL record in a log file.
+pub fn extract_cwd(path: &Path) -> Option<PathBuf> {
+    extract_jsonl_string_field(path, "cwd").map(PathBuf::from)
+}
+
+/// Remap `file_path` from `worktree_root` to `project_root` when the path is
+/// rooted inside the worktree. Returns the original path unchanged otherwise.
+pub fn remap_path(file_path: &Path, worktree_root: &Path, project_root: &Path) -> PathBuf {
+    if let Ok(rel) = file_path.strip_prefix(worktree_root) {
+        project_root.join(rel)
+    } else {
+        file_path.to_path_buf()
+    }
+}
+
 /// Extract a human-readable label for an agent from its JSONL log file.
 ///
 /// Reads the first line of the file and looks for:
 /// 1. The `message.content` field (the task prompt given to the agent) — truncated to 50 chars
 /// 2. Falls back to the filename stem (e.g., `agent-a9fe23c` → `a9fe23c`)
 pub fn extract_agent_label(path: &Path) -> String {
-    let fallback = path
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .strip_prefix("agent-")
-        .unwrap_or_else(|| {
-            path.file_stem()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-        })
-        .to_string();
+    let fallback = default_label(path);
 
     let file = match fs::File::open(path) {
         Ok(f) => f,
@@ -212,29 +266,73 @@ pub enum ParsedLine {
 /// SessionCleared signals are ignored in batch mode — dump/coverage modes show
 /// aggregate historical coverage, not live session state.
 pub fn parse_log_file(path: &Path, config: &ToolMappingConfig) -> Vec<AgentToolCall> {
-    parse_log_file_with_mapper(path, config)
+    parse_log_file_with_mapper(path, config, None)
 }
 
-fn parse_log_file_with_mapper(path: &Path, mapper: &dyn ToolCallMapper) -> Vec<AgentToolCall> {
+fn parse_log_file_with_mapper(
+    path: &Path,
+    mapper: &dyn ToolCallMapper,
+    project_root: Option<&Path>,
+) -> Vec<AgentToolCall> {
     let mut events = Vec::new();
     let file = match fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return events,
     };
-    let reader = BufReader::new(file);
 
-    // Derive a default agent ID from the filename.
     let default_id = path
         .file_stem()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string();
 
-    // Extract a human-readable label for this agent (Arc so each clone is free).
-    let label: Arc<str> = extract_agent_label(path).into();
+    let mut reader = BufReader::new(file);
+
+    // Read the first line once to extract the agent label and worktree cwd.
+    // This avoids a second file open for extract_agent_label / extract_cwd.
+    let mut first_line = String::new();
+    let _ = reader.read_line(&mut first_line);
+    let first_trimmed = first_line.trim();
+
+    let first_parsed: Option<Value> = serde_json::from_str(first_trimmed).ok();
+    let label: Arc<str> = match first_parsed.as_ref() {
+        Some(obj) => {
+            let content = obj.pointer("/message/content").and_then(|v| v.as_str()).unwrap_or("");
+            if content.is_empty() {
+                Arc::from(default_label(path).as_str())
+            } else {
+                let line_content = content.lines().next().unwrap_or(content);
+                if line_content.len() <= 50 {
+                    Arc::from(line_content)
+                } else {
+                    Arc::from(format!("{}...", &line_content[..47]).as_str())
+                }
+            }
+        }
+        None => Arc::from(default_label(path).as_str()),
+    };
+
+    // Detect worktree: cwd in the first record differs from the project root.
+    let cwd_remap: Option<(PathBuf, PathBuf)> = project_root.and_then(|root| {
+        let obj = first_parsed.as_ref()?;
+        let cwd = PathBuf::from(obj.get("cwd")?.as_str()?);
+        if cwd != root { Some((cwd, root.to_path_buf())) } else { None }
+    });
+
+    // Seek back to start so all lines — including line 1 — are processed for events.
+    let _ = reader.seek(SeekFrom::Start(0));
 
     for line in reader.lines().map_while(Result::ok) {
-        if let ParsedLine::Events(mut line_events) = parse_jsonl_line(&line, &default_id, mapper) {
+        if let ParsedLine::Events(mut line_events) =
+            parse_jsonl_line(line.trim(), &default_id, mapper)
+        {
+            if let Some((ref worktree, ref project)) = cwd_remap {
+                for ev in &mut line_events {
+                    if let Some(ref fp) = ev.file_path {
+                        ev.file_path = Some(remap_path(fp, worktree, project));
+                    }
+                }
+            }
             for ev in &mut line_events {
                 ev.label = label.clone();
             }
@@ -630,7 +728,14 @@ impl SessionIngester for ClaudeIngester {
         session_log_files(log_dir, session_id)
     }
     fn parse_log_file(&self, path: &Path) -> Vec<AgentToolCall> {
-        parse_log_file_with_mapper(path, &*self.mapper)
+        parse_log_file_with_mapper(path, &*self.mapper, None)
+    }
+    fn parse_log_file_with_root(&self, path: &Path, project_root: &Path) -> Vec<AgentToolCall> {
+        parse_log_file_with_mapper(path, &*self.mapper, Some(project_root))
+    }
+    fn session_slug(&self, log_dir: &Path, session_id: &str) -> Option<String> {
+        let path = log_dir.join(format!("{session_id}.jsonl"));
+        extract_session_slug(&path)
     }
     fn new_tailer(&self, files: Vec<PathBuf>) -> Box<dyn EventTailer> {
         Box::new(LogTailer::new(files, Arc::clone(&self.mapper)))
@@ -1204,6 +1309,139 @@ description  = "UserTool {target}"
     }
 
     // -----------------------------------------------------------------------
+    // Slug, cwd, remap, and acompact filter tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_slug_reads_from_first_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("session.jsonl");
+        fs::write(&log, r#"{"type":"user","slug":"crispy-crunching-nova","sessionId":"abc"}"#).unwrap();
+        assert_eq!(extract_session_slug(&log), Some("crispy-crunching-nova".into()));
+    }
+
+    #[test]
+    fn extract_slug_skips_records_without_slug() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("session.jsonl");
+        fs::write(&log,
+            "{\"type\":\"queue-operation\",\"sessionId\":\"abc\"}\n\
+             {\"type\":\"user\",\"slug\":\"amber-dancing-fox\",\"sessionId\":\"abc\"}\n"
+        ).unwrap();
+        assert_eq!(extract_session_slug(&log), Some("amber-dancing-fox".into()));
+    }
+
+    #[test]
+    fn extract_slug_returns_none_for_missing_file() {
+        assert_eq!(extract_session_slug(Path::new("/nonexistent/session.jsonl")), None);
+    }
+
+    #[test]
+    fn extract_slug_returns_none_when_no_slug_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("session.jsonl");
+        fs::write(&log, r#"{"type":"queue-operation","sessionId":"abc"}"#).unwrap();
+        assert_eq!(extract_session_slug(&log), None);
+    }
+
+    #[test]
+    fn extract_cwd_reads_first_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("agent.jsonl");
+        fs::write(&log, r#"{"type":"user","cwd":"/tmp/worktree-xyz","sessionId":"s1"}"#).unwrap();
+        assert_eq!(extract_cwd(&log), Some(PathBuf::from("/tmp/worktree-xyz")));
+    }
+
+    #[test]
+    fn remap_path_strips_worktree_prefix() {
+        let worktree = PathBuf::from("/tmp/worktree-abc");
+        let project  = PathBuf::from("/home/user/myproject");
+        let file     = PathBuf::from("/tmp/worktree-abc/src/main.rs");
+        assert_eq!(
+            remap_path(&file, &worktree, &project),
+            PathBuf::from("/home/user/myproject/src/main.rs"),
+        );
+    }
+
+    #[test]
+    fn remap_path_unchanged_when_no_prefix_match() {
+        let worktree = PathBuf::from("/tmp/worktree-abc");
+        let project  = PathBuf::from("/home/user/myproject");
+        let file     = PathBuf::from("/home/user/myproject/src/main.rs");
+        assert_eq!(remap_path(&file, &worktree, &project), file);
+    }
+
+    #[test]
+    fn session_log_files_excludes_acompact_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = "abcd1234-abcd-abcd-abcd-abcd12345678";
+        let subagents_dir = tmp.path().join(session).join("subagents");
+        fs::create_dir_all(&subagents_dir).unwrap();
+
+        let real = subagents_dir.join("agent-abc123.jsonl");
+        fs::write(&real, r#"{"type":"user"}"#).unwrap();
+        let compact = subagents_dir.join("agent-acompact-0687bac42d56804e.jsonl");
+        fs::write(&compact, r#"{"type":"user","isMeta":true}"#).unwrap();
+
+        let main_file = tmp.path().join(format!("{session}.jsonl"));
+        fs::write(&main_file, r#"{"type":"user"}"#).unwrap();
+
+        let files = session_log_files(tmp.path(), session);
+        assert!(files.contains(&real), "real subagent must be included");
+        assert!(!files.contains(&compact), "acompact agent must be excluded");
+    }
+
+    #[test]
+    fn parse_log_file_remaps_worktree_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        let project  = tmp.path().join("project");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(&project).unwrap();
+
+        let log = worktree.join("agent.jsonl");
+        let mut f = fs::File::create(&log).unwrap();
+        writeln!(f, r#"{{"type":"user","cwd":"{}","sessionId":"s1"}}"#,
+            worktree.to_str().unwrap()).unwrap();
+        writeln!(f, "{}", jsonl_assistant("mcp__acp__Read", &format!(
+            r#"{{"file_path":"{}/src/main.rs"}}"#, worktree.to_str().unwrap()
+        ))).unwrap();
+        drop(f);
+
+        let config = ToolMappingConfig::builtin().unwrap();
+        let events = parse_log_file_with_mapper(&log, &config, Some(&project));
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].file_path.as_ref().unwrap(),
+            &project.join("src/main.rs"),
+        );
+    }
+
+    #[test]
+    fn parse_log_file_no_remap_when_cwd_matches_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+
+        let log = project.join("session.jsonl");
+        let mut f = fs::File::create(&log).unwrap();
+        writeln!(f, r#"{{"type":"user","cwd":"{}","sessionId":"s1"}}"#,
+            project.to_str().unwrap()).unwrap();
+        writeln!(f, "{}", jsonl_assistant("mcp__acp__Read", &format!(
+            r#"{{"file_path":"{}/src/main.rs"}}"#, project.to_str().unwrap()
+        ))).unwrap();
+        drop(f);
+
+        let config = ToolMappingConfig::builtin().unwrap();
+        let events = parse_log_file_with_mapper(&log, &config, Some(&project));
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].file_path.as_ref().unwrap(),
+            &project.join("src/main.rs"),
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Bash per-command depth dispatch
     // -----------------------------------------------------------------------
 
@@ -1250,5 +1488,15 @@ description  = "UserTool {target}"
         // Unrecognised commands fall back to the PatternMatch default (NameOnly).
         assert_eq!(bash_event("cargo build --release").read_depth, ReadDepth::NameOnly);
         assert_eq!(bash_event("npm install").read_depth, ReadDepth::NameOnly);
+    }
+
+    #[test]
+    fn bash_ugrep_gets_overview() {
+        assert_eq!(bash_event("ugrep 'fn main' src/").read_depth, ReadDepth::Overview);
+    }
+
+    #[test]
+    fn bash_bfs_gets_name_only() {
+        assert_eq!(bash_event("bfs . -name '*.rs'").read_depth, ReadDepth::NameOnly);
     }
 }

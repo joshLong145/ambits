@@ -90,7 +90,7 @@ pub fn estimate_tokens(source: &str) -> usize {
             word_len += 1;
         } else {
             if word_len > 0 {
-                count += (word_len + 3) / 4;
+                count += word_len.div_ceil(4);
                 word_len = 0;
             }
             if !ch.is_whitespace() {
@@ -99,7 +99,7 @@ pub fn estimate_tokens(source: &str) -> usize {
         }
     }
     if word_len > 0 {
-        count += (word_len + 3) / 4;
+        count += word_len.div_ceil(4);
     }
     count
 }

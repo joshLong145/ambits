@@ -123,8 +123,10 @@ depth         = { type = "pattern_match", key = "command", default = "NameOnly",
     { prefix = "grep ", depth = "Overview" },
     { prefix = "rg ",   depth = "Overview" },
     { prefix = "awk ",  depth = "Overview" },
-    { prefix = "sed ",  depth = "Overview" },
-    { prefix = "git ",  depth = "Unseen" },
+    { prefix = "sed ",   depth = "Overview"  },
+    { prefix = "ugrep ", depth = "Overview"  },
+    { prefix = "bfs ",   depth = "NameOnly"  },
+    { prefix = "git ",   depth = "Unseen"    },
 ] }
 description   = "Bash {pattern|cmd}"
 
@@ -135,3 +137,59 @@ path_required = false
 pattern_keys  = []
 depth         = { type = "fixed", value = "NameOnly" }
 description   = "TodoWrite {pattern|cmd}"
+
+[[tool]]
+names         = ["Agent"]
+path_keys     = []
+path_required = false
+pattern_keys  = ["description"]
+depth         = { type = "fixed", value = "Unseen" }
+description   = "Agent: {pattern}"
+
+[[tool]]
+names         = ["ToolSearch"]
+path_keys     = []
+path_required = false
+pattern_keys  = ["query"]
+depth         = { type = "fixed", value = "Unseen" }
+description   = "ToolSearch {pattern}"
+
+[[tool]]
+names         = ["Skill"]
+path_keys     = []
+path_required = false
+pattern_keys  = ["skill"]
+depth         = { type = "fixed", value = "NameOnly" }
+description   = "Skill {pattern}"
+
+[[tool]]
+names         = ["SendMessage"]
+path_keys     = []
+path_required = false
+pattern_keys  = ["to"]
+depth         = { type = "fixed", value = "Unseen" }
+description   = "SendMessage {pattern}"
+
+[[tool]]
+names         = ["TaskList"]
+path_keys     = []
+path_required = false
+pattern_keys  = []
+depth         = { type = "fixed", value = "Unseen" }
+description   = "TaskList"
+
+[[tool]]
+names         = ["AskUserQuestion"]
+path_keys     = []
+path_required = false
+pattern_keys  = ["question"]
+depth         = { type = "fixed", value = "Unseen" }
+description   = "AskUserQuestion"
+
+[[tool]]
+names         = ["WebFetch", "WebSearch"]
+path_keys     = []
+path_required = false
+pattern_keys  = ["url", "query"]
+depth         = { type = "fixed", value = "Unseen" }
+description   = "Web {pattern}"
