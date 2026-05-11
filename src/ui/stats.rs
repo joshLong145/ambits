@@ -94,6 +94,28 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         ]));
     }
 
+    // Compactions summary.
+    if let Some(last) = app.compaction_history.last() {
+        lines.push(Line::from(vec![
+            Span::raw("  Compactions: "),
+            Span::styled(
+                format!("{}", app.compaction_history.len()),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("  Last: "),
+            Span::styled(
+                last.timestamp.clone(),
+                Style::default().fg(colors::ACCENT_MUTED),
+            ),
+            Span::styled(
+                format!("  {:.1}% seen before", last.ledger_before.seen_percent),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+
     // Agents section.
     if !app.agents_seen.is_empty() {
         lines.push(Line::from(""));

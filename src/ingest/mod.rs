@@ -26,6 +26,7 @@ pub struct AgentToolCall {
 }
 
 /// Point-in-time ledger snapshot captured at a compaction boundary.
+#[derive(Debug, Clone)]
 pub struct LedgerSnapshot {
     pub tool_call_count: usize,
     pub files_accessed: BTreeSet<PathBuf>,
@@ -34,6 +35,7 @@ pub struct LedgerSnapshot {
 }
 
 /// A detected compaction event with summary and pre-compaction state.
+#[derive(Debug, Clone)]
 pub struct CompactionEvent {
     pub sequence: u32,
     pub timestamp: String,
@@ -43,15 +45,25 @@ pub struct CompactionEvent {
 }
 
 /// An ordered session event emitted by batch parsing.
+#[derive(Debug, Clone)]
 pub enum SessionEvent {
     ToolCall(AgentToolCall),
     Compacted { summary: String, timestamp: String, agent_id: Arc<str> },
     SessionCleared,
 }
 
+/// A compaction event surfaced by the incremental tailer (no ledger snapshot
+/// here — that's filled in by `App::process_compaction` at receipt time).
+pub struct TailedCompaction {
+    pub summary: String,
+    pub timestamp: String,
+    pub agent_id: Arc<str>,
+}
+
 /// Output from a single incremental poll of an event tailer.
 pub struct TailerOutput {
     pub events: Vec<AgentToolCall>,
+    pub compactions: Vec<TailedCompaction>,
     pub session_cleared: bool,
 }
 

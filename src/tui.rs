@@ -178,6 +178,9 @@ impl TuiSession {
             for event in output.events {
                 app.process_agent_event(event);
             }
+            for compaction in output.compactions {
+                app.process_compaction(compaction.summary, compaction.timestamp, compaction.agent_id);
+            }
         }
 
         // Check if Serena cache files changed.

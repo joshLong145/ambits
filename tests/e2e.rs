@@ -9,11 +9,23 @@ use ambits::app::App;
 use ambits::coverage::{CoverageFormatter, CoverageReport, JsonFormatter, TextFormatter};
 use ambits::ingest::claude::parse_log_file;
 use ambits::ingest::tool_config::ToolMappingConfig;
-use ambits::ingest::AgentToolCall;
+use ambits::ingest::{AgentToolCall, SessionEvent};
 use ambits::symbols::merkle::content_hash;
 use ambits::symbols::{FileSymbols, ProjectTree, SymbolCategory, SymbolNode};
 use ambits::tracking::{ContextLedger, ReadDepth};
 use tempfile::NamedTempFile;
+
+/// Drain `SessionEvent::ToolCall` events into a flat `Vec<AgentToolCall>` so
+/// existing assertions that iterate raw tool calls keep working.
+fn tool_calls(events: Vec<SessionEvent>) -> Vec<AgentToolCall> {
+    events
+        .into_iter()
+        .filter_map(|e| match e {
+            SessionEvent::ToolCall(tc) => Some(tc),
+            _ => None,
+        })
+        .collect()
+}
 
 fn builtin_cfg() -> ToolMappingConfig {
     ToolMappingConfig::builtin().expect("built-in config must parse")
@@ -110,7 +122,7 @@ fn full_pipeline_read() {
 
     // Parse a Read event for file_a (absolute path gets normalized).
     let tmp = write_jsonl(&[jsonl_read("/test/project/mock/file_a.rs")]);
-    let events = parse_log_file(tmp.path(), &builtin_cfg());
+    let events = tool_calls(parse_log_file(tmp.path(), &builtin_cfg()));
     assert_eq!(events.len(), 1);
 
     for event in events {
@@ -137,7 +149,7 @@ fn targeted_symbol_partial() {
     let mut app = make_app(files);
 
     let tmp = write_jsonl(&[jsonl_find_symbol("mock/f.rs", "beta", true)]);
-    let events = parse_log_file(tmp.path(), &builtin_cfg());
+    let events = tool_calls(parse_log_file(tmp.path(), &builtin_cfg()));
     for event in events {
         app.process_agent_event(event);
     }
@@ -166,7 +178,7 @@ fn depth_upgrade_invariant() {
         jsonl_grep("pattern"),                      // NameOnly again — must NOT downgrade
     ];
     let tmp = write_jsonl(&lines);
-    let events = parse_log_file(tmp.path(), &builtin_cfg());
+    let events = tool_calls(parse_log_file(tmp.path(), &builtin_cfg()));
     for event in events {
         app.process_agent_event(event);
     }
@@ -186,7 +198,7 @@ fn multi_agent_session() {
         jsonl_read("/test/project/mock/f.rs"),
         jsonl_read("/test/project/mock/f.rs"),
     ]);
-    let mut events: Vec<AgentToolCall> = parse_log_file(tmp.path(), &builtin_cfg());
+    let mut events: Vec<AgentToolCall> = tool_calls(parse_log_file(tmp.path(), &builtin_cfg()));
     events[0].agent_id = "agent-alpha".into();
     events[1].agent_id = "agent-beta".into();
 
@@ -307,7 +319,7 @@ fn json_formatter_structure() {
     let v: serde_json::Value =
         serde_json::from_str(output.trim()).expect("output must be valid JSON");
 
-    assert_eq!(v["schema_version"], 1);
+    assert_eq!(v["schema_version"], 2);
     assert_eq!(v["session_id"], "test-session-456");
     assert!(v["agent_id"].is_null());
     assert_eq!(v["totals"]["symbols"], 1);
@@ -354,7 +366,7 @@ fn json_formatter_empty_project() {
     let output = JsonFormatter.format(&report);
     let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
 
-    assert_eq!(v["schema_version"], 1);
+    assert_eq!(v["schema_version"], 2);
     assert_eq!(v["totals"]["symbols"], 0);
     assert_eq!(v["totals"]["seen"], 0);
     assert_eq!(v["totals"]["full"], 0);

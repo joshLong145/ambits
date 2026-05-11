@@ -1352,6 +1352,61 @@ mod tests {
     }
 
     #[test]
+    fn process_compaction_snapshots_files() {
+        // Two files; touch one before triggering the compaction so the snapshot
+        // captures only that file.
+        let mut app = test_app(vec![
+            file("mock/a.rs", vec![sym("mock/a.rs::a1", "a1")]),
+            file("mock/b.rs", vec![sym("mock/b.rs::b1", "b1")]),
+        ]);
+
+        let event = tool_call("Read", "/test/project/mock/a.rs", ReadDepth::FullBody);
+        app.process_agent_event(event);
+
+        app.process_compaction(
+            "first compaction".into(),
+            "2026-05-11T14:23:00Z".into(),
+            "agent-1".into(),
+        );
+
+        assert_eq!(app.compaction_history.len(), 1);
+        let snapshot = &app.compaction_history[0];
+        assert_eq!(snapshot.sequence, 1);
+        assert_eq!(snapshot.summary, "first compaction");
+        assert_eq!(snapshot.timestamp, "2026-05-11T14:23:00Z");
+        assert_eq!(snapshot.ledger_before.tool_call_count, 1);
+        // mock/a.rs was touched → present; mock/b.rs untouched → absent.
+        assert!(snapshot
+            .ledger_before
+            .files_accessed
+            .contains(&std::path::PathBuf::from("mock/a.rs")));
+        assert!(!snapshot
+            .ledger_before
+            .files_accessed
+            .contains(&std::path::PathBuf::from("mock/b.rs")));
+        assert_eq!(snapshot.ledger_before.symbols_seen, 1);
+    }
+
+    #[test]
+    fn compaction_history_clears_on_reset_session() {
+        let mut app = test_app(vec![file("mock/a.rs", vec![sym("mock/a.rs::a", "a")])]);
+        let event = tool_call("Read", "/test/project/mock/a.rs", ReadDepth::FullBody);
+        app.process_agent_event(event);
+        app.process_compaction(
+            "summary".into(),
+            "2026-05-11T14:23:00Z".into(),
+            "agent-1".into(),
+        );
+        assert_eq!(app.compaction_history.len(), 1);
+        assert_eq!(app.compaction_call_count, 1);
+
+        app.reset_session();
+
+        assert!(app.compaction_history.is_empty());
+        assert_eq!(app.compaction_call_count, 0);
+    }
+
+    #[test]
     fn reset_session_clears_ledger_and_agents() {
         use crate::ingest::AgentToolCall;
         use crate::tracking::ReadDepth;

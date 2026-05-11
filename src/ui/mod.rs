@@ -2,6 +2,7 @@ pub mod colors;
 pub mod tree_view;
 pub mod stats;
 pub mod activity;
+pub mod compaction;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -30,6 +31,10 @@ pub fn render(f: &mut Frame, app: &App) {
     stats::render(f, app, top[1]);
     activity::render(f, app, outer[1]);
     render_status_bar(f, app, outer[2]);
+
+    if app.show_compaction_overlay && !app.compaction_history.is_empty() {
+        compaction::render(f, app, f.area());
+    }
 }
 
 fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -63,6 +68,15 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             Span::styled("[tab]", Style::default().fg(Color::DarkGray)),
             Span::raw("focus "),
         ];
+
+        if !app.compaction_history.is_empty() {
+            spans.push(Span::styled("[C]", Style::default().fg(Color::Yellow)));
+            spans.push(Span::raw(if app.show_compaction_overlay {
+                "close "
+            } else {
+                "ompact "
+            }));
+        }
 
         // Show current agent filter
         if let Some(ref agent_id) = app.agent_filter {

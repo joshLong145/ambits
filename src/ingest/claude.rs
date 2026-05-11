@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use crate::tracking::ReadDepth;
-use super::{AgentToolCall, EventTailer, SessionEvent, SessionIngester, TailerOutput, ToolCallMapper};
+use super::{AgentToolCall, EventTailer, SessionEvent, SessionIngester, TailedCompaction, TailerOutput, ToolCallMapper};
 use super::tool_config::ToolMappingConfig;
 
 /// Derive the Claude Code log directory for a given project path.
@@ -359,8 +359,23 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
 
     let msg_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-    // Detect /clear command in user messages.
+    // Detect compaction summary and /clear command in user messages.
     if msg_type == "user" {
+        // Claude Code emits the post-compaction summary as a `type:"user"` record
+        // with `isCompactSummary:true`. The `message.content` is a plain string.
+        if obj.get("isCompactSummary").and_then(|v| v.as_bool()) == Some(true) {
+            let summary = obj
+                .pointer("/message/content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let timestamp = obj
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            return ParsedLine::Compacted { summary, timestamp };
+        }
         let content = obj
             .pointer("/message/content")
             .and_then(|v| v.as_str())
@@ -393,19 +408,6 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
         Some(Value::Array(arr)) => arr,
         _ => return ParsedLine::Ignored,
     };
-
-    // Compaction blocks are mutually exclusive with tool_use in practice;
-    // scan for one before entering the tool-use loop.
-    for block in content {
-        if block.get("type").and_then(|v| v.as_str()) == Some("compaction") {
-            let summary = block
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            return ParsedLine::Compacted { summary, timestamp: timestamp_str };
-        }
-    }
 
     let mut events = Vec::new();
     for block in content {
@@ -671,6 +673,7 @@ impl LogTailer {
     pub fn read_new_events(&mut self) -> TailerOutput {
         let mut output = TailerOutput {
             events: Vec::new(),
+            compactions: Vec::new(),
             session_cleared: false,
         };
 
@@ -704,7 +707,13 @@ impl LogTailer {
                             Ok(_) => match parse_jsonl_line(line.trim(), &default_id, &*self.mapper) {
                                 ParsedLine::Events(events) => output.events.extend(events),
                                 ParsedLine::SessionCleared => output.session_cleared = true,
-                                ParsedLine::Compacted { .. } => {}
+                                ParsedLine::Compacted { summary, timestamp } => {
+                                    output.compactions.push(TailedCompaction {
+                                        summary,
+                                        timestamp,
+                                        agent_id: Arc::from(default_id.as_str()),
+                                    });
+                                }
                                 ParsedLine::Ignored => {}
                             },
                             Err(_) => break,
@@ -1528,15 +1537,51 @@ description  = "UserTool {target}"
     }
 
     #[test]
-    fn parse_compaction_block_returns_compacted() {
-        let line = r#"{"type":"assistant","sessionId":"abc","timestamp":"2026-05-11T14:23:00Z","message":{"role":"assistant","content":[{"type":"compaction","content":"Summary of the conversation: The user is building a CLI parser."},{"type":"text","text":"Based on our conversation so far..."}]}}"#;
+    fn parse_is_compact_summary_user_record_returns_compacted() {
+        // Real Claude Code (v2.1.132) shape: a `type:"user"` record with
+        // `isCompactSummary:true` carries the summary in `message.content` (string).
+        let line = r#"{"type":"user","sessionId":"abc","timestamp":"2026-05-11T20:59:25.329Z","isVisibleInTranscriptOnly":true,"isCompactSummary":true,"message":{"role":"user","content":"Summary of the conversation: The user is building a CLI parser."}}"#;
         let config = ToolMappingConfig::builtin().expect("builtin config");
         match parse_jsonl_line(line, "default", &config) {
             ParsedLine::Compacted { summary, timestamp } => {
-                assert!(summary.contains("CLI parser"), "summary should contain compaction text");
-                assert_eq!(timestamp, "2026-05-11T14:23:00Z");
+                assert!(summary.contains("CLI parser"), "summary should contain compaction text, got: {summary:?}");
+                assert_eq!(timestamp, "2026-05-11T20:59:25.329Z");
             }
-            _ => panic!("expected ParsedLine::Compacted"),
+            other => panic!("expected ParsedLine::Compacted, got {:?}", match other {
+                ParsedLine::Events(_) => "Events",
+                ParsedLine::Compacted { .. } => "Compacted",
+                ParsedLine::SessionCleared => "SessionCleared",
+                ParsedLine::Ignored => "Ignored",
+            }),
         }
+    }
+
+    #[test]
+    fn parse_is_compact_summary_does_not_trigger_session_cleared() {
+        // The summary content can mention `/clear` in prose; isCompactSummary
+        // must take precedence over the `<command-name>/clear</command-name>` heuristic.
+        let line = r#"{"type":"user","isCompactSummary":true,"timestamp":"2026-05-11T21:00:00Z","message":{"role":"user","content":"User ran <command-name>/clear</command-name> earlier in the session"}}"#;
+        let config = ToolMappingConfig::builtin().expect("builtin config");
+        assert!(matches!(
+            parse_jsonl_line(line, "d", &config),
+            ParsedLine::Compacted { .. }
+        ));
+    }
+
+    #[test]
+    fn tailer_emits_compactions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("session.jsonl");
+        fs::write(&log, "").unwrap();
+        let config: Arc<dyn ToolCallMapper> = Arc::new(ToolMappingConfig::builtin().unwrap());
+        let mut tailer = LogTailer::new(vec![log.clone()], config);
+
+        let compact_line = r#"{"type":"user","sessionId":"abc","timestamp":"2026-05-11T20:59:25.329Z","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued from a previous conversation."}}"#;
+        fs::write(&log, format!("{compact_line}\n")).unwrap();
+
+        let output = tailer.read_new_events();
+        assert_eq!(output.compactions.len(), 1);
+        assert!(output.compactions[0].summary.contains("being continued"));
+        assert_eq!(output.compactions[0].timestamp, "2026-05-11T20:59:25.329Z");
     }
 }
