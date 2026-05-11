@@ -160,7 +160,13 @@ impl App {
         self.rebuild_tree_rows();
     }
 
-    /// Snapshot the current ledger state and record a compaction event.
+    /// Snapshot the current ledger state, record a compaction event, then
+    /// clear the live ledger. The summary text doesn't reliably describe what
+    /// the model retained, so we drop all pre-compaction depth claims rather
+    /// than over-report coverage that may no longer reflect the model's
+    /// actual context. `compaction_history`, `activity`, and agent-tracking
+    /// state are preserved — only the live read-depth ledger and the
+    /// inter-compaction tool-call counter are reset.
     pub fn process_compaction(
         &mut self,
         summary: String,
@@ -201,6 +207,11 @@ impl App {
             metadata,
         });
         self.compaction_overlay_index = self.compaction_history.len().saturating_sub(1);
+
+        // Wipe the live ledger: post-compaction depth tracking starts fresh.
+        self.ledger = ContextLedger::new();
+        self.compaction_call_count = 0;
+        self.rebuild_tree_rows();
     }
 
     /// Rebuild the flattened tree rows from the project tree + collapsed state.
@@ -1391,6 +1402,62 @@ mod tests {
     }
 
     #[test]
+    fn process_compaction_clears_live_ledger() {
+        // Two files; read one. After compaction, the live ledger should be
+        // empty (symbol back to Unseen) but the snapshot captures the prior state.
+        let mut app = test_app(vec![
+            file("mock/a.rs", vec![sym("mock/a.rs::a1", "a1")]),
+        ]);
+        let event = tool_call("Read", "/test/project/mock/a.rs", ReadDepth::FullBody);
+        app.process_agent_event(event);
+
+        assert_eq!(app.ledger.depth_of("mock/a.rs::a1"), ReadDepth::FullBody);
+        assert_eq!(app.compaction_call_count, 1);
+
+        app.process_compaction(
+            "summary".into(),
+            "2026-05-11T14:23:00Z".into(),
+            "agent-1".into(),
+            None,
+        );
+
+        // Compaction history records the pre-compaction state.
+        assert_eq!(app.compaction_history.len(), 1);
+        assert_eq!(app.compaction_history[0].ledger_before.symbols_seen, 1);
+        // Live ledger is wiped — the symbol is Unseen again.
+        assert_eq!(app.ledger.depth_of("mock/a.rs::a1"), ReadDepth::Unseen);
+        assert_eq!(app.ledger.total_seen(), 0);
+        assert_eq!(app.compaction_call_count, 0);
+    }
+
+    #[test]
+    fn post_compaction_tool_calls_rebuild_ledger() {
+        // After compaction wipes the ledger, subsequent tool calls populate
+        // a fresh ledger without touching compaction_history.
+        let mut app = test_app(vec![
+            file("mock/a.rs", vec![sym("mock/a.rs::a1", "a1")]),
+            file("mock/b.rs", vec![sym("mock/b.rs::b1", "b1")]),
+        ]);
+        app.process_agent_event(tool_call("Read", "/test/project/mock/a.rs", ReadDepth::FullBody));
+        app.process_compaction(
+            "first".into(),
+            "2026-05-11T14:23:00Z".into(),
+            "agent-1".into(),
+            None,
+        );
+
+        // Read a different file after compaction.
+        app.process_agent_event(tool_call("Read", "/test/project/mock/b.rs", ReadDepth::FullBody));
+
+        assert_eq!(app.compaction_history.len(), 1, "compaction history retained");
+        assert_eq!(app.ledger.depth_of("mock/a.rs::a1"), ReadDepth::Unseen,
+            "pre-compaction read should not survive");
+        assert_eq!(app.ledger.depth_of("mock/b.rs::b1"), ReadDepth::FullBody,
+            "post-compaction read should be reflected");
+        assert_eq!(app.compaction_call_count, 1, "counter restarted from zero after compaction");
+    }
+
+    #[test]
     fn compaction_history_clears_on_reset_session() {
         let mut app = test_app(vec![file("mock/a.rs", vec![sym("mock/a.rs::a", "a")])]);
         let event = tool_call("Read", "/test/project/mock/a.rs", ReadDepth::FullBody);
@@ -1402,7 +1469,6 @@ mod tests {
             None,
         );
         assert_eq!(app.compaction_history.len(), 1);
-        assert_eq!(app.compaction_call_count, 1);
 
         app.reset_session();
 

@@ -93,14 +93,24 @@ fn is_uuid(s: &str) -> bool {
 /// (the main session file + any agent-*.jsonl files that reference it).
 /// Supports both old format (agent files flat in log dir) and new format
 /// (agent files in `<session-id>/subagents/`).
+///
+/// **Ordering:** subagent files first, main session file last. Callers
+/// (`coverage::run_report`, the TUI pre-populate loop) replay each file
+/// end-to-end before the next, so events are not globally timestamp-sorted.
+/// Putting the main session file last means any compaction in it — which now
+/// clears the ledger — fires after subagent work has been accumulated, so
+/// pre-compaction subagent reads survive into the post-compaction snapshot
+/// rather than being wiped by an out-of-order compaction.
+///
+/// Residual risk: a subagent whose work runs *concurrently with* and finishes
+/// *after* the main session's compaction will still have its post-compaction
+/// reads wiped when we process the main file later and replay the
+/// compaction. Strictly correct ordering would require a cross-file
+/// timestamp merge; that's deferred. In practice, subagents almost always
+/// complete before the main session reaches the token threshold for a
+/// compaction, so this heuristic covers the common case.
 pub fn session_log_files(log_dir: &Path, session_id: &str) -> Vec<PathBuf> {
     let mut files = Vec::new();
-
-    // Main session file.
-    let main_file = log_dir.join(format!("{session_id}.jsonl"));
-    if main_file.exists() {
-        files.push(main_file);
-    }
 
     // New format: <log_dir>/<session-id>/subagents/agent-*.jsonl
     // All files in this directory belong to the session by definition.
@@ -139,6 +149,13 @@ pub fn session_log_files(log_dir: &Path, session_id: &str) -> Vec<PathBuf> {
                 files.push(path);
             }
         }
+    }
+
+    // Main session file last — its compaction events clear the ledger, so
+    // we want subagent events accumulated first.
+    let main_file = log_dir.join(format!("{session_id}.jsonl"));
+    if main_file.exists() {
+        files.push(main_file);
     }
 
     files

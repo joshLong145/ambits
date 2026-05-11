@@ -587,6 +587,12 @@ pub fn run_report(
                                 duration_ms: m.duration_ms,
                             }),
                         });
+                        // Mirror `App::process_compaction`: wipe live depth state
+                        // so the final coverage report reflects post-compaction
+                        // context only. `compactions` is preserved.
+                        ledger = ContextLedger::new();
+                        files_accessed.clear();
+                        tool_call_count = 0;
                     }
                     SessionEvent::SessionCleared => {
                         ledger = ContextLedger::new();
