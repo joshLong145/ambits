@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use crate::tracking::ReadDepth;
-use super::{AgentToolCall, EventTailer, SessionIngester, TailerOutput, ToolCallMapper};
+use super::{AgentToolCall, EventTailer, SessionEvent, SessionIngester, TailerOutput, ToolCallMapper};
 use super::tool_config::ToolMappingConfig;
 
 /// Derive the Claude Code log directory for a given project path.
@@ -258,14 +258,13 @@ pub fn extract_agent_label(path: &Path) -> String {
 /// The result of parsing a single JSONL line.
 pub enum ParsedLine {
     Events(Vec<AgentToolCall>),
+    Compacted { summary: String, timestamp: String },
     SessionCleared,
     Ignored,
 }
 
 /// Parse all events from a JSONL log file.
-/// SessionCleared signals are ignored in batch mode — dump/coverage modes show
-/// aggregate historical coverage, not live session state.
-pub fn parse_log_file(path: &Path, config: &ToolMappingConfig) -> Vec<AgentToolCall> {
+pub fn parse_log_file(path: &Path, config: &ToolMappingConfig) -> Vec<SessionEvent> {
     parse_log_file_with_mapper(path, config, None)
 }
 
@@ -273,8 +272,8 @@ fn parse_log_file_with_mapper(
     path: &Path,
     mapper: &dyn ToolCallMapper,
     project_root: Option<&Path>,
-) -> Vec<AgentToolCall> {
-    let mut events = Vec::new();
+) -> Vec<SessionEvent> {
+    let mut events: Vec<SessionEvent> = Vec::new();
     let file = match fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return events,
@@ -323,20 +322,28 @@ fn parse_log_file_with_mapper(
     let _ = reader.seek(SeekFrom::Start(0));
 
     for line in reader.lines().map_while(Result::ok) {
-        if let ParsedLine::Events(mut line_events) =
-            parse_jsonl_line(line.trim(), &default_id, mapper)
-        {
-            if let Some((ref worktree, ref project)) = cwd_remap {
-                for ev in &mut line_events {
-                    if let Some(ref fp) = ev.file_path {
-                        ev.file_path = Some(remap_path(fp, worktree, project));
+        match parse_jsonl_line(line.trim(), &default_id, mapper) {
+            ParsedLine::Events(mut line_events) => {
+                if let Some((ref worktree, ref project)) = cwd_remap {
+                    for ev in &mut line_events {
+                        if let Some(ref fp) = ev.file_path {
+                            ev.file_path = Some(remap_path(fp, worktree, project));
+                        }
                     }
                 }
+                for ev in &mut line_events {
+                    ev.label = label.clone();
+                }
+                events.extend(line_events.into_iter().map(SessionEvent::ToolCall));
             }
-            for ev in &mut line_events {
-                ev.label = label.clone();
+            ParsedLine::Compacted { summary, timestamp } => {
+                let agent_id: Arc<str> = Arc::from(default_id.as_str());
+                events.push(SessionEvent::Compacted { summary, timestamp, agent_id });
             }
-            events.extend(line_events);
+            ParsedLine::SessionCleared => {
+                events.push(SessionEvent::SessionCleared);
+            }
+            ParsedLine::Ignored => {}
         }
     }
     events
@@ -386,6 +393,19 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
         Some(Value::Array(arr)) => arr,
         _ => return ParsedLine::Ignored,
     };
+
+    // Compaction blocks are mutually exclusive with tool_use in practice;
+    // scan for one before entering the tool-use loop.
+    for block in content {
+        if block.get("type").and_then(|v| v.as_str()) == Some("compaction") {
+            let summary = block
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            return ParsedLine::Compacted { summary, timestamp: timestamp_str };
+        }
+    }
 
     let mut events = Vec::new();
     for block in content {
@@ -684,6 +704,7 @@ impl LogTailer {
                             Ok(_) => match parse_jsonl_line(line.trim(), &default_id, &*self.mapper) {
                                 ParsedLine::Events(events) => output.events.extend(events),
                                 ParsedLine::SessionCleared => output.session_cleared = true,
+                                ParsedLine::Compacted { .. } => {}
                                 ParsedLine::Ignored => {}
                             },
                             Err(_) => break,
@@ -727,10 +748,10 @@ impl SessionIngester for ClaudeIngester {
     fn session_log_files(&self, log_dir: &Path, session_id: &str) -> Vec<PathBuf> {
         session_log_files(log_dir, session_id)
     }
-    fn parse_log_file(&self, path: &Path) -> Vec<AgentToolCall> {
+    fn parse_log_file(&self, path: &Path) -> Vec<SessionEvent> {
         parse_log_file_with_mapper(path, &*self.mapper, None)
     }
-    fn parse_log_file_with_root(&self, path: &Path, project_root: &Path) -> Vec<AgentToolCall> {
+    fn parse_log_file_with_root(&self, path: &Path, project_root: &Path) -> Vec<SessionEvent> {
         parse_log_file_with_mapper(path, &*self.mapper, Some(project_root))
     }
     fn session_slug(&self, log_dir: &Path, session_id: &str) -> Option<String> {
@@ -1136,7 +1157,11 @@ mod tests {
         let config = ToolMappingConfig::builtin().unwrap();
         let events = parse_log_file(&log, &config);
         assert_eq!(events.len(), 1);
-        assert_eq!(&*events[0].label, "Check the coverage");
+        if let SessionEvent::ToolCall(ref tc) = events[0] {
+            assert_eq!(&*tc.label, "Check the coverage");
+        } else {
+            panic!("expected ToolCall event");
+        }
     }
 
     #[test]
@@ -1411,10 +1436,11 @@ description  = "UserTool {target}"
         let config = ToolMappingConfig::builtin().unwrap();
         let events = parse_log_file_with_mapper(&log, &config, Some(&project));
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].file_path.as_ref().unwrap(),
-            &project.join("src/main.rs"),
-        );
+        if let SessionEvent::ToolCall(ref tc) = events[0] {
+            assert_eq!(tc.file_path.as_ref().unwrap(), &project.join("src/main.rs"));
+        } else {
+            panic!("expected ToolCall event");
+        }
     }
 
     #[test]
@@ -1435,10 +1461,11 @@ description  = "UserTool {target}"
         let config = ToolMappingConfig::builtin().unwrap();
         let events = parse_log_file_with_mapper(&log, &config, Some(&project));
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].file_path.as_ref().unwrap(),
-            &project.join("src/main.rs"),
-        );
+        if let SessionEvent::ToolCall(ref tc) = events[0] {
+            assert_eq!(tc.file_path.as_ref().unwrap(), &project.join("src/main.rs"));
+        } else {
+            panic!("expected ToolCall event");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1498,5 +1525,18 @@ description  = "UserTool {target}"
     #[test]
     fn bash_bfs_gets_name_only() {
         assert_eq!(bash_event("bfs . -name '*.rs'").read_depth, ReadDepth::NameOnly);
+    }
+
+    #[test]
+    fn parse_compaction_block_returns_compacted() {
+        let line = r#"{"type":"assistant","sessionId":"abc","timestamp":"2026-05-11T14:23:00Z","message":{"role":"assistant","content":[{"type":"compaction","content":"Summary of the conversation: The user is building a CLI parser."},{"type":"text","text":"Based on our conversation so far..."}]}}"#;
+        let config = ToolMappingConfig::builtin().expect("builtin config");
+        match parse_jsonl_line(line, "default", &config) {
+            ParsedLine::Compacted { summary, timestamp } => {
+                assert!(summary.contains("CLI parser"), "summary should contain compaction text");
+                assert_eq!(timestamp, "2026-05-11T14:23:00Z");
+            }
+            _ => panic!("expected ParsedLine::Compacted"),
+        }
     }
 }

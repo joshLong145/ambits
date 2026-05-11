@@ -3,11 +3,13 @@
 //! This module provides structures and formatters for generating coverage reports
 //! that show how much of a project's symbols have been seen by an LLM agent.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::Result;
 use serde::Serialize;
 
+use crate::ingest::SessionEvent;
 use crate::symbols::{ProjectTree, SymbolNode};
 use crate::tracking::{ContextLedger, ReadDepth};
 

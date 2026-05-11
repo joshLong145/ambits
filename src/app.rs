@@ -95,6 +95,12 @@ pub struct App {
     pub session_id: Option<String>,
     pub session_slug: Option<String>,
 
+    // Compaction tracking.
+    pub compaction_history: Vec<crate::ingest::CompactionEvent>,
+    pub compaction_call_count: usize,
+    pub show_compaction_overlay: bool,
+    pub compaction_overlay_index: usize,
+
     // Optional event log writer.
     pub event_log: Option<BufWriter<File>>,
 }
@@ -128,6 +134,10 @@ impl App {
             search_query: String::new(),
             session_id: None,
             session_slug: None,
+            compaction_history: Vec::new(),
+            compaction_call_count: 0,
+            show_compaction_overlay: false,
+            compaction_overlay_index: 0,
             event_log,
         };
         app.rebuild_tree_rows();
@@ -145,7 +155,50 @@ impl App {
         self.agent_filter = None;
         self.agent_selection_index = 0;
         self.session_slug = None;
+        self.compaction_history.clear();
+        self.compaction_call_count = 0;
         self.rebuild_tree_rows();
+    }
+
+    /// Snapshot the current ledger state and record a compaction event.
+    pub fn process_compaction(
+        &mut self,
+        summary: String,
+        timestamp: String,
+        agent_id: std::sync::Arc<str>,
+    ) {
+        use std::collections::BTreeSet;
+        let files_before: BTreeSet<std::path::PathBuf> = self
+            .project_tree
+            .files
+            .iter()
+            .filter(|f| f.symbols.iter().any(|sym| self.ledger.depth_of(&sym.id).is_seen()))
+            .map(|f| f.file_path.clone())
+            .collect();
+
+        let total = self.project_tree.total_symbols();
+        let seen = self.ledger.total_seen();
+
+        let snapshot = crate::ingest::LedgerSnapshot {
+            tool_call_count: self.compaction_call_count,
+            files_accessed: files_before,
+            symbols_seen: seen,
+            seen_percent: if total > 0 {
+                seen as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            },
+        };
+
+        let sequence = self.compaction_history.len() as u32 + 1;
+        self.compaction_history.push(crate::ingest::CompactionEvent {
+            sequence,
+            timestamp,
+            agent_id,
+            summary,
+            ledger_before: snapshot,
+        });
+        self.compaction_overlay_index = self.compaction_history.len().saturating_sub(1);
     }
 
     /// Rebuild the flattened tree rows from the project tree + collapsed state.
@@ -263,6 +316,21 @@ impl App {
             }
             KeyCode::Char('a') => self.cycle_agent_filter(),
             KeyCode::Char('A') => self.cycle_agent_filter_backward(),
+            KeyCode::Char('C') => {
+                if !self.compaction_history.is_empty() {
+                    self.show_compaction_overlay = !self.show_compaction_overlay;
+                }
+            }
+            KeyCode::Char('[') if self.show_compaction_overlay => {
+                if self.compaction_overlay_index > 0 {
+                    self.compaction_overlay_index -= 1;
+                }
+            }
+            KeyCode::Char(']') if self.show_compaction_overlay => {
+                if self.compaction_overlay_index + 1 < self.compaction_history.len() {
+                    self.compaction_overlay_index += 1;
+                }
+            }
             KeyCode::Tab => self.cycle_focus(),
             KeyCode::BackTab => self.cycle_agent_filter_backward(),
             KeyCode::PageDown => self.move_selection(20),
@@ -497,6 +565,7 @@ impl App {
 
     /// Process an agent tool call event and update the ledger.
     pub fn process_agent_event(&mut self, event: AgentToolCall) {
+        self.compaction_call_count += 1;
         // Track unique agents.
         if !self.agents_seen.iter().any(|a| a.as_str() == &*event.agent_id) {
             self.agents_seen.push(event.agent_id.to_string());

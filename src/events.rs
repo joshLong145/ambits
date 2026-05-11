@@ -13,6 +13,7 @@ pub enum AppEvent {
     FileChanged(PathBuf),
     AgentEvent(AgentToolCall),
     SessionCleared,
+    Compacted(ambits::ingest::CompactionEvent),
     Tick,
 }
 
