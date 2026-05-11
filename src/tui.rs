@@ -150,8 +150,8 @@ impl TuiSession {
                         for event in self.ingester.parse_log_file_with_root(log_file, project_path) {
                             match event {
                                 ambits::ingest::SessionEvent::ToolCall(tc) => app.process_agent_event(tc),
-                                ambits::ingest::SessionEvent::Compacted { summary, timestamp, agent_id } => {
-                                    app.process_compaction(summary, timestamp, agent_id);
+                                ambits::ingest::SessionEvent::Compacted { summary, timestamp, agent_id, metadata } => {
+                                    app.process_compaction(summary, timestamp, agent_id, metadata);
                                 }
                                 ambits::ingest::SessionEvent::SessionCleared => app.reset_session(),
                             }
@@ -179,7 +179,7 @@ impl TuiSession {
                 app.process_agent_event(event);
             }
             for compaction in output.compactions {
-                app.process_compaction(compaction.summary, compaction.timestamp, compaction.agent_id);
+                app.process_compaction(compaction.summary, compaction.timestamp, compaction.agent_id, compaction.metadata);
             }
         }
 

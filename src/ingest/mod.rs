@@ -34,6 +34,17 @@ pub struct LedgerSnapshot {
     pub seen_percent: f64,
 }
 
+/// Metadata extracted from the `compact_boundary` system record that
+/// precedes the `isCompactSummary` user record in Claude Code logs.
+#[derive(Debug, Clone)]
+pub struct CompactionMetadata {
+    /// "manual", "auto", "warning" — corresponds to the trigger that initiated the compaction.
+    pub trigger: String,
+    pub pre_tokens: u64,
+    pub post_tokens: u64,
+    pub duration_ms: u64,
+}
+
 /// A detected compaction event with summary and pre-compaction state.
 #[derive(Debug, Clone)]
 pub struct CompactionEvent {
@@ -42,13 +53,21 @@ pub struct CompactionEvent {
     pub agent_id: Arc<str>,
     pub summary: String,
     pub ledger_before: LedgerSnapshot,
+    /// Token counts and trigger info from the boundary record. `None` if the
+    /// boundary record was missing or unparseable (older Claude Code versions).
+    pub metadata: Option<CompactionMetadata>,
 }
 
 /// An ordered session event emitted by batch parsing.
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     ToolCall(AgentToolCall),
-    Compacted { summary: String, timestamp: String, agent_id: Arc<str> },
+    Compacted {
+        summary: String,
+        timestamp: String,
+        agent_id: Arc<str>,
+        metadata: Option<CompactionMetadata>,
+    },
     SessionCleared,
 }
 
@@ -58,6 +77,7 @@ pub struct TailedCompaction {
     pub summary: String,
     pub timestamp: String,
     pub agent_id: Arc<str>,
+    pub metadata: Option<CompactionMetadata>,
 }
 
 /// Output from a single incremental poll of an event tailer.

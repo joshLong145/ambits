@@ -46,6 +46,15 @@ impl FileCoverage {
     }
 }
 
+/// Token/trigger metadata for a compaction event, when present in the log.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactionMetadataSummary {
+    pub trigger: String,
+    pub pre_tokens: u64,
+    pub post_tokens: u64,
+    pub duration_ms: u64,
+}
+
 /// Pre-compaction snapshot for a single context compaction event, intended for the
 /// coverage report. Files are stored as relative-path strings (sorted) so the
 /// summary remains stable in JSON output.
@@ -58,6 +67,9 @@ pub struct CompactionSummary {
     pub files_before: Vec<String>,
     pub symbols_seen_before: usize,
     pub seen_percent_before: f64,
+    /// Token counts and trigger from the `compact_boundary` system record.
+    /// `None` when the log predates that record format or it was malformed.
+    pub metadata: Option<CompactionMetadataSummary>,
 }
 
 /// Complete coverage report for a project.
@@ -300,6 +312,21 @@ fn append_compactions_section(output: &mut String, compactions: &[CompactionSumm
             "#{}  {}  {} calls · {:.1}% seen\n",
             c.sequence, c.timestamp, c.tool_calls_before, c.seen_percent_before,
         ));
+        if let Some(m) = &c.metadata {
+            let delta_pct = if m.pre_tokens > 0 {
+                100.0 * (m.post_tokens as f64 - m.pre_tokens as f64) / m.pre_tokens as f64
+            } else {
+                0.0
+            };
+            output.push_str(&format!(
+                "    Tokens: {} → {} ({:+.1}%) · trigger: {} · {:.1}s\n",
+                m.pre_tokens,
+                m.post_tokens,
+                delta_pct,
+                m.trigger,
+                m.duration_ms as f64 / 1000.0,
+            ));
+        }
         output.push_str(&format!("    Files ({}):\n", c.files_before.len()));
         for path in c.files_before.iter().take(MAX_FILES_SHOWN) {
             output.push_str(&format!("      {path}\n"));
@@ -398,11 +425,21 @@ impl CoverageFormatter for JsonFormatter {
         }
 
         #[derive(Serialize)]
+        struct MetadataDto<'a> {
+            trigger: &'a str,
+            pre_tokens: u64,
+            post_tokens: u64,
+            duration_ms: u64,
+        }
+
+        #[derive(Serialize)]
         struct CompactionDto<'a> {
             sequence: u32,
             timestamp: &'a str,
             summary: &'a str,
             state_before: StateBeforeDto<'a>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            metadata: Option<MetadataDto<'a>>,
         }
 
         #[derive(Serialize)]
@@ -451,6 +488,12 @@ impl CoverageFormatter for JsonFormatter {
                         symbols_seen: c.symbols_seen_before,
                         seen_percent: c.seen_percent_before,
                     },
+                    metadata: c.metadata.as_ref().map(|m| MetadataDto {
+                        trigger: &m.trigger,
+                        pre_tokens: m.pre_tokens,
+                        post_tokens: m.post_tokens,
+                        duration_ms: m.duration_ms,
+                    }),
                 })
                 .collect(),
         };
@@ -519,7 +562,7 @@ pub fn run_report(
                             }
                         }
                     }
-                    SessionEvent::Compacted { summary, timestamp, .. } => {
+                    SessionEvent::Compacted { summary, timestamp, metadata, .. } => {
                         let seen = ledger.total_seen();
                         let total = project_tree.total_symbols();
                         compactions.push(CompactionSummary {
@@ -537,6 +580,12 @@ pub fn run_report(
                             } else {
                                 0.0
                             },
+                            metadata: metadata.map(|m| CompactionMetadataSummary {
+                                trigger: m.trigger,
+                                pre_tokens: m.pre_tokens,
+                                post_tokens: m.post_tokens,
+                                duration_ms: m.duration_ms,
+                            }),
                         });
                     }
                     SessionEvent::SessionCleared => {
@@ -823,7 +872,19 @@ mod tests {
             ],
             symbols_seen_before: 31,
             seen_percent_before: 31.2,
+            metadata: None,
         }
+    }
+
+    fn sample_compaction_with_metadata() -> CompactionSummary {
+        let mut c = sample_compaction();
+        c.metadata = Some(CompactionMetadataSummary {
+            trigger: "manual".to_string(),
+            pre_tokens: 195684,
+            post_tokens: 6416,
+            duration_ms: 64699,
+        });
+        c
     }
 
     #[test]
@@ -893,5 +954,41 @@ mod tests {
         let files = state["files_accessed"].as_array().unwrap();
         assert_eq!(files.len(), 2);
         assert_eq!(files[0], "src/cli.rs");
+        // `metadata` is absent (skip_serializing_if = "Option::is_none") when None.
+        assert!(entry.get("metadata").is_none(),
+            "metadata field should be omitted when None, got entry: {entry}");
+    }
+
+    #[test]
+    fn text_formatter_includes_token_metadata_line() {
+        let report = CoverageReport {
+            session_id: Some("s".into()),
+            agent_id: None,
+            files: vec![],
+            compactions: vec![sample_compaction_with_metadata()],
+        };
+        let output = TextFormatter::default().format(&report);
+        assert!(output.contains("Tokens: 195684"));
+        assert!(output.contains("6416"));
+        assert!(output.contains("trigger: manual"));
+        assert!(output.contains("64.7s"));
+    }
+
+    #[test]
+    fn json_formatter_includes_metadata_block() {
+        let report = CoverageReport {
+            session_id: Some("s".into()),
+            agent_id: None,
+            files: vec![],
+            compactions: vec![sample_compaction_with_metadata()],
+        };
+        let output = JsonFormatter.format(&report);
+        let value: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("output must be valid JSON");
+        let metadata = &value["compactions"][0]["metadata"];
+        assert_eq!(metadata["trigger"], "manual");
+        assert_eq!(metadata["pre_tokens"], 195684);
+        assert_eq!(metadata["post_tokens"], 6416);
+        assert_eq!(metadata["duration_ms"], 64699);
     }
 }

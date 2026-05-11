@@ -23,12 +23,23 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let mut lines: Vec<Line> = Vec::new();
-    let title = format!(
-        " Compaction #{} of {} — {} ",
-        ev.sequence,
-        app.compaction_history.len(),
-        ev.timestamp,
-    );
+    let title = match &ev.metadata {
+        Some(m) => format!(
+            " Compaction #{} of {} — {} · {} → {} tok · {} ",
+            ev.sequence,
+            app.compaction_history.len(),
+            ev.timestamp,
+            format_tokens(m.pre_tokens),
+            format_tokens(m.post_tokens),
+            m.trigger,
+        ),
+        None => format!(
+            " Compaction #{} of {} — {} ",
+            ev.sequence,
+            app.compaction_history.len(),
+            ev.timestamp,
+        ),
+    };
 
     // Summary block.
     lines.push(Line::from(Span::styled(
@@ -170,6 +181,17 @@ fn files_after_compaction(app: &App, ev: &CompactionEvent) -> Vec<(String, ReadD
         }
     }
     out
+}
+
+/// Format a token count in compact form: `1234` → `1.2k`, `1234567` → `1.2M`.
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 fn depth_label(d: ReadDepth) -> &'static str {

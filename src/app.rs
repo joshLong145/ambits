@@ -166,6 +166,7 @@ impl App {
         summary: String,
         timestamp: String,
         agent_id: std::sync::Arc<str>,
+        metadata: Option<crate::ingest::CompactionMetadata>,
     ) {
         use std::collections::BTreeSet;
         let files_before: BTreeSet<std::path::PathBuf> = self
@@ -197,6 +198,7 @@ impl App {
             agent_id,
             summary,
             ledger_before: snapshot,
+            metadata,
         });
         self.compaction_overlay_index = self.compaction_history.len().saturating_sub(1);
     }
@@ -1367,6 +1369,7 @@ mod tests {
             "first compaction".into(),
             "2026-05-11T14:23:00Z".into(),
             "agent-1".into(),
+            None,
         );
 
         assert_eq!(app.compaction_history.len(), 1);
@@ -1396,6 +1399,7 @@ mod tests {
             "summary".into(),
             "2026-05-11T14:23:00Z".into(),
             "agent-1".into(),
+            None,
         );
         assert_eq!(app.compaction_history.len(), 1);
         assert_eq!(app.compaction_call_count, 1);

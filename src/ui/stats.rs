@@ -114,6 +114,20 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
+        if let Some(m) = &last.metadata {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!(
+                        "{} → {} tok · {}",
+                        format_tokens(m.pre_tokens),
+                        format_tokens(m.post_tokens),
+                        m.trigger,
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
     }
 
     // Agents section.
@@ -246,6 +260,17 @@ fn short_id(id: &str) -> String {
         id[..12].to_string()
     } else {
         id.to_string()
+    }
+}
+
+/// Format a token count in compact form: `1234` → `1.2k`, `1234567` → `1.2M`.
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
     }
 }
 

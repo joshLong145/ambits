@@ -217,8 +217,8 @@ fn main() -> Result<()> {
             for event in ingester.parse_log_file_with_root(log_file, &project_path) {
                 match event {
                     ingest::SessionEvent::ToolCall(tc) => app.process_agent_event(tc),
-                    ingest::SessionEvent::Compacted { summary, timestamp, agent_id } => {
-                        app.process_compaction(summary, timestamp, agent_id);
+                    ingest::SessionEvent::Compacted { summary, timestamp, agent_id, metadata } => {
+                        app.process_compaction(summary, timestamp, agent_id, metadata);
                     }
                     ingest::SessionEvent::SessionCleared => app.reset_session(),
                 }
@@ -279,7 +279,7 @@ fn run_tui(
             Ok(AppEvent::AgentEvent(event)) => app.process_agent_event(event),
             Ok(AppEvent::SessionCleared) => app.reset_session(),
             Ok(AppEvent::Compacted(ev)) => {
-                app.process_compaction(ev.summary, ev.timestamp, ev.agent_id);
+                app.process_compaction(ev.summary, ev.timestamp, ev.agent_id, ev.metadata);
             }
             Ok(AppEvent::Tick) => {
                 session.handle_tick(log_dir, app, serena_mode, project_path);
