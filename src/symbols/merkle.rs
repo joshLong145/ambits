@@ -4,11 +4,51 @@ use super::SymbolNode;
 
 /// Compute content hash from the raw source text of a symbol.
 /// Normalizes whitespace to make hashing resilient to formatting changes.
+///
+/// For ASCII input — virtually all source code — we stream normalized bytes
+/// directly into the SHA-256 hasher through a stack buffer, skipping the
+/// intermediate `String` allocation and Unicode-aware classification used by
+/// the general fallback. Both paths feed bit-for-bit identical byte sequences
+/// to the hasher, so hash values are unchanged.
 pub fn content_hash(source: &str) -> [u8; 32] {
-    let normalized = normalize_source(source);
     let mut hasher = Sha256::new();
-    hasher.update(normalized.as_bytes());
+    if source.is_ascii() {
+        hash_normalized_ascii(source.trim().as_bytes(), &mut hasher);
+    } else {
+        let normalized = normalize_source(source);
+        hasher.update(normalized.as_bytes());
+    }
     hasher.finalize().into()
+}
+
+/// Stream `bytes` into `hasher` after collapsing runs of ASCII whitespace into a
+/// single space, matching `normalize_source` byte-for-byte. Caller must pre-trim.
+#[inline]
+fn hash_normalized_ascii(bytes: &[u8], hasher: &mut Sha256) {
+    let mut buf = [0u8; 256];
+    let mut len = 0;
+    let mut prev_was_space = false;
+    for &b in bytes {
+        let push = if is_unicode_ws_ascii(b) {
+            if prev_was_space {
+                continue;
+            }
+            prev_was_space = true;
+            b' '
+        } else {
+            prev_was_space = false;
+            b
+        };
+        buf[len] = push;
+        len += 1;
+        if len == buf.len() {
+            hasher.update(buf);
+            len = 0;
+        }
+    }
+    if len > 0 {
+        hasher.update(&buf[..len]);
+    }
 }
 
 /// Compute the Merkle hash for a symbol node.
@@ -173,6 +213,36 @@ mod tests {
         let h1 = content_hash("fn foo() {}");
         let h2 = content_hash("fn bar() {}");
         assert_ne!(h1, h2);
+    }
+
+    /// Reference implementation: hash the output of the existing Unicode
+    /// `normalize_source` path. Used to assert the ASCII fast path is
+    /// bit-for-bit equivalent.
+    fn content_hash_via_unicode(source: &str) -> [u8; 32] {
+        let normalized = normalize_source(source);
+        let mut hasher = Sha256::new();
+        hasher.update(normalized.as_bytes());
+        hasher.finalize().into()
+    }
+
+    #[test]
+    fn content_hash_ascii_path_matches_unicode_path() {
+        let samples = [
+            "",
+            "fn foo() {}",
+            "fn  foo()  {  }",
+            "   \n\t  fn bar() {}\n\n",
+            "let x = (a + b) * c;\nlet y = x * 2;",
+            "a\x0Bb",  // vertical tab — Unicode whitespace, not ASCII whitespace
+            include_str!("merkle.rs"),  // larger ASCII payload: this very file
+        ];
+        for s in samples {
+            assert_eq!(
+                content_hash(s),
+                content_hash_via_unicode(s),
+                "content_hash disagreement on {s:?}",
+            );
+        }
     }
 
     #[test]
