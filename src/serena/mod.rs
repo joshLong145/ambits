@@ -208,7 +208,7 @@ fn convert_symbol(
 
     let mut node = SymbolNode {
         id,
-        name,
+        name: std::sync::Arc::from(name.as_str()),
         category,
         label,
         file_path: std::sync::Arc::clone(file_path),

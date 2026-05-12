@@ -668,7 +668,7 @@ fn flatten_symbol(
 
     rows.push(TreeRow {
         symbol_id: sym.id.clone(),
-        display_name: sym.name.clone(),
+        display_name: sym.name.to_string(),
         label: sym.label,
         depth,
         is_file: false,
@@ -825,7 +825,7 @@ pub fn symbol_name_matches(sym: &SymbolNode, event: &AgentToolCall) -> bool {
     }
     // Plain name match (e.g. target = "handle_key", sym.name = "handle_key").
     let norm_sym_name = normalize_name_path(&sym.name);
-    sym.name == *target_name || norm_sym_name == norm_target
+    sym.name.as_ref() == target_name.as_str() || norm_sym_name == norm_target
 }
 
 /// Check if a symbol's line range overlaps with the tool call's `target_lines`.

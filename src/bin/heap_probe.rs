@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ambits::symbols::merkle::{compute_merkle_hash, content_hash};
-use ambits::symbols::{FileSymbols, ProjectTree, SymbolCategory, SymbolNode};
+use ambits::symbols::{FileSymbols, NameInterner, ProjectTree, SymbolCategory, SymbolNode};
 
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
@@ -84,16 +84,22 @@ fn build_file_symbols(file_path: &str, n: usize) -> Vec<SymbolNode> {
     let remainder = n - groups * 5;
     let mut out = Vec::with_capacity(groups + remainder);
     let file_path_arc = Arc::new(PathBuf::from(file_path));
+    // One interner per file — same scope as production parsers.
+    let names = NameInterner::new();
     for g in 0..groups {
         let parent_id = format!("{file_path}::Type_{g:04}");
-        let mut parent = make_sym(&parent_id, &format!("Type_{g:04}"));
+        let parent_name = format!("Type_{g:04}");
+        let mut parent = make_sym(&parent_id, &parent_name);
+        parent.name = names.intern(&parent_name);
         parent.category = SymbolCategory::Type;
         parent.label = "struct";
         parent.file_path = Arc::clone(&file_path_arc);
         parent.children = (0..4)
             .map(|i| {
                 let child_id = format!("{parent_id}::method_{i}");
-                let mut sym = make_sym(&child_id, &format!("method_{i}"));
+                let child_name = format!("method_{i}");
+                let mut sym = make_sym(&child_id, &child_name);
+                sym.name = names.intern(&child_name);
                 sym.file_path = Arc::clone(&file_path_arc);
                 sym
             })
@@ -103,7 +109,9 @@ fn build_file_symbols(file_path: &str, n: usize) -> Vec<SymbolNode> {
     }
     for i in 0..remainder {
         let leaf_id = format!("{file_path}::fn_{i:04}");
-        let mut sym = make_sym(&leaf_id, &format!("fn_{i:04}"));
+        let leaf_name = format!("fn_{i:04}");
+        let mut sym = make_sym(&leaf_id, &leaf_name);
+        sym.name = names.intern(&leaf_name);
         sym.file_path = Arc::clone(&file_path_arc);
         out.push(sym);
     }
@@ -114,7 +122,7 @@ fn make_sym(id: &str, name: &str) -> SymbolNode {
     let hash = content_hash(name);
     SymbolNode {
         id: id.to_string(),
-        name: name.to_string(),
+        name: Arc::from(name),
         category: SymbolCategory::Function,
         label: "fn",
         file_path: Arc::new(PathBuf::from("src/bench.rs")),

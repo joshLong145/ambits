@@ -39,7 +39,7 @@ use color_eyre::eyre::eyre;
 use tree_sitter::{Node, Parser};
 
 use crate::symbols::merkle::{compute_merkle_hash, content_hash, estimate_tokens};
-use crate::symbols::{FileSymbols, SymbolCategory, SymbolNode};
+use crate::symbols::{FileSymbols, NameInterner, SymbolCategory, SymbolNode};
 
 use super::LanguageParser;
 
@@ -78,8 +78,9 @@ impl LanguageParser for TypescriptParser {
         let src = source.as_bytes();
         let mut symbols = Vec::new();
         let file_path_arc = Arc::new(path.to_path_buf());
+        let names = NameInterner::new();
 
-        extract_symbols(root, src, &file_path_arc, &path_prefix, "", &mut symbols);
+        extract_symbols(root, src, &file_path_arc, &names, &path_prefix, "", &mut symbols);
 
         for sym in symbols.iter_mut() {
             compute_merkle_hash(sym);
@@ -149,6 +150,7 @@ fn extract_symbols(
     node: Node,
     src: &[u8],
     file_path: &Arc<PathBuf>,
+    names: &NameInterner,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -175,7 +177,7 @@ fn extract_symbols(
             let mut inner_cursor = child.walk();
             for inner in child.children(&mut inner_cursor) {
                 if inner.kind() == "internal_module" {
-                    emit_namespace(&inner, src, file_path, path_prefix, parent_name_path, out);
+                    emit_namespace(&inner, src, file_path, names, path_prefix, parent_name_path, out);
                 }
             }
             continue;
@@ -188,45 +190,45 @@ fn extract_symbols(
         match target.kind() {
             // `function foo()` or `function* gen()` - leaf symbol, no children.
             "function_declaration" | "generator_function_declaration" => {
-                if let Some(sym) = build_named_symbol(&target, src, file_path, path_prefix, parent_name_path, &FN, byte_range) {
+                if let Some(sym) = build_named_symbol(&target, src, file_path, names, path_prefix, parent_name_path, &FN, byte_range) {
                     out.push(sym);
                 }
             }
             // `class Foo { ... }` - container, recurse into class_body for members.
             "class_declaration" => {
-                emit_class(&target, src, file_path, path_prefix, parent_name_path, &CLASS, byte_range, out);
+                emit_class(&target, src, file_path, names, path_prefix, parent_name_path, &CLASS, byte_range, out);
             }
             // `abstract class Base { ... }` - same as class but different label.
             "abstract_class_declaration" => {
-                emit_class(&target, src, file_path, path_prefix, parent_name_path, &ABSTRACT_CLASS, byte_range, out);
+                emit_class(&target, src, file_path, names, path_prefix, parent_name_path, &ABSTRACT_CLASS, byte_range, out);
             }
             // `interface Config { ... }` - container, recurse into interface_body.
             "interface_declaration" => {
-                emit_interface(&target, src, file_path, path_prefix, parent_name_path, byte_range, out);
+                emit_interface(&target, src, file_path, names, path_prefix, parent_name_path, byte_range, out);
             }
             // `type Alias = ...` - leaf symbol.
             "type_alias_declaration" => {
-                if let Some(sym) = build_named_symbol(&target, src, file_path, path_prefix, parent_name_path, &TYPE, byte_range) {
+                if let Some(sym) = build_named_symbol(&target, src, file_path, names, path_prefix, parent_name_path, &TYPE, byte_range) {
                     out.push(sym);
                 }
             }
             // `enum Status { ... }` - leaf (we don't extract enum members).
             "enum_declaration" => {
-                if let Some(sym) = build_named_symbol(&target, src, file_path, path_prefix, parent_name_path, &ENUM, byte_range) {
+                if let Some(sym) = build_named_symbol(&target, src, file_path, names, path_prefix, parent_name_path, &ENUM, byte_range) {
                     out.push(sym);
                 }
             }
             // `namespace N { ... }` / `module M { ... }` - container, recurse.
             "internal_module" | "module" => {
-                emit_namespace(&target, src, file_path, path_prefix, parent_name_path, out);
+                emit_namespace(&target, src, file_path, names, path_prefix, parent_name_path, out);
             }
             // `const foo = () => {}` or `let bar = function() {}` - detect arrow/fn expressions.
             "lexical_declaration" | "variable_declaration" => {
-                extract_arrow_fns(&target, src, file_path, path_prefix, parent_name_path, out);
+                extract_arrow_fns(&target, src, file_path, names, path_prefix, parent_name_path, out);
             }
             // `declare function ...`, `declare class ...`, `declare const ...`, etc.
             "ambient_declaration" => {
-                extract_ambient(&target, src, file_path, path_prefix, parent_name_path, out);
+                extract_ambient(&target, src, file_path, names, path_prefix, parent_name_path, out);
             }
             // Imports, comments, expression statements, etc. - ignored.
             _ => {}
@@ -253,6 +255,7 @@ fn extract_arrow_fns(
     node: &Node,
     src: &[u8],
     file_path: &Arc<PathBuf>,
+    names: &NameInterner,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -283,7 +286,7 @@ fn extract_arrow_fns(
 
         // Use the full declaration range (includes const/let keyword).
         let byte_range = node.byte_range();
-        out.push(make_symbol(name, &FN, node, byte_range, src, file_path, path_prefix, parent_name_path, Vec::new()));
+        out.push(make_symbol(name, &FN, node, byte_range, src, file_path, names, path_prefix, parent_name_path, Vec::new()));
     }
 }
 
@@ -300,6 +303,7 @@ fn extract_ambient(
     node: &Node,
     src: &[u8],
     file_path: &Arc<PathBuf>,
+    names: &NameInterner,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -314,14 +318,14 @@ fn extract_ambient(
             | "internal_module" | "module" => child_name(&child, src),
             "lexical_declaration" | "variable_declaration" => {
                 // Extract variable names from declare const/let/var.
-                extract_ambient_vars(&child, src, file_path, path_prefix, parent_name_path, &ambient_range, out);
+                extract_ambient_vars(&child, src, file_path, names, path_prefix, parent_name_path, &ambient_range, out);
                 None
             }
             _ => None,
         };
 
         if let Some(name) = name {
-            out.push(make_symbol(name, &DECLARE, node, ambient_range, src, file_path, path_prefix, parent_name_path, Vec::new()));
+            out.push(make_symbol(name, &DECLARE, node, ambient_range, src, file_path, names, path_prefix, parent_name_path, Vec::new()));
             return; // One symbol per ambient_declaration.
         }
     }
@@ -332,6 +336,7 @@ fn extract_ambient_vars(
     node: &Node,
     src: &[u8],
     file_path: &Arc<PathBuf>,
+    names: &NameInterner,
     path_prefix: &str,
     parent_name_path: &str,
     ambient_range: &std::ops::Range<usize>,
@@ -351,7 +356,7 @@ fn extract_ambient_vars(
             None => continue,
         };
 
-        out.push(make_symbol(name, &DECLARE, &child, ambient_range.clone(), src, file_path, path_prefix, parent_name_path, Vec::new()));
+        out.push(make_symbol(name, &DECLARE, &child, ambient_range.clone(), src, file_path, names, path_prefix, parent_name_path, Vec::new()));
     }
 }
 
@@ -367,6 +372,7 @@ fn emit_class(
     node: &Node,
     src: &[u8],
     file_path: &Arc<PathBuf>,
+    names: &NameInterner,
     path_prefix: &str,
     parent_name_path: &str,
     meta: &SymbolMeta,
@@ -386,10 +392,10 @@ fn emit_class(
 
     let mut children = Vec::new();
     if let Some(body) = child_by_kind(node, "class_body") {
-        extract_members(body, src, file_path, path_prefix, &name_path, &mut children);
+        extract_members(body, src, file_path, names, path_prefix, &name_path, &mut children);
     }
 
-    out.push(make_symbol(name, meta, node, byte_range, src, file_path, path_prefix, parent_name_path, children));
+    out.push(make_symbol(name, meta, node, byte_range, src, file_path, names, path_prefix, parent_name_path, children));
 }
 
 /// Extract members from a `class_body` or `interface_body` node.
@@ -405,6 +411,7 @@ fn extract_members(
     body: Node,
     src: &[u8],
     file_path: &Arc<PathBuf>,
+    names: &NameInterner,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -442,7 +449,7 @@ fn extract_members(
         };
 
         let byte_range = child.byte_range();
-        out.push(make_symbol(name, meta, &child, byte_range, src, file_path, path_prefix, parent_name_path, Vec::new()));
+        out.push(make_symbol(name, meta, &child, byte_range, src, file_path, names, path_prefix, parent_name_path, Vec::new()));
     }
 }
 
@@ -454,6 +461,7 @@ fn emit_interface(
     node: &Node,
     src: &[u8],
     file_path: &Arc<PathBuf>,
+    names: &NameInterner,
     path_prefix: &str,
     parent_name_path: &str,
     byte_range: std::ops::Range<usize>,
@@ -472,10 +480,10 @@ fn emit_interface(
 
     let mut children = Vec::new();
     if let Some(body) = child_by_kind(node, "interface_body") {
-        extract_members(body, src, file_path, path_prefix, &name_path, &mut children);
+        extract_members(body, src, file_path, names, path_prefix, &name_path, &mut children);
     }
 
-    out.push(make_symbol(name, &IFACE, node, byte_range, src, file_path, path_prefix, parent_name_path, children));
+    out.push(make_symbol(name, &IFACE, node, byte_range, src, file_path, names, path_prefix, parent_name_path, children));
 }
 
 /// Emit a `namespace`/`module` symbol and recurse into `statement_block` for nested declarations.
@@ -487,6 +495,7 @@ fn emit_namespace(
     node: &Node,
     src: &[u8],
     file_path: &Arc<PathBuf>,
+    names: &NameInterner,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -504,11 +513,11 @@ fn emit_namespace(
 
     let mut children = Vec::new();
     if let Some(body) = child_by_kind(node, "statement_block") {
-        extract_symbols(body, src, file_path, path_prefix, &name_path, &mut children);
+        extract_symbols(body, src, file_path, names, path_prefix, &name_path, &mut children);
     }
 
     let byte_range = node.byte_range();
-    out.push(make_symbol(name, &NS, node, byte_range, src, file_path, path_prefix, parent_name_path, children));
+    out.push(make_symbol(name, &NS, node, byte_range, src, file_path, names, path_prefix, parent_name_path, children));
 }
 
 // ---------------------------------------------------------------------------
@@ -533,6 +542,7 @@ fn make_symbol(
     byte_range: std::ops::Range<usize>,
     src: &[u8],
     file_path: &Arc<PathBuf>,
+    names: &NameInterner,
     path_prefix: &str,
     parent_name_path: &str,
     children: Vec<SymbolNode>,
@@ -549,7 +559,7 @@ fn make_symbol(
 
     SymbolNode {
         id,
-        name,
+        name: names.intern(&name),
         category: meta.category,
         label: meta.label,
         file_path: Arc::clone(file_path),
@@ -569,13 +579,14 @@ fn build_named_symbol(
     node: &Node,
     src: &[u8],
     file_path: &Arc<PathBuf>,
+    names: &NameInterner,
     path_prefix: &str,
     parent_name_path: &str,
     meta: &SymbolMeta,
     byte_range: std::ops::Range<usize>,
 ) -> Option<SymbolNode> {
     let name = child_name(node, src)?;
-    Some(make_symbol(name, meta, node, byte_range, src, file_path, path_prefix, parent_name_path, Vec::new()))
+    Some(make_symbol(name, meta, node, byte_range, src, file_path, names, path_prefix, parent_name_path, Vec::new()))
 }
 
 // ---------------------------------------------------------------------------
@@ -640,7 +651,7 @@ mod tests {
     fn find<'a>(symbols: &'a [SymbolNode], name: &str) -> &'a SymbolNode {
         symbols
             .iter()
-            .find(|s| s.name == name)
+            .find(|s| s.name.as_ref() == name)
             .unwrap_or_else(|| panic!("symbol '{}' not found", name))
     }
 
@@ -652,7 +663,7 @@ mod tests {
     fn function_declaration() {
         let syms = parse("function greet(name: string): string { return name; }");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "greet");
+        assert_eq!(syms[0].name.as_ref(), "greet");
         assert_eq!(syms[0].label, "function");
         assert_eq!(syms[0].category, SymbolCategory::Function);
     }
@@ -661,7 +672,7 @@ mod tests {
     fn generator_function() {
         let syms = parse("function* gen() { yield 1; }");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "gen");
+        assert_eq!(syms[0].name.as_ref(), "gen");
         assert_eq!(syms[0].label, "function");
         assert_eq!(syms[0].category, SymbolCategory::Function);
     }
@@ -670,7 +681,7 @@ mod tests {
     fn async_function() {
         let syms = parse("async function fetchData(): Promise<void> {}");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "fetchData");
+        assert_eq!(syms[0].name.as_ref(), "fetchData");
         assert_eq!(syms[0].label, "function");
     }
 
@@ -682,7 +693,7 @@ mod tests {
     fn arrow_function_const() {
         let syms = parse("const handler = () => {};");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "handler");
+        assert_eq!(syms[0].name.as_ref(), "handler");
         assert_eq!(syms[0].label, "function");
         assert_eq!(syms[0].category, SymbolCategory::Function);
     }
@@ -691,7 +702,7 @@ mod tests {
     fn arrow_function_with_body() {
         let syms = parse("const process = (data: string) => {\n  return data;\n};");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "process");
+        assert_eq!(syms[0].name.as_ref(), "process");
         assert_eq!(syms[0].label, "function");
     }
 
@@ -699,7 +710,7 @@ mod tests {
     fn function_expression() {
         let syms = parse("const handler = function() {};");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "handler");
+        assert_eq!(syms[0].name.as_ref(), "handler");
         assert_eq!(syms[0].label, "function");
         assert_eq!(syms[0].category, SymbolCategory::Function);
     }
@@ -708,7 +719,7 @@ mod tests {
     fn arrow_function_let() {
         let syms = parse("let handler = () => {};");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "handler");
+        assert_eq!(syms[0].name.as_ref(), "handler");
         assert_eq!(syms[0].label, "function");
     }
 
@@ -738,7 +749,7 @@ mod tests {
     fn class_declaration() {
         let syms = parse("class Foo {}");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Foo");
+        assert_eq!(syms[0].name.as_ref(), "Foo");
         assert_eq!(syms[0].label, "class");
         assert_eq!(syms[0].category, SymbolCategory::Type);
     }
@@ -753,11 +764,11 @@ mod tests {
         );
         assert_eq!(syms.len(), 1);
         let cls = &syms[0];
-        assert_eq!(cls.name, "Service");
+        assert_eq!(cls.name.as_ref(), "Service");
         assert_eq!(cls.children.len(), 2);
-        assert_eq!(cls.children[0].name, "doWork");
+        assert_eq!(cls.children[0].name.as_ref(), "doWork");
         assert_eq!(cls.children[0].label, "method");
-        assert_eq!(cls.children[1].name, "process");
+        assert_eq!(cls.children[1].name.as_ref(), "process");
         assert_eq!(cls.children[1].label, "method");
     }
 
@@ -772,10 +783,10 @@ mod tests {
         assert_eq!(syms.len(), 1);
         let cls = &syms[0];
         assert_eq!(cls.children.len(), 2);
-        assert_eq!(cls.children[0].name, "host");
+        assert_eq!(cls.children[0].name.as_ref(), "host");
         assert_eq!(cls.children[0].label, "property");
         assert_eq!(cls.children[0].category, SymbolCategory::Variable);
-        assert_eq!(cls.children[1].name, "port");
+        assert_eq!(cls.children[1].name.as_ref(), "port");
         assert_eq!(cls.children[1].label, "property");
     }
 
@@ -805,7 +816,7 @@ mod tests {
         );
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].children.len(), 1);
-        assert_eq!(syms[0].children[0].name, "constructor");
+        assert_eq!(syms[0].children[0].name.as_ref(), "constructor");
         assert_eq!(syms[0].children[0].label, "method");
     }
 
@@ -822,13 +833,13 @@ mod tests {
             }",
         );
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Base");
+        assert_eq!(syms[0].name.as_ref(), "Base");
         assert_eq!(syms[0].label, "abstract class");
         assert_eq!(syms[0].category, SymbolCategory::Type);
         assert_eq!(syms[0].children.len(), 2);
-        assert_eq!(syms[0].children[0].name, "doWork");
+        assert_eq!(syms[0].children[0].name.as_ref(), "doWork");
         assert_eq!(syms[0].children[0].label, "method");
-        assert_eq!(syms[0].children[1].name, "concrete");
+        assert_eq!(syms[0].children[1].name.as_ref(), "concrete");
         assert_eq!(syms[0].children[1].label, "method");
     }
 
@@ -840,7 +851,7 @@ mod tests {
     fn interface_declaration() {
         let syms = parse("interface Foo {}");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Foo");
+        assert_eq!(syms[0].name.as_ref(), "Foo");
         assert_eq!(syms[0].label, "interface");
         assert_eq!(syms[0].category, SymbolCategory::Type);
     }
@@ -858,15 +869,15 @@ mod tests {
         assert_eq!(syms.len(), 1);
         let iface = &syms[0];
         assert_eq!(iface.children.len(), 4);
-        assert_eq!(iface.children[0].name, "host");
+        assert_eq!(iface.children[0].name.as_ref(), "host");
         assert_eq!(iface.children[0].label, "property");
         assert_eq!(iface.children[0].category, SymbolCategory::Variable);
-        assert_eq!(iface.children[1].name, "port");
+        assert_eq!(iface.children[1].name.as_ref(), "port");
         assert_eq!(iface.children[1].label, "property");
-        assert_eq!(iface.children[2].name, "connect");
+        assert_eq!(iface.children[2].name.as_ref(), "connect");
         assert_eq!(iface.children[2].label, "method");
         assert_eq!(iface.children[2].category, SymbolCategory::Function);
-        assert_eq!(iface.children[3].name, "disconnect");
+        assert_eq!(iface.children[3].name.as_ref(), "disconnect");
         assert_eq!(iface.children[3].label, "method");
     }
 
@@ -878,7 +889,7 @@ mod tests {
     fn type_alias() {
         let syms = parse("type UserId = string;");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "UserId");
+        assert_eq!(syms[0].name.as_ref(), "UserId");
         assert_eq!(syms[0].label, "type");
         assert_eq!(syms[0].category, SymbolCategory::Type);
     }
@@ -887,7 +898,7 @@ mod tests {
     fn generic_type_alias() {
         let syms = parse("type Result<T> = { ok: true; value: T } | { ok: false; error: Error };");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Result");
+        assert_eq!(syms[0].name.as_ref(), "Result");
         assert_eq!(syms[0].label, "type");
     }
 
@@ -899,7 +910,7 @@ mod tests {
     fn enum_declaration() {
         let syms = parse("enum Status { Active, Inactive, Pending }");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Status");
+        assert_eq!(syms[0].name.as_ref(), "Status");
         assert_eq!(syms[0].label, "enum");
         assert_eq!(syms[0].category, SymbolCategory::Type);
         assert_eq!(syms[0].children.len(), 0, "enum should not recurse into members");
@@ -909,7 +920,7 @@ mod tests {
     fn const_enum() {
         let syms = parse("const enum Direction { Up, Down, Left, Right }");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Direction");
+        assert_eq!(syms[0].name.as_ref(), "Direction");
         assert_eq!(syms[0].label, "enum");
     }
 
@@ -925,12 +936,12 @@ mod tests {
             }",
         );
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Validation");
+        assert_eq!(syms[0].name.as_ref(), "Validation");
         assert_eq!(syms[0].label, "namespace");
         assert_eq!(syms[0].category, SymbolCategory::Module);
         // Namespace should recurse into children.
         assert_eq!(syms[0].children.len(), 1);
-        assert_eq!(syms[0].children[0].name, "isValid");
+        assert_eq!(syms[0].children[0].name.as_ref(), "isValid");
         assert_eq!(syms[0].children[0].label, "function");
     }
 
@@ -942,10 +953,10 @@ mod tests {
             }",
         );
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "MyModule");
+        assert_eq!(syms[0].name.as_ref(), "MyModule");
         assert_eq!(syms[0].label, "namespace");
         assert_eq!(syms[0].children.len(), 1);
-        assert_eq!(syms[0].children[0].name, "Inner");
+        assert_eq!(syms[0].children[0].name.as_ref(), "Inner");
         assert_eq!(syms[0].children[0].label, "class");
     }
 
@@ -957,7 +968,7 @@ mod tests {
     fn declare_function() {
         let syms = parse("declare function require(id: string): any;");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "require");
+        assert_eq!(syms[0].name.as_ref(), "require");
         assert_eq!(syms[0].label, "declare");
         assert_eq!(syms[0].category, SymbolCategory::Variable);
     }
@@ -966,7 +977,7 @@ mod tests {
     fn declare_const() {
         let syms = parse("declare const __dirname: string;");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "__dirname");
+        assert_eq!(syms[0].name.as_ref(), "__dirname");
         assert_eq!(syms[0].label, "declare");
     }
 
@@ -981,7 +992,7 @@ mod tests {
     fn declare_class() {
         let syms = parse("declare class Buffer { constructor(str: string); }");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Buffer");
+        assert_eq!(syms[0].name.as_ref(), "Buffer");
         assert_eq!(syms[0].label, "declare");
     }
 
@@ -993,7 +1004,7 @@ mod tests {
     fn export_function() {
         let syms = parse("export function greet(): void {}");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "greet");
+        assert_eq!(syms[0].name.as_ref(), "greet");
         assert_eq!(syms[0].label, "function");
     }
 
@@ -1001,7 +1012,7 @@ mod tests {
     fn export_class() {
         let syms = parse("export class Service {}");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Service");
+        assert_eq!(syms[0].name.as_ref(), "Service");
         assert_eq!(syms[0].label, "class");
     }
 
@@ -1009,7 +1020,7 @@ mod tests {
     fn export_interface() {
         let syms = parse("export interface Config { host: string; }");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Config");
+        assert_eq!(syms[0].name.as_ref(), "Config");
         assert_eq!(syms[0].label, "interface");
         assert_eq!(syms[0].children.len(), 1);
     }
@@ -1018,7 +1029,7 @@ mod tests {
     fn export_type_alias() {
         let syms = parse("export type Id = string;");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Id");
+        assert_eq!(syms[0].name.as_ref(), "Id");
         assert_eq!(syms[0].label, "type");
     }
 
@@ -1026,7 +1037,7 @@ mod tests {
     fn export_enum() {
         let syms = parse("export enum Color { Red, Green, Blue }");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Color");
+        assert_eq!(syms[0].name.as_ref(), "Color");
         assert_eq!(syms[0].label, "enum");
     }
 
@@ -1034,7 +1045,7 @@ mod tests {
     fn export_arrow_function() {
         let syms = parse("export const handler = () => {};");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "handler");
+        assert_eq!(syms[0].name.as_ref(), "handler");
         assert_eq!(syms[0].label, "function");
         assert_eq!(syms[0].category, SymbolCategory::Function);
     }
@@ -1043,7 +1054,7 @@ mod tests {
     fn export_default_function() {
         let syms = parse("export default function main() {}");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "main");
+        assert_eq!(syms[0].name.as_ref(), "main");
         assert_eq!(syms[0].label, "function");
     }
 
@@ -1051,7 +1062,7 @@ mod tests {
     fn export_default_class() {
         let syms = parse("export default class App {}");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "App");
+        assert_eq!(syms[0].name.as_ref(), "App");
         assert_eq!(syms[0].label, "class");
     }
 

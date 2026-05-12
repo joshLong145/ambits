@@ -40,7 +40,7 @@ fn sym(id: &str, name: &str) -> SymbolNode {
     let hash = content_hash(name);
     SymbolNode {
         id: id.to_string(),
-        name: name.to_string(),
+        name: Arc::from(name),
         category: SymbolCategory::Function,
         label: "fn",
         file_path: Arc::new(PathBuf::new()),

@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -44,7 +46,14 @@ impl fmt::Display for SymbolCategory {
 #[derive(Debug, Clone)]
 pub struct SymbolNode {
     pub id: SymbolId,
-    pub name: String,
+    /// Symbol's short name (`foo`, `Bar`, `method_0`, etc). Stored as
+    /// `Arc<str>` so common names (`new`, `default`, `get`, `build`,
+    /// `method_0` repeating across types in a file) share one heap
+    /// allocation. Construct via [`NameInterner::intern`] from a parser, or
+    /// directly with `Arc::from(name)` from a test/fixture. Display, Eq, and
+    /// `as_ref()` work via deref to `&str`; explicit comparisons against
+    /// `String` need `&*sym.name == &**other` or `sym.name.as_ref() == other`.
+    pub name: Arc<str>,
     pub category: SymbolCategory,
     pub label: &'static str, // Language-specific label (e.g., "class", "struct", "def")
     /// Path to the source file that produced this symbol. Wrapped in `Arc` so
@@ -61,6 +70,39 @@ pub struct SymbolNode {
     pub merkle_hash: [u8; 32],
     pub children: Vec<SymbolNode>,
     pub estimated_tokens: usize,
+}
+
+/// Per-file interner for symbol names. Real code has heavy name repetition
+/// within a file (think methods named `new`, `default`, `build` across every
+/// type in a module), so a small hash cache here lets us share one `Arc<str>`
+/// across every reuse instead of allocating one heap buffer per occurrence.
+///
+/// Uses interior mutability so it can be threaded as `&NameInterner` alongside
+/// other immutable parser state without requiring `&mut` propagation through
+/// every recursive helper.
+///
+/// Scope is intentionally per-file rather than global: simpler borrow story
+/// (no thread safety needed), and the wins from within-file repetition
+/// dominate.
+#[derive(Debug, Default)]
+pub struct NameInterner {
+    cache: RefCell<HashMap<String, Arc<str>>>,
+}
+
+impl NameInterner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn intern(&self, s: &str) -> Arc<str> {
+        let mut cache = self.cache.borrow_mut();
+        if let Some(arc) = cache.get(s) {
+            return Arc::clone(arc);
+        }
+        let arc: Arc<str> = Arc::from(s);
+        cache.insert(s.to_string(), Arc::clone(&arc));
+        arc
+    }
 }
 
 impl SymbolNode {
