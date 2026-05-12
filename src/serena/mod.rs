@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{bail, eyre, Result};
 use serde_pickle::value::{HashableValue, Value};
-use sha2::{Digest, Sha256};
 
 use ambits::symbols::merkle::compute_merkle_hash;
 use ambits::symbols::{FileSymbols, ProjectTree, SymbolCategory, SymbolNode};
@@ -186,13 +185,14 @@ fn convert_symbol(
         1
     };
 
-    // Content hash from identity (no source text available in raw format)
-    let content_hash = {
-        let mut hasher = Sha256::new();
+    // Content hash from identity (no source text available in raw format).
+    // BLAKE3 matches `symbols::merkle::content_hash` algorithm choice.
+    let content_hash: [u8; 32] = {
+        let mut hasher = blake3::Hasher::new();
         hasher.update(name.as_bytes());
-        hasher.update(kind_int.to_le_bytes());
-        hasher.update(start_line.to_le_bytes());
-        hasher.update(end_line.to_le_bytes());
+        hasher.update(&kind_int.to_le_bytes());
+        hasher.update(&start_line.to_le_bytes());
+        hasher.update(&end_line.to_le_bytes());
         hasher.finalize().into()
     };
 
