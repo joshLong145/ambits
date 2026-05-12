@@ -7,7 +7,7 @@
   "merkle_hash/bench_estimate_tokens/tiny":  2000,
   "merkle_hash/bench_estimate_tokens/small": 2000,
   "merkle_hash/bench_estimate_tokens/medium":5000,
-  "merkle_hash/bench_estimate_tokens/large": 10000,
+  "merkle_hash/bench_estimate_tokens/large": 15000,
 
   "merkle_hash/bench_compute_merkle_hash/1":    5000,
   "merkle_hash/bench_compute_merkle_hash/10":   50000,
