@@ -29,13 +29,14 @@
 //! | `MAX_SIZE = ...` (UPPER_SNAKE_CASE)        | Variable | `"var"`  |
 //! | class methods                              | Function | `"def"`  |
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use color_eyre::eyre::eyre;
 use tree_sitter::{Node, Parser};
 
 use crate::symbols::merkle::{compute_merkle_hash, content_hash, estimate_tokens};
-use crate::symbols::{FileSymbols, SymbolCategory, SymbolNode};
+use crate::symbols::{FileSymbols, NameInterner, SymbolCategory, SymbolNode};
 
 use super::LanguageParser;
 
@@ -73,8 +74,10 @@ impl LanguageParser for PythonParser {
         let path_prefix = path.to_string_lossy();
         let src = source.as_bytes();
         let mut symbols = Vec::new();
+        let file_path_arc = Arc::new(path.to_path_buf());
+        let names = NameInterner::new();
 
-        extract_symbols(root, src, path, &path_prefix, "", &mut symbols);
+        extract_symbols(root, src, &file_path_arc, &names, &path_prefix, "", &mut symbols);
 
         for sym in symbols.iter_mut() {
             compute_merkle_hash(sym);
@@ -136,7 +139,8 @@ const TYPE_ALIAS: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, labe
 fn extract_symbols(
     node: Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
+    names: &NameInterner,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -150,7 +154,7 @@ fn extract_symbols(
             "class_definition" => child_name(&child, src).map(|n| (n, CLASS)),
             // Decorated definitions: unwrap the decorator to find the inner def/class.
             "decorated_definition" => {
-                extract_decorated(&child, src, file_path, path_prefix, parent_name_path, out);
+                extract_decorated(&child, src, file_path, names, path_prefix, parent_name_path, out);
                 None
             }
             // Module-level assignments: annotated or UPPER_SNAKE_CASE only.
@@ -161,7 +165,7 @@ fn extract_symbols(
             "if_statement" | "for_statement" | "while_statement"
             | "try_statement" | "with_statement" | "match_statement" => {
                 extract_from_compound_bodies(
-                    &child, src, file_path, path_prefix, parent_name_path, out,
+                    &child, src, file_path, names, path_prefix, parent_name_path, out,
                 );
                 None
             }
@@ -183,22 +187,22 @@ fn extract_symbols(
 
             let mut sym = SymbolNode {
                 id,
-                name: name.clone(),
+                name: names.intern(&name),
                 category: meta.category,
                 label: meta.label,
-                file_path: file_path.to_path_buf(),
-                byte_range,
-                line_range: start_line..end_line,
+                file_path: Arc::clone(file_path),
+                byte_range: byte_range.start as u32..byte_range.end as u32,
+                line_range: start_line as u32..end_line as u32,
                 content_hash: content_hash(text),
                 merkle_hash: [0u8; 32],
                 children: Vec::new(),
-                estimated_tokens: estimate_tokens(text),
+                estimated_tokens: estimate_tokens(text) as u32,
             };
 
             // For classes, recurse into the body block to find methods.
             if meta.category == SymbolCategory::Type {
                 if let Some(body) = child.child_by_field_name("body") {
-                    extract_symbols(body, src, file_path, path_prefix, &name_path, &mut sym.children);
+                    extract_symbols(body, src, file_path, names, path_prefix, &name_path, &mut sym.children);
                 }
             }
 
@@ -224,7 +228,8 @@ fn extract_symbols(
 fn extract_decorated(
     node: &Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
+    names: &NameInterner,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -258,21 +263,21 @@ fn extract_decorated(
 
                 let mut sym = SymbolNode {
                     id,
-                    name: name.clone(),
+                    name: names.intern(&name),
                     category: meta.category,
                     label: meta.label,
-                    file_path: file_path.to_path_buf(),
-                    byte_range,
-                    line_range: start_line..end_line,
+                    file_path: Arc::clone(file_path),
+                    byte_range: byte_range.start as u32..byte_range.end as u32,
+                    line_range: start_line as u32..end_line as u32,
                     content_hash: content_hash(text),
                     merkle_hash: [0u8; 32],
                     children: Vec::new(),
-                    estimated_tokens: estimate_tokens(text),
+                    estimated_tokens: estimate_tokens(text) as u32,
                 };
 
                 if meta.category == SymbolCategory::Type {
                     if let Some(body) = child.child_by_field_name("body") {
-                        extract_symbols(body, src, file_path, path_prefix, &name_path, &mut sym.children);
+                        extract_symbols(body, src, file_path, names, path_prefix, &name_path, &mut sym.children);
                     }
                 }
 
@@ -396,7 +401,8 @@ fn extract_type_alias(node: &Node, src: &[u8]) -> Option<(String, SymbolMeta)> {
 fn extract_from_compound_bodies(
     node: &Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
+    names: &NameInterner,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -404,12 +410,12 @@ fn extract_from_compound_bodies(
     match node.kind() {
         "for_statement" | "while_statement" | "with_statement" => {
             if let Some(body) = node.child_by_field_name("body") {
-                extract_symbols(body, src, file_path, path_prefix, parent_name_path, out);
+                extract_symbols(body, src, file_path, names, path_prefix, parent_name_path, out);
             }
         }
         "if_statement" => {
             if let Some(body) = node.child_by_field_name("consequence") {
-                extract_symbols(body, src, file_path, path_prefix, parent_name_path, out);
+                extract_symbols(body, src, file_path, names, path_prefix, parent_name_path, out);
             }
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
@@ -417,14 +423,14 @@ fn extract_from_compound_bodies(
                     "elif_clause" => {
                         if let Some(body) = child.child_by_field_name("consequence") {
                             extract_symbols(
-                                body, src, file_path, path_prefix, parent_name_path, out,
+                                body, src, file_path, names, path_prefix, parent_name_path, out,
                             );
                         }
                     }
                     "else_clause" => {
                         if let Some(body) = child.child_by_field_name("body") {
                             extract_symbols(
-                                body, src, file_path, path_prefix, parent_name_path, out,
+                                body, src, file_path, names, path_prefix, parent_name_path, out,
                             );
                         }
                     }
@@ -434,7 +440,7 @@ fn extract_from_compound_bodies(
         }
         "try_statement" => {
             if let Some(body) = node.child_by_field_name("body") {
-                extract_symbols(body, src, file_path, path_prefix, parent_name_path, out);
+                extract_symbols(body, src, file_path, names, path_prefix, parent_name_path, out);
             }
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
@@ -444,7 +450,7 @@ fn extract_from_compound_bodies(
                         for inner in child.children(&mut inner_cursor) {
                             if inner.kind() == "block" {
                                 extract_symbols(
-                                    inner, src, file_path, path_prefix, parent_name_path, out,
+                                    inner, src, file_path, names, path_prefix, parent_name_path, out,
                                 );
                             }
                         }
@@ -452,7 +458,7 @@ fn extract_from_compound_bodies(
                     "else_clause" => {
                         if let Some(body) = child.child_by_field_name("body") {
                             extract_symbols(
-                                body, src, file_path, path_prefix, parent_name_path, out,
+                                body, src, file_path, names, path_prefix, parent_name_path, out,
                             );
                         }
                     }
@@ -467,7 +473,7 @@ fn extract_from_compound_bodies(
                     if child.kind() == "case_clause" {
                         if let Some(consequence) = child.child_by_field_name("consequence") {
                             extract_symbols(
-                                consequence, src, file_path, path_prefix, parent_name_path, out,
+                                consequence, src, file_path, names, path_prefix, parent_name_path, out,
                             );
                         }
                     }
@@ -506,7 +512,7 @@ mod tests {
     fn parse_simple_function() {
         let syms = parse("def foo():\n    pass\n");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "foo");
+        assert_eq!(syms[0].name.as_ref(), "foo");
         assert_eq!(syms[0].category, SymbolCategory::Function);
         assert_eq!(syms[0].label, "def");
         assert_eq!(syms[0].id, "test.py::foo");
@@ -517,15 +523,15 @@ mod tests {
     fn parse_multiple_functions() {
         let syms = parse("def foo():\n    pass\n\ndef bar():\n    pass\n");
         assert_eq!(syms.len(), 2);
-        assert_eq!(syms[0].name, "foo");
-        assert_eq!(syms[1].name, "bar");
+        assert_eq!(syms[0].name.as_ref(), "foo");
+        assert_eq!(syms[1].name.as_ref(), "bar");
     }
 
     #[test]
     fn parse_simple_class() {
         let syms = parse("class Foo:\n    pass\n");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Foo");
+        assert_eq!(syms[0].name.as_ref(), "Foo");
         assert_eq!(syms[0].category, SymbolCategory::Type);
         assert_eq!(syms[0].label, "class");
         assert_eq!(syms[0].id, "test.py::Foo");
@@ -537,13 +543,13 @@ mod tests {
             "class Foo:\n    def __init__(self):\n        pass\n    def bar(self):\n        pass\n",
         );
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Foo");
+        assert_eq!(syms[0].name.as_ref(), "Foo");
         assert_eq!(syms[0].category, SymbolCategory::Type);
         assert_eq!(syms[0].children.len(), 2);
-        assert_eq!(syms[0].children[0].name, "__init__");
+        assert_eq!(syms[0].children[0].name.as_ref(), "__init__");
         assert_eq!(syms[0].children[0].category, SymbolCategory::Function);
         assert_eq!(syms[0].children[0].id, "test.py::Foo/__init__");
-        assert_eq!(syms[0].children[1].name, "bar");
+        assert_eq!(syms[0].children[1].name.as_ref(), "bar");
         assert_eq!(syms[0].children[1].id, "test.py::Foo/bar");
     }
 
@@ -551,7 +557,7 @@ mod tests {
     fn parse_decorated_function() {
         let syms = parse("@staticmethod\ndef foo():\n    pass\n");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "foo");
+        assert_eq!(syms[0].name.as_ref(), "foo");
         assert_eq!(syms[0].category, SymbolCategory::Function);
         assert_eq!(syms[0].label, "def");
         // Decorated definitions include the decorator in the byte range
@@ -562,7 +568,7 @@ mod tests {
     fn parse_decorated_class() {
         let syms = parse("@dataclass\nclass Point:\n    x: int\n    y: int\n");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Point");
+        assert_eq!(syms[0].name.as_ref(), "Point");
         assert_eq!(syms[0].category, SymbolCategory::Type);
         assert_eq!(syms[0].label, "class");
         // Decorated class range includes the decorator
@@ -575,11 +581,11 @@ mod tests {
             "@dataclass\nclass Point:\n    def __init__(self):\n        pass\n    def distance(self):\n        pass\n",
         );
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Point");
+        assert_eq!(syms[0].name.as_ref(), "Point");
         assert_eq!(syms[0].category, SymbolCategory::Type);
         assert_eq!(syms[0].children.len(), 2);
-        assert_eq!(syms[0].children[0].name, "__init__");
-        assert_eq!(syms[0].children[1].name, "distance");
+        assert_eq!(syms[0].children[0].name.as_ref(), "__init__");
+        assert_eq!(syms[0].children[1].name.as_ref(), "distance");
     }
 
     #[test]
@@ -588,12 +594,12 @@ mod tests {
             "def helper():\n    pass\n\nclass Foo:\n    def method(self):\n        pass\n\ndef another():\n    pass\n",
         );
         assert_eq!(syms.len(), 3);
-        assert_eq!(syms[0].name, "helper");
+        assert_eq!(syms[0].name.as_ref(), "helper");
         assert_eq!(syms[0].category, SymbolCategory::Function);
-        assert_eq!(syms[1].name, "Foo");
+        assert_eq!(syms[1].name.as_ref(), "Foo");
         assert_eq!(syms[1].category, SymbolCategory::Type);
         assert_eq!(syms[1].children.len(), 1);
-        assert_eq!(syms[2].name, "another");
+        assert_eq!(syms[2].name.as_ref(), "another");
         assert_eq!(syms[2].category, SymbolCategory::Function);
     }
 
@@ -603,14 +609,14 @@ mod tests {
             "class Outer:\n    class Inner:\n        def method(self):\n            pass\n",
         );
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Outer");
+        assert_eq!(syms[0].name.as_ref(), "Outer");
         assert_eq!(syms[0].children.len(), 1);
-        assert_eq!(syms[0].children[0].name, "Inner");
+        assert_eq!(syms[0].children[0].name.as_ref(), "Inner");
         assert_eq!(syms[0].children[0].category, SymbolCategory::Type);
         assert_eq!(syms[0].children[0].id, "test.py::Outer/Inner");
         // Inner class should have its own children
         assert_eq!(syms[0].children[0].children.len(), 1);
-        assert_eq!(syms[0].children[0].children[0].name, "method");
+        assert_eq!(syms[0].children[0].children[0].name.as_ref(), "method");
         assert_eq!(syms[0].children[0].children[0].id, "test.py::Outer/Inner/method");
     }
 
@@ -656,7 +662,7 @@ mod tests {
             .parse_file(Path::new("src/main.py"), "def foo():\n    pass\n")
             .unwrap();
         assert_eq!(file.file_path, Path::new("src/main.py"));
-        assert_eq!(file.symbols[0].file_path, Path::new("src/main.py"));
+        assert_eq!(file.symbols[0].file_path.as_path(), Path::new("src/main.py"));
         assert_eq!(file.symbols[0].id, "src/main.py::foo");
     }
 
@@ -673,9 +679,9 @@ mod tests {
             "class Foo:\n    @staticmethod\n    def bar():\n        pass\n",
         );
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Foo");
+        assert_eq!(syms[0].name.as_ref(), "Foo");
         assert_eq!(syms[0].children.len(), 1);
-        assert_eq!(syms[0].children[0].name, "bar");
+        assert_eq!(syms[0].children[0].name.as_ref(), "bar");
         assert_eq!(syms[0].children[0].category, SymbolCategory::Function);
     }
 
@@ -683,7 +689,7 @@ mod tests {
     fn parse_multiple_decorators() {
         let syms = parse("@decorator1\n@decorator2\ndef foo():\n    pass\n");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "foo");
+        assert_eq!(syms[0].name.as_ref(), "foo");
         assert_eq!(syms[0].line_range.start, 1);
     }
 
@@ -695,7 +701,7 @@ mod tests {
         // async def is not a direct `function_definition` – it is an expression_statement
         // or may be wrapped. Verify actual behavior either way.
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "foo");
+        assert_eq!(syms[0].name.as_ref(), "foo");
         assert_eq!(syms[0].category, SymbolCategory::Function);
     }
 
@@ -705,7 +711,7 @@ mod tests {
         let syms = parse(src);
         let range = &syms[0].byte_range;
         assert!(range.start < range.end);
-        assert!(range.end <= src.len());
+        assert!(range.end as usize <= src.len());
     }
 
     // --- Variable extraction tests ---
@@ -714,7 +720,7 @@ mod tests {
     fn parse_annotated_variable() {
         let syms = parse("x: int = 42\n");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "x");
+        assert_eq!(syms[0].name.as_ref(), "x");
         assert_eq!(syms[0].category, SymbolCategory::Variable);
         assert_eq!(syms[0].label, "var");
         assert_eq!(syms[0].id, "test.py::x");
@@ -725,7 +731,7 @@ mod tests {
     fn parse_annotated_variable_no_value() {
         let syms = parse("x: int\n");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "x");
+        assert_eq!(syms[0].name.as_ref(), "x");
         assert_eq!(syms[0].category, SymbolCategory::Variable);
     }
 
@@ -733,7 +739,7 @@ mod tests {
     fn parse_upper_case_constant() {
         let syms = parse("MAX_SIZE = 100\n");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "MAX_SIZE");
+        assert_eq!(syms[0].name.as_ref(), "MAX_SIZE");
         assert_eq!(syms[0].category, SymbolCategory::Variable);
         assert_eq!(syms[0].label, "var");
     }
@@ -742,7 +748,7 @@ mod tests {
     fn parse_upper_case_no_underscore() {
         let syms = parse("DEBUG = True\n");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "DEBUG");
+        assert_eq!(syms[0].name.as_ref(), "DEBUG");
         assert_eq!(syms[0].category, SymbolCategory::Variable);
     }
 
@@ -774,11 +780,11 @@ mod tests {
     fn parse_variables_mixed_with_functions() {
         let syms = parse("MAX: int = 100\n\ndef foo():\n    pass\n\nDEBUG = True\n");
         assert_eq!(syms.len(), 3);
-        assert_eq!(syms[0].name, "MAX");
+        assert_eq!(syms[0].name.as_ref(), "MAX");
         assert_eq!(syms[0].category, SymbolCategory::Variable);
-        assert_eq!(syms[1].name, "foo");
+        assert_eq!(syms[1].name.as_ref(), "foo");
         assert_eq!(syms[1].category, SymbolCategory::Function);
-        assert_eq!(syms[2].name, "DEBUG");
+        assert_eq!(syms[2].name.as_ref(), "DEBUG");
         assert_eq!(syms[2].category, SymbolCategory::Variable);
     }
 
@@ -788,7 +794,7 @@ mod tests {
     fn parse_type_alias() {
         let syms = parse("type Vector = list[float]\n");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Vector");
+        assert_eq!(syms[0].name.as_ref(), "Vector");
         assert_eq!(syms[0].category, SymbolCategory::Type);
         assert_eq!(syms[0].label, "type");
         assert_eq!(syms[0].id, "test.py::Vector");
@@ -798,9 +804,9 @@ mod tests {
     fn parse_type_alias_with_functions() {
         let syms = parse("type ID = int\n\ndef process(x: ID) -> None:\n    pass\n");
         assert_eq!(syms.len(), 2);
-        assert_eq!(syms[0].name, "ID");
+        assert_eq!(syms[0].name.as_ref(), "ID");
         assert_eq!(syms[0].category, SymbolCategory::Type);
-        assert_eq!(syms[1].name, "process");
+        assert_eq!(syms[1].name.as_ref(), "process");
         assert_eq!(syms[1].category, SymbolCategory::Function);
     }
 
@@ -810,7 +816,7 @@ mod tests {
     fn parse_function_inside_if() {
         let syms = parse("if True:\n    def foo():\n        pass\n");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "foo");
+        assert_eq!(syms[0].name.as_ref(), "foo");
         assert_eq!(syms[0].category, SymbolCategory::Function);
     }
 
@@ -820,8 +826,8 @@ mod tests {
             "if sys.platform == 'win32':\n    def init():\n        pass\nelse:\n    def init():\n        pass\n",
         );
         assert_eq!(syms.len(), 2);
-        assert_eq!(syms[0].name, "init");
-        assert_eq!(syms[1].name, "init");
+        assert_eq!(syms[0].name.as_ref(), "init");
+        assert_eq!(syms[1].name.as_ref(), "init");
     }
 
     #[test]
@@ -830,7 +836,7 @@ mod tests {
             "if False:\n    pass\nelif True:\n    def handler():\n        pass\n",
         );
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "handler");
+        assert_eq!(syms[0].name.as_ref(), "handler");
     }
 
     #[test]
@@ -839,9 +845,9 @@ mod tests {
             "try:\n    class Foo:\n        pass\nexcept Exception:\n    class FallbackFoo:\n        pass\n",
         );
         assert_eq!(syms.len(), 2);
-        assert_eq!(syms[0].name, "Foo");
+        assert_eq!(syms[0].name.as_ref(), "Foo");
         assert_eq!(syms[0].category, SymbolCategory::Type);
-        assert_eq!(syms[1].name, "FallbackFoo");
+        assert_eq!(syms[1].name.as_ref(), "FallbackFoo");
         assert_eq!(syms[1].category, SymbolCategory::Type);
     }
 
@@ -851,36 +857,36 @@ mod tests {
             "try:\n    def setup():\n        pass\nfinally:\n    def cleanup():\n        pass\n",
         );
         assert_eq!(syms.len(), 2);
-        assert_eq!(syms[0].name, "setup");
-        assert_eq!(syms[1].name, "cleanup");
+        assert_eq!(syms[0].name.as_ref(), "setup");
+        assert_eq!(syms[1].name.as_ref(), "cleanup");
     }
 
     #[test]
     fn parse_function_inside_for() {
         let syms = parse("for i in range(1):\n    def worker():\n        pass\n");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "worker");
+        assert_eq!(syms[0].name.as_ref(), "worker");
     }
 
     #[test]
     fn parse_function_inside_while() {
         let syms = parse("while True:\n    def loop_body():\n        pass\n    break\n");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "loop_body");
+        assert_eq!(syms[0].name.as_ref(), "loop_body");
     }
 
     #[test]
     fn parse_function_inside_with() {
         let syms = parse("with open('f') as f:\n    def process():\n        pass\n");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "process");
+        assert_eq!(syms[0].name.as_ref(), "process");
     }
 
     #[test]
     fn parse_decorated_function_inside_if() {
         let syms = parse("if True:\n    @decorator\n    def foo():\n        pass\n");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "foo");
+        assert_eq!(syms[0].name.as_ref(), "foo");
         assert_eq!(syms[0].category, SymbolCategory::Function);
     }
 
@@ -890,7 +896,7 @@ mod tests {
             "try:\n    if True:\n        def deeply_nested():\n            pass\nexcept:\n    pass\n",
         );
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "deeply_nested");
+        assert_eq!(syms[0].name.as_ref(), "deeply_nested");
     }
 
     #[test]
@@ -899,10 +905,10 @@ mod tests {
             "if True:\n    class Foo:\n        def method(self):\n            pass\n",
         );
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "Foo");
+        assert_eq!(syms[0].name.as_ref(), "Foo");
         assert_eq!(syms[0].category, SymbolCategory::Type);
         assert_eq!(syms[0].children.len(), 1);
-        assert_eq!(syms[0].children[0].name, "method");
+        assert_eq!(syms[0].children[0].name.as_ref(), "method");
     }
 
     // --- is_upper_snake_case unit tests ---

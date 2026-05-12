@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{bail, eyre, Result};
 use serde_pickle::value::{HashableValue, Value};
-use sha2::{Digest, Sha256};
 
 use ambits::symbols::merkle::compute_merkle_hash;
 use ambits::symbols::{FileSymbols, ProjectTree, SymbolCategory, SymbolNode};
@@ -94,9 +93,10 @@ fn parse_raw_pickle(value: &Value) -> Result<Vec<FileSymbols>> {
             as_list(&items[1]).ok_or_else(|| eyre!("Symbol list not an array for {file_path_str}"))?;
 
         let path_prefix = file_path.to_string_lossy();
+        let file_path_arc = std::sync::Arc::new(file_path.clone());
         let mut symbols = Vec::new();
         for sym_val in symbol_list {
-            if let Ok(node) = convert_symbol(sym_val, &file_path, &path_prefix, "") {
+            if let Ok(node) = convert_symbol(sym_val, &file_path_arc, &path_prefix, "") {
                 symbols.push(node);
             }
         }
@@ -136,9 +136,10 @@ fn parse_document_pickle(value: &Value) -> Result<Vec<FileSymbols>> {
             .ok_or_else(|| eyre!("Cannot find symbols for {file_path_str}"))?;
 
         let path_prefix = file_path.to_string_lossy();
+        let file_path_arc = std::sync::Arc::new(file_path.clone());
         let mut symbols = Vec::new();
         for sym_val in symbol_list {
-            if let Ok(node) = convert_symbol(sym_val, &file_path, &path_prefix, "") {
+            if let Ok(node) = convert_symbol(sym_val, &file_path_arc, &path_prefix, "") {
                 symbols.push(node);
             }
         }
@@ -156,7 +157,7 @@ fn parse_document_pickle(value: &Value) -> Result<Vec<FileSymbols>> {
 /// Convert a pickle Value dict into a SymbolNode.
 fn convert_symbol(
     val: &Value,
-    file_path: &Path,
+    file_path: &std::sync::Arc<PathBuf>,
     path_prefix: &str,
     parent_id: &str,
 ) -> Result<SymbolNode> {
@@ -184,13 +185,14 @@ fn convert_symbol(
         1
     };
 
-    // Content hash from identity (no source text available in raw format)
-    let content_hash = {
-        let mut hasher = Sha256::new();
+    // Content hash from identity (no source text available in raw format).
+    // BLAKE3 matches `symbols::merkle::content_hash` algorithm choice.
+    let content_hash: [u8; 32] = {
+        let mut hasher = blake3::Hasher::new();
         hasher.update(name.as_bytes());
-        hasher.update(kind_int.to_le_bytes());
-        hasher.update(start_line.to_le_bytes());
-        hasher.update(end_line.to_le_bytes());
+        hasher.update(&kind_int.to_le_bytes());
+        hasher.update(&start_line.to_le_bytes());
+        hasher.update(&end_line.to_le_bytes());
         hasher.finalize().into()
     };
 
@@ -206,16 +208,16 @@ fn convert_symbol(
 
     let mut node = SymbolNode {
         id,
-        name,
+        name: std::sync::Arc::from(name.as_str()),
         category,
         label,
-        file_path: file_path.to_path_buf(),
-        byte_range: (start_line * 40 + start_char)..(end_line * 40 + end_char),
-        line_range: (start_line + 1)..(end_line + 1), // 1-indexed like tree-sitter
+        file_path: std::sync::Arc::clone(file_path),
+        byte_range: ((start_line * 40 + start_char) as u32)..((end_line * 40 + end_char) as u32),
+        line_range: ((start_line + 1) as u32)..((end_line + 1) as u32), // 1-indexed like tree-sitter
         content_hash,
         merkle_hash: [0u8; 32],
         children,
-        estimated_tokens: line_count * 15,
+        estimated_tokens: (line_count * 15) as u32,
     };
     compute_merkle_hash(&mut node);
     Ok(node)
@@ -244,7 +246,7 @@ fn extract_range(val: &Value) -> (usize, usize, usize, usize) {
 fn estimate_total_lines(symbols: &[SymbolNode]) -> usize {
     symbols
         .iter()
-        .map(|s| s.line_range.end)
+        .map(|s| s.line_range.end as usize)
         .max()
         .unwrap_or(0)
 }

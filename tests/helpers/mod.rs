@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::ingest::AgentToolCall;
 use crate::symbols::{FileSymbols, ProjectTree, SymbolCategory, SymbolNode};
@@ -10,10 +11,10 @@ pub fn sym(id: &str, name: &str) -> SymbolNode {
     let hash = crate::symbols::merkle::content_hash(name);
     SymbolNode {
         id: id.to_string(),
-        name: name.to_string(),
+        name: Arc::from(name),
         category: SymbolCategory::Function,
         label: "fn",
-        file_path: PathBuf::new(),
+        file_path: Arc::new(PathBuf::new()),
         byte_range: 0..100,
         line_range: 1..10,
         content_hash: hash,
@@ -33,7 +34,7 @@ pub fn sym_with_children(id: &str, name: &str, children: Vec<SymbolNode>) -> Sym
 /// Create a SymbolNode with a custom line range.
 pub fn sym_with_lines(id: &str, name: &str, start: usize, end: usize) -> SymbolNode {
     let mut s = sym(id, name);
-    s.line_range = start..end;
+    s.line_range = start as u32..end as u32;
     s
 }
 
@@ -47,17 +48,18 @@ pub fn sym_with_children_and_lines(
 ) -> SymbolNode {
     let mut s = sym(id, name);
     s.children = children;
-    s.line_range = start..end;
+    s.line_range = start as u32..end as u32;
     s
 }
 
 /// Create a FileSymbols entry, setting each symbol's `file_path` to match.
 pub fn file(path: &str, symbols: Vec<SymbolNode>) -> FileSymbols {
     let file_path = PathBuf::from(path);
+    let file_path_arc = Arc::new(file_path.clone());
     let symbols = symbols
         .into_iter()
         .map(|mut s| {
-            s.file_path = file_path.clone();
+            s.file_path = Arc::clone(&file_path_arc);
             s
         })
         .collect();
@@ -101,7 +103,7 @@ pub fn tool_call_targeted(tool: &str, path: &str, depth: ReadDepth, symbol: &str
 /// Create a tool call targeting a line range.
 pub fn tool_call_lines(tool: &str, path: &str, depth: ReadDepth, start: usize, end: usize) -> AgentToolCall {
     let mut tc = tool_call(tool, path, depth);
-    tc.target_lines = Some(start..end);
+    tc.target_lines = Some(start as u32..end as u32);
     tc
 }
 

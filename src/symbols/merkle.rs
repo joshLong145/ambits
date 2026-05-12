@@ -1,12 +1,16 @@
-use sha2::{Digest, Sha256};
-
 use super::SymbolNode;
 
 /// Compute content hash from the raw source text of a symbol.
 /// Normalizes whitespace to make hashing resilient to formatting changes.
+///
+/// Uses BLAKE3 (256-bit output) — fast, SIMD-accelerated, no adversary threat
+/// model required for our change-detection use case. Output width matches the
+/// `[u8; 32]` field on `SymbolNode`. Hash values differ from previous SHA-256
+/// runs; no on-disk format references these hashes, so the change is internal
+/// only.
 pub fn content_hash(source: &str) -> [u8; 32] {
     let normalized = normalize_source(source);
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     hasher.update(normalized.as_bytes());
     hasher.finalize().into()
 }
@@ -16,10 +20,10 @@ pub fn content_hash(source: &str) -> [u8; 32] {
 /// This must be called bottom-up (children first).
 ///
 /// Leaf nodes (no children) reuse `content_hash` as their `merkle_hash` directly,
-/// skipping a SHA-256 invocation. The input would be a 32-byte cryptographic hash
-/// either way, so hashing it again adds no collision resistance. Real source
+/// skipping a hash invocation. The input would be a 32-byte cryptographic-quality
+/// hash either way, so hashing it again adds no collision resistance. Real source
 /// projects are leaf-dominated (≈90% leaves in typical symbol trees), so this
-/// skips the majority of SHA-256 calls during parse.
+/// skips the majority of hash calls during parse.
 pub fn compute_merkle_hash(node: &mut SymbolNode) {
     if node.children.is_empty() {
         node.merkle_hash = node.content_hash;
@@ -30,10 +34,10 @@ pub fn compute_merkle_hash(node: &mut SymbolNode) {
         compute_merkle_hash(child);
     }
 
-    let mut hasher = Sha256::new();
-    hasher.update(node.content_hash);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&node.content_hash);
     for child in &node.children {
-        hasher.update(child.merkle_hash);
+        hasher.update(&child.merkle_hash);
     }
     node.merkle_hash = hasher.finalize().into();
 }
@@ -150,12 +154,13 @@ mod tests {
     fn leaf_merkle_hash_equals_content_hash() {
         use super::super::{SymbolCategory, SymbolNode};
         use std::path::PathBuf;
+        use std::sync::Arc;
         let mut leaf = SymbolNode {
             id: "x".into(),
             name: "x".into(),
             category: SymbolCategory::Function,
             label: "fn",
-            file_path: PathBuf::new(),
+            file_path: Arc::new(PathBuf::new()),
             byte_range: 0..0,
             line_range: 0..0,
             content_hash: content_hash("fn x() {}"),
@@ -172,12 +177,13 @@ mod tests {
     fn parent_merkle_hash_differs_from_content_hash() {
         use super::super::{SymbolCategory, SymbolNode};
         use std::path::PathBuf;
+        use std::sync::Arc;
         let make = |name: &str| SymbolNode {
             id: name.into(),
             name: name.into(),
             category: SymbolCategory::Function,
             label: "fn",
-            file_path: PathBuf::new(),
+            file_path: Arc::new(PathBuf::new()),
             byte_range: 0..0,
             line_range: 0..0,
             content_hash: content_hash(name),

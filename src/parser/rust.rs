@@ -1,10 +1,11 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use color_eyre::eyre::eyre;
 use tree_sitter::{Node, Parser};
 
 use crate::symbols::merkle::{compute_merkle_hash, content_hash, estimate_tokens};
-use crate::symbols::{FileSymbols, SymbolCategory, SymbolNode};
+use crate::symbols::{FileSymbols, NameInterner, SymbolCategory, SymbolNode};
 
 use super::LanguageParser;
 
@@ -38,8 +39,10 @@ impl LanguageParser for RustParser {
         let path_prefix = path.to_string_lossy();
         let src = source.as_bytes();
         let mut symbols = Vec::new();
+        let file_path_arc = Arc::new(path.to_path_buf());
+        let names = NameInterner::new();
 
-        extract_symbols(root, src, path, &path_prefix, "", &mut symbols);
+        extract_symbols(root, src, &file_path_arc, &names, &path_prefix, "", &mut symbols);
 
         for sym in symbols.iter_mut() {
             compute_merkle_hash(sym);
@@ -75,7 +78,8 @@ const MACRO: SymbolMeta = SymbolMeta { category: SymbolCategory::Macro, label: "
 fn extract_symbols(
     node: Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
+    names: &NameInterner,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -111,16 +115,16 @@ fn extract_symbols(
 
             let mut sym = SymbolNode {
                 id,
-                name: name.clone(),
+                name: names.intern(&name),
                 category: meta.category,
                 label: meta.label,
-                file_path: file_path.to_path_buf(),
-                byte_range,
-                line_range: start_line..end_line,
+                file_path: Arc::clone(file_path),
+                byte_range: byte_range.start as u32..byte_range.end as u32,
+                line_range: start_line as u32..end_line as u32,
                 content_hash: content_hash(text),
                 merkle_hash: [0u8; 32],
                 children: Vec::new(),
-                estimated_tokens: estimate_tokens(text),
+                estimated_tokens: estimate_tokens(text) as u32,
             };
 
             // Recurse into container types for their children.
@@ -128,7 +132,7 @@ fn extract_symbols(
                 || meta.label == "trait"
             {
                 if let Some(body) = child_by_kind(&child, "declaration_list") {
-                    extract_body_children(body, src, file_path, path_prefix, &name_path, &mut sym.children);
+                    extract_body_children(body, src, file_path, names, path_prefix, &name_path, &mut sym.children);
                 }
             }
 
@@ -140,7 +144,8 @@ fn extract_symbols(
 fn extract_body_children(
     body: Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
+    names: &NameInterner,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -165,16 +170,16 @@ fn extract_body_children(
 
             out.push(SymbolNode {
                 id,
-                name,
+                name: names.intern(&name),
                 category: meta.category,
                 label: meta.label,
-                file_path: file_path.to_path_buf(),
-                byte_range,
-                line_range: start_line..end_line,
+                file_path: Arc::clone(file_path),
+                byte_range: byte_range.start as u32..byte_range.end as u32,
+                line_range: start_line as u32..end_line as u32,
                 content_hash: content_hash(text),
                 merkle_hash: [0u8; 32],
                 children: Vec::new(),
-                estimated_tokens: estimate_tokens(text),
+                estimated_tokens: estimate_tokens(text) as u32,
             });
         }
     }
@@ -248,7 +253,7 @@ mod tests {
     fn parse_function() {
         let syms = parse("fn foo() {}");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "foo");
+        assert_eq!(syms[0].name.as_ref(), "foo");
         assert_eq!(syms[0].category, SymbolCategory::Function);
     }
 
@@ -258,22 +263,22 @@ mod tests {
             "struct Point { x: i32 }\nimpl Point {\n    fn new() -> Self { Self { x: 0 } }\n}",
         );
         assert_eq!(syms.len(), 2);
-        assert_eq!(syms[0].name, "Point");
+        assert_eq!(syms[0].name.as_ref(), "Point");
         assert_eq!(syms[0].category, SymbolCategory::Type);
-        assert_eq!(syms[1].name, "Point");
+        assert_eq!(syms[1].name.as_ref(), "Point");
         assert_eq!(syms[1].category, SymbolCategory::Implementation);
         assert_eq!(syms[1].children.len(), 1);
-        assert_eq!(syms[1].children[0].name, "new");
+        assert_eq!(syms[1].children[0].name.as_ref(), "new");
     }
 
     #[test]
     fn parse_nested_module() {
         let syms = parse("mod inner {\n    fn bar() {}\n}");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "inner");
+        assert_eq!(syms[0].name.as_ref(), "inner");
         assert_eq!(syms[0].category, SymbolCategory::Module);
         assert_eq!(syms[0].children.len(), 1);
-        assert_eq!(syms[0].children[0].name, "bar");
+        assert_eq!(syms[0].children[0].name.as_ref(), "bar");
     }
 
     #[test]

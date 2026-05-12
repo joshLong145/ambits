@@ -19,7 +19,7 @@ pub struct AgentToolCall {
     /// Optional symbol name path to target (e.g. "MyClass/my_method").
     pub target_symbol: Option<String>,
     /// Optional line range to target (1-based, e.g. 10..25).
-    pub target_lines: Option<Range<usize>>,
+    pub target_lines: Option<Range<u32>>,
     /// Human-readable label for the agent (e.g. "Explore parser and symbol types").
     /// Falls back to agent_id if no label could be extracted from the session log.
     pub label: Arc<str>,

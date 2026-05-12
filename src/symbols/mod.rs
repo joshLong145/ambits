@@ -1,6 +1,9 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub mod merkle;
 
@@ -43,16 +46,68 @@ impl fmt::Display for SymbolCategory {
 #[derive(Debug, Clone)]
 pub struct SymbolNode {
     pub id: SymbolId,
-    pub name: String,
+    /// Symbol's short name (`foo`, `Bar`, `method_0`, etc). Stored as
+    /// `Arc<str>` so common names (`new`, `default`, `get`, `build`,
+    /// `method_0` repeating across types in a file) share one heap
+    /// allocation. Construct via [`NameInterner::intern`] from a parser, or
+    /// directly with `Arc::from(name)` from a test/fixture. Display, Eq, and
+    /// `as_ref()` work via deref to `&str`; explicit comparisons against
+    /// `String` need `&*sym.name == &**other` or `sym.name.as_ref() == other`.
+    pub name: Arc<str>,
     pub category: SymbolCategory,
     pub label: &'static str, // Language-specific label (e.g., "class", "struct", "def")
-    pub file_path: PathBuf,
-    pub byte_range: Range<usize>,
-    pub line_range: Range<usize>,
+    /// Path to the source file that produced this symbol. Wrapped in `Arc` so
+    /// symbols within the same file share one backing `PathBuf` instead of
+    /// each carrying their own clone — saves real heap at monorepo scale where
+    /// a typical file has dozens of symbols. Reads go through deref: most
+    /// consumers don't notice the change (`.as_path()`, `.display()`,
+    /// `.to_string_lossy()` all work). Equality checks against `Path` /
+    /// `PathBuf` need `&**arc` or `arc.as_path()` to unwrap.
+    pub file_path: Arc<PathBuf>,
+    /// Byte range of the symbol in its source file. `u32` is plenty for any
+    /// realistic single-file size (4 GB cap) and saves 8 B/symbol over `usize`
+    /// on 64-bit targets. Cast to `usize` at slice sites:
+    /// `&src[sym.byte_range.start as usize..sym.byte_range.end as usize]`.
+    pub byte_range: Range<u32>,
+    /// 1-based inclusive line range. `u32` for the same reason as `byte_range`.
+    pub line_range: Range<u32>,
     pub content_hash: [u8; 32],
     pub merkle_hash: [u8; 32],
     pub children: Vec<SymbolNode>,
-    pub estimated_tokens: usize,
+    pub estimated_tokens: u32,
+}
+
+/// Per-file interner for symbol names. Real code has heavy name repetition
+/// within a file (think methods named `new`, `default`, `build` across every
+/// type in a module), so a small hash cache here lets us share one `Arc<str>`
+/// across every reuse instead of allocating one heap buffer per occurrence.
+///
+/// Uses interior mutability so it can be threaded as `&NameInterner` alongside
+/// other immutable parser state without requiring `&mut` propagation through
+/// every recursive helper.
+///
+/// Scope is intentionally per-file rather than global: simpler borrow story
+/// (no thread safety needed), and the wins from within-file repetition
+/// dominate.
+#[derive(Debug, Default)]
+pub struct NameInterner {
+    cache: RefCell<HashMap<String, Arc<str>>>,
+}
+
+impl NameInterner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn intern(&self, s: &str) -> Arc<str> {
+        let mut cache = self.cache.borrow_mut();
+        if let Some(arc) = cache.get(s) {
+            return Arc::clone(arc);
+        }
+        let arc: Arc<str> = Arc::from(s);
+        cache.insert(s.to_string(), Arc::clone(&arc));
+        arc
+    }
 }
 
 impl SymbolNode {
@@ -61,7 +116,8 @@ impl SymbolNode {
     }
 
     pub fn total_tokens(&self) -> usize {
-        self.estimated_tokens + self.children.iter().map(|c| c.total_tokens()).sum::<usize>()
+        self.estimated_tokens as usize
+            + self.children.iter().map(|c| c.total_tokens()).sum::<usize>()
     }
 }
 

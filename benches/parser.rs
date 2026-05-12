@@ -67,7 +67,7 @@ fn typescript_parse_and_coverage(bencher: divan::Bencher, size: &&str) {
         let mut ledger = ContextLedger::new();
         let hash = [0u8; 32];
         for sym in &file_syms.symbols {
-            ledger.record(sym.id.clone(), ReadDepth::FullBody, hash, "agent".to_string(), sym.estimated_tokens);
+            ledger.record(sym.id.clone(), ReadDepth::FullBody, hash, "agent".to_string(), sym.estimated_tokens as usize);
         }
 
         // 3. Build project tree from the single file
