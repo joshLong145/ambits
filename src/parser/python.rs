@@ -191,12 +191,12 @@ fn extract_symbols(
                 category: meta.category,
                 label: meta.label,
                 file_path: Arc::clone(file_path),
-                byte_range,
-                line_range: start_line..end_line,
+                byte_range: byte_range.start as u32..byte_range.end as u32,
+                line_range: start_line as u32..end_line as u32,
                 content_hash: content_hash(text),
                 merkle_hash: [0u8; 32],
                 children: Vec::new(),
-                estimated_tokens: estimate_tokens(text),
+                estimated_tokens: estimate_tokens(text) as u32,
             };
 
             // For classes, recurse into the body block to find methods.
@@ -267,12 +267,12 @@ fn extract_decorated(
                     category: meta.category,
                     label: meta.label,
                     file_path: Arc::clone(file_path),
-                    byte_range,
-                    line_range: start_line..end_line,
+                    byte_range: byte_range.start as u32..byte_range.end as u32,
+                    line_range: start_line as u32..end_line as u32,
                     content_hash: content_hash(text),
                     merkle_hash: [0u8; 32],
                     children: Vec::new(),
-                    estimated_tokens: estimate_tokens(text),
+                    estimated_tokens: estimate_tokens(text) as u32,
                 };
 
                 if meta.category == SymbolCategory::Type {
@@ -711,7 +711,7 @@ mod tests {
         let syms = parse(src);
         let range = &syms[0].byte_range;
         assert!(range.start < range.end);
-        assert!(range.end <= src.len());
+        assert!(range.end as usize <= src.len());
     }
 
     // --- Variable extraction tests ---

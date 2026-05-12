@@ -64,12 +64,17 @@ pub struct SymbolNode {
     /// `.to_string_lossy()` all work). Equality checks against `Path` /
     /// `PathBuf` need `&**arc` or `arc.as_path()` to unwrap.
     pub file_path: Arc<PathBuf>,
-    pub byte_range: Range<usize>,
-    pub line_range: Range<usize>,
+    /// Byte range of the symbol in its source file. `u32` is plenty for any
+    /// realistic single-file size (4 GB cap) and saves 8 B/symbol over `usize`
+    /// on 64-bit targets. Cast to `usize` at slice sites:
+    /// `&src[sym.byte_range.start as usize..sym.byte_range.end as usize]`.
+    pub byte_range: Range<u32>,
+    /// 1-based inclusive line range. `u32` for the same reason as `byte_range`.
+    pub line_range: Range<u32>,
     pub content_hash: [u8; 32],
     pub merkle_hash: [u8; 32],
     pub children: Vec<SymbolNode>,
-    pub estimated_tokens: usize,
+    pub estimated_tokens: u32,
 }
 
 /// Per-file interner for symbol names. Real code has heavy name repetition
@@ -111,7 +116,8 @@ impl SymbolNode {
     }
 
     pub fn total_tokens(&self) -> usize {
-        self.estimated_tokens + self.children.iter().map(|c| c.total_tokens()).sum::<usize>()
+        self.estimated_tokens as usize
+            + self.children.iter().map(|c| c.total_tokens()).sum::<usize>()
     }
 }
 

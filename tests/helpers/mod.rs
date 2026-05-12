@@ -34,7 +34,7 @@ pub fn sym_with_children(id: &str, name: &str, children: Vec<SymbolNode>) -> Sym
 /// Create a SymbolNode with a custom line range.
 pub fn sym_with_lines(id: &str, name: &str, start: usize, end: usize) -> SymbolNode {
     let mut s = sym(id, name);
-    s.line_range = start..end;
+    s.line_range = start as u32..end as u32;
     s
 }
 
@@ -48,7 +48,7 @@ pub fn sym_with_children_and_lines(
 ) -> SymbolNode {
     let mut s = sym(id, name);
     s.children = children;
-    s.line_range = start..end;
+    s.line_range = start as u32..end as u32;
     s
 }
 
@@ -103,7 +103,7 @@ pub fn tool_call_targeted(tool: &str, path: &str, depth: ReadDepth, symbol: &str
 /// Create a tool call targeting a line range.
 pub fn tool_call_lines(tool: &str, path: &str, depth: ReadDepth, start: usize, end: usize) -> AgentToolCall {
     let mut tc = tool_call(tool, path, depth);
-    tc.target_lines = Some(start..end);
+    tc.target_lines = Some(start as u32..end as u32);
     tc
 }
 

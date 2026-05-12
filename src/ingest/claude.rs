@@ -664,8 +664,8 @@ pub fn map_tool_call(
 
     // Extract target_lines.
     let target_lines = mapping.target_lines.as_ref().and_then(|spec| {
-        let offset = input.get(&spec.offset_key)?.as_u64()? as usize;
-        let limit  = input.get(&spec.limit_key)?.as_u64()? as usize;
+        let offset = input.get(&spec.offset_key)?.as_u64()? as u32;
+        let limit  = input.get(&spec.limit_key)?.as_u64()? as u32;
         Some(offset..offset + limit)
     });
 

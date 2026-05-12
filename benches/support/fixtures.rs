@@ -1089,7 +1089,7 @@ pub fn make_populated_ledger(project: &ProjectTree) -> ContextLedger {
     let hash = [0u8; 32];
     for file in &project.files {
         for sym in &file.symbols {
-            ledger.record(sym.id.clone(), ReadDepth::FullBody, hash, "agent-0".to_string(), sym.estimated_tokens);
+            ledger.record(sym.id.clone(), ReadDepth::FullBody, hash, "agent-0".to_string(), sym.estimated_tokens as usize);
         }
     }
     ledger

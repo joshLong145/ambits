@@ -70,7 +70,7 @@ fn ledger_populate_full_project(bencher: divan::Bencher, n_files: &usize) {
                         ReadDepth::Overview,
                         sym.content_hash,
                         "agent-0".to_string(),
-                        sym.estimated_tokens,
+                        sym.estimated_tokens as usize,
                     );
                 }
             }
@@ -87,7 +87,7 @@ fn populate_full(project: &ProjectTree) -> ContextLedger {
                 ReadDepth::FullBody,
                 sym.content_hash,
                 "agent-0".to_string(),
-                sym.estimated_tokens,
+                sym.estimated_tokens as usize,
             );
         }
     }

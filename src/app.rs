@@ -675,7 +675,7 @@ fn flatten_symbol(
         is_expanded,
         has_children: !sym.children.is_empty(),
         line_range: format!("L{}-{}", sym.line_range.start, sym.line_range.end),
-        token_count: sym.estimated_tokens,
+        token_count: sym.estimated_tokens as usize,
         read_depth,
         coverage_status: None,
         file_coverage_seen: 0,
@@ -719,7 +719,7 @@ pub fn mark_file_symbols(
             event.read_depth,
             sym.content_hash,
             event.agent_id.to_string(),
-            sym.estimated_tokens,
+            sym.estimated_tokens as usize,
         );
         mark_file_symbols(&sym.children, event, ledger);
     }
@@ -744,7 +744,7 @@ pub fn mark_targeted_symbols(
                     event.read_depth,
                     sym.content_hash,
                     event.agent_id.to_string(),
-                    sym.estimated_tokens,
+                    sym.estimated_tokens as usize,
                 );
                 // Full body was in the response — bulk-mark all descendants.
                 mark_file_symbols(&sym.children, event, ledger);
@@ -755,7 +755,7 @@ pub fn mark_targeted_symbols(
                     event.read_depth,
                     sym.content_hash,
                     event.agent_id.to_string(),
-                    sym.estimated_tokens,
+                    sym.estimated_tokens as usize,
                 );
                 // Parent container overlaps the read range — recurse precisely so
                 // only children whose ranges also overlap get promoted.
