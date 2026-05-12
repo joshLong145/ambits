@@ -3,11 +3,13 @@
 //! This module provides structures and formatters for generating coverage reports
 //! that show how much of a project's symbols have been seen by an LLM agent.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::Result;
 use serde::Serialize;
 
+use crate::ingest::SessionEvent;
 use crate::symbols::{ProjectTree, SymbolNode};
 use crate::tracking::{ContextLedger, ReadDepth};
 
@@ -44,6 +46,32 @@ impl FileCoverage {
     }
 }
 
+/// Token/trigger metadata for a compaction event, when present in the log.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactionMetadataSummary {
+    pub trigger: String,
+    pub pre_tokens: u64,
+    pub post_tokens: u64,
+    pub duration_ms: u64,
+}
+
+/// Pre-compaction snapshot for a single context compaction event, intended for the
+/// coverage report. Files are stored as relative-path strings (sorted) so the
+/// summary remains stable in JSON output.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactionSummary {
+    pub sequence: u32,
+    pub timestamp: String,
+    pub summary: String,
+    pub tool_calls_before: usize,
+    pub files_before: Vec<String>,
+    pub symbols_seen_before: usize,
+    pub seen_percent_before: f64,
+    /// Token counts and trigger from the `compact_boundary` system record.
+    /// `None` when the log predates that record format or it was malformed.
+    pub metadata: Option<CompactionMetadataSummary>,
+}
+
 /// Complete coverage report for a project.
 #[derive(Debug, Clone, Serialize)]
 pub struct CoverageReport {
@@ -53,6 +81,8 @@ pub struct CoverageReport {
     pub agent_id: Option<String>,
     /// Per-file coverage metrics.
     pub files: Vec<FileCoverage>,
+    /// Compactions detected in the session, in occurrence order. Empty when none.
+    pub compactions: Vec<CompactionSummary>,
 }
 
 impl CoverageReport {
@@ -89,6 +119,7 @@ impl CoverageReport {
             session_id: None,
             agent_id: agent_filter.map(|s| s.to_string()),
             files,
+            compactions: Vec::new(),
         }
     }
 
@@ -257,7 +288,101 @@ impl CoverageFormatter for TextFormatter {
             width = max_path_len
         ));
 
+        if !report.compactions.is_empty() {
+            append_compactions_section(&mut output, &report.compactions);
+        }
+
         output
+    }
+}
+
+/// Render the "Context Compactions" section after the TOTAL row. Caller must
+/// have already confirmed that `compactions` is non-empty.
+fn append_compactions_section(output: &mut String, compactions: &[CompactionSummary]) {
+    const MAX_FILES_SHOWN: usize = 10;
+    const SEP_WIDTH: usize = 63;
+    output.push('\n');
+    output.push_str(&format!("Context Compactions ({})\n", compactions.len()));
+    let separator: String = "─".repeat(SEP_WIDTH);
+    output.push_str(&separator);
+    output.push('\n');
+
+    for c in compactions {
+        output.push_str(&format!(
+            "#{}  {}  {} calls · {:.1}% seen\n",
+            c.sequence, c.timestamp, c.tool_calls_before, c.seen_percent_before,
+        ));
+        if let Some(m) = &c.metadata {
+            let delta_pct = if m.pre_tokens > 0 {
+                100.0 * (m.post_tokens as f64 - m.pre_tokens as f64) / m.pre_tokens as f64
+            } else {
+                0.0
+            };
+            output.push_str(&format!(
+                "    Tokens: {} → {} ({:+.1}%) · trigger: {} · {:.1}s\n",
+                m.pre_tokens,
+                m.post_tokens,
+                delta_pct,
+                m.trigger,
+                m.duration_ms as f64 / 1000.0,
+            ));
+        }
+        output.push_str(&format!("    Files ({}):\n", c.files_before.len()));
+        for path in c.files_before.iter().take(MAX_FILES_SHOWN) {
+            output.push_str(&format!("      {path}\n"));
+        }
+        if c.files_before.len() > MAX_FILES_SHOWN {
+            output.push_str(&format!(
+                "      ... ({} more)\n",
+                c.files_before.len() - MAX_FILES_SHOWN,
+            ));
+        }
+        append_wrapped_summary(output, &c.summary);
+        output.push('\n');
+    }
+}
+
+/// Append the summary text after a `Summary:` label, wrapping at 80 chars with
+/// a hanging indent so continuation lines line up under the first character of
+/// the summary text.
+fn append_wrapped_summary(output: &mut String, summary: &str) {
+    const LINE_WIDTH: usize = 80;
+    const INDENT_FIRST: &str = "    Summary: ";
+    const INDENT_CONT: &str = "      ";
+
+    let first_budget = LINE_WIDTH.saturating_sub(INDENT_FIRST.len());
+    let cont_budget = LINE_WIDTH.saturating_sub(INDENT_CONT.len());
+
+    let mut words = summary.split_whitespace().peekable();
+    let mut line = String::new();
+    let mut first = true;
+    while let Some(word) = words.next() {
+        let budget = if first { first_budget } else { cont_budget };
+        if line.is_empty() {
+            line.push_str(word);
+        } else if line.len() + 1 + word.len() > budget {
+            // Flush current line.
+            output.push_str(if first { INDENT_FIRST } else { INDENT_CONT });
+            output.push_str(&line);
+            output.push('\n');
+            line.clear();
+            line.push_str(word);
+            first = false;
+        } else {
+            line.push(' ');
+            line.push_str(word);
+        }
+        if words.peek().is_none() && !line.is_empty() {
+            output.push_str(if first { INDENT_FIRST } else { INDENT_CONT });
+            output.push_str(&line);
+            output.push('\n');
+            line.clear();
+        }
+    }
+    if line.is_empty() && first {
+        // Empty summary — still print the label so the structure is consistent.
+        output.push_str(INDENT_FIRST);
+        output.push('\n');
     }
 }
 
@@ -292,16 +417,43 @@ impl CoverageFormatter for JsonFormatter {
         }
 
         #[derive(Serialize)]
+        struct StateBeforeDto<'a> {
+            tool_calls: usize,
+            files_accessed: &'a [String],
+            symbols_seen: usize,
+            seen_percent: f64,
+        }
+
+        #[derive(Serialize)]
+        struct MetadataDto<'a> {
+            trigger: &'a str,
+            pre_tokens: u64,
+            post_tokens: u64,
+            duration_ms: u64,
+        }
+
+        #[derive(Serialize)]
+        struct CompactionDto<'a> {
+            sequence: u32,
+            timestamp: &'a str,
+            summary: &'a str,
+            state_before: StateBeforeDto<'a>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            metadata: Option<MetadataDto<'a>>,
+        }
+
+        #[derive(Serialize)]
         struct ReportDto<'a> {
             schema_version: u32,
             session_id: Option<&'a str>,
             agent_id: Option<&'a str>,
             totals: Totals,
             files: Vec<FileDto<'a>>,
+            compactions: Vec<CompactionDto<'a>>,
         }
 
         let dto = ReportDto {
-            schema_version: 1,
+            schema_version: 2,
             session_id: report.session_id.as_deref(),
             agent_id: report.agent_id.as_deref(),
             totals: Totals {
@@ -321,6 +473,27 @@ impl CoverageFormatter for JsonFormatter {
                     full_count: f.full_count,
                     seen_percent: f.seen_percent(),
                     full_percent: f.full_percent(),
+                })
+                .collect(),
+            compactions: report
+                .compactions
+                .iter()
+                .map(|c| CompactionDto {
+                    sequence: c.sequence,
+                    timestamp: &c.timestamp,
+                    summary: &c.summary,
+                    state_before: StateBeforeDto {
+                        tool_calls: c.tool_calls_before,
+                        files_accessed: &c.files_before,
+                        symbols_seen: c.symbols_seen_before,
+                        seen_percent: c.seen_percent_before,
+                    },
+                    metadata: c.metadata.as_ref().map(|m| MetadataDto {
+                        trigger: &m.trigger,
+                        pre_tokens: m.pre_tokens,
+                        post_tokens: m.post_tokens,
+                        duration_ms: m.duration_ms,
+                    }),
                 })
                 .collect(),
         };
@@ -361,24 +534,71 @@ pub fn run_report(
     // 3. Build ledger from session logs.
     let mut ledger = ContextLedger::new();
     let mut known_agents: Vec<String> = Vec::new();
+    let mut files_accessed: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut tool_call_count: usize = 0;
+    let mut compactions: Vec<CompactionSummary> = Vec::new();
     if let (Some(ref log_dir), Some(ref sid)) = (&log_dir, &session_id) {
         let log_files = ingester.session_log_files(log_dir, sid);
         for log_file in &log_files {
-            let events = ingester.parse_log_file(log_file);
+            let events = ingester.parse_log_file_with_root(log_file, project_path);
             for event in events {
-                if !known_agents.iter().any(|a: &String| a.as_str() == &*event.agent_id) {
-                    known_agents.push(event.agent_id.to_string());
-                }
-                if let Some(ref file_path) = event.file_path {
-                    let tool_rel = crate::app::normalize_tool_path(file_path, project_path);
-                    for file in &project_tree.files {
-                        if file.file_path == tool_rel {
-                            if event.target_symbol.is_some() || event.target_lines.is_some() {
-                                crate::app::mark_targeted_symbols(&file.symbols, &event, &mut ledger);
-                            } else {
-                                crate::app::mark_file_symbols(&file.symbols, &event, &mut ledger);
+                match event {
+                    SessionEvent::ToolCall(tc) => {
+                        tool_call_count += 1;
+                        if !known_agents.iter().any(|a: &String| a.as_str() == &*tc.agent_id) {
+                            known_agents.push(tc.agent_id.to_string());
+                        }
+                        if let Some(ref file_path) = tc.file_path {
+                            let tool_rel = crate::app::normalize_tool_path(file_path, project_path);
+                            files_accessed.insert(tool_rel.clone());
+                            for file in &project_tree.files {
+                                if file.file_path == tool_rel {
+                                    if tc.target_symbol.is_some() || tc.target_lines.is_some() {
+                                        crate::app::mark_targeted_symbols(&file.symbols, &tc, &mut ledger);
+                                    } else {
+                                        crate::app::mark_file_symbols(&file.symbols, &tc, &mut ledger);
+                                    }
+                                }
                             }
                         }
+                    }
+                    SessionEvent::Compacted { summary, timestamp, metadata, .. } => {
+                        let seen = ledger.total_seen();
+                        let total = project_tree.total_symbols();
+                        compactions.push(CompactionSummary {
+                            sequence: compactions.len() as u32 + 1,
+                            timestamp,
+                            summary,
+                            tool_calls_before: tool_call_count,
+                            files_before: files_accessed
+                                .iter()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .collect(),
+                            symbols_seen_before: seen,
+                            seen_percent_before: if total > 0 {
+                                seen as f64 / total as f64 * 100.0
+                            } else {
+                                0.0
+                            },
+                            metadata: metadata.map(|m| CompactionMetadataSummary {
+                                trigger: m.trigger,
+                                pre_tokens: m.pre_tokens,
+                                post_tokens: m.post_tokens,
+                                duration_ms: m.duration_ms,
+                            }),
+                        });
+                        // Mirror `App::process_compaction`: wipe live depth state
+                        // so the final coverage report reflects post-compaction
+                        // context only. `compactions` is preserved.
+                        ledger = ContextLedger::new();
+                        files_accessed.clear();
+                        tool_call_count = 0;
+                    }
+                    SessionEvent::SessionCleared => {
+                        ledger = ContextLedger::new();
+                        files_accessed.clear();
+                        tool_call_count = 0;
+                        compactions.clear();
                     }
                 }
             }
@@ -411,6 +631,7 @@ pub fn run_report(
     // 5. Generate and print report.
     let mut report = CoverageReport::from_project(project_tree, &ledger, resolved_agent.as_deref());
     report.session_id = session_id;
+    report.compactions = compactions;
 
     print!("{}", formatter.format(&report));
 
@@ -594,9 +815,17 @@ mod tests {
 
     #[test]
     fn text_formatter_output() {
-        let report = CoverageReport { session_id: Some("abc-123".into()), agent_id: None, files: vec![
-            FileCoverage { path: "src/main.rs".into(), total_symbols: 10, seen_count: 8, full_count: 5 },
-        ]};
+        let report = CoverageReport {
+            session_id: Some("abc-123".into()),
+            agent_id: None,
+            files: vec![FileCoverage {
+                path: "src/main.rs".into(),
+                total_symbols: 10,
+                seen_count: 8,
+                full_count: 5,
+            }],
+            compactions: Vec::new(),
+        };
         let formatter = TextFormatter::default();
         let output = formatter.format(&report);
         assert!(output.contains("Coverage Report (session: abc-123)"));
@@ -610,11 +839,12 @@ mod tests {
             session_id: Some("s".into()),
             agent_id: None,
             files: vec![],
+            compactions: Vec::new(),
         };
         let output = JsonFormatter.format(&report);
         let value: serde_json::Value =
             serde_json::from_str(output.trim()).expect("output must be valid JSON");
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
     }
 
     #[test]
@@ -628,10 +858,143 @@ mod tests {
                 seen_count: 1,
                 full_count: 1,
             }],
+            compactions: Vec::new(),
         };
         let output = JsonFormatter.format(&report);
         assert!(output.ends_with('\n'), "output must end with a trailing newline");
         let body = output.trim_end_matches('\n');
         assert!(!body.contains('\n'), "JSON body must be a single line");
+    }
+
+    fn sample_compaction() -> CompactionSummary {
+        CompactionSummary {
+            sequence: 1,
+            timestamp: "2026-05-11T14:23:00Z".to_string(),
+            summary: "The user is building a CLI parser. Files modified: src/parser/mod.rs, src/cli.rs. Next step: add flag validation.".to_string(),
+            tool_calls_before: 47,
+            files_before: vec![
+                "src/cli.rs".to_string(),
+                "src/parser/mod.rs".to_string(),
+            ],
+            symbols_seen_before: 31,
+            seen_percent_before: 31.2,
+            metadata: None,
+        }
+    }
+
+    fn sample_compaction_with_metadata() -> CompactionSummary {
+        let mut c = sample_compaction();
+        c.metadata = Some(CompactionMetadataSummary {
+            trigger: "manual".to_string(),
+            pre_tokens: 195684,
+            post_tokens: 6416,
+            duration_ms: 64699,
+        });
+        c
+    }
+
+    #[test]
+    fn text_formatter_compaction_section_omitted_when_empty() {
+        let report = CoverageReport {
+            session_id: Some("s".into()),
+            agent_id: None,
+            files: vec![],
+            compactions: Vec::new(),
+        };
+        let output = TextFormatter::default().format(&report);
+        assert!(!output.contains("Context Compactions"),
+            "compaction section must be absent when empty, got:\n{output}");
+    }
+
+    #[test]
+    fn text_formatter_compaction_section_with_entries() {
+        let report = CoverageReport {
+            session_id: Some("s".into()),
+            agent_id: None,
+            files: vec![],
+            compactions: vec![sample_compaction()],
+        };
+        let output = TextFormatter::default().format(&report);
+        assert!(output.contains("Context Compactions (1)"));
+        assert!(output.contains("#1"));
+        assert!(output.contains("47 calls"));
+        assert!(output.contains("src/cli.rs"));
+        assert!(output.contains("CLI parser"));
+    }
+
+    #[test]
+    fn json_formatter_compaction_array_empty_when_none() {
+        let report = CoverageReport {
+            session_id: Some("s".into()),
+            agent_id: None,
+            files: vec![],
+            compactions: Vec::new(),
+        };
+        let output = JsonFormatter.format(&report);
+        let value: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("output must be valid JSON");
+        assert_eq!(value["schema_version"], 2);
+        assert!(value["compactions"].is_array());
+        assert_eq!(value["compactions"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn json_formatter_compaction_array_with_entries() {
+        let report = CoverageReport {
+            session_id: Some("s".into()),
+            agent_id: None,
+            files: vec![],
+            compactions: vec![sample_compaction()],
+        };
+        let output = JsonFormatter.format(&report);
+        let value: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("output must be valid JSON");
+        let arr = value["compactions"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        let entry = &arr[0];
+        assert_eq!(entry["sequence"], 1);
+        assert_eq!(entry["timestamp"], "2026-05-11T14:23:00Z");
+        let state = &entry["state_before"];
+        assert_eq!(state["tool_calls"], 47);
+        assert_eq!(state["symbols_seen"], 31);
+        let files = state["files_accessed"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0], "src/cli.rs");
+        // `metadata` is absent (skip_serializing_if = "Option::is_none") when None.
+        assert!(entry.get("metadata").is_none(),
+            "metadata field should be omitted when None, got entry: {entry}");
+    }
+
+    #[test]
+    fn text_formatter_includes_token_metadata_line() {
+        let report = CoverageReport {
+            session_id: Some("s".into()),
+            agent_id: None,
+            files: vec![],
+            compactions: vec![sample_compaction_with_metadata()],
+        };
+        let output = TextFormatter::default().format(&report);
+        assert!(output.contains("Tokens: 195684"));
+        assert!(output.contains("6416"));
+        assert!(output.contains("trigger: manual"));
+        assert!(output.contains("64.7s"));
+    }
+
+    #[test]
+    fn json_formatter_includes_metadata_block() {
+        let report = CoverageReport {
+            session_id: Some("s".into()),
+            agent_id: None,
+            files: vec![],
+            compactions: vec![sample_compaction_with_metadata()],
+        };
+        let output = JsonFormatter.format(&report);
+        let value: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("output must be valid JSON");
+        let metadata = &value["compactions"][0]["metadata"];
+        assert_eq!(metadata["trigger"], "manual");
+        assert_eq!(metadata["pre_tokens"], 195684);
+        assert_eq!(metadata["post_tokens"], 6416);
+        assert_eq!(metadata["duration_ms"], 64699);
     }
 }

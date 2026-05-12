@@ -95,6 +95,12 @@ pub struct App {
     pub session_id: Option<String>,
     pub session_slug: Option<String>,
 
+    // Compaction tracking.
+    pub compaction_history: Vec<crate::ingest::CompactionEvent>,
+    pub compaction_call_count: usize,
+    pub show_compaction_overlay: bool,
+    pub compaction_overlay_index: usize,
+
     // Optional event log writer.
     pub event_log: Option<BufWriter<File>>,
 }
@@ -128,6 +134,10 @@ impl App {
             search_query: String::new(),
             session_id: None,
             session_slug: None,
+            compaction_history: Vec::new(),
+            compaction_call_count: 0,
+            show_compaction_overlay: false,
+            compaction_overlay_index: 0,
             event_log,
         };
         app.rebuild_tree_rows();
@@ -145,6 +155,62 @@ impl App {
         self.agent_filter = None;
         self.agent_selection_index = 0;
         self.session_slug = None;
+        self.compaction_history.clear();
+        self.compaction_call_count = 0;
+        self.rebuild_tree_rows();
+    }
+
+    /// Snapshot the current ledger state, record a compaction event, then
+    /// clear the live ledger. The summary text doesn't reliably describe what
+    /// the model retained, so we drop all pre-compaction depth claims rather
+    /// than over-report coverage that may no longer reflect the model's
+    /// actual context. `compaction_history`, `activity`, and agent-tracking
+    /// state are preserved — only the live read-depth ledger and the
+    /// inter-compaction tool-call counter are reset.
+    pub fn process_compaction(
+        &mut self,
+        summary: String,
+        timestamp: String,
+        agent_id: std::sync::Arc<str>,
+        metadata: Option<crate::ingest::CompactionMetadata>,
+    ) {
+        use std::collections::BTreeSet;
+        let files_before: BTreeSet<std::path::PathBuf> = self
+            .project_tree
+            .files
+            .iter()
+            .filter(|f| f.symbols.iter().any(|sym| self.ledger.depth_of(&sym.id).is_seen()))
+            .map(|f| f.file_path.clone())
+            .collect();
+
+        let total = self.project_tree.total_symbols();
+        let seen = self.ledger.total_seen();
+
+        let snapshot = crate::ingest::LedgerSnapshot {
+            tool_call_count: self.compaction_call_count,
+            files_accessed: files_before,
+            symbols_seen: seen,
+            seen_percent: if total > 0 {
+                seen as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            },
+        };
+
+        let sequence = self.compaction_history.len() as u32 + 1;
+        self.compaction_history.push(crate::ingest::CompactionEvent {
+            sequence,
+            timestamp,
+            agent_id,
+            summary,
+            ledger_before: snapshot,
+            metadata,
+        });
+        self.compaction_overlay_index = self.compaction_history.len().saturating_sub(1);
+
+        // Wipe the live ledger: post-compaction depth tracking starts fresh.
+        self.ledger = ContextLedger::new();
+        self.compaction_call_count = 0;
         self.rebuild_tree_rows();
     }
 
@@ -263,6 +329,21 @@ impl App {
             }
             KeyCode::Char('a') => self.cycle_agent_filter(),
             KeyCode::Char('A') => self.cycle_agent_filter_backward(),
+            KeyCode::Char('C') => {
+                if !self.compaction_history.is_empty() {
+                    self.show_compaction_overlay = !self.show_compaction_overlay;
+                }
+            }
+            KeyCode::Char('[') if self.show_compaction_overlay => {
+                if self.compaction_overlay_index > 0 {
+                    self.compaction_overlay_index -= 1;
+                }
+            }
+            KeyCode::Char(']') if self.show_compaction_overlay => {
+                if self.compaction_overlay_index + 1 < self.compaction_history.len() {
+                    self.compaction_overlay_index += 1;
+                }
+            }
             KeyCode::Tab => self.cycle_focus(),
             KeyCode::BackTab => self.cycle_agent_filter_backward(),
             KeyCode::PageDown => self.move_selection(20),
@@ -497,6 +578,7 @@ impl App {
 
     /// Process an agent tool call event and update the ledger.
     pub fn process_agent_event(&mut self, event: AgentToolCall) {
+        self.compaction_call_count += 1;
         // Track unique agents.
         if !self.agents_seen.iter().any(|a| a.as_str() == &*event.agent_id) {
             self.agents_seen.push(event.agent_id.to_string());
@@ -1280,6 +1362,118 @@ mod tests {
     fn flattened_agents_empty_when_no_agents() {
         let app = test_app(vec![]);
         assert!(app.flattened_agents().is_empty());
+    }
+
+    #[test]
+    fn process_compaction_snapshots_files() {
+        // Two files; touch one before triggering the compaction so the snapshot
+        // captures only that file.
+        let mut app = test_app(vec![
+            file("mock/a.rs", vec![sym("mock/a.rs::a1", "a1")]),
+            file("mock/b.rs", vec![sym("mock/b.rs::b1", "b1")]),
+        ]);
+
+        let event = tool_call("Read", "/test/project/mock/a.rs", ReadDepth::FullBody);
+        app.process_agent_event(event);
+
+        app.process_compaction(
+            "first compaction".into(),
+            "2026-05-11T14:23:00Z".into(),
+            "agent-1".into(),
+            None,
+        );
+
+        assert_eq!(app.compaction_history.len(), 1);
+        let snapshot = &app.compaction_history[0];
+        assert_eq!(snapshot.sequence, 1);
+        assert_eq!(snapshot.summary, "first compaction");
+        assert_eq!(snapshot.timestamp, "2026-05-11T14:23:00Z");
+        assert_eq!(snapshot.ledger_before.tool_call_count, 1);
+        // mock/a.rs was touched → present; mock/b.rs untouched → absent.
+        assert!(snapshot
+            .ledger_before
+            .files_accessed
+            .contains(&std::path::PathBuf::from("mock/a.rs")));
+        assert!(!snapshot
+            .ledger_before
+            .files_accessed
+            .contains(&std::path::PathBuf::from("mock/b.rs")));
+        assert_eq!(snapshot.ledger_before.symbols_seen, 1);
+    }
+
+    #[test]
+    fn process_compaction_clears_live_ledger() {
+        // Two files; read one. After compaction, the live ledger should be
+        // empty (symbol back to Unseen) but the snapshot captures the prior state.
+        let mut app = test_app(vec![
+            file("mock/a.rs", vec![sym("mock/a.rs::a1", "a1")]),
+        ]);
+        let event = tool_call("Read", "/test/project/mock/a.rs", ReadDepth::FullBody);
+        app.process_agent_event(event);
+
+        assert_eq!(app.ledger.depth_of("mock/a.rs::a1"), ReadDepth::FullBody);
+        assert_eq!(app.compaction_call_count, 1);
+
+        app.process_compaction(
+            "summary".into(),
+            "2026-05-11T14:23:00Z".into(),
+            "agent-1".into(),
+            None,
+        );
+
+        // Compaction history records the pre-compaction state.
+        assert_eq!(app.compaction_history.len(), 1);
+        assert_eq!(app.compaction_history[0].ledger_before.symbols_seen, 1);
+        // Live ledger is wiped — the symbol is Unseen again.
+        assert_eq!(app.ledger.depth_of("mock/a.rs::a1"), ReadDepth::Unseen);
+        assert_eq!(app.ledger.total_seen(), 0);
+        assert_eq!(app.compaction_call_count, 0);
+    }
+
+    #[test]
+    fn post_compaction_tool_calls_rebuild_ledger() {
+        // After compaction wipes the ledger, subsequent tool calls populate
+        // a fresh ledger without touching compaction_history.
+        let mut app = test_app(vec![
+            file("mock/a.rs", vec![sym("mock/a.rs::a1", "a1")]),
+            file("mock/b.rs", vec![sym("mock/b.rs::b1", "b1")]),
+        ]);
+        app.process_agent_event(tool_call("Read", "/test/project/mock/a.rs", ReadDepth::FullBody));
+        app.process_compaction(
+            "first".into(),
+            "2026-05-11T14:23:00Z".into(),
+            "agent-1".into(),
+            None,
+        );
+
+        // Read a different file after compaction.
+        app.process_agent_event(tool_call("Read", "/test/project/mock/b.rs", ReadDepth::FullBody));
+
+        assert_eq!(app.compaction_history.len(), 1, "compaction history retained");
+        assert_eq!(app.ledger.depth_of("mock/a.rs::a1"), ReadDepth::Unseen,
+            "pre-compaction read should not survive");
+        assert_eq!(app.ledger.depth_of("mock/b.rs::b1"), ReadDepth::FullBody,
+            "post-compaction read should be reflected");
+        assert_eq!(app.compaction_call_count, 1, "counter restarted from zero after compaction");
+    }
+
+    #[test]
+    fn compaction_history_clears_on_reset_session() {
+        let mut app = test_app(vec![file("mock/a.rs", vec![sym("mock/a.rs::a", "a")])]);
+        let event = tool_call("Read", "/test/project/mock/a.rs", ReadDepth::FullBody);
+        app.process_agent_event(event);
+        app.process_compaction(
+            "summary".into(),
+            "2026-05-11T14:23:00Z".into(),
+            "agent-1".into(),
+            None,
+        );
+        assert_eq!(app.compaction_history.len(), 1);
+
+        app.reset_session();
+
+        assert!(app.compaction_history.is_empty());
+        assert_eq!(app.compaction_call_count, 0);
     }
 
     #[test]

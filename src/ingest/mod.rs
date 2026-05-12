@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,9 +25,65 @@ pub struct AgentToolCall {
     pub label: Arc<str>,
 }
 
+/// Point-in-time ledger snapshot captured at a compaction boundary.
+#[derive(Debug, Clone)]
+pub struct LedgerSnapshot {
+    pub tool_call_count: usize,
+    pub files_accessed: BTreeSet<PathBuf>,
+    pub symbols_seen: usize,
+    pub seen_percent: f64,
+}
+
+/// Metadata extracted from the `compact_boundary` system record that
+/// precedes the `isCompactSummary` user record in Claude Code logs.
+#[derive(Debug, Clone)]
+pub struct CompactionMetadata {
+    /// "manual", "auto", "warning" — corresponds to the trigger that initiated the compaction.
+    pub trigger: String,
+    pub pre_tokens: u64,
+    pub post_tokens: u64,
+    pub duration_ms: u64,
+}
+
+/// A detected compaction event with summary and pre-compaction state.
+#[derive(Debug, Clone)]
+pub struct CompactionEvent {
+    pub sequence: u32,
+    pub timestamp: String,
+    pub agent_id: Arc<str>,
+    pub summary: String,
+    pub ledger_before: LedgerSnapshot,
+    /// Token counts and trigger info from the boundary record. `None` if the
+    /// boundary record was missing or unparseable (older Claude Code versions).
+    pub metadata: Option<CompactionMetadata>,
+}
+
+/// An ordered session event emitted by batch parsing.
+#[derive(Debug, Clone)]
+pub enum SessionEvent {
+    ToolCall(AgentToolCall),
+    Compacted {
+        summary: String,
+        timestamp: String,
+        agent_id: Arc<str>,
+        metadata: Option<CompactionMetadata>,
+    },
+    SessionCleared,
+}
+
+/// A compaction event surfaced by the incremental tailer (no ledger snapshot
+/// here — that's filled in by `App::process_compaction` at receipt time).
+pub struct TailedCompaction {
+    pub summary: String,
+    pub timestamp: String,
+    pub agent_id: Arc<str>,
+    pub metadata: Option<CompactionMetadata>,
+}
+
 /// Output from a single incremental poll of an event tailer.
 pub struct TailerOutput {
     pub events: Vec<AgentToolCall>,
+    pub compactions: Vec<TailedCompaction>,
     pub session_cleared: bool,
 }
 
@@ -52,7 +109,7 @@ pub trait SessionIngester: Send + Sync {
     /// List all log files belonging to `session_id` within `log_dir`.
     fn session_log_files(&self, log_dir: &Path, session_id: &str) -> Vec<PathBuf>;
     /// Parse all events from a single log file in batch.
-    fn parse_log_file(&self, path: &Path) -> Vec<AgentToolCall>;
+    fn parse_log_file(&self, path: &Path) -> Vec<SessionEvent>;
     /// Create a new incremental event tailer for the given set of files.
     fn new_tailer(&self, files: Vec<PathBuf>) -> Box<dyn EventTailer>;
 
@@ -66,7 +123,7 @@ pub trait SessionIngester: Send + Sync {
     /// Parse all events from a log file, remapping paths when the agent ran in a
     /// worktree whose cwd differs from `project_root`.
     /// Default delegates to `parse_log_file` (no remapping).
-    fn parse_log_file_with_root(&self, path: &Path, project_root: &Path) -> Vec<AgentToolCall> {
+    fn parse_log_file_with_root(&self, path: &Path, project_root: &Path) -> Vec<SessionEvent> {
         let _ = project_root;
         self.parse_log_file(path)
     }

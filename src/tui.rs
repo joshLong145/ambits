@@ -148,7 +148,13 @@ impl TuiSession {
                     let new_files = self.ingester.session_log_files(ld, &latest);
                     for log_file in &new_files {
                         for event in self.ingester.parse_log_file_with_root(log_file, project_path) {
-                            app.process_agent_event(event);
+                            match event {
+                                ambits::ingest::SessionEvent::ToolCall(tc) => app.process_agent_event(tc),
+                                ambits::ingest::SessionEvent::Compacted { summary, timestamp, agent_id, metadata } => {
+                                    app.process_compaction(summary, timestamp, agent_id, metadata);
+                                }
+                                ambits::ingest::SessionEvent::SessionCleared => app.reset_session(),
+                            }
                         }
                     }
 
@@ -171,6 +177,9 @@ impl TuiSession {
             let output = tailer.read_new_events();
             for event in output.events {
                 app.process_agent_event(event);
+            }
+            for compaction in output.compactions {
+                app.process_compaction(compaction.summary, compaction.timestamp, compaction.agent_id, compaction.metadata);
             }
         }
 

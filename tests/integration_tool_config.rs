@@ -459,6 +459,12 @@ fn parse_log_file_all_tool_stanzas() {
     }
 
     let events = parse_log_file(tmp.path(), &cfg);
-    assert_eq!(events.len(), 15, "expected 15 events, got {}: {:?}", events.len(),
-        events.iter().map(|e| &e.tool_name).collect::<Vec<_>>());
+    let tool_names: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            ambits::ingest::SessionEvent::ToolCall(tc) => Some(tc.tool_name.as_ref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tool_names.len(), 15, "expected 15 events, got {}: {:?}", tool_names.len(), tool_names);
 }

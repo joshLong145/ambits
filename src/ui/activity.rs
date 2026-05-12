@@ -5,8 +5,35 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use ambits::app::{App, FocusPanel};
+use ambits::ingest::{AgentToolCall, CompactionEvent};
 
 use super::colors;
+
+/// A single rendered row in the activity feed: either a tool call or a
+/// compaction boundary marker.
+enum FeedEntry<'a> {
+    Tool(&'a AgentToolCall),
+    Compaction(&'a CompactionEvent),
+}
+
+/// Build the merged feed, sorted by timestamp. Tool calls are filtered by
+/// the active agent filter; compactions are always shown.
+fn build_feed<'a>(app: &'a App) -> Vec<FeedEntry<'a>> {
+    let filter = app.agent_filter.as_deref();
+    let mut entries: Vec<(&'a str, FeedEntry<'a>)> = app
+        .activity
+        .iter()
+        .filter(|e| filter.is_none_or(|id| &*e.agent_id == id))
+        .map(|e| (e.timestamp_str.as_str(), FeedEntry::Tool(e)))
+        .chain(
+            app.compaction_history
+                .iter()
+                .map(|c| (c.timestamp.as_str(), FeedEntry::Compaction(c))),
+        )
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    entries.into_iter().map(|(_, e)| e).collect()
+}
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let border_style = if app.focus == FocusPanel::Activity {
@@ -20,45 +47,44 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    // Filter events by agent when a filter is active.
-    let filtered: Vec<&crate::ingest::AgentToolCall> = match app.agent_filter.as_deref() {
-        Some(agent_id) => app.activity.iter().filter(|e| &*e.agent_id == agent_id).collect(),
-        None => app.activity.iter().collect(),
-    };
+    let feed = build_feed(app);
 
     // Window the visible events using the scroll offset.
     let max_lines = area.height.saturating_sub(2) as usize;
-    let total = filtered.len();
+    let total = feed.len();
     // Clamp scroll offset so we can't scroll past the top.
     let max_offset = total.saturating_sub(max_lines);
     let offset = app.activity_scroll_offset.min(max_offset);
     let end = total.saturating_sub(offset);
     let start = end.saturating_sub(max_lines);
-    let visible = &filtered[start..end];
+    let visible = &feed[start..end];
 
+    let width = area.width.saturating_sub(2) as usize;
     let lines: Vec<Line> = visible
         .iter()
-        .map(|event| {
-            let agent_short = if event.agent_id.len() > 8 {
-                &event.agent_id[..8]
-            } else {
-                &event.agent_id
-            };
-
-            Line::from(vec![
-                Span::styled(
-                    format!(" [{}] ", agent_short),
-                    Style::default().fg(colors::ACCENT_MUTED),
-                ),
-                Span::styled(
-                    &event.description,
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled(
-                    format!("  ({})", event.read_depth),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])
+        .map(|entry| match entry {
+            FeedEntry::Tool(event) => {
+                let agent_short = if event.agent_id.len() > 8 {
+                    &event.agent_id[..8]
+                } else {
+                    &event.agent_id
+                };
+                Line::from(vec![
+                    Span::styled(
+                        format!(" [{}] ", agent_short),
+                        Style::default().fg(colors::ACCENT_MUTED),
+                    ),
+                    Span::styled(
+                        &event.description,
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(
+                        format!("  ({})", event.read_depth),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])
+            }
+            FeedEntry::Compaction(c) => compaction_marker_line(c, width),
         })
         .collect();
 
@@ -75,6 +101,25 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     };
 
     f.render_widget(paragraph, area);
+}
+
+/// Render a single-line separator marking a compaction boundary.
+/// Format: ─── compaction #1 · 31.2% seen · 12 files ───────
+fn compaction_marker_line<'a>(c: &'a CompactionEvent, width: usize) -> Line<'a> {
+    let info = format!(
+        " compaction #{} · {:.1}% seen · {} files ",
+        c.sequence,
+        c.ledger_before.seen_percent,
+        c.ledger_before.files_accessed.len(),
+    );
+    let lead = "─".repeat(3);
+    let trail_count = width.saturating_sub(lead.chars().count() + info.chars().count());
+    let trail = "─".repeat(trail_count);
+    Line::from(vec![
+        Span::styled(lead, Style::default().fg(Color::Yellow)),
+        Span::styled(info, Style::default().fg(Color::Yellow)),
+        Span::styled(trail, Style::default().fg(Color::Yellow)),
+    ])
 }
 
 #[cfg(test)]

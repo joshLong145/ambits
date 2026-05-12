@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use crate::tracking::ReadDepth;
-use super::{AgentToolCall, EventTailer, SessionIngester, TailerOutput, ToolCallMapper};
+use super::{AgentToolCall, CompactionMetadata, EventTailer, SessionEvent, SessionIngester, TailedCompaction, TailerOutput, ToolCallMapper};
 use super::tool_config::ToolMappingConfig;
 
 /// Derive the Claude Code log directory for a given project path.
@@ -93,14 +93,24 @@ fn is_uuid(s: &str) -> bool {
 /// (the main session file + any agent-*.jsonl files that reference it).
 /// Supports both old format (agent files flat in log dir) and new format
 /// (agent files in `<session-id>/subagents/`).
+///
+/// **Ordering:** subagent files first, main session file last. Callers
+/// (`coverage::run_report`, the TUI pre-populate loop) replay each file
+/// end-to-end before the next, so events are not globally timestamp-sorted.
+/// Putting the main session file last means any compaction in it — which now
+/// clears the ledger — fires after subagent work has been accumulated, so
+/// pre-compaction subagent reads survive into the post-compaction snapshot
+/// rather than being wiped by an out-of-order compaction.
+///
+/// Residual risk: a subagent whose work runs *concurrently with* and finishes
+/// *after* the main session's compaction will still have its post-compaction
+/// reads wiped when we process the main file later and replay the
+/// compaction. Strictly correct ordering would require a cross-file
+/// timestamp merge; that's deferred. In practice, subagents almost always
+/// complete before the main session reaches the token threshold for a
+/// compaction, so this heuristic covers the common case.
 pub fn session_log_files(log_dir: &Path, session_id: &str) -> Vec<PathBuf> {
     let mut files = Vec::new();
-
-    // Main session file.
-    let main_file = log_dir.join(format!("{session_id}.jsonl"));
-    if main_file.exists() {
-        files.push(main_file);
-    }
 
     // New format: <log_dir>/<session-id>/subagents/agent-*.jsonl
     // All files in this directory belong to the session by definition.
@@ -139,6 +149,13 @@ pub fn session_log_files(log_dir: &Path, session_id: &str) -> Vec<PathBuf> {
                 files.push(path);
             }
         }
+    }
+
+    // Main session file last — its compaction events clear the ledger, so
+    // we want subagent events accumulated first.
+    let main_file = log_dir.join(format!("{session_id}.jsonl"));
+    if main_file.exists() {
+        files.push(main_file);
     }
 
     files
@@ -258,14 +275,19 @@ pub fn extract_agent_label(path: &Path) -> String {
 /// The result of parsing a single JSONL line.
 pub enum ParsedLine {
     Events(Vec<AgentToolCall>),
+    /// `type:"user", isCompactSummary:true` — carries the post-compaction summary text.
+    Compacted { summary: String, timestamp: String },
+    /// `type:"system", subtype:"compact_boundary"` — carries token metadata.
+    /// In Claude Code logs this record always precedes the `Compacted` record by
+    /// one line, so callers buffer the metadata and attach it to the next
+    /// `Compacted` event.
+    CompactBoundary { metadata: CompactionMetadata, timestamp: String },
     SessionCleared,
     Ignored,
 }
 
 /// Parse all events from a JSONL log file.
-/// SessionCleared signals are ignored in batch mode — dump/coverage modes show
-/// aggregate historical coverage, not live session state.
-pub fn parse_log_file(path: &Path, config: &ToolMappingConfig) -> Vec<AgentToolCall> {
+pub fn parse_log_file(path: &Path, config: &ToolMappingConfig) -> Vec<SessionEvent> {
     parse_log_file_with_mapper(path, config, None)
 }
 
@@ -273,8 +295,8 @@ fn parse_log_file_with_mapper(
     path: &Path,
     mapper: &dyn ToolCallMapper,
     project_root: Option<&Path>,
-) -> Vec<AgentToolCall> {
-    let mut events = Vec::new();
+) -> Vec<SessionEvent> {
+    let mut events: Vec<SessionEvent> = Vec::new();
     let file = match fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return events,
@@ -322,24 +344,58 @@ fn parse_log_file_with_mapper(
     // Seek back to start so all lines — including line 1 — are processed for events.
     let _ = reader.seek(SeekFrom::Start(0));
 
+    // Buffer the most-recent compact_boundary record. Claude Code emits the
+    // boundary immediately before the corresponding `isCompactSummary` line, so
+    // we attach the buffered metadata to the next `Compacted` event we see.
+    let mut pending_metadata: Option<CompactionMetadata> = None;
+
     for line in reader.lines().map_while(Result::ok) {
-        if let ParsedLine::Events(mut line_events) =
-            parse_jsonl_line(line.trim(), &default_id, mapper)
-        {
-            if let Some((ref worktree, ref project)) = cwd_remap {
-                for ev in &mut line_events {
-                    if let Some(ref fp) = ev.file_path {
-                        ev.file_path = Some(remap_path(fp, worktree, project));
+        match parse_jsonl_line(line.trim(), &default_id, mapper) {
+            ParsedLine::Events(mut line_events) => {
+                if let Some((ref worktree, ref project)) = cwd_remap {
+                    for ev in &mut line_events {
+                        if let Some(ref fp) = ev.file_path {
+                            ev.file_path = Some(remap_path(fp, worktree, project));
+                        }
                     }
                 }
+                for ev in &mut line_events {
+                    ev.label = label.clone();
+                }
+                events.extend(line_events.into_iter().map(SessionEvent::ToolCall));
             }
-            for ev in &mut line_events {
-                ev.label = label.clone();
+            ParsedLine::CompactBoundary { metadata, .. } => {
+                pending_metadata = Some(metadata);
             }
-            events.extend(line_events);
+            ParsedLine::Compacted { summary, timestamp } => {
+                let agent_id: Arc<str> = Arc::from(default_id.as_str());
+                events.push(SessionEvent::Compacted {
+                    summary,
+                    timestamp,
+                    agent_id,
+                    metadata: pending_metadata.take(),
+                });
+            }
+            ParsedLine::SessionCleared => {
+                events.push(SessionEvent::SessionCleared);
+            }
+            ParsedLine::Ignored => {}
         }
     }
     events
+}
+
+/// Parse the `compactMetadata` block from a `compact_boundary` system record.
+/// Returns None if any required field is missing or wrong-typed — `trigger` is
+/// required, token counts and duration default to 0 when absent.
+fn parse_compact_metadata(meta: &Value) -> Option<CompactionMetadata> {
+    let trigger = meta.get("trigger").and_then(|v| v.as_str())?.to_string();
+    Some(CompactionMetadata {
+        trigger,
+        pre_tokens: meta.get("preTokens").and_then(|v| v.as_u64()).unwrap_or(0),
+        post_tokens: meta.get("postTokens").and_then(|v| v.as_u64()).unwrap_or(0),
+        duration_ms: meta.get("durationMs").and_then(|v| v.as_u64()).unwrap_or(0),
+    })
 }
 
 /// Parse a single JSONL line from a Claude Code session log.
@@ -352,8 +408,39 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
 
     let msg_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-    // Detect /clear command in user messages.
+    // Detect the compaction boundary marker (precedes the summary by one line).
+    if msg_type == "system"
+        && obj.get("subtype").and_then(|v| v.as_str()) == Some("compact_boundary")
+    {
+        let timestamp = obj
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let metadata = obj.get("compactMetadata").and_then(parse_compact_metadata);
+        return match metadata {
+            Some(metadata) => ParsedLine::CompactBoundary { metadata, timestamp },
+            None => ParsedLine::Ignored,
+        };
+    }
+
+    // Detect compaction summary and /clear command in user messages.
     if msg_type == "user" {
+        // Claude Code emits the post-compaction summary as a `type:"user"` record
+        // with `isCompactSummary:true`. The `message.content` is a plain string.
+        if obj.get("isCompactSummary").and_then(|v| v.as_bool()) == Some(true) {
+            let summary = obj
+                .pointer("/message/content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let timestamp = obj
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            return ParsedLine::Compacted { summary, timestamp };
+        }
         let content = obj
             .pointer("/message/content")
             .and_then(|v| v.as_str())
@@ -619,6 +706,10 @@ pub struct LogTailer {
     files: Vec<PathBuf>,
     positions: std::collections::HashMap<PathBuf, u64>,
     mapper: Arc<dyn ToolCallMapper>,
+    /// Most-recent `compact_boundary` metadata, held until the matching
+    /// `isCompactSummary` line arrives (usually within the same poll, but kept
+    /// across polls in case the writer flushes them separately).
+    pending_metadata: Option<CompactionMetadata>,
 }
 
 impl LogTailer {
@@ -632,7 +723,7 @@ impl LogTailer {
                 positions.insert(f.clone(), meta.len());
             }
         }
-        Self { files, positions, mapper }
+        Self { files, positions, mapper, pending_metadata: None }
     }
 
 
@@ -651,6 +742,7 @@ impl LogTailer {
     pub fn read_new_events(&mut self) -> TailerOutput {
         let mut output = TailerOutput {
             events: Vec::new(),
+            compactions: Vec::new(),
             session_cleared: false,
         };
 
@@ -684,6 +776,17 @@ impl LogTailer {
                             Ok(_) => match parse_jsonl_line(line.trim(), &default_id, &*self.mapper) {
                                 ParsedLine::Events(events) => output.events.extend(events),
                                 ParsedLine::SessionCleared => output.session_cleared = true,
+                                ParsedLine::CompactBoundary { metadata, .. } => {
+                                    self.pending_metadata = Some(metadata);
+                                }
+                                ParsedLine::Compacted { summary, timestamp } => {
+                                    output.compactions.push(TailedCompaction {
+                                        summary,
+                                        timestamp,
+                                        agent_id: Arc::from(default_id.as_str()),
+                                        metadata: self.pending_metadata.take(),
+                                    });
+                                }
                                 ParsedLine::Ignored => {}
                             },
                             Err(_) => break,
@@ -727,10 +830,10 @@ impl SessionIngester for ClaudeIngester {
     fn session_log_files(&self, log_dir: &Path, session_id: &str) -> Vec<PathBuf> {
         session_log_files(log_dir, session_id)
     }
-    fn parse_log_file(&self, path: &Path) -> Vec<AgentToolCall> {
+    fn parse_log_file(&self, path: &Path) -> Vec<SessionEvent> {
         parse_log_file_with_mapper(path, &*self.mapper, None)
     }
-    fn parse_log_file_with_root(&self, path: &Path, project_root: &Path) -> Vec<AgentToolCall> {
+    fn parse_log_file_with_root(&self, path: &Path, project_root: &Path) -> Vec<SessionEvent> {
         parse_log_file_with_mapper(path, &*self.mapper, Some(project_root))
     }
     fn session_slug(&self, log_dir: &Path, session_id: &str) -> Option<String> {
@@ -1136,7 +1239,11 @@ mod tests {
         let config = ToolMappingConfig::builtin().unwrap();
         let events = parse_log_file(&log, &config);
         assert_eq!(events.len(), 1);
-        assert_eq!(&*events[0].label, "Check the coverage");
+        if let SessionEvent::ToolCall(ref tc) = events[0] {
+            assert_eq!(&*tc.label, "Check the coverage");
+        } else {
+            panic!("expected ToolCall event");
+        }
     }
 
     #[test]
@@ -1411,10 +1518,11 @@ description  = "UserTool {target}"
         let config = ToolMappingConfig::builtin().unwrap();
         let events = parse_log_file_with_mapper(&log, &config, Some(&project));
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].file_path.as_ref().unwrap(),
-            &project.join("src/main.rs"),
-        );
+        if let SessionEvent::ToolCall(ref tc) = events[0] {
+            assert_eq!(tc.file_path.as_ref().unwrap(), &project.join("src/main.rs"));
+        } else {
+            panic!("expected ToolCall event");
+        }
     }
 
     #[test]
@@ -1435,10 +1543,11 @@ description  = "UserTool {target}"
         let config = ToolMappingConfig::builtin().unwrap();
         let events = parse_log_file_with_mapper(&log, &config, Some(&project));
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].file_path.as_ref().unwrap(),
-            &project.join("src/main.rs"),
-        );
+        if let SessionEvent::ToolCall(ref tc) = events[0] {
+            assert_eq!(tc.file_path.as_ref().unwrap(), &project.join("src/main.rs"));
+        } else {
+            panic!("expected ToolCall event");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1498,5 +1607,149 @@ description  = "UserTool {target}"
     #[test]
     fn bash_bfs_gets_name_only() {
         assert_eq!(bash_event("bfs . -name '*.rs'").read_depth, ReadDepth::NameOnly);
+    }
+
+    #[test]
+    fn parse_is_compact_summary_user_record_returns_compacted() {
+        // Real Claude Code (v2.1.132) shape: a `type:"user"` record with
+        // `isCompactSummary:true` carries the summary in `message.content` (string).
+        let line = r#"{"type":"user","sessionId":"abc","timestamp":"2026-05-11T20:59:25.329Z","isVisibleInTranscriptOnly":true,"isCompactSummary":true,"message":{"role":"user","content":"Summary of the conversation: The user is building a CLI parser."}}"#;
+        let config = ToolMappingConfig::builtin().expect("builtin config");
+        match parse_jsonl_line(line, "default", &config) {
+            ParsedLine::Compacted { summary, timestamp } => {
+                assert!(summary.contains("CLI parser"), "summary should contain compaction text, got: {summary:?}");
+                assert_eq!(timestamp, "2026-05-11T20:59:25.329Z");
+            }
+            other => panic!("expected ParsedLine::Compacted, got {:?}", match other {
+                ParsedLine::Events(_) => "Events",
+                ParsedLine::Compacted { .. } => "Compacted",
+                ParsedLine::CompactBoundary { .. } => "CompactBoundary",
+                ParsedLine::SessionCleared => "SessionCleared",
+                ParsedLine::Ignored => "Ignored",
+            }),
+        }
+    }
+
+    #[test]
+    fn parse_is_compact_summary_does_not_trigger_session_cleared() {
+        // The summary content can mention `/clear` in prose; isCompactSummary
+        // must take precedence over the `<command-name>/clear</command-name>` heuristic.
+        let line = r#"{"type":"user","isCompactSummary":true,"timestamp":"2026-05-11T21:00:00Z","message":{"role":"user","content":"User ran <command-name>/clear</command-name> earlier in the session"}}"#;
+        let config = ToolMappingConfig::builtin().expect("builtin config");
+        assert!(matches!(
+            parse_jsonl_line(line, "d", &config),
+            ParsedLine::Compacted { .. }
+        ));
+    }
+
+    #[test]
+    fn tailer_emits_compactions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("session.jsonl");
+        fs::write(&log, "").unwrap();
+        let config: Arc<dyn ToolCallMapper> = Arc::new(ToolMappingConfig::builtin().unwrap());
+        let mut tailer = LogTailer::new(vec![log.clone()], config);
+
+        let compact_line = r#"{"type":"user","sessionId":"abc","timestamp":"2026-05-11T20:59:25.329Z","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued from a previous conversation."}}"#;
+        fs::write(&log, format!("{compact_line}\n")).unwrap();
+
+        let output = tailer.read_new_events();
+        assert_eq!(output.compactions.len(), 1);
+        assert!(output.compactions[0].summary.contains("being continued"));
+        assert_eq!(output.compactions[0].timestamp, "2026-05-11T20:59:25.329Z");
+    }
+
+    // -----------------------------------------------------------------------
+    // compact_boundary metadata parsing & pairing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_compact_boundary_returns_metadata() {
+        let line = r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-05-11T20:59:25.328Z","compactMetadata":{"trigger":"manual","preTokens":195684,"postTokens":6416,"durationMs":64699}}"#;
+        let config = ToolMappingConfig::builtin().unwrap();
+        match parse_jsonl_line(line, "d", &config) {
+            ParsedLine::CompactBoundary { metadata, timestamp } => {
+                assert_eq!(metadata.trigger, "manual");
+                assert_eq!(metadata.pre_tokens, 195684);
+                assert_eq!(metadata.post_tokens, 6416);
+                assert_eq!(metadata.duration_ms, 64699);
+                assert_eq!(timestamp, "2026-05-11T20:59:25.328Z");
+            }
+            _ => panic!("expected CompactBoundary"),
+        }
+    }
+
+    #[test]
+    fn parse_compact_boundary_missing_trigger_is_ignored() {
+        // No trigger → metadata is unparseable → record is dropped (not surfaced
+        // as a half-populated CompactBoundary).
+        let line = r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-05-11T20:59:25.328Z","compactMetadata":{"preTokens":100}}"#;
+        let config = ToolMappingConfig::builtin().unwrap();
+        assert!(matches!(parse_jsonl_line(line, "d", &config), ParsedLine::Ignored));
+    }
+
+    #[test]
+    fn parse_log_file_attaches_boundary_metadata_to_next_summary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("session.jsonl");
+        let boundary = r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-05-11T20:59:25.328Z","compactMetadata":{"trigger":"manual","preTokens":195684,"postTokens":6416,"durationMs":64699}}"#;
+        let summary = r#"{"type":"user","timestamp":"2026-05-11T20:59:25.329Z","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued..."}}"#;
+        fs::write(&log, format!("{boundary}\n{summary}\n")).unwrap();
+
+        let config = ToolMappingConfig::builtin().unwrap();
+        let events = parse_log_file(&log, &config);
+        assert_eq!(events.len(), 1, "boundary should be folded into the summary");
+        match &events[0] {
+            SessionEvent::Compacted { metadata, summary, timestamp, .. } => {
+                let m = metadata.as_ref().expect("metadata should be attached");
+                assert_eq!(m.trigger, "manual");
+                assert_eq!(m.pre_tokens, 195684);
+                assert_eq!(m.post_tokens, 6416);
+                assert!(summary.contains("being continued"));
+                assert_eq!(timestamp, "2026-05-11T20:59:25.329Z");
+            }
+            _ => panic!("expected Compacted event"),
+        }
+    }
+
+    #[test]
+    fn parse_log_file_summary_without_boundary_has_no_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("session.jsonl");
+        let summary = r#"{"type":"user","timestamp":"2026-05-11T20:59:25.329Z","isCompactSummary":true,"message":{"role":"user","content":"Continuing..."}}"#;
+        fs::write(&log, format!("{summary}\n")).unwrap();
+
+        let config = ToolMappingConfig::builtin().unwrap();
+        let events = parse_log_file(&log, &config);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            SessionEvent::Compacted { metadata, .. } => assert!(metadata.is_none()),
+            _ => panic!("expected Compacted event"),
+        }
+    }
+
+    #[test]
+    fn tailer_pairs_boundary_with_summary_across_polls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("session.jsonl");
+        fs::write(&log, "").unwrap();
+        let config: Arc<dyn ToolCallMapper> = Arc::new(ToolMappingConfig::builtin().unwrap());
+        let mut tailer = LogTailer::new(vec![log.clone()], config);
+
+        // Poll 1: only the boundary record arrives.
+        let boundary = r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-05-11T20:59:25.328Z","compactMetadata":{"trigger":"auto","preTokens":50000,"postTokens":5000,"durationMs":12345}}"#;
+        fs::write(&log, format!("{boundary}\n")).unwrap();
+        let out1 = tailer.read_new_events();
+        assert_eq!(out1.compactions.len(), 0, "boundary alone should not surface a compaction");
+
+        // Poll 2: the summary record arrives — metadata from the buffered
+        // boundary should be attached.
+        let summary = r#"{"type":"user","timestamp":"2026-05-11T20:59:25.329Z","isCompactSummary":true,"message":{"role":"user","content":"Continuing..."}}"#;
+        fs::write(&log, format!("{boundary}\n{summary}\n")).unwrap();
+        let out2 = tailer.read_new_events();
+        assert_eq!(out2.compactions.len(), 1);
+        let m = out2.compactions[0].metadata.as_ref().expect("metadata pairs across polls");
+        assert_eq!(m.trigger, "auto");
+        assert_eq!(m.pre_tokens, 50000);
     }
 }
