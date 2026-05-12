@@ -1,6 +1,7 @@
 use std::fmt;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub mod merkle;
 
@@ -46,7 +47,14 @@ pub struct SymbolNode {
     pub name: String,
     pub category: SymbolCategory,
     pub label: &'static str, // Language-specific label (e.g., "class", "struct", "def")
-    pub file_path: PathBuf,
+    /// Path to the source file that produced this symbol. Wrapped in `Arc` so
+    /// symbols within the same file share one backing `PathBuf` instead of
+    /// each carrying their own clone — saves real heap at monorepo scale where
+    /// a typical file has dozens of symbols. Reads go through deref: most
+    /// consumers don't notice the change (`.as_path()`, `.display()`,
+    /// `.to_string_lossy()` all work). Equality checks against `Path` /
+    /// `PathBuf` need `&**arc` or `arc.as_path()` to unwrap.
+    pub file_path: Arc<PathBuf>,
     pub byte_range: Range<usize>,
     pub line_range: Range<usize>,
     pub content_hash: [u8; 32],

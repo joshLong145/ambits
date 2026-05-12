@@ -32,7 +32,8 @@
 //! | class properties / interface props         | Variable | `"property"`       |
 //! | `declare ...`                              | Variable | `"declare"`        |
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use color_eyre::eyre::eyre;
 use tree_sitter::{Node, Parser};
@@ -76,8 +77,9 @@ impl LanguageParser for TypescriptParser {
         let path_prefix = path.to_string_lossy();
         let src = source.as_bytes();
         let mut symbols = Vec::new();
+        let file_path_arc = Arc::new(path.to_path_buf());
 
-        extract_symbols(root, src, path, &path_prefix, "", &mut symbols);
+        extract_symbols(root, src, &file_path_arc, &path_prefix, "", &mut symbols);
 
         for sym in symbols.iter_mut() {
             compute_merkle_hash(sym);
@@ -146,7 +148,7 @@ const DECLARE: SymbolMeta = SymbolMeta { category: SymbolCategory::Variable, lab
 fn extract_symbols(
     node: Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -250,7 +252,7 @@ fn extract_symbols(
 fn extract_arrow_fns(
     node: &Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -297,7 +299,7 @@ fn extract_arrow_fns(
 fn extract_ambient(
     node: &Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -329,7 +331,7 @@ fn extract_ambient(
 fn extract_ambient_vars(
     node: &Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
     path_prefix: &str,
     parent_name_path: &str,
     ambient_range: &std::ops::Range<usize>,
@@ -364,7 +366,7 @@ fn extract_ambient_vars(
 fn emit_class(
     node: &Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
     path_prefix: &str,
     parent_name_path: &str,
     meta: &SymbolMeta,
@@ -402,7 +404,7 @@ fn emit_class(
 fn extract_members(
     body: Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -451,7 +453,7 @@ fn extract_members(
 fn emit_interface(
     node: &Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
     path_prefix: &str,
     parent_name_path: &str,
     byte_range: std::ops::Range<usize>,
@@ -484,7 +486,7 @@ fn emit_interface(
 fn emit_namespace(
     node: &Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -530,7 +532,7 @@ fn make_symbol(
     line_node: &Node,
     byte_range: std::ops::Range<usize>,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
     path_prefix: &str,
     parent_name_path: &str,
     children: Vec<SymbolNode>,
@@ -550,7 +552,7 @@ fn make_symbol(
         name,
         category: meta.category,
         label: meta.label,
-        file_path: file_path.to_path_buf(),
+        file_path: Arc::clone(file_path),
         byte_range,
         line_range: start_line..end_line,
         content_hash: content_hash(text),
@@ -566,7 +568,7 @@ fn make_symbol(
 fn build_named_symbol(
     node: &Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
     path_prefix: &str,
     parent_name_path: &str,
     meta: &SymbolMeta,

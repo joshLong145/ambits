@@ -29,7 +29,8 @@
 //! | `MAX_SIZE = ...` (UPPER_SNAKE_CASE)        | Variable | `"var"`  |
 //! | class methods                              | Function | `"def"`  |
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use color_eyre::eyre::eyre;
 use tree_sitter::{Node, Parser};
@@ -73,8 +74,9 @@ impl LanguageParser for PythonParser {
         let path_prefix = path.to_string_lossy();
         let src = source.as_bytes();
         let mut symbols = Vec::new();
+        let file_path_arc = Arc::new(path.to_path_buf());
 
-        extract_symbols(root, src, path, &path_prefix, "", &mut symbols);
+        extract_symbols(root, src, &file_path_arc, &path_prefix, "", &mut symbols);
 
         for sym in symbols.iter_mut() {
             compute_merkle_hash(sym);
@@ -136,7 +138,7 @@ const TYPE_ALIAS: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, labe
 fn extract_symbols(
     node: Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -186,7 +188,7 @@ fn extract_symbols(
                 name: name.clone(),
                 category: meta.category,
                 label: meta.label,
-                file_path: file_path.to_path_buf(),
+                file_path: Arc::clone(file_path),
                 byte_range,
                 line_range: start_line..end_line,
                 content_hash: content_hash(text),
@@ -224,7 +226,7 @@ fn extract_symbols(
 fn extract_decorated(
     node: &Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -261,7 +263,7 @@ fn extract_decorated(
                     name: name.clone(),
                     category: meta.category,
                     label: meta.label,
-                    file_path: file_path.to_path_buf(),
+                    file_path: Arc::clone(file_path),
                     byte_range,
                     line_range: start_line..end_line,
                     content_hash: content_hash(text),
@@ -396,7 +398,7 @@ fn extract_type_alias(node: &Node, src: &[u8]) -> Option<(String, SymbolMeta)> {
 fn extract_from_compound_bodies(
     node: &Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -656,7 +658,7 @@ mod tests {
             .parse_file(Path::new("src/main.py"), "def foo():\n    pass\n")
             .unwrap();
         assert_eq!(file.file_path, Path::new("src/main.py"));
-        assert_eq!(file.symbols[0].file_path, Path::new("src/main.py"));
+        assert_eq!(file.symbols[0].file_path.as_path(), Path::new("src/main.py"));
         assert_eq!(file.symbols[0].id, "src/main.py::foo");
     }
 

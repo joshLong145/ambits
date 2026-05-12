@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::ingest::AgentToolCall;
 use crate::symbols::{FileSymbols, ProjectTree, SymbolCategory, SymbolNode};
@@ -13,7 +14,7 @@ pub fn sym(id: &str, name: &str) -> SymbolNode {
         name: name.to_string(),
         category: SymbolCategory::Function,
         label: "fn",
-        file_path: PathBuf::new(),
+        file_path: Arc::new(PathBuf::new()),
         byte_range: 0..100,
         line_range: 1..10,
         content_hash: hash,
@@ -54,10 +55,11 @@ pub fn sym_with_children_and_lines(
 /// Create a FileSymbols entry, setting each symbol's `file_path` to match.
 pub fn file(path: &str, symbols: Vec<SymbolNode>) -> FileSymbols {
     let file_path = PathBuf::from(path);
+    let file_path_arc = Arc::new(file_path.clone());
     let symbols = symbols
         .into_iter()
         .map(|mut s| {
-            s.file_path = file_path.clone();
+            s.file_path = Arc::clone(&file_path_arc);
             s
         })
         .collect();

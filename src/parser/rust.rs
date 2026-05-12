@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use color_eyre::eyre::eyre;
 use tree_sitter::{Node, Parser};
@@ -38,8 +39,9 @@ impl LanguageParser for RustParser {
         let path_prefix = path.to_string_lossy();
         let src = source.as_bytes();
         let mut symbols = Vec::new();
+        let file_path_arc = Arc::new(path.to_path_buf());
 
-        extract_symbols(root, src, path, &path_prefix, "", &mut symbols);
+        extract_symbols(root, src, &file_path_arc, &path_prefix, "", &mut symbols);
 
         for sym in symbols.iter_mut() {
             compute_merkle_hash(sym);
@@ -75,7 +77,7 @@ const MACRO: SymbolMeta = SymbolMeta { category: SymbolCategory::Macro, label: "
 fn extract_symbols(
     node: Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -114,7 +116,7 @@ fn extract_symbols(
                 name: name.clone(),
                 category: meta.category,
                 label: meta.label,
-                file_path: file_path.to_path_buf(),
+                file_path: Arc::clone(file_path),
                 byte_range,
                 line_range: start_line..end_line,
                 content_hash: content_hash(text),
@@ -140,7 +142,7 @@ fn extract_symbols(
 fn extract_body_children(
     body: Node,
     src: &[u8],
-    file_path: &Path,
+    file_path: &Arc<PathBuf>,
     path_prefix: &str,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
@@ -168,7 +170,7 @@ fn extract_body_children(
                 name,
                 category: meta.category,
                 label: meta.label,
-                file_path: file_path.to_path_buf(),
+                file_path: Arc::clone(file_path),
                 byte_range,
                 line_range: start_line..end_line,
                 content_hash: content_hash(text),

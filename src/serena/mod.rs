@@ -94,9 +94,10 @@ fn parse_raw_pickle(value: &Value) -> Result<Vec<FileSymbols>> {
             as_list(&items[1]).ok_or_else(|| eyre!("Symbol list not an array for {file_path_str}"))?;
 
         let path_prefix = file_path.to_string_lossy();
+        let file_path_arc = std::sync::Arc::new(file_path.clone());
         let mut symbols = Vec::new();
         for sym_val in symbol_list {
-            if let Ok(node) = convert_symbol(sym_val, &file_path, &path_prefix, "") {
+            if let Ok(node) = convert_symbol(sym_val, &file_path_arc, &path_prefix, "") {
                 symbols.push(node);
             }
         }
@@ -136,9 +137,10 @@ fn parse_document_pickle(value: &Value) -> Result<Vec<FileSymbols>> {
             .ok_or_else(|| eyre!("Cannot find symbols for {file_path_str}"))?;
 
         let path_prefix = file_path.to_string_lossy();
+        let file_path_arc = std::sync::Arc::new(file_path.clone());
         let mut symbols = Vec::new();
         for sym_val in symbol_list {
-            if let Ok(node) = convert_symbol(sym_val, &file_path, &path_prefix, "") {
+            if let Ok(node) = convert_symbol(sym_val, &file_path_arc, &path_prefix, "") {
                 symbols.push(node);
             }
         }
@@ -156,7 +158,7 @@ fn parse_document_pickle(value: &Value) -> Result<Vec<FileSymbols>> {
 /// Convert a pickle Value dict into a SymbolNode.
 fn convert_symbol(
     val: &Value,
-    file_path: &Path,
+    file_path: &std::sync::Arc<PathBuf>,
     path_prefix: &str,
     parent_id: &str,
 ) -> Result<SymbolNode> {
@@ -209,7 +211,7 @@ fn convert_symbol(
         name,
         category,
         label,
-        file_path: file_path.to_path_buf(),
+        file_path: std::sync::Arc::clone(file_path),
         byte_range: (start_line * 40 + start_char)..(end_line * 40 + end_char),
         line_range: (start_line + 1)..(end_line + 1), // 1-indexed like tree-sitter
         content_hash,

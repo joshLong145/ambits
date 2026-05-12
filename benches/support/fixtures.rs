@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ambits::symbols::merkle::content_hash;
 use ambits::symbols::{FileSymbols, ProjectTree, SymbolCategory, SymbolNode};
@@ -962,7 +963,7 @@ pub fn make_sym(id: &str, name: &str) -> SymbolNode {
         name: name.to_string(),
         category: SymbolCategory::Function,
         label: "fn",
-        file_path: PathBuf::from("src/bench.rs"),
+        file_path: Arc::new(PathBuf::from("src/bench.rs")),
         byte_range: 0..100,
         line_range: 1..10,
         content_hash: hash,
@@ -996,9 +997,10 @@ pub fn make_flat_symbols(n: usize) -> Vec<SymbolNode> {
 /// Build a FileSymbols containing `n_symbols` flat symbols.
 pub fn make_file(path: &str, n_symbols: usize) -> FileSymbols {
     let file_path = PathBuf::from(path);
+    let file_path_arc = Arc::new(file_path.clone());
     let symbols = make_flat_symbols(n_symbols)
         .into_iter()
-        .map(|mut s| { s.file_path = file_path.clone(); s })
+        .map(|mut s| { s.file_path = Arc::clone(&file_path_arc); s })
         .collect();
     FileSymbols { file_path, symbols, total_lines: n_symbols * 5 }
 }
@@ -1046,18 +1048,18 @@ fn build_file_symbols(file_path: &str, n: usize) -> Vec<SymbolNode> {
     let groups = n / 5;
     let remainder = n - groups * 5;
     let mut out = Vec::with_capacity(groups + remainder);
-    let file_path_buf = PathBuf::from(file_path);
+    let file_path_arc = Arc::new(PathBuf::from(file_path));
     for g in 0..groups {
         let parent_id = format!("{file_path}::Type_{g:04}");
         let mut parent = make_sym(&parent_id, &format!("Type_{g:04}"));
         parent.category = SymbolCategory::Type;
         parent.label = "struct";
-        parent.file_path = file_path_buf.clone();
+        parent.file_path = Arc::clone(&file_path_arc);
         parent.children = (0..4)
             .map(|i| {
                 let child_id = format!("{parent_id}::method_{i}");
                 let mut sym = make_sym(&child_id, &format!("method_{i}"));
-                sym.file_path = file_path_buf.clone();
+                sym.file_path = Arc::clone(&file_path_arc);
                 sym
             })
             .collect();
@@ -1067,7 +1069,7 @@ fn build_file_symbols(file_path: &str, n: usize) -> Vec<SymbolNode> {
     for i in 0..remainder {
         let leaf_id = format!("{file_path}::fn_{i:04}");
         let mut sym = make_sym(&leaf_id, &format!("fn_{i:04}"));
-        sym.file_path = file_path_buf.clone();
+        sym.file_path = Arc::clone(&file_path_arc);
         out.push(sym);
     }
     out

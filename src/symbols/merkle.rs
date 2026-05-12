@@ -150,12 +150,13 @@ mod tests {
     fn leaf_merkle_hash_equals_content_hash() {
         use super::super::{SymbolCategory, SymbolNode};
         use std::path::PathBuf;
+        use std::sync::Arc;
         let mut leaf = SymbolNode {
             id: "x".into(),
             name: "x".into(),
             category: SymbolCategory::Function,
             label: "fn",
-            file_path: PathBuf::new(),
+            file_path: Arc::new(PathBuf::new()),
             byte_range: 0..0,
             line_range: 0..0,
             content_hash: content_hash("fn x() {}"),
@@ -172,12 +173,13 @@ mod tests {
     fn parent_merkle_hash_differs_from_content_hash() {
         use super::super::{SymbolCategory, SymbolNode};
         use std::path::PathBuf;
+        use std::sync::Arc;
         let make = |name: &str| SymbolNode {
             id: name.into(),
             name: name.into(),
             category: SymbolCategory::Function,
             label: "fn",
-            file_path: PathBuf::new(),
+            file_path: Arc::new(PathBuf::new()),
             byte_range: 0..0,
             line_range: 0..0,
             content_hash: content_hash(name),
