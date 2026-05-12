@@ -82,6 +82,36 @@ fn normalize_source(source: &str) -> String {
 /// vocabulary. It will be most accurate for English-identifier code (Rust, Python,
 /// TypeScript) and less accurate for heavily symbolic code (e.g. APL, dense regex).
 pub fn estimate_tokens(source: &str) -> usize {
+    if source.is_ascii() {
+        return estimate_tokens_ascii(source.as_bytes());
+    }
+    estimate_tokens_unicode(source)
+}
+
+#[inline]
+fn estimate_tokens_ascii(bytes: &[u8]) -> usize {
+    let mut count = 0usize;
+    let mut word_len = 0usize;
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            word_len += 1;
+        } else {
+            if word_len > 0 {
+                count += word_len.div_ceil(4);
+                word_len = 0;
+            }
+            if !is_unicode_ws_ascii(b) {
+                count += 1;
+            }
+        }
+    }
+    if word_len > 0 {
+        count += word_len.div_ceil(4);
+    }
+    count
+}
+
+fn estimate_tokens_unicode(source: &str) -> usize {
     let mut count = 0usize;
     let mut word_len = 0usize;
 
@@ -102,6 +132,15 @@ pub fn estimate_tokens(source: &str) -> usize {
         count += word_len.div_ceil(4);
     }
     count
+}
+
+/// ASCII subset of Unicode's `White_Space` property: matches `char::is_whitespace()`
+/// for any ASCII byte. `u8::is_ascii_whitespace()` excludes U+000B (vertical tab),
+/// which Unicode treats as whitespace — we include it so the fast path is bit-for-bit
+/// equivalent to the Unicode path for ASCII input.
+#[inline]
+fn is_unicode_ws_ascii(b: u8) -> bool {
+    matches!(b, b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | b' ')
 }
 
 #[cfg(test)]
@@ -134,6 +173,27 @@ mod tests {
         let h1 = content_hash("fn foo() {}");
         let h2 = content_hash("fn bar() {}");
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn ascii_and_unicode_paths_agree_on_ascii_input() {
+        // The fast path takes the ASCII branch; we manually compare against the
+        // Unicode fallback for the same input.
+        let samples = [
+            "",
+            "fn foo() {}",
+            "calculate_result",
+            "let x = (a + b) * c;",
+            "  \n\t  ",
+            "a\x0Bb",  // includes vertical tab — Unicode whitespace but not ASCII whitespace
+        ];
+        for s in samples {
+            assert_eq!(
+                estimate_tokens_ascii(s.as_bytes()),
+                estimate_tokens_unicode(s),
+                "estimate_tokens disagreement on {s:?}",
+            );
+        }
     }
 
     #[test]
