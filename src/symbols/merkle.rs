@@ -14,8 +14,18 @@ pub fn content_hash(source: &str) -> [u8; 32] {
 /// Compute the Merkle hash for a symbol node.
 /// Combines the node's own content hash with all children's Merkle hashes.
 /// This must be called bottom-up (children first).
+///
+/// Leaf nodes (no children) reuse `content_hash` as their `merkle_hash` directly,
+/// skipping a SHA-256 invocation. The input would be a 32-byte cryptographic hash
+/// either way, so hashing it again adds no collision resistance. Real source
+/// projects are leaf-dominated (≈90% leaves in typical symbol trees), so this
+/// skips the majority of SHA-256 calls during parse.
 pub fn compute_merkle_hash(node: &mut SymbolNode) {
-    // First, recursively compute children's merkle hashes.
+    if node.children.is_empty() {
+        node.merkle_hash = node.content_hash;
+        return;
+    }
+
     for child in node.children.iter_mut() {
         compute_merkle_hash(child);
     }
@@ -134,6 +144,53 @@ mod tests {
         let h1 = content_hash("fn foo() {}");
         let h2 = content_hash("fn bar() {}");
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn leaf_merkle_hash_equals_content_hash() {
+        use super::super::{SymbolCategory, SymbolNode};
+        use std::path::PathBuf;
+        let mut leaf = SymbolNode {
+            id: "x".into(),
+            name: "x".into(),
+            category: SymbolCategory::Function,
+            label: "fn",
+            file_path: PathBuf::new(),
+            byte_range: 0..0,
+            line_range: 0..0,
+            content_hash: content_hash("fn x() {}"),
+            merkle_hash: [0u8; 32],
+            children: Vec::new(),
+            estimated_tokens: 0,
+        };
+        let expected = leaf.content_hash;
+        compute_merkle_hash(&mut leaf);
+        assert_eq!(leaf.merkle_hash, expected);
+    }
+
+    #[test]
+    fn parent_merkle_hash_differs_from_content_hash() {
+        use super::super::{SymbolCategory, SymbolNode};
+        use std::path::PathBuf;
+        let make = |name: &str| SymbolNode {
+            id: name.into(),
+            name: name.into(),
+            category: SymbolCategory::Function,
+            label: "fn",
+            file_path: PathBuf::new(),
+            byte_range: 0..0,
+            line_range: 0..0,
+            content_hash: content_hash(name),
+            merkle_hash: [0u8; 32],
+            children: Vec::new(),
+            estimated_tokens: 0,
+        };
+        let mut parent = make("parent");
+        parent.children = vec![make("a"), make("b")];
+        compute_merkle_hash(&mut parent);
+        assert_ne!(parent.merkle_hash, parent.content_hash);
+        assert_eq!(parent.children[0].merkle_hash, parent.children[0].content_hash);
+        assert_eq!(parent.children[1].merkle_hash, parent.children[1].content_hash);
     }
 
     #[test]
