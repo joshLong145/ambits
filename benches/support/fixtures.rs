@@ -1011,6 +1011,68 @@ pub fn make_project(n_files: usize, symbols_per_file: usize) -> ProjectTree {
     ProjectTree { root: PathBuf::from("/bench/project"), files }
 }
 
+/// Build a synthetic monorepo `ProjectTree` for project-scale benchmarks.
+///
+/// Distributes `n_files` across nested package directories (mimicking realistic
+/// path depth) and varies file extensions across `rs`/`ts`/`py`. Within each
+/// file the symbol mix is ~80% flat leaves and ~20% one-level-nested groups
+/// (a type with four methods), so `compute_merkle_hash`'s leaf-vs-parent code
+/// paths both get exercised in proportions roughly matching real source.
+///
+/// Pure in-memory construction — no disk I/O, no tree-sitter. Use this for
+/// benchmarking the code paths *downstream* of parsing.
+pub fn make_monorepo_tree(n_files: usize, symbols_per_file: usize) -> ProjectTree {
+    const EXTENSIONS: [&str; 3] = ["rs", "ts", "py"];
+    let files: Vec<FileSymbols> = (0..n_files)
+        .map(|file_idx| {
+            let ext = EXTENSIONS[file_idx % EXTENSIONS.len()];
+            let pkg_idx = file_idx / 20;
+            let path_str = format!("src/pkg_{pkg_idx:04}/module_{file_idx:06}.{ext}");
+            let symbols = build_file_symbols(&path_str, symbols_per_file);
+            FileSymbols {
+                file_path: PathBuf::from(&path_str),
+                symbols,
+                total_lines: symbols_per_file * 5,
+            }
+        })
+        .collect();
+    ProjectTree {
+        root: PathBuf::from("/bench/monorepo"),
+        files,
+    }
+}
+
+fn build_file_symbols(file_path: &str, n: usize) -> Vec<SymbolNode> {
+    let groups = n / 5;
+    let remainder = n - groups * 5;
+    let mut out = Vec::with_capacity(groups + remainder);
+    let file_path_buf = PathBuf::from(file_path);
+    for g in 0..groups {
+        let parent_id = format!("{file_path}::Type_{g:04}");
+        let mut parent = make_sym(&parent_id, &format!("Type_{g:04}"));
+        parent.category = SymbolCategory::Type;
+        parent.label = "struct";
+        parent.file_path = file_path_buf.clone();
+        parent.children = (0..4)
+            .map(|i| {
+                let child_id = format!("{parent_id}::method_{i}");
+                let mut sym = make_sym(&child_id, &format!("method_{i}"));
+                sym.file_path = file_path_buf.clone();
+                sym
+            })
+            .collect();
+        ambits::symbols::merkle::compute_merkle_hash(&mut parent);
+        out.push(parent);
+    }
+    for i in 0..remainder {
+        let leaf_id = format!("{file_path}::fn_{i:04}");
+        let mut sym = make_sym(&leaf_id, &format!("fn_{i:04}"));
+        sym.file_path = file_path_buf.clone();
+        out.push(sym);
+    }
+    out
+}
+
 /// Build a ContextLedger pre-populated with entries for all symbols in `project`.
 pub fn make_populated_ledger(project: &ProjectTree) -> ContextLedger {
     let mut ledger = ContextLedger::new();

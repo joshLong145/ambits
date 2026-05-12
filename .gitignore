@@ -6,3 +6,7 @@ node_modules/
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+
+# Heap probe / perf measurement artifacts — machine-specific.
+.perf-baseline/
+dhat-heap.json
