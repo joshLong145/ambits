@@ -28,6 +28,7 @@ use ratatui::Terminal;
 use std::sync::Arc;
 
 use ambits::app::App;
+use ambits::filter::PathFilter;
 use ambits::ingest::tool_config::ToolMappingConfig;
 use ambits::ingest::{SessionIngester, ToolCallMapper};
 use events::AppEvent;
@@ -76,6 +77,19 @@ struct Cli {
     /// Output format for --coverage. Ignored when --coverage is not set.
     #[arg(long, value_enum, default_value = "table")]
     format: CoverageFormat,
+
+    /// Restrict analysis to a project-relative subpath (e.g. `src/parser`).
+    /// Leading slash is accepted but optional. Matches by path component:
+    /// `src/parser` matches `src/parser/rust.rs` but NOT `src/parser_extra.rs`.
+    /// Errors if the path does not exist under --project.
+    #[arg(long, conflicts_with = "filter_regex")]
+    filter: Option<String>,
+
+    /// Restrict analysis to files whose project-relative path matches a regex
+    /// (e.g. `^src/.*\.rs$`). Unanchored by default — anchor with `^...$` as
+    /// needed. Mutually exclusive with --filter.
+    #[arg(long, conflicts_with = "filter")]
+    filter_regex: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -139,11 +153,23 @@ fn main() -> Result<()> {
         color_eyre::eyre::eyre!("--project is required (use `ambits --project <path>`)")
     })?;
     let project_path = project.canonicalize().unwrap_or(project);
+
+    // Build the optional path filter. clap already enforces mutual exclusion
+    // between --filter and --filter-regex, so at most one branch fires.
+    let filter: Option<PathFilter> = match (&cli.filter, &cli.filter_regex) {
+        (Some(p), _) => Some(PathFilter::literal(p)),
+        (_, Some(r)) => Some(PathFilter::regex(r)?),
+        _ => None,
+    };
+    if let Some(ref f) = filter {
+        f.validate(&project_path)?;
+    }
+
     let registry = ParserRegistry::new();
     let project_tree = if cli.serena {
-        serena::scan_project_serena(&project_path)?
+        serena::scan_project_serena(&project_path, filter.as_ref())?
     } else {
-        registry.scan_project(&project_path)?
+        registry.scan_project(&project_path, filter.as_ref())?
     };
 
     if cli.dump {

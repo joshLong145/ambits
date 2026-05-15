@@ -28,6 +28,7 @@ serde-pickle = "1.2"
 flume = "0.12"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 blake3 = "1"
+regex = "1"
 dhat = { version = "0.3", optional = true }
 
 [features]
