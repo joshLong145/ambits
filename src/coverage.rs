@@ -79,6 +79,10 @@ pub struct CoverageReport {
     pub session_id: Option<String>,
     /// Agent ID if filtering by agent.
     pub agent_id: Option<String>,
+    /// Active path filter (display form, e.g. `"src/parser"` or `"re:^src/.*\\.rs$"`),
+    /// or `None` when no filter was applied. Populated by `run_report` so the
+    /// formatter can surface it to readers.
+    pub filter: Option<String>,
     /// Per-file coverage metrics.
     pub files: Vec<FileCoverage>,
     /// Compactions detected in the session, in occurrence order. Empty when none.
@@ -118,6 +122,7 @@ impl CoverageReport {
         Self {
             session_id: None,
             agent_id: agent_filter.map(|s| s.to_string()),
+            filter: None,
             files,
             compactions: Vec::new(),
         }
@@ -229,6 +234,9 @@ impl CoverageFormatter for TextFormatter {
             .map(|a| format!(", agent: {}", a))
             .unwrap_or_default();
         output.push_str(&format!("Coverage Report (session: {}{})\n", session_str, agent_str));
+        if let Some(ref f) = report.filter {
+            output.push_str(&format!("Filter: {f}\n"));
+        }
 
         // Calculate path width based on longest path
         let max_path_len = report
@@ -447,6 +455,8 @@ impl CoverageFormatter for JsonFormatter {
             schema_version: u32,
             session_id: Option<&'a str>,
             agent_id: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            filter: Option<&'a str>,
             totals: Totals,
             files: Vec<FileDto<'a>>,
             compactions: Vec<CompactionDto<'a>>,
@@ -456,6 +466,7 @@ impl CoverageFormatter for JsonFormatter {
             schema_version: 2,
             session_id: report.session_id.as_deref(),
             agent_id: report.agent_id.as_deref(),
+            filter: report.filter.as_deref(),
             totals: Totals {
                 symbols: report.total_symbols(),
                 seen: report.total_seen(),
@@ -514,6 +525,7 @@ pub fn run_report(
     log_dir_opt: &Option<PathBuf>,
     session_opt: &Option<String>,
     agent_opt: &Option<String>,
+    filter: Option<&crate::filter::PathFilter>,
     ingester: &dyn crate::ingest::SessionIngester,
     formatter: &dyn CoverageFormatter,
 ) -> Result<()> {
@@ -631,6 +643,7 @@ pub fn run_report(
     // 5. Generate and print report.
     let mut report = CoverageReport::from_project(project_tree, &ledger, resolved_agent.as_deref());
     report.session_id = session_id;
+    report.filter = filter.map(|f| f.display());
     report.compactions = compactions;
 
     print!("{}", formatter.format(&report));
@@ -639,13 +652,20 @@ pub fn run_report(
 }
 
 /// Print a project's symbol tree to stdout.
-pub fn dump_tree(root: &Path, project_tree: &ProjectTree) {
+pub fn dump_tree(
+    root: &Path,
+    project_tree: &ProjectTree,
+    filter: Option<&crate::filter::PathFilter>,
+) {
     println!(
         "Project: {} ({} files, {} symbols)",
         root.display(),
         project_tree.total_files(),
         project_tree.total_symbols(),
     );
+    if let Some(f) = filter {
+        println!("Filter: {}", f.display());
+    }
     println!();
 
     for file in &project_tree.files {
@@ -818,6 +838,7 @@ mod tests {
         let report = CoverageReport {
             session_id: Some("abc-123".into()),
             agent_id: None,
+            filter: None,
             files: vec![FileCoverage {
                 path: "src/main.rs".into(),
                 total_symbols: 10,
@@ -838,6 +859,7 @@ mod tests {
         let report = CoverageReport {
             session_id: Some("s".into()),
             agent_id: None,
+            filter: None,
             files: vec![],
             compactions: Vec::new(),
         };
@@ -852,6 +874,7 @@ mod tests {
         let report = CoverageReport {
             session_id: Some("s".into()),
             agent_id: None,
+            filter: None,
             files: vec![FileCoverage {
                 path: "a.rs".into(),
                 total_symbols: 1,
@@ -898,6 +921,7 @@ mod tests {
         let report = CoverageReport {
             session_id: Some("s".into()),
             agent_id: None,
+            filter: None,
             files: vec![],
             compactions: Vec::new(),
         };
@@ -911,6 +935,7 @@ mod tests {
         let report = CoverageReport {
             session_id: Some("s".into()),
             agent_id: None,
+            filter: None,
             files: vec![],
             compactions: vec![sample_compaction()],
         };
@@ -927,6 +952,7 @@ mod tests {
         let report = CoverageReport {
             session_id: Some("s".into()),
             agent_id: None,
+            filter: None,
             files: vec![],
             compactions: Vec::new(),
         };
@@ -943,6 +969,7 @@ mod tests {
         let report = CoverageReport {
             session_id: Some("s".into()),
             agent_id: None,
+            filter: None,
             files: vec![],
             compactions: vec![sample_compaction()],
         };
@@ -970,6 +997,7 @@ mod tests {
         let report = CoverageReport {
             session_id: Some("s".into()),
             agent_id: None,
+            filter: None,
             files: vec![],
             compactions: vec![sample_compaction_with_metadata()],
         };
@@ -985,6 +1013,7 @@ mod tests {
         let report = CoverageReport {
             session_id: Some("s".into()),
             agent_id: None,
+            filter: None,
             files: vec![],
             compactions: vec![sample_compaction_with_metadata()],
         };
@@ -996,5 +1025,73 @@ mod tests {
         assert_eq!(metadata["pre_tokens"], 195684);
         assert_eq!(metadata["post_tokens"], 6416);
         assert_eq!(metadata["duration_ms"], 64699);
+    }
+
+    #[test]
+    fn text_formatter_renders_filter_line_when_present() {
+        let report = CoverageReport {
+            session_id: Some("abc".into()),
+            agent_id: None,
+            filter: Some("src/parser".into()),
+            files: vec![],
+            compactions: Vec::new(),
+        };
+        let output = TextFormatter::default().format(&report);
+        assert!(
+            output.contains("Filter: src/parser"),
+            "expected Filter line, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn text_formatter_omits_filter_line_when_absent() {
+        let report = CoverageReport {
+            session_id: Some("abc".into()),
+            agent_id: None,
+            filter: None,
+            files: vec![],
+            compactions: Vec::new(),
+        };
+        let output = TextFormatter::default().format(&report);
+        assert!(
+            !output.contains("Filter:"),
+            "Filter line must not appear without a filter, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn json_formatter_includes_filter_when_present() {
+        let report = CoverageReport {
+            session_id: Some("s".into()),
+            agent_id: None,
+            filter: Some("re:^src/.*\\.rs$".into()),
+            files: vec![],
+            compactions: Vec::new(),
+        };
+        let output = JsonFormatter.format(&report);
+        let value: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("output must be valid JSON");
+        assert_eq!(value["filter"], "re:^src/.*\\.rs$");
+    }
+
+    #[test]
+    fn json_formatter_omits_filter_when_absent() {
+        let report = CoverageReport {
+            session_id: Some("s".into()),
+            agent_id: None,
+            filter: None,
+            files: vec![],
+            compactions: Vec::new(),
+        };
+        let output = JsonFormatter.format(&report);
+        let value: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("output must be valid JSON");
+        // The field is `skip_serializing_if = Option::is_none`, so it should
+        // be absent entirely rather than `null`. This keeps the schema
+        // additive — pre-filter consumers see an unchanged object.
+        assert!(
+            value.get("filter").is_none(),
+            "filter field should be omitted when None, got: {value}",
+        );
     }
 }

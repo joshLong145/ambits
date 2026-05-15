@@ -94,6 +94,13 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         ]));
     }
 
+    if let Some(ref f) = app.filter {
+        lines.push(Line::from(vec![
+            Span::raw("  Filter: "),
+            Span::styled(f.display(), Style::default().fg(colors::ACCENT_MUTED)),
+        ]));
+    }
+
     // Compactions summary.
     if let Some(last) = app.compaction_history.last() {
         lines.push(Line::from(vec![

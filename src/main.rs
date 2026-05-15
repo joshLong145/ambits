@@ -176,7 +176,7 @@ fn main() -> Result<()> {
         for w in &config_warnings {
             println!("[ambit warning] {w}");
         }
-        coverage::dump_tree(&project_path, &project_tree);
+        coverage::dump_tree(&project_path, &project_tree, filter.as_ref());
         return Ok(());
     }
 
@@ -194,6 +194,7 @@ fn main() -> Result<()> {
             &cli.log_dir,
             &cli.session,
             &cli.agent,
+            filter.as_ref(),
             &*ingester,
             &*formatter,
         );
