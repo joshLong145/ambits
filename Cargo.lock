@@ -46,6 +46,7 @@ dependencies = [
  "ignore",
  "notify",
  "ratatui",
+ "regex",
  "serde",
  "serde-pickle",
  "serde_json",
