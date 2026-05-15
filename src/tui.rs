@@ -195,7 +195,8 @@ impl TuiSession {
                 }
             }
             if changed {
-                if let Ok(new_tree) = crate::serena::scan_project_serena(project_path, None) {
+                let filter = app.filter.as_deref();
+                if let Ok(new_tree) = crate::serena::scan_project_serena(project_path, filter) {
                     let mut old_map = std::collections::HashMap::new();
                     for file in &app.project_tree.files {
                         ambits::tracking::collect_symbol_hashes(&file.symbols, &mut old_map);
@@ -211,6 +212,10 @@ impl TuiSession {
     }
 
     /// Re-parse a changed source file and update the project tree in `app`.
+    ///
+    /// If `app.filter` is set and the changed file's project-relative path
+    /// does not satisfy the filter, the function returns early — keeping the
+    /// excluded file out of the tree even after a `notify` event fires on it.
     pub fn handle_file_changed(
         path: PathBuf,
         project_path: &Path,
@@ -218,6 +223,11 @@ impl TuiSession {
         app: &mut App,
     ) {
         if let Ok(rel) = path.strip_prefix(project_path) {
+            if let Some(filter) = app.filter.as_deref() {
+                if !filter.matches(rel) {
+                    return;
+                }
+            }
             if let Some(parser) = registry.parser_for(&path) {
                 if let Ok(source) = fs::read_to_string(&path) {
                     if let Ok(new_file) = parser.parse_file(rel, &source) {

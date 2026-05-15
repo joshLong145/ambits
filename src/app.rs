@@ -1,10 +1,12 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 use crate::coverage::count_symbols;
+use crate::filter::PathFilter;
 use crate::symbols::{ProjectTree, SymbolNode};
 use crate::tracking::ReadDepth;
 use crate::tracking::ContextLedger;
@@ -103,6 +105,13 @@ pub struct App {
 
     // Optional event log writer.
     pub event_log: Option<BufWriter<File>>,
+
+    /// Path filter restricting which files are tracked, if any. Shared with
+    /// the TUI re-parse paths (file watcher, Serena cache rescan) so that
+    /// changes to excluded files don't inject symbols back into the tree
+    /// after the initial filtered scan. `None` means no filter — track
+    /// everything.
+    pub filter: Option<Arc<PathFilter>>,
 }
 
 impl App {
@@ -139,6 +148,7 @@ impl App {
             show_compaction_overlay: false,
             compaction_overlay_index: 0,
             event_log,
+            filter: None,
         };
         app.rebuild_tree_rows();
         app
