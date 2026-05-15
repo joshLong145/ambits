@@ -7,6 +7,7 @@ use std::path::Path;
 
 use color_eyre::eyre::Result;
 
+use crate::filter::PathFilter;
 use crate::symbols::{FileSymbols, ProjectTree};
 
 /// Trait for language-specific parsers.
@@ -58,7 +59,15 @@ impl ParserRegistry {
 
     /// Walk `root` (respecting .gitignore and hidden files) and parse all
     /// recognized source files into a `ProjectTree`.
-    pub fn scan_project(&self, root: &Path) -> Result<ProjectTree> {
+    ///
+    /// If `filter` is `Some`, files whose project-relative path does not
+    /// satisfy the filter are skipped *before* I/O — excluded files are not
+    /// read from disk or parsed.
+    pub fn scan_project(
+        &self,
+        root: &Path,
+        filter: Option<&PathFilter>,
+    ) -> Result<ProjectTree> {
         use ignore::WalkBuilder;
 
         let mut files = Vec::new();
@@ -74,9 +83,15 @@ impl ParserRegistry {
                 continue;
             }
 
+            let rel_path = path.strip_prefix(root).unwrap_or(path);
+            if let Some(f) = filter {
+                if !f.matches(rel_path) {
+                    continue;
+                }
+            }
+
             if let Some(parser) = self.parser_for(path) {
                 let source = fs::read_to_string(path)?;
-                let rel_path = path.strip_prefix(root).unwrap_or(path);
                 match parser.parse_file(rel_path, &source) {
                     Ok(file_symbols) => files.push(file_symbols),
                     Err(e) => {

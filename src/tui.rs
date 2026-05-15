@@ -195,7 +195,7 @@ impl TuiSession {
                 }
             }
             if changed {
-                if let Ok(new_tree) = crate::serena::scan_project_serena(project_path) {
+                if let Ok(new_tree) = crate::serena::scan_project_serena(project_path, None) {
                     let mut old_map = std::collections::HashMap::new();
                     for file in &app.project_tree.files {
                         ambits::tracking::collect_symbol_hashes(&file.symbols, &mut old_map);

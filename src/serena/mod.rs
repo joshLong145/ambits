@@ -5,11 +5,20 @@ use std::path::{Path, PathBuf};
 use color_eyre::eyre::{bail, eyre, Result};
 use serde_pickle::value::{HashableValue, Value};
 
+use ambits::filter::PathFilter;
 use ambits::symbols::merkle::compute_merkle_hash;
 use ambits::symbols::{FileSymbols, ProjectTree, SymbolCategory, SymbolNode};
 
 /// Scan a project using Serena's cached symbol data (.pkl files).
-pub fn scan_project_serena(project_root: &Path) -> Result<ProjectTree> {
+///
+/// If `filter` is `Some`, files whose project-relative path does not satisfy
+/// the filter are dropped before the final tree is assembled. Filtering happens
+/// after pickle parse (we don't control the cache layout), but before any
+/// downstream consumer sees the file list.
+pub fn scan_project_serena(
+    project_root: &Path,
+    filter: Option<&PathFilter>,
+) -> Result<ProjectTree> {
     let pkl_files = find_serena_caches(project_root);
     if pkl_files.is_empty() {
         bail!(
@@ -35,6 +44,10 @@ pub fn scan_project_serena(project_root: &Path) -> Result<ProjectTree> {
             parse_document_pickle(&value)?
         };
         all_files.extend(files);
+    }
+
+    if let Some(f) = filter {
+        all_files.retain(|file| f.matches(&file.file_path));
     }
 
     all_files.sort_by(|a, b| a.file_path.cmp(&b.file_path));

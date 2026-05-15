@@ -141,9 +141,9 @@ fn main() -> Result<()> {
     let project_path = project.canonicalize().unwrap_or(project);
     let registry = ParserRegistry::new();
     let project_tree = if cli.serena {
-        serena::scan_project_serena(&project_path)?
+        serena::scan_project_serena(&project_path, None)?
     } else {
-        registry.scan_project(&project_path)?
+        registry.scan_project(&project_path, None)?
     };
 
     if cli.dump {
