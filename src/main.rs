@@ -176,7 +176,7 @@ fn main() -> Result<()> {
         for w in &config_warnings {
             println!("[ambit warning] {w}");
         }
-        coverage::dump_tree(&project_path, &project_tree);
+        coverage::dump_tree(&project_path, &project_tree, filter.as_ref());
         return Ok(());
     }
 
@@ -194,6 +194,7 @@ fn main() -> Result<()> {
             &cli.log_dir,
             &cli.session,
             &cli.agent,
+            filter.as_ref(),
             &*ingester,
             &*formatter,
         );
@@ -231,6 +232,7 @@ fn main() -> Result<()> {
     };
 
     let mut app = App::new(project_tree, project_path.clone(), event_log);
+    app.filter = filter.map(Arc::new);
     app.session_id = session_id.clone();
     app.session_slug = log_dir.as_ref()
         .zip(session_id.as_ref())
