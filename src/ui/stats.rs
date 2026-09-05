@@ -262,9 +262,14 @@ fn stat_line(label: &str, count: usize, color: Color) -> Line<'static> {
     ])
 }
 
+/// Max chars of an agent/session id to display. Long enough to show the
+/// full id for the common ~17-char agent id format, while still bounding
+/// the 36-char UUID session ids seen for the root/main session.
+const SHORT_ID_LEN: usize = 20;
+
 pub(crate) fn short_id(id: &str) -> String {
-    if id.len() > 12 {
-        id[..12].to_string()
+    if id.len() > SHORT_ID_LEN {
+        id[..SHORT_ID_LEN].to_string()
     } else {
         id.to_string()
     }
@@ -346,9 +351,16 @@ mod tests {
 
     #[test]
     fn short_id_truncates() {
-        assert_eq!(short_id("abcdefghijklmnop"), "abcdefghijkl");
+        assert_eq!(
+            short_id("0eb2bbd0-fcd7-46a1-84e7-990a6f4734b4"),
+            "0eb2bbd0-fcd7-46a1-8"
+        );
         assert_eq!(short_id("short"), "short");
-        assert_eq!(short_id("exactly12chr"), "exactly12chr");
+        assert_eq!(short_id("a63c858997b4e6124"), "a63c858997b4e6124");
+        assert_eq!(
+            short_id("exactly20characters0"),
+            "exactly20characters0"
+        );
     }
 
     #[test]
