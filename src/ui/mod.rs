@@ -3,6 +3,7 @@ pub mod tree_view;
 pub mod stats;
 pub mod activity;
 pub mod compaction;
+pub mod alignment;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -34,6 +35,10 @@ pub fn render(f: &mut Frame, app: &App) {
 
     if app.show_compaction_overlay && !app.compaction_history.is_empty() {
         compaction::render(f, app, f.area());
+    }
+
+    if app.show_alignment_overlay {
+        alignment::render(f, app, f.area());
     }
 }
 
@@ -78,15 +83,15 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             }));
         }
 
+        if app.agent_filter.is_some() {
+            spans.push(Span::styled("[d]", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::raw("iff-align "));
+        }
+
         // Show current agent filter
         if let Some(ref agent_id) = app.agent_filter {
-            let display = if agent_id.len() > 12 {
-                &agent_id[..12]
-            } else {
-                agent_id
-            };
             spans.push(Span::styled(
-                format!(" Agent: {}", display),
+                format!(" Agent: {}", stats::short_id(agent_id)),
                 Style::default().fg(Color::Yellow),
             ));
         }

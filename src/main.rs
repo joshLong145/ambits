@@ -233,7 +233,7 @@ fn main() -> Result<()> {
 
     let mut app = App::new(project_tree, project_path.clone(), event_log);
     app.filter = filter.map(Arc::new);
-    app.session_id = session_id.clone();
+    app.set_session_id(session_id.clone());
     app.session_slug = log_dir.as_ref()
         .zip(session_id.as_ref())
         .and_then(|(ld, sid)| ingester.session_slug(ld, sid));

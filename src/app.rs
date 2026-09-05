@@ -103,6 +103,19 @@ pub struct App {
     pub show_compaction_overlay: bool,
     pub compaction_overlay_index: usize,
 
+    // Sub-agent alignment popup (see `tracking::alignment`).
+    /// Whether the alignment popup is currently shown.
+    pub show_alignment_overlay: bool,
+    /// Pairwise alignment scores for the selected agent's sibling group,
+    /// computed once when the popup is opened (not recomputed per frame).
+    pub agent_alignment: Vec<crate::tracking::alignment::PairAlignment>,
+    /// Standalone precomputed `(symbol, agent) -> depth ordinal` cache, kept
+    /// in lockstep with `ledger` at the same `mark_file_symbols` /
+    /// `mark_targeted_symbols` call sites. See `tracking::alignment` module
+    /// docs for why this is a separate structure rather than reading depths
+    /// back out of `ledger`.
+    pub depth_cache: crate::tracking::alignment::DepthOrdinalCache,
+
     // Optional event log writer.
     pub event_log: Option<BufWriter<File>>,
 
@@ -147,11 +160,48 @@ impl App {
             compaction_call_count: 0,
             show_compaction_overlay: false,
             compaction_overlay_index: 0,
+            show_alignment_overlay: false,
+            agent_alignment: Vec::new(),
+            depth_cache: crate::tracking::alignment::DepthOrdinalCache::new(),
             event_log,
             filter: None,
         };
         app.rebuild_tree_rows();
         app
+    }
+
+    /// Set the resolved session ID and deterministically seed the agent
+    /// hierarchy's root node from it, *before* any tool-call events are
+    /// processed.
+    ///
+    /// Without this, `agent_tree.root_id` is only discovered lazily as
+    /// events stream in (see `process_agent_event`), which is order-
+    /// dependent: if the orchestrator/root session never emits a file-tool
+    /// event of its own — common for orchestrator-only sessions that only
+    /// dispatch `Task` calls — the first sub-agent event processed would be
+    /// mistaken for the root, corrupting every subsequent sibling
+    /// relationship (and silently breaking the sub-agent alignment popup,
+    /// whose sibling lookup walks `parent_id`). Seeding here guarantees the
+    /// *true* root is always known first, regardless of event arrival order.
+    pub fn set_session_id(&mut self, session_id: Option<String>) {
+        self.session_id = session_id;
+        self.seed_agent_tree_root();
+    }
+
+    /// Register `self.session_id` as the agent hierarchy's root node, if not
+    /// already present. No-op when `session_id` is `None` (falls back to the
+    /// existing lazy root-inference in `process_agent_event`).
+    fn seed_agent_tree_root(&mut self) {
+        if let Some(sid) = self.session_id.clone() {
+            if !self.agent_tree.agents.contains_key(&sid) {
+                self.agent_tree.add_agent(AgentNode {
+                    id: sid,
+                    parent_id: None,
+                    session_file: PathBuf::new(),
+                    label: "main".to_string(),
+                });
+            }
+        }
     }
 
     /// Reset all live session state (ledger, agents, activity) while preserving
@@ -162,11 +212,15 @@ impl App {
         self.activity.clear();
         self.agents_seen.clear();
         self.agent_tree = AgentTree::new();
+        self.seed_agent_tree_root();
         self.agent_filter = None;
         self.agent_selection_index = 0;
         self.session_slug = None;
         self.compaction_history.clear();
         self.compaction_call_count = 0;
+        self.show_alignment_overlay = false;
+        self.agent_alignment.clear();
+        self.depth_cache = crate::tracking::alignment::DepthOrdinalCache::new();
         self.rebuild_tree_rows();
     }
 
@@ -220,6 +274,7 @@ impl App {
 
         // Wipe the live ledger: post-compaction depth tracking starts fresh.
         self.ledger = ContextLedger::new();
+        self.depth_cache = crate::tracking::alignment::DepthOrdinalCache::new();
         self.compaction_call_count = 0;
         self.rebuild_tree_rows();
     }
@@ -353,6 +408,10 @@ impl App {
                 if self.compaction_overlay_index + 1 < self.compaction_history.len() {
                     self.compaction_overlay_index += 1;
                 }
+            }
+            KeyCode::Char('d') => self.open_alignment_overlay(),
+            KeyCode::Esc if self.show_alignment_overlay => {
+                self.show_alignment_overlay = false;
             }
             KeyCode::Tab => self.cycle_focus(),
             KeyCode::BackTab => self.cycle_agent_filter_backward(),
@@ -505,6 +564,55 @@ impl App {
         self.rebuild_tree_rows();
     }
 
+    /// Open the sub-agent alignment popup for the currently selected agent's
+    /// comparison group: its parent plus all of that parent's children (or,
+    /// when the selected agent is itself the root/orchestrator, the root
+    /// plus all of its direct children).
+    ///
+    /// The parent is included deliberately — an orchestrator that spawned a
+    /// single sub-agent still has something to compare (root vs. that one
+    /// child), and an orchestrator with several sub-agents is itself a
+    /// meaningful comparison point against each of them, not just an
+    /// excluded coordinator.
+    ///
+    /// No-op when no agent is selected (`agent_filter` is `None`, meaning
+    /// "All"), or when the resulting group has fewer than 2 members —
+    /// there is nothing to compare.
+    fn open_alignment_overlay(&mut self) {
+        let Some(agent_id) = self.agent_filter.clone() else {
+            return;
+        };
+        let Some(node) = self.agent_tree.agents.get(&agent_id) else {
+            return;
+        };
+
+        // The parent whose children form the sibling half of the group:
+        // the selected agent's own parent, or (when the selected agent has
+        // no parent, i.e. it *is* the root) the selected agent itself.
+        let parent_id = node.parent_id.clone().unwrap_or_else(|| agent_id.clone());
+
+        let mut group_ids: Vec<String> = self
+            .agent_tree
+            .children_of(&parent_id)
+            .into_iter()
+            .map(|a| a.id.clone())
+            .collect();
+        group_ids.push(parent_id);
+        group_ids.sort();
+        group_ids.dedup();
+
+        if group_ids.len() < 2 {
+            return;
+        }
+
+        self.agent_alignment = crate::tracking::alignment::compute_group_alignment(
+            &self.project_tree,
+            &self.depth_cache,
+            &group_ids,
+        );
+        self.show_alignment_overlay = true;
+    }
+
     fn move_agent_selection(&mut self, delta: i32) {
         let total = self.agents_seen.len() + 1; // +1 for "All"
         if total == 0 {
@@ -594,11 +702,31 @@ impl App {
             self.agents_seen.push(event.agent_id.to_string());
 
             // Register in the agent hierarchy tree.
-            // Subagent filenames start with "agent-"; their parent is the root session.
-            let parent_id = if event.agent_id.starts_with("agent-") {
-                self.agent_tree.root_id.clone()
-            } else {
-                None
+            //
+            // NOTE: sub-agent JSONL *filenames* are prefixed `agent-<hash>`,
+            // but the `agentId` field *inside* each line — which
+            // `parse_jsonl_line` (src/ingest/claude.rs) prefers over the
+            // filename/session-derived fallback — carries no such prefix
+            // (e.g. `"a63c858997b4e6124"`, not `"agent-a63c858997b4e6124"`).
+            // A `starts_with("agent-")` check therefore never matches real
+            // sub-agent events; only hand-constructed test fixtures that
+            // bake the prefix into `agent_id` happened to pass. Don't repeat
+            // that mistake in future tests — use realistic unprefixed ids.
+            //
+            // Now that `self.session_id` is deterministically known before
+            // any events are processed (see `set_session_id` /
+            // `seed_agent_tree_root`), identity is the correct and only
+            // check we need: the root's own events carry `agent_id ==
+            // session_id` (and must NOT be re-parented to themselves);
+            // every other `agent_id` is a child of the root. Fall back to
+            // the old prefix heuristic only when no session_id is known
+            // (e.g. test paths that skip `set_session_id`), preserving
+            // prior behavior there.
+            let parent_id = match self.session_id.as_deref() {
+                Some(root) if event.agent_id.as_ref() == root => None,
+                Some(root) => Some(root.to_string()),
+                None if event.agent_id.starts_with("agent-") => self.agent_tree.root_id.clone(),
+                None => None,
             };
             self.agent_tree.add_agent(AgentNode {
                 id: event.agent_id.to_string(),
@@ -615,9 +743,9 @@ impl App {
             for file in &self.project_tree.files {
                 if file.file_path == tool_rel {
                     if event.target_symbol.is_some() || event.target_lines.is_some() {
-                        mark_targeted_symbols(&file.symbols, &event, &mut self.ledger);
+                        mark_targeted_symbols(&file.symbols, &event, &mut self.ledger, &mut self.depth_cache);
                     } else {
-                        mark_file_symbols(&file.symbols, &event, &mut self.ledger);
+                        mark_file_symbols(&file.symbols, &event, &mut self.ledger, &mut self.depth_cache);
                     }
                 }
             }
@@ -722,6 +850,7 @@ pub fn mark_file_symbols(
     symbols: &[SymbolNode],
     event: &AgentToolCall,
     ledger: &mut ContextLedger,
+    depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
 ) {
     for sym in symbols {
         ledger.record(
@@ -731,7 +860,8 @@ pub fn mark_file_symbols(
             event.agent_id.to_string(),
             sym.estimated_tokens as usize,
         );
-        mark_file_symbols(&sym.children, event, ledger);
+        depth_cache.record(&sym.id, &event.agent_id, event.read_depth);
+        mark_file_symbols(&sym.children, event, ledger, depth_cache);
     }
 }
 
@@ -745,6 +875,7 @@ pub fn mark_targeted_symbols(
     symbols: &[SymbolNode],
     event: &AgentToolCall,
     ledger: &mut ContextLedger,
+    depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
 ) {
     for sym in symbols {
         match classify_symbol_match(sym, event) {
@@ -756,8 +887,9 @@ pub fn mark_targeted_symbols(
                     event.agent_id.to_string(),
                     sym.estimated_tokens as usize,
                 );
+                depth_cache.record(&sym.id, &event.agent_id, event.read_depth);
                 // Full body was in the response — bulk-mark all descendants.
-                mark_file_symbols(&sym.children, event, ledger);
+                mark_file_symbols(&sym.children, event, ledger, depth_cache);
             }
             MatchKind::ByLineOverlap => {
                 ledger.record(
@@ -767,13 +899,14 @@ pub fn mark_targeted_symbols(
                     event.agent_id.to_string(),
                     sym.estimated_tokens as usize,
                 );
+                depth_cache.record(&sym.id, &event.agent_id, event.read_depth);
                 // Parent container overlaps the read range — recurse precisely so
                 // only children whose ranges also overlap get promoted.
-                mark_targeted_symbols(&sym.children, event, ledger);
+                mark_targeted_symbols(&sym.children, event, ledger, depth_cache);
             }
             MatchKind::None => {
                 // No match at this level — keep searching in children.
-                mark_targeted_symbols(&sym.children, event, ledger);
+                mark_targeted_symbols(&sym.children, event, ledger, depth_cache);
             }
         }
     }
@@ -933,8 +1066,9 @@ mod tests {
         let parent = sym_with_children("mock/f.rs::parent", "parent", vec![child]);
         let event = tool_call("Read", "mock/f.rs", ReadDepth::FullBody);
         let mut ledger = ContextLedger::new();
+        let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
 
-        mark_file_symbols(&[parent], &event, &mut ledger);
+        mark_file_symbols(&[parent], &event, &mut ledger, &mut cache);
 
         assert_eq!(ledger.depth_of("mock/f.rs::parent"), ReadDepth::FullBody);
         assert_eq!(ledger.depth_of("mock/f.rs::child"), ReadDepth::FullBody);
@@ -946,8 +1080,9 @@ mod tests {
         let s2 = sym("mock/f.rs::beta", "beta");
         let event = tool_call_targeted("find_symbol", "mock/f.rs", ReadDepth::FullBody, "beta");
         let mut ledger = ContextLedger::new();
+        let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
 
-        mark_targeted_symbols(&[s1, s2], &event, &mut ledger);
+        mark_targeted_symbols(&[s1, s2], &event, &mut ledger, &mut cache);
 
         assert_eq!(ledger.depth_of("mock/f.rs::alpha"), ReadDepth::Unseen);
         assert_eq!(ledger.depth_of("mock/f.rs::beta"), ReadDepth::FullBody);
@@ -959,8 +1094,9 @@ mod tests {
         let s2 = sym_with_lines("mock/f.rs::b", "b", 10, 20);
         let event = tool_call_lines("Read", "mock/f.rs", ReadDepth::FullBody, 12, 18);
         let mut ledger = ContextLedger::new();
+        let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
 
-        mark_targeted_symbols(&[s1, s2], &event, &mut ledger);
+        mark_targeted_symbols(&[s1, s2], &event, &mut ledger, &mut cache);
 
         assert_eq!(ledger.depth_of("mock/f.rs::a"), ReadDepth::Unseen);
         assert_eq!(ledger.depth_of("mock/f.rs::b"), ReadDepth::FullBody);
@@ -1088,8 +1224,9 @@ mod tests {
         // Read only covers method_b's range.
         let event = tool_call_lines("Read", "f.rs", ReadDepth::FullBody, 50, 70);
         let mut ledger = ContextLedger::new();
+        let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
 
-        mark_targeted_symbols(&[impl_block], &event, &mut ledger);
+        mark_targeted_symbols(&[impl_block], &event, &mut ledger, &mut cache);
 
         // The parent is marked (it overlaps), but method_a is NOT.
         assert_eq!(ledger.depth_of("f.rs::Foo"), ReadDepth::FullBody);
@@ -1109,8 +1246,9 @@ mod tests {
         // find_symbol("impl Foo", include_body=true) — all children embedded in response.
         let event = tool_call_targeted("find_symbol", "f.rs", ReadDepth::FullBody, "impl Foo");
         let mut ledger = ContextLedger::new();
+        let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
 
-        mark_targeted_symbols(&[impl_block], &event, &mut ledger);
+        mark_targeted_symbols(&[impl_block], &event, &mut ledger, &mut cache);
 
         assert_eq!(ledger.depth_of("f.rs::Foo"), ReadDepth::FullBody);
         assert_eq!(ledger.depth_of("f.rs::Foo/method_a"), ReadDepth::FullBody);
@@ -1339,6 +1477,181 @@ mod tests {
         let sub = &app.agent_tree.agents["agent-abc123"];
         assert_eq!(sub.parent_id, Some("session-main".to_string()));
         assert_eq!(sub.label, "Explore parser module");
+    }
+
+    /// Regression test for the accidental-root bug: an orchestrator-only
+    /// session where the root/main session never emits a file-tool event
+    /// itself — every event's `agent_id` is "agent-"-prefixed. Without
+    /// seeding the root from `session_id` up front, `AgentTree::add_agent`'s
+    /// "first parentless agent becomes root" rule would silently promote
+    /// whichever sub-agent event arrives first, corrupting every sibling
+    /// relationship and breaking the alignment popup's sibling lookup.
+    #[test]
+    fn orchestrator_only_stream_roots_correctly() {
+        let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::a", "a")])]);
+        app.set_session_id(Some("session-main".to_string()));
+
+        // Every event is a sub-agent — the root never appears as an
+        // event's agent_id at all.
+        for (agent_id, label) in [
+            ("agent-1", "Explore parser"),
+            ("agent-2", "Explore symbols"),
+            ("agent-3", "Explore tracking"),
+        ] {
+            let mut e = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::FullBody);
+            e.agent_id = agent_id.into();
+            e.label = label.into();
+            app.process_agent_event(e);
+        }
+
+        // The root is the seeded session id, never a sub-agent.
+        assert_eq!(app.agent_tree.root_id, Some("session-main".to_string()));
+        assert_ne!(app.agent_tree.root_id, Some("agent-1".to_string()));
+        assert_ne!(app.agent_tree.root_id, Some("agent-2".to_string()));
+        assert_ne!(app.agent_tree.root_id, Some("agent-3".to_string()));
+
+        // Every sub-agent parents directly to the true root — none rootless,
+        // none parented to another sub-agent.
+        for agent_id in ["agent-1", "agent-2", "agent-3"] {
+            let node = &app.agent_tree.agents[agent_id];
+            assert_eq!(node.parent_id, Some("session-main".to_string()));
+        }
+
+        // The sibling lookup `open_alignment_overlay` depends on resolves
+        // all three as children of the root.
+        let root_id = app.agent_tree.root_id.clone().unwrap();
+        let mut children: Vec<String> = app
+            .agent_tree
+            .children_of(&root_id)
+            .into_iter()
+            .map(|a| a.id.clone())
+            .collect();
+        children.sort();
+        assert_eq!(children, vec!["agent-1", "agent-2", "agent-3"]);
+    }
+
+    /// End-to-end regression test for the alignment popup path itself: given
+    /// a correctly-rooted orchestrator-only tree, filtering to any one
+    /// sub-agent and opening the alignment overlay must populate
+    /// `agent_alignment` with the other siblings *and* the orchestrator
+    /// itself — not silently no-op the way it did when the first sub-agent
+    /// was mistaken for the root, and not exclude the orchestrator from the
+    /// comparison group either.
+    #[test]
+    fn open_alignment_overlay_resolves_siblings_in_orchestrator_only_session() {
+        let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::a", "a")])]);
+        app.set_session_id(Some("session-main".to_string()));
+
+        for agent_id in ["agent-1", "agent-2", "agent-3"] {
+            let mut e = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::FullBody);
+            e.agent_id = agent_id.into();
+            app.process_agent_event(e);
+        }
+
+        // Filter to the *first* agent seen — exactly what `a` (cycle_agent_filter)
+        // does on first press, and exactly the agent that used to be
+        // mistaken for the root.
+        app.agent_filter = Some("agent-1".to_string());
+        app.open_alignment_overlay();
+
+        assert!(app.show_alignment_overlay);
+        // Group = {session-main, agent-1, agent-2, agent-3} -> 4 choose 2 = 6
+        // pairs, agent-1 involved in 3 of them (one per other group member).
+        assert_eq!(app.agent_alignment.len(), 6);
+        let involves_agent_1 = app
+            .agent_alignment
+            .iter()
+            .filter(|p| p.agent_a == "agent-1" || p.agent_b == "agent-1")
+            .count();
+        assert_eq!(involves_agent_1, 3);
+        let involves_root = app
+            .agent_alignment
+            .iter()
+            .filter(|p| p.agent_a == "session-main" || p.agent_b == "session-main")
+            .count();
+        assert_eq!(involves_root, 3);
+    }
+
+    /// Regression test for a lone sub-agent: an orchestrator that spawned
+    /// exactly one sub-agent has no *siblings* to compare (the sub-agent's
+    /// sibling group is itself alone), but there is still a meaningful
+    /// comparison to make — the orchestrator against its one child. Before
+    /// the parent was folded into the comparison group, this silently
+    /// no-op'd because `sibling_ids.len() < 2`.
+    #[test]
+    fn open_alignment_overlay_compares_root_against_lone_sub_agent() {
+        let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::a", "a")])]);
+        app.set_session_id(Some("session-main".to_string()));
+
+        let mut e = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::FullBody);
+        e.agent_id = "agent-1".into();
+        app.process_agent_event(e);
+
+        // Selecting the lone sub-agent must compare it against its parent.
+        app.agent_filter = Some("agent-1".to_string());
+        app.open_alignment_overlay();
+        assert!(app.show_alignment_overlay);
+        assert_eq!(app.agent_alignment.len(), 1);
+        let pair = &app.agent_alignment[0];
+        assert!(
+            (pair.agent_a == "session-main" && pair.agent_b == "agent-1")
+                || (pair.agent_a == "agent-1" && pair.agent_b == "session-main")
+        );
+
+        // Selecting the root/orchestrator itself must produce the same
+        // comparison against its one child.
+        app.show_alignment_overlay = false;
+        app.agent_alignment.clear();
+        app.agent_filter = Some("session-main".to_string());
+        app.open_alignment_overlay();
+        assert!(app.show_alignment_overlay);
+        assert_eq!(app.agent_alignment.len(), 1);
+    }
+
+    /// Regression test for the identity-vs-prefix bug: real ingestion never
+    /// produces `agent_id`s prefixed `"agent-"` — that prefix only exists in
+    /// sub-agent JSONL *filenames* (`agent-<hash>.jsonl`); the `agentId`
+    /// field `parse_jsonl_line` actually reads (and prefers over the
+    /// filename/session fallback) has no prefix at all, e.g.
+    /// `"a63c858997b4e6124"`. A `starts_with("agent-")` check silently never
+    /// matches real events, so this uses realistic unprefixed ids rather
+    /// than the prefixed synthetic ids other tests use — repeating that
+    /// mistake is exactly how the bug shipped undetected.
+    #[test]
+    fn unprefixed_real_world_agent_ids_parent_to_root_by_identity() {
+        let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::a", "a")])]);
+        let root_id = "0eb2bbd0-fcd7-46a1-84e7-990a6f4734b4".to_string();
+        app.set_session_id(Some(root_id.clone()));
+
+        for agent_id in ["a63c858997b4e6124", "b71fa9231c8de55a0"] {
+            let mut e = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::FullBody);
+            e.agent_id = agent_id.into();
+            app.process_agent_event(e);
+        }
+
+        for agent_id in ["a63c858997b4e6124", "b71fa9231c8de55a0"] {
+            let node = &app.agent_tree.agents[agent_id];
+            assert_eq!(node.parent_id, Some(root_id.clone()));
+        }
+        assert_eq!(app.agent_tree.root_id, Some(root_id.clone()));
+
+        // Sibling lookup resolves correctly for the alignment popup, and the
+        // root/orchestrator is included in the comparison group alongside
+        // the two sub-agents: group = {root, a63c..., b71fa...} -> 3 choose
+        // 2 = 3 pairs.
+        app.agent_filter = Some("a63c858997b4e6124".to_string());
+        app.open_alignment_overlay();
+
+        assert!(app.show_alignment_overlay);
+        assert_eq!(app.agent_alignment.len(), 3);
+        let has_pair = |a: &str, b: &str| {
+            app.agent_alignment
+                .iter()
+                .any(|p| (p.agent_a == a && p.agent_b == b) || (p.agent_a == b && p.agent_b == a))
+        };
+        assert!(has_pair("a63c858997b4e6124", "b71fa9231c8de55a0"));
+        assert!(has_pair(&root_id, "a63c858997b4e6124"));
+        assert!(has_pair(&root_id, "b71fa9231c8de55a0"));
     }
 
     #[test]

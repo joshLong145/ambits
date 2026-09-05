@@ -139,7 +139,7 @@ impl TuiSession {
                     // New session detected — reset app state and switch tailer.
                     app.reset_session();
                     self.current_session_id = Some(latest.clone());
-                    app.session_id = self.current_session_id.clone();
+                    app.set_session_id(self.current_session_id.clone());
                     app.session_slug = log_dir.as_ref()
                         .zip(self.current_session_id.as_ref())
                         .and_then(|(ld2, sid)| self.ingester.session_slug(ld2, sid));

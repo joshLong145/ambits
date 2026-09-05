@@ -545,6 +545,10 @@ pub fn run_report(
 
     // 3. Build ledger from session logs.
     let mut ledger = ContextLedger::new();
+    // `run_report` is the CLI (non-TUI) report path; it has no alignment
+    // popup to serve, so this cache is populated (to satisfy the shared
+    // `mark_*_symbols` signature) but never read.
+    let mut depth_cache = crate::tracking::alignment::DepthOrdinalCache::new();
     let mut known_agents: Vec<String> = Vec::new();
     let mut files_accessed: BTreeSet<PathBuf> = BTreeSet::new();
     let mut tool_call_count: usize = 0;
@@ -566,9 +570,9 @@ pub fn run_report(
                             for file in &project_tree.files {
                                 if file.file_path == tool_rel {
                                     if tc.target_symbol.is_some() || tc.target_lines.is_some() {
-                                        crate::app::mark_targeted_symbols(&file.symbols, &tc, &mut ledger);
+                                        crate::app::mark_targeted_symbols(&file.symbols, &tc, &mut ledger, &mut depth_cache);
                                     } else {
-                                        crate::app::mark_file_symbols(&file.symbols, &tc, &mut ledger);
+                                        crate::app::mark_file_symbols(&file.symbols, &tc, &mut ledger, &mut depth_cache);
                                     }
                                 }
                             }

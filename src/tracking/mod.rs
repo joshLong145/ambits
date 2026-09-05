@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod alignment;
 
 use std::collections::HashMap;
 use std::time::Instant;

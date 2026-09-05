@@ -262,7 +262,7 @@ fn stat_line(label: &str, count: usize, color: Color) -> Line<'static> {
     ])
 }
 
-fn short_id(id: &str) -> String {
+pub(crate) fn short_id(id: &str) -> String {
     if id.len() > 12 {
         id[..12].to_string()
     } else {
