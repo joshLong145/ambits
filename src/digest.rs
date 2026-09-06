@@ -39,7 +39,12 @@ const CHARS_PER_TOKEN: usize = 4;
 
 /// Default budget for injected context. Large enough to be useful, small
 /// enough that it never competes with the context it is trying to restore.
-pub const DEFAULT_MAX_TOKENS: usize = 2_000;
+///
+/// Raised from 2,000 when line ranges were added. Ranges cost roughly 16% more
+/// per symbol, which at the old budget would have bought precision by dropping
+/// symbols — the wrong trade, since a symbol that goes unnamed is one the agent
+/// does not know it has. The extra 1,000 tokens buys both.
+pub const DEFAULT_MAX_TOKENS: usize = 3_000;
 
 /// How to render a digest. Mirrors [`crate::coverage::CoverageFormatter`].
 pub trait DigestFormatter {
@@ -77,12 +82,31 @@ fn grouped(report: &RestoreReport) -> Vec<FileGroup<'_>> {
     groups
 }
 
+/// Render one symbol as `name:start-end`.
+///
+/// The line range comes from the tree node whose hash matched, so it describes
+/// the code as it is *now*, not as it was when read. That distinction is what
+/// makes it safe to print: the journal deliberately stores no coordinates,
+/// because a symbol keeps its content hash when code above it shifts, and any
+/// stored line number would silently rot in exactly the files being edited
+/// most.
+///
+/// It earns its ~16% size cost downstream: an agent that knows a symbol sits
+/// at `src/app.rs:227-280` can read 53 lines instead of pulling a 40k-token
+/// file or spending a `find_symbol` round-trip to locate it.
+fn symbol_label(sym: &RestoredSymbol) -> String {
+    format!(
+        "{}:{}-{}",
+        sym.name_path, sym.line_range.start, sym.line_range.end
+    )
+}
+
 /// Fit as many comma-separated names as `budget` chars allow, returning the
 /// rendered list and how many were left out.
 ///
 /// Always emits at least one name — a file heading with no symbols under it
 /// tells the reader nothing they can act on.
-fn fit_names(names: &[&str], budget: usize) -> (String, usize) {
+fn fit_names(names: &[String], budget: usize) -> (String, usize) {
     let mut out = String::new();
     let mut used = 0usize;
     for (i, name) in names.iter().enumerate() {
@@ -132,13 +156,16 @@ impl DigestFormatter for MarkdownFormatter {
         if report.source.verifies_drift() {
             out.push_str(
                 "These symbols were read earlier in this session and are unchanged since.\n\
-                 Treat them as known. Anything not listed here is not covered.\n\n",
+                 Treat them as known. Anything not listed here is not covered.\n\
+                 Each entry is `name:first-last`, current line numbers — read that range\n\
+                 directly rather than re-reading the whole file.\n\n",
             );
         } else {
             out.push_str(
                 "Recovered from session logs, which do not record what a file looked like\n\
                  when it was read. These symbols were read at some point, but whether they\n\
-                 have changed since is unknown. Re-read before relying on them.\n\n",
+                 have changed since is unknown. Re-read before relying on them.\n\
+                 Each entry is `name:first-last`, current line numbers.\n\n",
             );
         }
 
@@ -165,7 +192,7 @@ impl DigestFormatter for MarkdownFormatter {
                 break;
             }
 
-            let names: Vec<&str> = group.symbols.iter().map(|s| s.name_path.as_str()).collect();
+            let names: Vec<String> = group.symbols.iter().map(|s| symbol_label(s)).collect();
             let room = budget_chars.saturating_sub(out.len() + header.len());
             let (listed, hidden) = fit_names(&names, room);
 
@@ -395,6 +422,10 @@ mod tests {
     use crate::tracking::ReadDepth;
     use std::path::PathBuf;
 
+    fn names_of<const N: usize>(names: [&str; N]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
     fn restored(file: &str, name: &str, tokens: u32) -> RestoredSymbol {
         RestoredSymbol {
             symbol_id: format!("{file}::{name}"),
@@ -431,9 +462,25 @@ mod tests {
         );
         let out = MarkdownFormatter.format(&r, DEFAULT_MAX_TOKENS);
         assert!(out.contains("### a.rs — 2 symbols"));
-        assert!(out.contains("one, two"));
+        assert!(out.contains("one:1-10, two:1-10"));
         assert!(out.contains("### b.rs — 1 symbol"));
         assert!(out.contains("unchanged since"));
+    }
+
+    /// Line ranges are what let an agent read a slice instead of a whole file,
+    /// so they have to survive into the rendered output and be explained.
+    #[test]
+    fn symbols_carry_their_current_line_range() {
+        let mut sym = restored("src/app.rs", "App/process_compaction", 400);
+        sym.line_range = 227..280;
+        let r = report(vec![sym], RestoreSource::Journal);
+
+        let out = MarkdownFormatter.format(&r, DEFAULT_MAX_TOKENS);
+        assert!(out.contains("App/process_compaction:227-280"));
+        assert!(
+            out.contains("name:first-last"),
+            "the notation is explained, or the numbers are ambiguous"
+        );
     }
 
     /// Heaviest files first, so a truncated digest keeps the most valuable
@@ -497,11 +544,11 @@ mod tests {
 
     #[test]
     fn fit_names_keeps_one_name_minimum_and_counts_the_rest() {
-        let (listed, hidden) = fit_names(&["alpha", "beta", "gamma"], 0);
+        let (listed, hidden) = fit_names(&names_of(["alpha", "beta", "gamma"]), 0);
         assert_eq!(listed, "alpha", "at least one name always survives");
         assert_eq!(hidden, 2);
 
-        let (listed, hidden) = fit_names(&["alpha", "beta", "gamma"], 1_000);
+        let (listed, hidden) = fit_names(&names_of(["alpha", "beta", "gamma"]), 1_000);
         assert_eq!(listed, "alpha, beta, gamma");
         assert_eq!(hidden, 0);
     }

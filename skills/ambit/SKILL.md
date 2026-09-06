@@ -98,7 +98,12 @@ rather than the coverage journal. Those logs do not record what a file looked
 like when it was read, so drift cannot be detected there — re-read before
 relying on it.
 
-Use `--max-tokens N` to fit a budget (default 2000), and `--format json` for
+Entries are listed as `name:first-last` — current line numbers, taken from a
+fresh scan rather than stored, so they are accurate even for files edited since
+the read. Use them: read that range directly instead of re-reading the file or
+spending a `find_symbol` call to locate the symbol.
+
+Use `--max-tokens N` to fit a budget (default 3000), and `--format json` for
 programmatic use.
 
 ### Automatic injection
