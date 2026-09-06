@@ -4,6 +4,7 @@ use ambits::ingest;
 
 // Binary-only modules.
 mod events;
+mod hook;
 mod serena;
 mod skill;
 mod tui;
@@ -122,6 +123,13 @@ enum Commands {
         command: SkillCommands,
     },
 
+    /// Manage the Claude Code SessionStart hook that injects restored context
+    /// automatically after a compaction
+    Hook {
+        #[command(subcommand)]
+        command: HookCommands,
+    },
+
     /// Print the symbols read earlier in this session that are still
     /// unchanged, for re-injection after a compaction.
     ///
@@ -145,6 +153,26 @@ enum DigestFormat {
     Markdown,
     /// Compact, schema-versioned JSON on a single line.
     Json,
+    /// Claude Code `SessionStart` hook envelope. Prints nothing when there is
+    /// nothing to restore. See `ambits hook install`.
+    Hook,
+}
+
+#[derive(Subcommand, Debug)]
+enum HookCommands {
+    /// Register the SessionStart hook in .claude/settings.json.
+    ///
+    /// Merges into any existing settings; a file that cannot be parsed is left
+    /// untouched and the snippet is printed instead.
+    Install {
+        /// Install to ~/.claude/settings.json (applies to all projects).
+        #[arg(long, short)]
+        global: bool,
+
+        /// Project directory to install for (defaults to the current directory).
+        #[arg(long, short)]
+        project: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -169,10 +197,22 @@ fn main() -> Result<()> {
     // handled here. `restore-context` needs a scanned tree to compare against,
     // so it falls through and is dispatched once the project is resolved.
     let command = cli.command.take();
-    if let Some(Commands::Skill { command }) = &command {
-        return match command {
-            SkillCommands::Install { global, project } => skill::install(*global, project.clone()),
-        };
+    match &command {
+        Some(Commands::Skill { command }) => {
+            return match command {
+                SkillCommands::Install { global, project } => {
+                    skill::install(*global, project.clone())
+                }
+            };
+        }
+        Some(Commands::Hook { command }) => {
+            return match command {
+                HookCommands::Install { global, project } => {
+                    hook::install(*global, project.clone())
+                }
+            };
+        }
+        _ => {}
     }
 
     // Resolve tool call mapping config. Warnings are displayed to stdout before TUI launch.
@@ -368,7 +408,7 @@ fn run_restore_context(
     max_tokens: usize,
     format: DigestFormat,
 ) -> Result<()> {
-    use ambits::digest::{DigestFormatter, JsonFormatter, MarkdownFormatter};
+    use ambits::digest::{DigestFormatter, HookFormatter, JsonFormatter, MarkdownFormatter};
     use ambits::restore::{self, RestoreReport, RestoreSource};
 
     let journaled = session_id
@@ -401,8 +441,15 @@ fn run_restore_context(
     let formatter: Box<dyn DigestFormatter> = match format {
         DigestFormat::Markdown => Box::new(MarkdownFormatter),
         DigestFormat::Json => Box::new(JsonFormatter),
+        DigestFormat::Hook => Box::new(HookFormatter),
     };
-    println!("{}", formatter.format(&report, max_tokens));
+    let rendered = formatter.format(&report, max_tokens);
+    // The hook format returns an empty string when there is nothing to
+    // restore; printing a bare newline there would be stdout Claude Code has
+    // to parse and reject.
+    if !rendered.is_empty() {
+        println!("{rendered}");
+    }
     Ok(())
 }
 

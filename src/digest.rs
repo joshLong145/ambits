@@ -236,6 +236,49 @@ fn append_omissions(out: &mut String, report: &RestoreReport) {
     }
 }
 
+/// Claude Code `SessionStart` hook envelope.
+///
+/// Wraps the markdown digest in the exact shape Claude Code parses from a
+/// hook's stdout, so `settings.json` can invoke `ambits` directly — no wrapper
+/// script and no `jq` dependency to escape the payload.
+///
+/// Emits **nothing** when there is nothing to restore. Empty stdout injects
+/// nothing, which makes the hook self-regulating: silent on a fresh session,
+/// useful after a compaction.
+#[derive(Debug, Clone, Default)]
+pub struct HookFormatter;
+
+#[derive(Serialize)]
+struct HookSpecificOutput<'a> {
+    #[serde(rename = "hookEventName")]
+    hook_event_name: &'static str,
+    #[serde(rename = "additionalContext")]
+    additional_context: &'a str,
+}
+
+#[derive(Serialize)]
+struct HookEnvelope<'a> {
+    #[serde(rename = "hookSpecificOutput")]
+    hook_specific_output: HookSpecificOutput<'a>,
+}
+
+impl DigestFormatter for HookFormatter {
+    fn format(&self, report: &RestoreReport, max_tokens: usize) -> String {
+        if report.outcome.restored.is_empty() {
+            return String::new();
+        }
+        let body = MarkdownFormatter.format(report, max_tokens);
+        let envelope = HookEnvelope {
+            hook_specific_output: HookSpecificOutput {
+                hook_event_name: "SessionStart",
+                additional_context: &body,
+            },
+        };
+        // serde handles the JSON string escaping the payload needs.
+        serde_json::to_string(&envelope).unwrap_or_default()
+    }
+}
+
 /// Machine-readable digest. Schema-versioned like the coverage report's JSON.
 #[derive(Debug, Clone, Default)]
 pub struct JsonFormatter;
@@ -515,6 +558,37 @@ mod tests {
         let r = report(vec![], RestoreSource::Journal);
         let out = MarkdownFormatter.format(&r, DEFAULT_MAX_TOKENS);
         assert!(out.contains("No prior reads recovered"));
+    }
+
+    #[test]
+    fn hook_envelope_matches_the_sessionstart_contract() {
+        let r = report(vec![restored("a.rs", "one", 10)], RestoreSource::Journal);
+        let out = HookFormatter.format(&r, DEFAULT_MAX_TOKENS);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        let ctx = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        assert!(ctx.contains("### a.rs"), "markdown body is carried through");
+        // Must be one line: Claude Code parses stdout as a single JSON value.
+        assert!(!out.contains('\n'));
+    }
+
+    /// Empty stdout injects nothing, so the hook stays quiet on a fresh
+    /// session instead of announcing that it has nothing to say.
+    #[test]
+    fn hook_emits_nothing_when_there_is_nothing_to_restore() {
+        let r = report(vec![], RestoreSource::Journal);
+        assert_eq!(HookFormatter.format(&r, DEFAULT_MAX_TOKENS), "");
+    }
+
+    #[test]
+    fn hook_respects_the_budget() {
+        let syms: Vec<RestoredSymbol> = (0..200)
+            .map(|i| restored(&format!("f{i}.rs"), &format!("symbol_number_{i}"), 100))
+            .collect();
+        let r = report(syms, RestoreSource::Journal);
+        let small = HookFormatter.format(&r, 50);
+        let big = HookFormatter.format(&r, 4_000);
+        assert!(small.len() < big.len());
     }
 
     #[test]

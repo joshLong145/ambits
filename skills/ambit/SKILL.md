@@ -101,6 +101,19 @@ relying on it.
 Use `--max-tokens N` to fit a budget (default 2000), and `--format json` for
 programmatic use.
 
+### Automatic injection
+
+To have this happen without being asked, register the hook once:
+
+```bash
+ambits hook install --project .
+```
+
+That adds a `SessionStart` hook with `matcher: "compact"` to
+`.claude/settings.json`, so Claude Code runs `restore-context` and injects the
+result the moment a compaction completes. It merges into existing settings and
+is safe to re-run. When there is nothing to restore it emits nothing.
+
 ## Bash Fallback
 
 If MCP tools are unavailable:
