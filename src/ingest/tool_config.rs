@@ -10,11 +10,27 @@ use crate::tracking::ReadDepth;
 // Top-level config
 // ---------------------------------------------------------------------------
 
+/// `[cache]` stanza: project-level defaults for coverage journaling.
+/// CLI flags override anything set here. Every field is optional so an absent
+/// stanza means "use the built-in defaults" rather than "disable".
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CacheConfig {
+    /// Set `false` to disable journaling for this project.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// How often to diff the ledger into the journal.
+    #[serde(default)]
+    pub flush_interval_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToolMappingConfig {
     pub version: u32,
     #[serde(rename = "tool", default)]
     pub tools: Vec<ToolMapping>,
+    /// Coverage-journal settings. See [`CacheConfig`].
+    #[serde(default)]
+    pub cache: CacheConfig,
     /// Name → index into `tools`. Built after deserialization via `build_index()`.
     #[serde(skip)]
     pub(crate) index: HashMap<String, usize>,
@@ -304,6 +320,13 @@ impl ToolMappingConfig {
     /// Merge user config over built-in base.
     /// Steps: A=dedup user, B=skip empty names, C=extends inheritance, D=filter+append
     pub fn merge(base: Self, user: Self, warnings: &mut Vec<ConfigWarning>) -> Self {
+        // `[cache]` is plain scalar settings, not a mergeable stanza list: the
+        // user file simply wins where it says anything. Captured up front
+        // because `user` is consumed below.
+        let cache = CacheConfig {
+            enabled: user.cache.enabled.or(base.cache.enabled),
+            flush_interval_ms: user.cache.flush_interval_ms.or(base.cache.flush_interval_ms),
+        };
         // Step A — deduplicate user stanzas (last stanza per name wins).
         // Stanzas with empty `names` are passed through to Step B for warning emission.
         let mut name_to_winner: HashMap<&str, usize> = HashMap::new();
@@ -393,6 +416,7 @@ impl ToolMappingConfig {
         let mut merged = ToolMappingConfig {
             version: base.version,
             tools: result,
+            cache,
             index: HashMap::new(),
         };
         merged.build_index();
@@ -444,6 +468,7 @@ impl ToolMappingConfig {
         Self {
             version: Self::SUPPORTED_VERSION,
             tools: vec![],
+            cache: CacheConfig::default(),
             index: HashMap::new(),
         }
     }

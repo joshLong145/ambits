@@ -375,3 +375,88 @@ fn json_formatter_empty_project() {
     assert_eq!(v["totals"]["full"], 0);
     assert_eq!(v["files"].as_array().unwrap().len(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Coverage journal: App -> disk -> back
+// ---------------------------------------------------------------------------
+
+/// Drive a real `App` through tool calls and assert the journal on disk
+/// reflects exactly the symbols it read.
+#[test]
+fn journal_records_symbols_read_through_app() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let tree = ProjectTree {
+        root: root.clone(),
+        files: vec![file("a.rs", vec![sym("a.rs::x", "x"), sym("a.rs::y", "y")])],
+    };
+    let mut app = App::new(tree, root.clone(), None);
+    app.set_session_id(Some("sess-1".into()));
+    app.enable_journal("tree-sitter", std::time::Duration::from_millis(0));
+
+    let mut call = AgentToolCall {
+        agent_id: "ag".into(),
+        tool_name: "Read".into(),
+        file_path: Some(root.join("a.rs")),
+        read_depth: ReadDepth::FullBody,
+        description: String::new(),
+        timestamp_str: "t".into(),
+        target_symbol: None,
+        target_lines: None,
+        label: "ag".into(),
+    };
+    app.process_agent_event(call.clone());
+    app.sync_journal();
+
+    let path = root.join(ambits::journal::JOURNAL_SUBDIR).join("sess-1.ndjson");
+    let contents = ambits::journal::read_journal(&path);
+    assert!(contents.warnings.is_empty(), "{:?}", contents.warnings);
+    assert!(contents.header.is_some(), "header written");
+    let mut ids: Vec<&String> = contents.reads.keys().collect();
+    ids.sort();
+    assert_eq!(ids, vec!["a.rs::x", "a.rs::y"]);
+
+    // Re-reading unchanged content is not a read-set change.
+    let before = std::fs::read_to_string(&path).unwrap();
+    call.timestamp_str = "t2".into();
+    app.process_agent_event(call);
+    app.sync_journal();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+}
+
+/// A symbol read before a compaction stays in the journal: compaction changes
+/// what the *model* retains, not whether the file still looks the way it did
+/// when it was read.
+#[test]
+fn journal_survives_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let tree = ProjectTree {
+        root: root.clone(),
+        files: vec![file("a.rs", vec![sym("a.rs::x", "x")])],
+    };
+    let mut app = App::new(tree, root.clone(), None);
+    app.set_session_id(Some("sess-2".into()));
+    app.enable_journal("tree-sitter", std::time::Duration::from_millis(0));
+
+    app.process_agent_event(AgentToolCall {
+        agent_id: "ag".into(),
+        tool_name: "Read".into(),
+        file_path: Some(root.join("a.rs")),
+        read_depth: ReadDepth::FullBody,
+        description: String::new(),
+        timestamp_str: "t".into(),
+        target_symbol: None,
+        target_lines: None,
+        label: "ag".into(),
+    });
+    app.process_compaction("summary".into(), "ts".into(), "ag".into(), None);
+    app.sync_journal();
+
+    let path = root.join(ambits::journal::JOURNAL_SUBDIR).join("sess-2.ndjson");
+    let contents = ambits::journal::read_journal(&path);
+    assert_eq!(contents.reads.len(), 1, "pre-compaction read is still recorded");
+    assert!(app.ledger.is_restored("a.rs::x"));
+}

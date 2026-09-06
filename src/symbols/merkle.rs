@@ -5,9 +5,14 @@ use super::SymbolNode;
 ///
 /// Uses BLAKE3 (256-bit output) — fast, SIMD-accelerated, no adversary threat
 /// model required for our change-detection use case. Output width matches the
-/// `[u8; 32]` field on `SymbolNode`. Hash values differ from previous SHA-256
-/// runs; no on-disk format references these hashes, so the change is internal
-/// only.
+/// `[u8; 32]` field on `SymbolNode`.
+///
+/// These hashes are **no longer internal only**: the coverage journal
+/// (`crate::journal`) persists them to disk to detect whether a symbol has
+/// drifted since it was read. Changing the algorithm or the normalization
+/// therefore invalidates every existing journal, and must come with a bump to
+/// `journal::SUPPORTED_SCHEMA_VERSION` so readers reject stale files rather
+/// than silently comparing incomparable hashes.
 pub fn content_hash(source: &str) -> [u8; 32] {
     let normalized = normalize_source(source);
     let mut hasher = blake3::Hasher::new();

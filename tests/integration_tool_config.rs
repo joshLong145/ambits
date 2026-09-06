@@ -468,3 +468,49 @@ fn parse_log_file_all_tool_stanzas() {
         .collect();
     assert_eq!(tool_names.len(), 15, "expected 15 events, got {}: {:?}", tool_names.len(), tool_names);
 }
+
+// ---------------------------------------------------------------------------
+// [cache] stanza — coverage journal settings
+// ---------------------------------------------------------------------------
+
+fn load_cfg(toml_src: &str) -> ToolMappingConfig {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tools.toml");
+    std::fs::write(&path, toml_src).unwrap();
+    let (cfg, warnings) = ToolMappingConfig::load(&path);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    cfg.expect("config should parse")
+}
+
+#[test]
+fn cache_stanza_is_optional() {
+    // The built-in config has no [cache]; absence must mean "defaults", not
+    // "disabled", or journaling would silently never start.
+    let cfg = builtin();
+    assert_eq!(cfg.cache.enabled, None);
+    assert_eq!(cfg.cache.flush_interval_ms, None);
+}
+
+#[test]
+fn cache_stanza_parses() {
+    let cfg = load_cfg("version = 1\n[cache]\nenabled = false\nflush_interval_ms = 250\n");
+    assert_eq!(cfg.cache.enabled, Some(false));
+    assert_eq!(cfg.cache.flush_interval_ms, Some(250));
+}
+
+#[test]
+fn cache_stanza_fields_are_individually_optional() {
+    let cfg = load_cfg("version = 1\n[cache]\nflush_interval_ms = 900\n");
+    assert_eq!(cfg.cache.enabled, None, "unset stays unset rather than defaulting to false");
+    assert_eq!(cfg.cache.flush_interval_ms, Some(900));
+}
+
+#[test]
+fn user_cache_settings_survive_merge_with_builtin() {
+    let user = load_cfg("version = 1\n[cache]\nflush_interval_ms = 1234\n");
+    let mut warnings = Vec::new();
+    let merged = ToolMappingConfig::merge(builtin(), user, &mut warnings);
+    assert_eq!(merged.cache.flush_interval_ms, Some(1234));
+    // Tool mappings must still come through.
+    assert!(!merged.tools.is_empty());
+}

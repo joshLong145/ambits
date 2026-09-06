@@ -183,6 +183,10 @@ impl TuiSession {
             }
         }
 
+        // Bring the coverage journal up to date. Interval-gated internally, so
+        // this is a cheap no-op on most ticks.
+        app.maybe_sync_journal();
+
         // Check if Serena cache files changed.
         if serena_mode {
             let mut changed = false;

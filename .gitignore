@@ -10,3 +10,7 @@ node_modules/
 # Heap probe / perf measurement artifacts — machine-specific.
 .perf-baseline/
 dhat-heap.json
+
+# Coverage journals — per-session derived state, not shared config.
+# `.ambit/tools.toml` is deliberately still committable.
+.ambit/coverage/

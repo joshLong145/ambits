@@ -91,6 +91,17 @@ struct Cli {
     #[arg(long, conflicts_with = "filter")]
     filter_regex: Option<String>,
 
+    /// Disable the coverage journal (`.ambit/coverage/<session>.ndjson`), which
+    /// records which symbols were read and what they looked like at the time.
+    /// Overrides `enabled` in the `[cache]` section of tools.toml.
+    #[arg(long)]
+    no_journal: bool,
+
+    /// How often, in milliseconds, to diff the ledger into the coverage
+    /// journal. Overrides `flush_interval_ms` in the `[cache]` section.
+    #[arg(long)]
+    flush_interval_ms: Option<u64>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -142,6 +153,10 @@ fn main() -> Result<()> {
     // Resolve tool call mapping config. Warnings are displayed to stdout before TUI launch.
     let (tool_config, config_warnings) =
         ToolMappingConfig::resolve(cli.tools_config.as_deref());
+
+    // Capture the `[cache]` stanza before `tool_config` is coerced into the
+    // mapper trait object below and its concrete type is no longer reachable.
+    let cache_cfg = tool_config.cache.clone();
 
     // Build the session ingester — coerce ToolMappingConfig to Arc<dyn ToolCallMapper>.
     let mapper: Arc<dyn ToolCallMapper> = tool_config;
@@ -255,7 +270,32 @@ fn main() -> Result<()> {
     }
 
     let serena_mode = cli.serena;
+
+    // Open the coverage journal *after* the startup replay above. `Journal::open`
+    // seeds its dedup map from what is already on disk, so the immediate sync
+    // below appends only genuinely new reads — which is what keeps relaunching
+    // ambit idempotent instead of re-appending the whole session every time.
+    // CLI flags win over the `[cache]` stanza in tools.toml.
+    let journal_enabled = !cli.no_journal && cache_cfg.enabled.unwrap_or(true);
+    if journal_enabled {
+        let interval = std::time::Duration::from_millis(
+            cli.flush_interval_ms
+                .or(cache_cfg.flush_interval_ms)
+                .unwrap_or(ambits::journal::DEFAULT_FLUSH_INTERVAL_MS),
+        );
+        let backend = if serena_mode { "serena" } else { "tree-sitter" };
+        for warning in app.enable_journal(backend, interval) {
+            eprintln!("[ambit warning] {warning}");
+        }
+        app.sync_journal();
+    }
+
     let result = run_tui(&mut terminal, &mut app, &project_path, &log_dir, session_id, &registry, serena_mode, &ingester);
+
+    // Capture the tail of the session. Records are written unbuffered, so this
+    // is not a buffer flush — it is a final diff of anything read since the
+    // last interval tick.
+    app.sync_journal();
 
     // Flush event log before exiting.
     if let Some(ref mut writer) = app.event_log {

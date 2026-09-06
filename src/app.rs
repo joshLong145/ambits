@@ -123,6 +123,12 @@ pub struct App {
     // Optional event log writer.
     pub event_log: Option<BufWriter<File>>,
 
+    /// Durable record of which symbols were read and what they looked like at
+    /// the time. `None` when journaling is disabled, or when no session id is
+    /// known (the journal is keyed by session, and guessing a filename would
+    /// silently merge unrelated sessions). See `crate::journal`.
+    pub journal: Option<crate::journal::Journal>,
+
     /// Path filter restricting which files are tracked, if any. Shared with
     /// the TUI re-parse paths (file watcher, Serena cache rescan) so that
     /// changes to excluded files don't inject symbols back into the tree
@@ -168,10 +174,58 @@ impl App {
             agent_alignment: Vec::new(),
             depth_cache: crate::tracking::alignment::DepthOrdinalCache::new(),
             event_log,
+            journal: None,
             filter: None,
         };
         app.rebuild_tree_rows();
         app
+    }
+
+    /// Start journaling this session's reads to `.ambit/coverage/`.
+    ///
+    /// Deliberately separate from [`App::set_session_id`], which already does
+    /// double duty seeding the agent tree — opening a file is a side effect
+    /// callers should ask for explicitly. Returns any non-fatal complaints
+    /// (corrupt existing lines, unwritable directory) for the caller to
+    /// surface; a journal that cannot be written must never be fatal.
+    pub fn enable_journal(&mut self, backend: &str, interval: std::time::Duration) -> Vec<String> {
+        let Some(session_id) = self.session_id.clone() else {
+            return vec![
+                "no session id resolved; coverage journaling disabled".to_string()
+            ];
+        };
+        let manifest = crate::journal::EnvironmentManifest::capture(
+            &self.project_tree,
+            backend,
+            // Same display form the coverage report records (`CoverageReport.filter`),
+            // so the two agree on what "this run was filtered" means.
+            self.filter.as_ref().map(|f| f.display()),
+        );
+        let journal = crate::journal::Journal::open(
+            &self.project_root,
+            &session_id,
+            manifest,
+            interval,
+        );
+        let warnings = journal.warnings().to_vec();
+        self.journal = Some(journal);
+        warnings
+    }
+
+    /// Bring the journal up to date if its flush interval has elapsed.
+    /// Cheap and safe to call every tick.
+    pub fn maybe_sync_journal(&mut self) {
+        if let Some(journal) = self.journal.as_mut() {
+            journal.maybe_sync(&self.ledger);
+        }
+    }
+
+    /// Bring the journal up to date now, ignoring the interval. Called before
+    /// exit so the tail of a session isn't lost.
+    pub fn sync_journal(&mut self) {
+        if let Some(journal) = self.journal.as_mut() {
+            journal.sync(&self.ledger);
+        }
     }
 
     /// Set the resolved session ID and deterministically seed the agent
