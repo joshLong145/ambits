@@ -4,5 +4,6 @@ pub mod filter;
 pub mod ingest;
 pub mod journal;
 pub mod parser;
+pub mod restore;
 pub mod symbols;
 pub mod tracking;

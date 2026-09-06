@@ -460,3 +460,135 @@ fn journal_survives_compaction() {
     assert_eq!(contents.reads.len(), 1, "pre-compaction read is still recorded");
     assert!(app.ledger.is_restored("a.rs::x"));
 }
+
+// ---------------------------------------------------------------------------
+// Journal -> restore round trip
+// ---------------------------------------------------------------------------
+
+fn read_call(root: &std::path::Path, rel: &str) -> AgentToolCall {
+    AgentToolCall {
+        agent_id: "ag".into(),
+        tool_name: "Read".into(),
+        file_path: Some(root.join(rel)),
+        read_depth: ReadDepth::FullBody,
+        description: String::new(),
+        timestamp_str: "t".into(),
+        target_symbol: None,
+        target_lines: None,
+        label: "ag".into(),
+    }
+}
+
+/// The anchor property: with nothing changed on disk, everything the ledger
+/// saw comes back through the journal. If this holds, the on-disk format
+/// faithfully represents the in-memory state.
+#[test]
+fn journal_round_trips_to_the_ledgers_seen_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let tree = ProjectTree {
+        root: root.clone(),
+        files: vec![
+            file("a.rs", vec![sym("a.rs::x", "x"), sym("a.rs::y", "y")]),
+            file("b.rs", vec![sym("b.rs::z", "z")]),
+            file("untouched.rs", vec![sym("untouched.rs::q", "q")]),
+        ],
+    };
+
+    let mut app = App::new(tree.clone(), root.clone(), None);
+    app.set_session_id(Some("rt".into()));
+    app.enable_journal("tree-sitter", std::time::Duration::from_millis(0));
+    app.process_agent_event(read_call(&root, "a.rs"));
+    app.process_agent_event(read_call(&root, "b.rs"));
+    app.sync_journal();
+
+    let path = root.join(ambits::journal::JOURNAL_SUBDIR).join("rt.ndjson");
+    let contents = ambits::journal::read_journal(&path);
+    assert!(contents.warnings.is_empty(), "{:?}", contents.warnings);
+
+    let outcome = ambits::restore::classify(&contents.reads, &tree);
+
+    let mut restored: Vec<&str> = outcome.restored.iter().map(|s| s.symbol_id.as_str()).collect();
+    restored.sort();
+    let mut expected: Vec<&str> = app
+        .ledger
+        .entries
+        .values()
+        .filter(|e| e.depth.is_seen() && !e.stale)
+        .map(|e| e.symbol_id.as_str())
+        .collect();
+    expected.sort();
+
+    assert_eq!(restored, expected, "journal round-trips the ledger's seen set");
+    assert!(outcome.drifted.is_empty() && outcome.removed.is_empty());
+    // A file nobody read is simply absent, not "omitted".
+    assert!(!restored.contains(&"untouched.rs::q"));
+}
+
+/// Editing a symbol after it was read must withhold *that symbol* on restore,
+/// while its unedited neighbours survive. This is the behavior the whole
+/// design exists to produce.
+#[test]
+fn edited_symbols_are_withheld_but_neighbours_survive() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let tree = ProjectTree {
+        root: root.clone(),
+        files: vec![file("a.rs", vec![sym("a.rs::kept", "kept"), sym("a.rs::edited", "edited")])],
+    };
+
+    let mut app = App::new(tree.clone(), root.clone(), None);
+    app.set_session_id(Some("drift".into()));
+    app.enable_journal("tree-sitter", std::time::Duration::from_millis(0));
+    app.process_agent_event(read_call(&root, "a.rs"));
+    app.sync_journal();
+
+    // Simulate re-scanning after one function was edited.
+    let mut rescanned = tree.clone();
+    rescanned.files[0].symbols[1].content_hash = content_hash("a brand new body");
+
+    let path = root.join(ambits::journal::JOURNAL_SUBDIR).join("drift.ndjson");
+    let contents = ambits::journal::read_journal(&path);
+    let outcome = ambits::restore::classify(&contents.reads, &rescanned);
+
+    assert_eq!(outcome.restored.len(), 1);
+    assert_eq!(outcome.restored[0].symbol_id, "a.rs::kept");
+    assert_eq!(outcome.drifted.len(), 1);
+    assert_eq!(outcome.drifted[0].symbol_id, "a.rs::edited");
+    assert!(outcome.removed.is_empty());
+}
+
+/// A deleted symbol is reported as removed rather than silently vanishing, so
+/// a digest can tell the agent what it must no longer assume.
+#[test]
+fn deleted_symbols_are_reported_as_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let tree = ProjectTree {
+        root: root.clone(),
+        files: vec![file("a.rs", vec![sym("a.rs::doomed", "doomed")])],
+    };
+
+    let mut app = App::new(tree.clone(), root.clone(), None);
+    app.set_session_id(Some("gone".into()));
+    app.enable_journal("tree-sitter", std::time::Duration::from_millis(0));
+    app.process_agent_event(read_call(&root, "a.rs"));
+    app.sync_journal();
+
+    let rescanned = ProjectTree {
+        root: root.clone(),
+        files: vec![file("a.rs", vec![])],
+    };
+
+    let path = root.join(ambits::journal::JOURNAL_SUBDIR).join("gone.ndjson");
+    let contents = ambits::journal::read_journal(&path);
+    let outcome = ambits::restore::classify(&contents.reads, &rescanned);
+
+    assert!(outcome.restored.is_empty());
+    assert_eq!(outcome.removed.len(), 1);
+    assert_eq!(outcome.removed[0].symbol_id, "a.rs::doomed");
+    assert_eq!(outcome.omitted_files(), vec![std::path::Path::new("a.rs")]);
+}
