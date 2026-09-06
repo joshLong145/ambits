@@ -548,6 +548,19 @@ pub fn run_report(
     });
 
     // 3. Build ledger from session logs.
+    //
+    // KNOWN GAP: this path cannot detect staleness, so drifted symbols are
+    // reported as fresh (inflating Full%). The TUI catches drift via its file
+    // watcher (`check_staleness` / `mark_stale_symbols` in src/tui.rs), but
+    // `run_report` has no equivalent — and could not use one as written:
+    // `mark_file_symbols` stamps `content_hash_at_read` from the
+    // *freshly scanned* tree, so by the time we replay a historical read the
+    // hash already matches current content and the comparison is vacuous.
+    //
+    // Fixing it needs the hash as of the read, which the session JSONL does
+    // not record. The coverage journal (see the cache work) is exactly that
+    // missing record, so the fix is to have this path consult the journal when
+    // one exists rather than to bolt a staleness check on here.
     let mut ledger = ContextLedger::new();
     // `run_report` is the CLI (non-TUI) report path; it has no alignment
     // popup to serve, so this cache is populated (to satisfy the shared

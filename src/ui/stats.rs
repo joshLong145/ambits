@@ -58,9 +58,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         stat_line("  Signature", count_for(ReadDepth::Signature), colors::DEPTH_SIGNATURE),
         stat_line("  Overview ", count_for(ReadDepth::Overview), colors::DEPTH_OVERVIEW),
         stat_line("  Name Only", count_for(ReadDepth::NameOnly), colors::DEPTH_NAME_ONLY),
-        // Staleness cuts across the depth buckets rather than being one of
-        // them, so this count overlaps the four above by design.
+        // Staleness and restored-ness cut across the depth buckets rather than
+        // being buckets themselves, so these counts overlap the four above by
+        // design.
         stat_line("  Stale    ", app.ledger.total_stale(), colors::DEPTH_STALE),
+        stat_line("  Restored ", app.ledger.total_restored(), colors::ACCENT_MUTED),
         stat_line(
             "  Unseen   ",
             total.saturating_sub(seen),

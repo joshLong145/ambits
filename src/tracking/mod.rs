@@ -43,11 +43,28 @@ impl std::fmt::Display for ReadDepth {
     }
 }
 
+/// Where a ledger entry's knowledge came from.
+///
+/// Compaction does not destroy the fact that a symbol was read — it destroys
+/// the model's *retention* of it. Marking those entries `Restored` keeps the
+/// coverage visible without claiming it as freshly read, which is what the old
+/// wipe-on-compaction behavior was guarding against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Provenance {
+    /// Read during the current context window.
+    Live,
+    /// Read before a compaction, or rehydrated from the coverage journal.
+    Restored,
+}
+
 #[derive(Debug, Clone)]
 pub struct ContextEntry {
     pub symbol_id: SymbolId,
     /// Aggregate depth: the maximum depth across all agents.
     pub depth: ReadDepth,
+    /// Whether this read survives in the model's context, or predates a
+    /// compaction. Reset to [`Provenance::Live`] by any subsequent read.
+    pub provenance: Provenance,
     /// Whether the symbol's content has changed since it was last read.
     ///
     /// Orthogonal to `depth` — a stale symbol retains the depth it was read
@@ -102,6 +119,7 @@ impl ContextLedger {
         let entry = self.entries.entry(symbol_id.clone()).or_insert_with(|| ContextEntry {
             symbol_id: symbol_id.clone(),
             depth: ReadDepth::Unseen,
+            provenance: Provenance::Live,
             stale: false,
             content_hash_at_read: [0u8; 32],
             timestamp: Instant::now(),
@@ -125,8 +143,10 @@ impl ContextLedger {
             .unwrap_or(ReadDepth::Unseen);
 
         // A read always re-establishes provenance: we have just seen this
-        // symbol at its current content, so it is by definition not stale.
+        // symbol at its current content, so it is by definition neither stale
+        // nor merely restored.
         entry.stale = false;
+        entry.provenance = Provenance::Live;
         entry.content_hash_at_read = content_hash;
         entry.timestamp = Instant::now();
         entry.agent_id = agent_id;
@@ -159,6 +179,34 @@ impl ContextLedger {
     /// untracked symbols.
     pub fn is_stale(&self, symbol_id: &str) -> bool {
         self.entries.get(symbol_id).map(|e| e.stale).unwrap_or(false)
+    }
+
+    /// Whether the symbol's read predates a compaction. `false` for untracked
+    /// symbols.
+    pub fn is_restored(&self, symbol_id: &str) -> bool {
+        self.entries
+            .get(symbol_id)
+            .map(|e| e.provenance == Provenance::Restored)
+            .unwrap_or(false)
+    }
+
+    /// Demote every entry to [`Provenance::Restored`].
+    ///
+    /// Called at a compaction boundary: the reads still happened and the
+    /// content is still current, but the model has lost the context, so the
+    /// coverage should no longer be presented as live.
+    pub fn mark_all_restored(&mut self) {
+        for entry in self.entries.values_mut() {
+            entry.provenance = Provenance::Restored;
+        }
+    }
+
+    /// Count of seen entries whose reads predate a compaction.
+    pub fn total_restored(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|e| e.provenance == Provenance::Restored && e.depth.is_seen())
+            .count()
     }
 
     /// Count of seen entries currently flagged stale.

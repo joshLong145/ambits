@@ -62,7 +62,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                     format!("{} ", row.label),
                     Style::default().fg(Color::DarkGray),
                 ));
-                spans.push(Span::styled(&row.display_name, Style::default().fg(color)));
+                spans.push(Span::styled(&row.display_name, symbol_style(color, row.restored)));
                 spans.push(Span::styled(
                     format!("  [{}] ~{} tok", row.line_range, row.token_count),
                     Style::default().fg(Color::DarkGray),
@@ -86,6 +86,18 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         );
 
     f.render_stateful_widget(list, area, &mut state);
+}
+
+/// Restored reads keep their depth color but render dimmed, so pre-compaction
+/// coverage stays visible without looking like it is still in the model's
+/// context.
+fn symbol_style(color: Color, restored: bool) -> Style {
+    let style = Style::default().fg(color);
+    if restored {
+        style.add_modifier(Modifier::DIM)
+    } else {
+        style
+    }
 }
 
 /// Stale symbols get the stale color regardless of how deeply they were read —

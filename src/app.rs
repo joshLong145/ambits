@@ -45,6 +45,8 @@ pub struct TreeRow {
     pub read_depth: ReadDepth,
     /// Content changed since this symbol was read. Orthogonal to `read_depth`.
     pub stale: bool,
+    /// Read predates a compaction, so the model no longer holds it in context.
+    pub restored: bool,
     pub coverage_status: Option<FileCoverageStatus>,
     pub file_coverage_seen: usize,
     pub file_coverage_total: usize,
@@ -227,12 +229,22 @@ impl App {
     }
 
     /// Snapshot the current ledger state, record a compaction event, then
-    /// clear the live ledger. The summary text doesn't reliably describe what
-    /// the model retained, so we drop all pre-compaction depth claims rather
-    /// than over-report coverage that may no longer reflect the model's
-    /// actual context. `compaction_history`, `activity`, and agent-tracking
-    /// state are preserved — only the live read-depth ledger and the
-    /// inter-compaction tool-call counter are reset.
+    /// demote every ledger entry to [`Provenance::Restored`].
+    ///
+    /// This used to wipe the ledger outright, on the grounds that the summary
+    /// doesn't reliably describe what the model retained, so pre-compaction
+    /// depth claims would over-report coverage. That reasoning was sound while
+    /// the alternative was silently presenting stale reads as live — but it
+    /// threw away real, verifiable information (which symbols were read, and
+    /// whether they have changed since) to avoid a display problem.
+    ///
+    /// Marking instead of wiping keeps that information and fixes the display
+    /// problem directly: restored entries render distinctly and are counted
+    /// separately, so coverage survives compaction without ever being claimed
+    /// as freshly read. Any genuine re-read flips the entry back to `Live`.
+    ///
+    /// `compaction_history`, `activity`, and agent-tracking state are
+    /// preserved; only the inter-compaction tool-call counter is reset.
     pub fn process_compaction(
         &mut self,
         summary: String,
@@ -274,9 +286,11 @@ impl App {
         });
         self.compaction_overlay_index = self.compaction_history.len().saturating_sub(1);
 
-        // Wipe the live ledger: post-compaction depth tracking starts fresh.
-        self.ledger = ContextLedger::new();
-        self.depth_cache = crate::tracking::alignment::DepthOrdinalCache::new();
+        // Demote rather than wipe: the reads are still facts, they just no
+        // longer live in the model's context. `depth_cache` is deliberately
+        // left intact — it backs the sub-agent alignment popup, which compares
+        // what agents *read*, a question compaction doesn't change.
+        self.ledger.mark_all_restored();
         self.compaction_call_count = 0;
         self.rebuild_tree_rows();
     }
@@ -335,6 +349,7 @@ impl App {
                 read_depth: file_read_depth,
                 // File rows are colored by coverage status, not depth/staleness.
                 stale: false,
+                restored: false,
                 coverage_status: Some(status),
                 file_coverage_seen: seen,
                 file_coverage_total: total,
@@ -820,6 +835,7 @@ fn flatten_symbol(
         token_count: sym.estimated_tokens as usize,
         read_depth,
         stale: ledger.is_stale(&sym.id),
+        restored: ledger.is_restored(&sym.id),
         coverage_status: None,
         file_coverage_seen: 0,
         file_coverage_total: 0,
@@ -1752,16 +1768,19 @@ mod tests {
         // Compaction history records the pre-compaction state.
         assert_eq!(app.compaction_history.len(), 1);
         assert_eq!(app.compaction_history[0].ledger_before.symbols_seen, 1);
-        // Live ledger is wiped — the symbol is Unseen again.
-        assert_eq!(app.ledger.depth_of("mock/a.rs::a1"), ReadDepth::Unseen);
-        assert_eq!(app.ledger.total_seen(), 0);
+        // The read survives with its depth intact — it is a fact about what
+        // the agent looked at — but is demoted to Restored.
+        assert_eq!(app.ledger.depth_of("mock/a.rs::a1"), ReadDepth::FullBody);
+        assert!(app.ledger.is_restored("mock/a.rs::a1"));
+        assert_eq!(app.ledger.total_seen(), 1);
+        assert_eq!(app.ledger.total_restored(), 1);
         assert_eq!(app.compaction_call_count, 0);
     }
 
     #[test]
-    fn post_compaction_tool_calls_rebuild_ledger() {
-        // After compaction wipes the ledger, subsequent tool calls populate
-        // a fresh ledger without touching compaction_history.
+    fn post_compaction_reads_are_live_alongside_restored_ones() {
+        // Compaction demotes existing entries; subsequent tool calls add Live
+        // ones beside them, without touching compaction_history.
         let mut app = test_app(vec![
             file("mock/a.rs", vec![sym("mock/a.rs::a1", "a1")]),
             file("mock/b.rs", vec![sym("mock/b.rs::b1", "b1")]),
@@ -1778,11 +1797,34 @@ mod tests {
         app.process_agent_event(tool_call("Read", "/test/project/mock/b.rs", ReadDepth::FullBody));
 
         assert_eq!(app.compaction_history.len(), 1, "compaction history retained");
-        assert_eq!(app.ledger.depth_of("mock/a.rs::a1"), ReadDepth::Unseen,
-            "pre-compaction read should not survive");
+        assert_eq!(app.ledger.depth_of("mock/a.rs::a1"), ReadDepth::FullBody,
+            "pre-compaction read survives");
+        assert!(app.ledger.is_restored("mock/a.rs::a1"), "but is marked restored");
         assert_eq!(app.ledger.depth_of("mock/b.rs::b1"), ReadDepth::FullBody,
             "post-compaction read should be reflected");
+        assert!(!app.ledger.is_restored("mock/b.rs::b1"), "and is live");
+        assert_eq!(app.ledger.total_restored(), 1, "only the pre-compaction read is restored");
         assert_eq!(app.compaction_call_count, 1, "counter restarted from zero after compaction");
+    }
+
+    /// Re-reading a symbol after a compaction promotes it back to Live — the
+    /// model demonstrably has it in context again.
+    #[test]
+    fn re_read_after_compaction_promotes_back_to_live() {
+        let mut app = test_app(vec![file("mock/a.rs", vec![sym("mock/a.rs::a1", "a1")])]);
+        app.process_agent_event(tool_call("Read", "/test/project/mock/a.rs", ReadDepth::FullBody));
+        app.process_compaction(
+            "s".into(),
+            "2026-05-11T14:23:00Z".into(),
+            "agent-1".into(),
+            None,
+        );
+        assert!(app.ledger.is_restored("mock/a.rs::a1"));
+
+        app.process_agent_event(tool_call("Read", "/test/project/mock/a.rs", ReadDepth::FullBody));
+
+        assert!(!app.ledger.is_restored("mock/a.rs::a1"));
+        assert_eq!(app.ledger.total_restored(), 0);
     }
 
     #[test]
