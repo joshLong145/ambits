@@ -212,6 +212,44 @@ impl App {
         warnings
     }
 
+    /// Fold this session's journal into the freshly replayed ledger.
+    ///
+    /// Must run after the startup log replay and before the journal is opened
+    /// for writing. See [`crate::restore::rehydrate_ledger`] for why replaying
+    /// the log alone leaves every historical read looking current.
+    ///
+    /// Also feeds the restored per-agent depths into `depth_cache`, so the
+    /// alignment popup sees the same coverage the tree view does rather than
+    /// scoring a cold-started session as if no agent had read anything.
+    pub fn rehydrate_from_journal(&mut self) -> Option<crate::restore::RehydrateStats> {
+        let session_id = self.session_id.clone()?;
+        let path = self
+            .project_root
+            .join(crate::journal::JOURNAL_SUBDIR)
+            .join(format!("{session_id}.ndjson"));
+        let contents = crate::journal::read_journal(&path);
+        if contents.reads.is_empty() {
+            return None;
+        }
+
+        let stats = crate::restore::rehydrate_ledger(
+            &mut self.ledger,
+            &contents,
+            // v1 journals carry no attribution; the session's own id is the
+            // closest true label available, and matches how Claude Code names
+            // the root agent's own events.
+            &session_id,
+            &self.project_tree,
+        );
+
+        for ((symbol_id, agent), (_, depth)) in &contents.agent_reads {
+            self.depth_cache.record(symbol_id, agent, *depth);
+        }
+
+        self.rebuild_tree_rows();
+        Some(stats)
+    }
+
     /// Bring the journal up to date if its flush interval has elapsed.
     /// Cheap and safe to call every tick.
     pub fn maybe_sync_journal(&mut self) {
@@ -1335,6 +1373,83 @@ mod tests {
     fn test_app(files: Vec<FileSymbols>) -> App {
         let tree = project(files);
         App::new(tree, PathBuf::from("/test/project"), None)
+    }
+
+    /// End-to-end wiring for cold-start rehydrate: the journal is found by
+    /// session id under the project root, folded in, and the alignment cache
+    /// is fed the restored per-agent depths.
+    #[test]
+    fn rehydrate_from_journal_reads_the_session_file_and_feeds_the_depth_cache() {
+        use ambits_journal_test_support::*;
+
+        let dir = tempfile::tempdir().unwrap();
+        let syms = vec![sym("mock/f.rs::alpha", "alpha")];
+        let tree = project(vec![file("mock/f.rs", syms)]);
+        let current = tree.files[0].symbols[0].content_hash;
+
+        let mut app = App::new(tree, dir.path().to_path_buf(), None);
+        app.set_session_id(Some("sess-1".into()));
+        write_journal(dir.path(), "sess-1", &[("mock/f.rs::alpha", "agent-9", current)]);
+
+        let stats = app.rehydrate_from_journal().expect("journal was found");
+
+        assert_eq!(stats.inserted, 1);
+        assert_eq!(stats.drifted, 0);
+        assert_eq!(app.ledger.depth_of("mock/f.rs::alpha"), ReadDepth::FullBody);
+        assert_eq!(
+            app.depth_cache.get("mock/f.rs::alpha", "agent-9"),
+            4,
+            "the alignment popup sees restored coverage too"
+        );
+    }
+
+    /// No journal is not an error — it is the normal state for a session whose
+    /// TUI has never run.
+    #[test]
+    fn rehydrate_from_journal_is_a_no_op_without_a_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            project(vec![file("mock/f.rs", vec![sym("mock/f.rs::alpha", "alpha")])]),
+            dir.path().to_path_buf(),
+            None,
+        );
+        app.set_session_id(Some("sess-none".into()));
+        assert!(app.rehydrate_from_journal().is_none());
+    }
+
+    /// Without a session id there is no journal to name, and guessing one
+    /// would merge unrelated sessions.
+    #[test]
+    fn rehydrate_from_journal_needs_a_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(project(vec![]), dir.path().to_path_buf(), None);
+        assert!(app.rehydrate_from_journal().is_none());
+    }
+
+    /// Minimal journal writer, so this test exercises the real on-disk format
+    /// and path layout rather than a hand-built `JournalContents`.
+    mod ambits_journal_test_support {
+        use crate::journal::*;
+        use std::path::Path;
+
+        pub fn write_journal(root: &Path, session: &str, reads: &[(&str, &str, [u8; 32])]) {
+            let dir = root.join(JOURNAL_SUBDIR);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut out = String::new();
+            for (symbol_id, agent, hash) in reads {
+                out.push_str(
+                    &serde_json::to_string(&Record::Read {
+                        symbol_id: (*symbol_id).into(),
+                        hash: encode_hash(hash),
+                        depth: DepthDto::FullBody,
+                        agent: Some((*agent).into()),
+                    })
+                    .unwrap(),
+                );
+                out.push('\n');
+            }
+            std::fs::write(dir.join(format!("{session}.ndjson")), out).unwrap();
+        }
     }
 
     #[test]

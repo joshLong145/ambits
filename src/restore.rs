@@ -374,6 +374,113 @@ fn split_id(id: &str) -> (PathBuf, String) {
     }
 }
 
+/// What a cold-start rehydrate changed about the ledger.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RehydrateStats {
+    /// Entries the session log had already rebuilt, whose recorded hash the
+    /// journal replaced with the true hash-at-read.
+    pub corrected: usize,
+    /// Entries the journal knew about that the session log did not account
+    /// for.
+    pub inserted: usize,
+    /// Entries the post-overlay comparison found no longer match the tree.
+    /// Without the overlay these would all have looked fresh.
+    pub drifted: usize,
+}
+
+/// Fold the journal into a freshly replayed ledger, then re-derive staleness.
+///
+/// ## Why this is not redundant with replaying the session log
+///
+/// Startup already replays the whole session JSONL, which rebuilds essentially
+/// the same set of entries. What it cannot rebuild is *drift*: replay stamps
+/// each entry with the hash the symbol has right now, so the later comparison
+/// is against itself and always passes. `check_staleness` can't help either —
+/// it diffs two trees, and at cold start there is no earlier tree to diff
+/// against. The upshot is that a freshly launched TUI reports every historical
+/// read as current, including reads of files that have since been rewritten.
+///
+/// The journal is the only record of the hash at read time, so overlaying it
+/// and re-comparing is what converts that silent over-report into an accurate
+/// one.
+///
+/// Where the two sources disagree the journal wins, which is the conservative
+/// direction: if a symbol was re-read while ambit was not running, the journal
+/// holds the older hash, the entry is marked stale, and the agent re-reads
+/// something it arguably still knew. The opposite error — declaring a drifted
+/// symbol fresh — is the one that actually misleads.
+///
+/// `fallback_agent` attributes reads from v1 journals, which predate per-agent
+/// records and so carry no attribution of their own.
+pub fn rehydrate_ledger(
+    ledger: &mut crate::tracking::ContextLedger,
+    contents: &crate::journal::JournalContents,
+    fallback_agent: &str,
+    tree: &ProjectTree,
+) -> RehydrateStats {
+    let mut stats = RehydrateStats::default();
+
+    for ((symbol_id, agent), (hash, depth)) in &contents.agent_reads {
+        if ledger.rehydrate(symbol_id.clone(), *depth, *hash, agent.clone()) {
+            stats.inserted += 1;
+        } else {
+            stats.corrected += 1;
+        }
+    }
+
+    // v1 journals have no attribution to recover, so their reads are only
+    // visible in the symbol-level fold. Applying them under `fallback_agent`
+    // keeps the coverage rather than discarding it for want of a label.
+    let attributed: std::collections::HashSet<&str> = contents
+        .agent_reads
+        .keys()
+        .map(|(sym, _)| sym.as_str())
+        .collect();
+    for (symbol_id, (hash, depth)) in &contents.reads {
+        if attributed.contains(symbol_id.as_str()) {
+            continue;
+        }
+        if ledger.rehydrate(symbol_id.clone(), *depth, *hash, fallback_agent.to_string()) {
+            stats.inserted += 1;
+        } else {
+            stats.corrected += 1;
+        }
+    }
+
+    stats.drifted = refresh_staleness(ledger, tree);
+    stats
+}
+
+/// Re-derive `stale` for every ledger entry by comparing its recorded
+/// hash-at-read against the current tree. Returns how many are stale.
+///
+/// Unlike `tracking::check_staleness` this needs no previous tree — the
+/// entry's own `content_hash_at_read` is the earlier side of the comparison.
+/// That makes it usable at startup, where no earlier tree exists.
+pub fn refresh_staleness(ledger: &mut crate::tracking::ContextLedger, tree: &ProjectTree) -> usize {
+    let index = index_tree(tree);
+
+    // One id can name several symbols (`struct Foo` and `impl Foo` collide), so
+    // an entry is only stale when *none* of its candidates match — the same
+    // rule `classify` applies.
+    let stale: Vec<String> = ledger
+        .entries
+        .iter()
+        .filter(|(_, entry)| entry.depth.is_seen())
+        .filter(|(id, entry)| {
+            !index
+                .get(id.as_str())
+                .is_some_and(|syms| syms.iter().any(|s| s.content_hash == entry.content_hash_at_read))
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+
+    for id in &stale {
+        ledger.mark_stale(id);
+    }
+    stale.len()
+}
+
 #[cfg(test)]
 #[path = "../tests/helpers/mod.rs"]
 #[allow(dead_code)]
@@ -638,5 +745,177 @@ mod tests {
         );
         assert_eq!(out.restored[0].file_path, PathBuf::from("src/a.rs"));
         assert_eq!(out.restored[0].name_path, "Outer/inner");
+    }
+
+    // -----------------------------------------------------------------------
+    // Cold-start rehydrate
+    // -----------------------------------------------------------------------
+
+    use crate::journal::JournalContents;
+    use crate::tracking::{ContextLedger, Provenance};
+
+    fn journal_of(entries: &[(&str, &str, [u8; 32], ReadDepth)]) -> JournalContents {
+        let mut c = JournalContents::default();
+        for (symbol, agent, hash, depth) in entries {
+            c.reads.insert(symbol.to_string(), (*hash, *depth));
+            c.agent_reads
+                .insert((symbol.to_string(), agent.to_string()), (*hash, *depth));
+        }
+        c
+    }
+
+    /// The whole reason increment 6 exists. Replaying the session log stamps
+    /// every entry with the hash the symbol has *now*, so a symbol rewritten
+    /// since it was read still looks fresh. Only the journal knows better.
+    #[test]
+    fn rehydrate_detects_drift_that_replay_alone_cannot() {
+        let tree = project(vec![file("a.rs", vec![sym("a.rs::x", "current")])]);
+        let current = tree.files[0].symbols[0].content_hash;
+        let at_read = content_hash("what it looked like when read");
+
+        // What startup replay produces: the read is known, but its hash was
+        // taken from the tree as it is today.
+        let mut ledger = ContextLedger::new();
+        ledger.record("a.rs::x".into(), ReadDepth::FullBody, current, "ag".into(), 10);
+        assert!(!ledger.is_stale("a.rs::x"), "replay alone sees nothing wrong");
+
+        let contents = journal_of(&[("a.rs::x", "ag", at_read, ReadDepth::FullBody)]);
+        let stats = rehydrate_ledger(&mut ledger, &contents, "sess", &tree);
+
+        assert!(ledger.is_stale("a.rs::x"), "the journal exposes the drift");
+        assert_eq!(stats.drifted, 1);
+        assert_eq!(stats.corrected, 1);
+        assert_eq!(stats.inserted, 0);
+    }
+
+    /// Precision: correcting one symbol must not evict its neighbours.
+    #[test]
+    fn rehydrate_leaves_unchanged_symbols_alone() {
+        let tree = project(vec![file(
+            "a.rs",
+            vec![sym("a.rs::x", "x"), sym("a.rs::y", "y")],
+        )]);
+        let x_now = tree.files[0].symbols[0].content_hash;
+        let y_now = tree.files[0].symbols[1].content_hash;
+
+        let mut ledger = ContextLedger::new();
+        ledger.record("a.rs::x".into(), ReadDepth::FullBody, x_now, "ag".into(), 10);
+        ledger.record("a.rs::y".into(), ReadDepth::FullBody, y_now, "ag".into(), 10);
+
+        let contents = journal_of(&[
+            ("a.rs::x", "ag", content_hash("stale"), ReadDepth::FullBody),
+            ("a.rs::y", "ag", y_now, ReadDepth::FullBody),
+        ]);
+        let stats = rehydrate_ledger(&mut ledger, &contents, "sess", &tree);
+
+        assert!(ledger.is_stale("a.rs::x"));
+        assert!(!ledger.is_stale("a.rs::y"), "its neighbour is untouched");
+        assert_eq!(stats.drifted, 1);
+    }
+
+    /// A journal entry the session log cannot account for — the log was
+    /// rotated, or the journal came from another machine.
+    #[test]
+    fn rehydrate_recovers_reads_the_log_no_longer_has() {
+        let tree = project(vec![file("a.rs", vec![sym("a.rs::x", "x")])]);
+        let current = tree.files[0].symbols[0].content_hash;
+
+        let mut ledger = ContextLedger::new();
+        let contents = journal_of(&[("a.rs::x", "agent-7", current, ReadDepth::Signature)]);
+        let stats = rehydrate_ledger(&mut ledger, &contents, "sess", &tree);
+
+        assert_eq!(stats.inserted, 1);
+        assert_eq!(ledger.depth_of("a.rs::x"), ReadDepth::Signature);
+        assert!(!ledger.is_stale("a.rs::x"), "it still matches the tree");
+        assert!(
+            ledger.is_restored("a.rs::x"),
+            "a journaled read predates this process, so it is not live context"
+        );
+        assert_eq!(
+            ledger.depth_of_for_agent("a.rs::x", "agent-7"),
+            ReadDepth::Signature,
+            "attribution survives the round trip"
+        );
+    }
+
+    /// The aggregate depth is a max over `agent_depths`, so a rehydrated entry
+    /// with no agent recorded would be silently downgraded by the next real
+    /// read. Seeding the agent is what prevents that.
+    #[test]
+    fn a_later_shallower_read_cannot_downgrade_a_rehydrated_entry() {
+        let tree = project(vec![file("a.rs", vec![sym("a.rs::x", "x")])]);
+        let current = tree.files[0].symbols[0].content_hash;
+
+        let mut ledger = ContextLedger::new();
+        let contents = journal_of(&[("a.rs::x", "old-agent", current, ReadDepth::FullBody)]);
+        rehydrate_ledger(&mut ledger, &contents, "sess", &tree);
+
+        ledger.record("a.rs::x".into(), ReadDepth::NameOnly, current, "new-agent".into(), 1);
+
+        assert_eq!(ledger.depth_of("a.rs::x"), ReadDepth::FullBody);
+        assert_eq!(ledger.provenance_of("a.rs::x"), Some(Provenance::Live));
+    }
+
+    /// v1 journals carry no attribution. Their reads must still land, under
+    /// the session id, rather than being dropped for want of a label.
+    #[test]
+    fn unattributed_reads_fall_back_to_the_session_id() {
+        let tree = project(vec![file("a.rs", vec![sym("a.rs::x", "x")])]);
+        let current = tree.files[0].symbols[0].content_hash;
+
+        let mut contents = JournalContents::default();
+        contents
+            .reads
+            .insert("a.rs::x".into(), (current, ReadDepth::Overview));
+
+        let mut ledger = ContextLedger::new();
+        let stats = rehydrate_ledger(&mut ledger, &contents, "sess-42", &tree);
+
+        assert_eq!(stats.inserted, 1);
+        assert_eq!(
+            ledger.depth_of_for_agent("a.rs::x", "sess-42"),
+            ReadDepth::Overview
+        );
+    }
+
+    /// Symbol ids are not unique (`struct Foo` and `impl Foo` collide), so a
+    /// match against any candidate has to count — otherwise every ambiguous id
+    /// is reported as drifted.
+    #[test]
+    fn refresh_staleness_accepts_any_matching_candidate() {
+        let mut struct_node = sym("a.rs::Foo", "struct Foo");
+        let impl_node = sym("a.rs::Foo", "impl Foo");
+        struct_node.content_hash = content_hash("struct body");
+        let tree = project(vec![file("a.rs", vec![struct_node, impl_node.clone()])]);
+
+        let mut ledger = ContextLedger::new();
+        ledger.record(
+            "a.rs::Foo".into(),
+            ReadDepth::FullBody,
+            impl_node.content_hash,
+            "ag".into(),
+            10,
+        );
+
+        assert_eq!(refresh_staleness(&mut ledger, &tree), 0);
+        assert!(!ledger.is_stale("a.rs::Foo"));
+    }
+
+    /// A symbol that no longer exists cannot be verified, so it is stale.
+    #[test]
+    fn refresh_staleness_marks_vanished_symbols() {
+        let tree = project(vec![file("a.rs", vec![sym("a.rs::x", "x")])]);
+
+        let mut ledger = ContextLedger::new();
+        ledger.record(
+            "a.rs::gone".into(),
+            ReadDepth::FullBody,
+            content_hash("gone"),
+            "ag".into(),
+            10,
+        );
+
+        assert_eq!(refresh_staleness(&mut ledger, &tree), 1);
+        assert!(ledger.is_stale("a.rs::gone"));
     }
 }

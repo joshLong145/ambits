@@ -145,6 +145,34 @@ enum Commands {
         #[arg(long, value_enum, default_value = "markdown")]
         format: DigestFormat,
     },
+
+    /// Inspect or remove the coverage journals under .ambit/coverage.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CacheCommands {
+    /// List the coverage journals on disk with their size and age.
+    Status,
+
+    /// Delete coverage journals.
+    ///
+    /// Deliberately requires naming what to remove. Journals are the only
+    /// record of what a past session read *and what it looked like at the
+    /// time*; deleting one silently downgrades any later restore of that
+    /// session to the UNVERIFIED session-log fallback.
+    Clear {
+        /// Delete only this session's journal.
+        #[arg(long, conflicts_with = "all")]
+        session: Option<String>,
+
+        /// Delete every journal for this project.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -243,6 +271,18 @@ fn main() -> Result<()> {
     };
     if let Some(ref f) = filter {
         f.validate(&project_path)?;
+    }
+
+    // Dispatched before the tree scan: inspecting or deleting journal files
+    // needs the project path and nothing else, and scanning first would make
+    // `cache status` pay seconds for an answer it does not use.
+    if let Some(Commands::Cache { command }) = &command {
+        return match command {
+            CacheCommands::Status => ambits::cache::status(&project_path),
+            CacheCommands::Clear { session, all } => {
+                ambits::cache::clear(&project_path, session.as_deref(), *all)
+            }
+        };
     }
 
     let registry = ParserRegistry::new();
@@ -351,12 +391,28 @@ fn main() -> Result<()> {
 
     let serena_mode = cli.serena;
 
+    // Fold in the journal before opening it for writing. The replay above
+    // rebuilt *which* symbols were read but stamped each with the hash it has
+    // now, so nothing looks drifted; only the journal knows what they looked
+    // like at the time. Skipped entirely when journaling is off, since then
+    // there is no journal to trust.
+    let journal_enabled = !cli.no_journal && cache_cfg.enabled.unwrap_or(true);
+    if journal_enabled {
+        if let Some(stats) = app.rehydrate_from_journal() {
+            if stats.drifted > 0 || stats.inserted > 0 {
+                eprintln!(
+                    "[ambit] rehydrated from journal: {} corrected, {} recovered, {} stale",
+                    stats.corrected, stats.inserted, stats.drifted
+                );
+            }
+        }
+    }
+
     // Open the coverage journal *after* the startup replay above. `Journal::open`
     // seeds its dedup map from what is already on disk, so the immediate sync
     // below appends only genuinely new reads — which is what keeps relaunching
     // ambit idempotent instead of re-appending the whole session every time.
     // CLI flags win over the `[cache]` stanza in tools.toml.
-    let journal_enabled = !cli.no_journal && cache_cfg.enabled.unwrap_or(true);
     if journal_enabled {
         let interval = std::time::Duration::from_millis(
             cli.flush_interval_ms

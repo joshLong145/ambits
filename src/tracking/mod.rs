@@ -175,10 +175,86 @@ impl ContextLedger {
         }
     }
 
+    /// Flag a seen entry as stale outright.
+    ///
+    /// For callers that have already decided the entry cannot be verified —
+    /// because no symbol with that id survives in the tree, or because the id
+    /// is ambiguous and none of its candidates match. Distinct from
+    /// [`Self::mark_stale_if_changed`], which does the comparison itself and
+    /// so needs a single authoritative hash to compare against.
+    pub fn mark_stale(&mut self, symbol_id: &str) {
+        if let Some(entry) = self.entries.get_mut(symbol_id) {
+            if entry.depth.is_seen() {
+                entry.stale = true;
+            }
+        }
+    }
+
+    /// Install a read recovered from the durable journal.
+    ///
+    /// Cold-start only: this must run before any live ingestion, because it
+    /// treats the journal as authoritative over whatever is already in the
+    /// entry.
+    ///
+    /// The point of the overwrite is `hash_at_read`. Replaying a session log
+    /// can only stamp the hash a symbol has *now*, which makes the later drift
+    /// comparison vacuous — every restored symbol looks fresh. The journal
+    /// holds the hash the symbol actually had when it was read, so installing
+    /// it is what makes drift detectable at all.
+    ///
+    /// Depth is merged upgrade-only per agent and the aggregate is recomputed,
+    /// so a rehydrated entry can never lose depth to a later read. Staleness
+    /// is deliberately *not* decided here — the caller runs one comparison
+    /// pass against the tree afterwards.
+    ///
+    /// Returns `true` when this created a new entry, i.e. the journal knew
+    /// about a read the session log could not account for.
+    pub fn rehydrate(
+        &mut self,
+        symbol_id: SymbolId,
+        depth: ReadDepth,
+        hash_at_read: [u8; 32],
+        agent_id: String,
+    ) -> bool {
+        let inserted = !self.entries.contains_key(&symbol_id);
+        let entry = self.entries.entry(symbol_id.clone()).or_insert_with(|| ContextEntry {
+            symbol_id,
+            depth: ReadDepth::Unseen,
+            // A journaled read is by definition from before this process
+            // started, so no live context holds it.
+            provenance: Provenance::Restored,
+            stale: false,
+            content_hash_at_read: hash_at_read,
+            timestamp: Instant::now(),
+            agent_id: agent_id.clone(),
+            token_count: 0,
+            agent_depths: HashMap::new(),
+        });
+
+        let agent_depth = entry.agent_depths.entry(agent_id).or_insert(ReadDepth::Unseen);
+        if depth > *agent_depth {
+            *agent_depth = depth;
+        }
+        entry.depth = entry
+            .agent_depths
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(ReadDepth::Unseen);
+        entry.content_hash_at_read = hash_at_read;
+
+        inserted
+    }
+
     /// Whether the symbol has been read and has since drifted. `false` for
     /// untracked symbols.
     pub fn is_stale(&self, symbol_id: &str) -> bool {
         self.entries.get(symbol_id).map(|e| e.stale).unwrap_or(false)
+    }
+
+    /// Provenance of a tracked symbol, or `None` if it is untracked.
+    pub fn provenance_of(&self, symbol_id: &str) -> Option<Provenance> {
+        self.entries.get(symbol_id).map(|e| e.provenance)
     }
 
     /// Whether the symbol's read predates a compaction. `false` for untracked
