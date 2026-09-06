@@ -79,6 +79,28 @@ in your allowed tools):
 | `mcp__ambit__symbol_tree` | Full symbol tree — use when you need to understand project structure |
 | `mcp__ambit__list_sessions` | Find available sessions — use when session context is unclear |
 
+## After a Compaction
+
+When context has just been compacted, the summary describes what a model
+*remembered* while it was losing that context. `restore-context` instead
+reports what was demonstrably read and demonstrably has not changed since:
+
+```bash
+ambits -p . restore-context
+```
+
+Treat the symbols it lists as known — no need to re-read them. Anything it does
+not list is not covered, and it names the files that changed since they were
+read so you can re-read only those.
+
+If the output is labelled `UNVERIFIED`, it was recovered from session logs
+rather than the coverage journal. Those logs do not record what a file looked
+like when it was read, so drift cannot be detected there — re-read before
+relying on it.
+
+Use `--max-tokens N` to fit a budget (default 2000), and `--format json` for
+programmatic use.
+
 ## Bash Fallback
 
 If MCP tools are unavailable:

@@ -121,6 +121,30 @@ enum Commands {
         #[command(subcommand)]
         command: SkillCommands,
     },
+
+    /// Print the symbols read earlier in this session that are still
+    /// unchanged, for re-injection after a compaction.
+    ///
+    /// Reads the coverage journal when one exists. Otherwise falls back to
+    /// replaying the session logs, which cannot detect drift — that output is
+    /// labelled UNVERIFIED.
+    RestoreContext {
+        /// Approximate token budget for the output.
+        #[arg(long, default_value_t = ambits::digest::DEFAULT_MAX_TOKENS)]
+        max_tokens: usize,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value = "markdown")]
+        format: DigestFormat,
+    },
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum DigestFormat {
+    /// Markdown, intended to be pasted or piped into a session (default).
+    Markdown,
+    /// Compact, schema-versioned JSON on a single line.
+    Json,
 }
 
 #[derive(Subcommand, Debug)]
@@ -139,14 +163,15 @@ enum SkillCommands {
 
 fn main() -> Result<()> {
     color_eyre::install()?;
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
-    // Handle subcommands first (don't require --project).
-    if let Some(command) = cli.command {
+    // `skill` is the only subcommand that doesn't need --project, so it is
+    // handled here. `restore-context` needs a scanned tree to compare against,
+    // so it falls through and is dispatched once the project is resolved.
+    let command = cli.command.take();
+    if let Some(Commands::Skill { command }) = &command {
         return match command {
-            Commands::Skill { command } => match command {
-                SkillCommands::Install { global, project } => skill::install(global, project),
-            },
+            SkillCommands::Install { global, project } => skill::install(*global, project.clone()),
         };
     }
 
@@ -225,6 +250,21 @@ fn main() -> Result<()> {
             .as_ref()
             .and_then(|d| ingester.find_latest_session(d))
     });
+
+    if let Some(Commands::RestoreContext { max_tokens, format }) = command {
+        for w in &config_warnings {
+            eprintln!("[ambit warning] {w}");
+        }
+        return run_restore_context(
+            &project_path,
+            &project_tree,
+            &log_dir,
+            &session_id,
+            &*ingester,
+            max_tokens,
+            format,
+        );
+    }
 
     // Launch TUI.
     enable_raw_mode()?;
@@ -308,6 +348,62 @@ fn main() -> Result<()> {
     terminal.show_cursor()?;
 
     result
+}
+
+/// Print the still-valid prior reads for a session.
+///
+/// Prefers the coverage journal, which records what each symbol looked like
+/// when it was read and can therefore prove a read is still accurate. Falls
+/// back to replaying session logs — which cannot prove anything of the sort,
+/// because Claude Code never recorded those hashes — rather than returning
+/// nothing for sessions that predate journaling or never ran the TUI. The
+/// formatter labels that output UNVERIFIED.
+#[allow(clippy::too_many_arguments)]
+fn run_restore_context(
+    project_path: &std::path::Path,
+    project_tree: &ambits::symbols::ProjectTree,
+    log_dir: &Option<PathBuf>,
+    session_id: &Option<String>,
+    ingester: &dyn SessionIngester,
+    max_tokens: usize,
+    format: DigestFormat,
+) -> Result<()> {
+    use ambits::digest::{DigestFormatter, JsonFormatter, MarkdownFormatter};
+    use ambits::restore::{self, RestoreReport, RestoreSource};
+
+    let journaled = session_id
+        .as_ref()
+        .and_then(|sid| restore::load_from_journal(project_path, sid));
+
+    let (reads, source, warnings) = match journaled {
+        Some((reads, warnings)) => (reads, RestoreSource::Journal, warnings),
+        None => match (log_dir.as_ref(), session_id.as_ref()) {
+            (Some(dir), Some(sid)) => {
+                let ledger =
+                    restore::replay_session_logs(project_path, project_tree, dir, sid, ingester);
+                (
+                    restore::reads_from_ledger(&ledger),
+                    RestoreSource::SessionLogs,
+                    Vec::new(),
+                )
+            }
+            _ => (Default::default(), RestoreSource::Journal, Vec::new()),
+        },
+    };
+
+    let report = RestoreReport {
+        outcome: restore::classify(&reads, project_tree),
+        source,
+        session_id: session_id.clone(),
+        warnings,
+    };
+
+    let formatter: Box<dyn DigestFormatter> = match format {
+        DigestFormat::Markdown => Box::new(MarkdownFormatter),
+        DigestFormat::Json => Box::new(JsonFormatter),
+    };
+    println!("{}", formatter.format(&report, max_tokens));
+    Ok(())
 }
 
 fn run_tui(

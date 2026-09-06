@@ -1,5 +1,6 @@
 pub mod app;
 pub mod coverage;
+pub mod digest;
 pub mod filter;
 pub mod ingest;
 pub mod journal;

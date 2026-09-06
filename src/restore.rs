@@ -115,6 +115,146 @@ impl RestoreOutcome {
     }
 }
 
+/// Symbol id → (content hash as of the read, depth read at).
+///
+/// The common currency between the journal, the session-log fallback, and
+/// [`classify`]. Deliberately not keyed by agent: who read a symbol does not
+/// change whether that read is still accurate.
+pub type ReadSet = HashMap<String, ([u8; 32], ReadDepth)>;
+
+/// Where a set of prior reads came from, and therefore how much it can be
+/// trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreSource {
+    /// The coverage journal — records the hash as of each read, so drift is
+    /// detectable and the result is trustworthy.
+    Journal,
+    /// Replayed from Claude Code's session logs, which do **not** record what
+    /// a file looked like when it was read. Drift is therefore undetectable:
+    /// a symbol edited after being read still compares equal, because both
+    /// sides of the comparison come from the current tree. Everything is
+    /// reported as restored, some of it wrongly.
+    ///
+    /// Kept because the alternative is returning nothing at all for every
+    /// session that predates journaling, or any session where the TUI was
+    /// never run. Callers must label it.
+    SessionLogs,
+}
+
+impl RestoreSource {
+    /// Whether drift could actually be detected. `false` means "reads are
+    /// listed, but freshness is unverified".
+    pub fn verifies_drift(&self) -> bool {
+        matches!(self, RestoreSource::Journal)
+    }
+}
+
+/// A classification plus the provenance needed to interpret it.
+#[derive(Debug, Clone)]
+pub struct RestoreReport {
+    pub outcome: RestoreOutcome,
+    pub source: RestoreSource,
+    pub session_id: Option<String>,
+    /// Non-fatal complaints from reading the journal.
+    pub warnings: Vec<String>,
+}
+
+/// Read the journal for `session_id`, if one exists and is non-empty.
+pub fn load_from_journal(
+    project_root: &Path,
+    session_id: &str,
+) -> Option<(ReadSet, Vec<String>)> {
+    let path = project_root
+        .join(crate::journal::JOURNAL_SUBDIR)
+        .join(format!("{session_id}.ndjson"));
+    let contents = crate::journal::read_journal(&path);
+    if contents.reads.is_empty() {
+        return None;
+    }
+    Some((contents.reads, contents.warnings))
+}
+
+/// Rebuild a ledger by replaying a session's logs.
+///
+/// The fallback path for sessions with no journal. Compaction is deliberately
+/// **not** replayed as a wipe: the point of restoring is to recover what a
+/// compaction cost, so honoring it here would return exactly the state the
+/// agent already has — nothing.
+pub fn replay_session_logs(
+    project_root: &Path,
+    project_tree: &ProjectTree,
+    log_dir: &Path,
+    session_id: &str,
+    ingester: &dyn crate::ingest::SessionIngester,
+) -> crate::tracking::ContextLedger {
+    use crate::ingest::SessionEvent;
+
+    let mut ledger = crate::tracking::ContextLedger::new();
+    // Required by the shared marking signature; the alignment popup is not
+    // involved here, so nothing reads it back.
+    let mut depth_cache = crate::tracking::alignment::DepthOrdinalCache::new();
+
+    for log_file in ingester.session_log_files(log_dir, session_id) {
+        for event in ingester.parse_log_file_with_root(&log_file, project_root) {
+            match event {
+                SessionEvent::ToolCall(tc) => {
+                    let Some(ref path) = tc.file_path else { continue };
+                    let rel = crate::app::normalize_tool_path(path, project_root);
+                    for file in &project_tree.files {
+                        if file.file_path != rel {
+                            continue;
+                        }
+                        if tc.target_symbol.is_some() || tc.target_lines.is_some() {
+                            crate::app::mark_targeted_symbols(
+                                &file.symbols,
+                                &tc,
+                                &mut ledger,
+                                &mut depth_cache,
+                            );
+                        } else {
+                            crate::app::mark_file_symbols(
+                                &file.symbols,
+                                &tc,
+                                &mut ledger,
+                                &mut depth_cache,
+                            );
+                        }
+                    }
+                }
+                // A `/clear` is a voluntary discard — resurrecting that
+                // context would mislead, so it is the one boundary we honor.
+                SessionEvent::SessionCleared => {
+                    ledger = crate::tracking::ContextLedger::new();
+                    depth_cache = crate::tracking::alignment::DepthOrdinalCache::new();
+                }
+                SessionEvent::Compacted { .. } => {}
+            }
+        }
+    }
+    ledger
+}
+
+/// Recover prior reads from a ledger built by replaying session logs.
+///
+/// Every hash here is taken from the *current* tree, because that is all the
+/// session log can tell us — see [`RestoreSource::SessionLogs`]. The result
+/// therefore classifies as fully restored by construction.
+pub fn reads_from_ledger(
+    ledger: &crate::tracking::ContextLedger,
+) -> ReadSet {
+    ledger
+        .entries
+        .values()
+        .filter(|e| e.depth.is_seen() && !e.stale)
+        .map(|e| {
+            (
+                e.symbol_id.clone(),
+                (e.content_hash_at_read, e.depth),
+            )
+        })
+        .collect()
+}
+
 /// Split `"<relative-path>::<Name/Path>"` into its two halves.
 ///
 /// Symbol ids are built as `{path_prefix}::{name_path}` by every parser, with
@@ -125,15 +265,27 @@ pub fn split_symbol_id(id: &str) -> Option<(&str, &str)> {
 }
 
 /// Recursively index every symbol in the tree by id, including nested children.
-fn index_symbols<'a>(symbols: &'a [SymbolNode], out: &mut HashMap<&'a str, &'a SymbolNode>) {
+fn index_symbols<'a>(symbols: &'a [SymbolNode], out: &mut HashMap<&'a str, Vec<&'a SymbolNode>>) {
     for sym in symbols {
-        out.insert(sym.id.as_str(), sym);
+        out.entry(sym.id.as_str()).or_default().push(sym);
         index_symbols(&sym.children, out);
     }
 }
 
-/// Build an id → symbol index over the whole project tree.
-pub fn index_tree(tree: &ProjectTree) -> HashMap<&str, &SymbolNode> {
+/// Build an id → symbols index over the whole project tree.
+///
+/// The value is a `Vec` because **symbol ids are not unique**. Ids are
+/// `{relative_path}::{name_path}`, so in Rust a `struct Foo` and its
+/// `impl Foo` in the same file both produce `path::Foo` — with different
+/// content hashes, since they are different spans of source.
+///
+/// That collision predates this module and affects `ContextLedger` (keyed by
+/// id) and the coverage counts too. Here it would be actively harmful:
+/// keeping one arbitrary node per id means the one we compare against may not
+/// be the one whose hash was journaled, reporting drift on a file nobody
+/// touched. Since almost every Rust type has an impl block, that would be the
+/// common case rather than an edge case.
+pub fn index_tree(tree: &ProjectTree) -> HashMap<&str, Vec<&SymbolNode>> {
     let mut out = HashMap::new();
     for file in &tree.files {
         index_symbols(&file.symbols, &mut out);
@@ -146,7 +298,7 @@ pub fn index_tree(tree: &ProjectTree) -> HashMap<&str, &SymbolNode> {
 /// `reads` is the last-write-wins fold produced by
 /// [`crate::journal::read_journal`].
 pub fn classify(
-    reads: &HashMap<String, ([u8; 32], ReadDepth)>,
+    reads: &ReadSet,
     tree: &ProjectTree,
 ) -> RestoreOutcome {
     let index = index_tree(tree);
@@ -159,8 +311,15 @@ pub fn classify(
         // exist, and using it uniformly means one rule instead of two.
         let (file_path, name_path) = split_id(id);
 
-        match index.get(id.as_str()) {
-            Some(sym) if sym.content_hash == *hash_at_read => {
+        // A read is still good if *any* symbol under this id still hashes to
+        // what was recorded — see `index_tree` on why one id can name several
+        // symbols.
+        let candidates = index.get(id.as_str());
+        let matched = candidates
+            .and_then(|syms| syms.iter().find(|s| s.content_hash == *hash_at_read));
+
+        match (candidates, matched) {
+            (_, Some(sym)) => {
                 outcome.restored.push(RestoredSymbol {
                     symbol_id: id.clone(),
                     file_path,
@@ -170,13 +329,13 @@ pub fn classify(
                     estimated_tokens: sym.estimated_tokens,
                 });
             }
-            Some(_) => outcome.drifted.push(OmittedSymbol {
+            (Some(_), None) => outcome.drifted.push(OmittedSymbol {
                 symbol_id: id.clone(),
                 file_path,
                 name_path,
                 reason: OmissionReason::Drifted,
             }),
-            None => outcome.removed.push(OmittedSymbol {
+            (None, _) => outcome.removed.push(OmittedSymbol {
                 symbol_id: id.clone(),
                 file_path,
                 name_path,
@@ -228,7 +387,7 @@ mod tests {
 
     fn reads(
         entries: &[(&str, [u8; 32], ReadDepth)],
-    ) -> HashMap<String, ([u8; 32], ReadDepth)> {
+    ) -> ReadSet {
         entries
             .iter()
             .map(|(id, h, d)| (id.to_string(), (*h, *d)))
@@ -306,6 +465,41 @@ mod tests {
         assert_eq!(out.restored[0].name_path, "kept");
         assert_eq!(out.drifted.len(), 1);
         assert_eq!(out.drifted[0].name_path, "edited");
+    }
+
+    /// Symbol ids are not unique — a Rust `struct Foo` and its `impl Foo` in
+    /// the same file share the id `path::Foo` with different content hashes.
+    /// A read matching either one must restore, or nearly every Rust type
+    /// would report spurious drift.
+    #[test]
+    fn colliding_ids_restore_when_any_candidate_matches() {
+        let tree = project(vec![file(
+            "a.rs",
+            vec![
+                sym_hashed("a.rs::Foo", "Foo", "struct Foo { x: u8 }"),
+                sym_hashed("a.rs::Foo", "Foo", "impl Foo { fn new() {} }"),
+            ],
+        )]);
+
+        // Read recorded the impl block's hash; the struct is indexed first.
+        let out = classify(
+            &reads(&[(
+                "a.rs::Foo",
+                content_hash("impl Foo { fn new() {} }"),
+                ReadDepth::FullBody,
+            )]),
+            &tree,
+        );
+        assert_eq!(out.restored.len(), 1, "matching either candidate is enough");
+        assert!(out.drifted.is_empty());
+
+        // A hash matching neither is still genuine drift.
+        let out = classify(
+            &reads(&[("a.rs::Foo", content_hash("something else"), ReadDepth::FullBody)]),
+            &tree,
+        );
+        assert!(out.restored.is_empty());
+        assert_eq!(out.drifted.len(), 1);
     }
 
     #[test]
