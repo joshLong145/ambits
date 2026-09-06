@@ -6,6 +6,15 @@ use std::time::Instant;
 
 use crate::symbols::{SymbolId, SymbolNode};
 
+/// How much of a symbol an agent has actually read.
+///
+/// This is a strict total order (`Unseen < NameOnly < .. < FullBody`) and is
+/// only ever *upgraded* by [`ContextLedger::record`]. Staleness is
+/// deliberately **not** a variant here: "the content changed since we read it"
+/// is orthogonal to "how much of it we read", and modelling it as the maximum
+/// depth made it absorbing — a stale symbol could never recover, because a
+/// later `FullBody` read failed the `depth > current` upgrade test. See
+/// [`ContextEntry::stale`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReadDepth {
     Unseen,
@@ -13,7 +22,6 @@ pub enum ReadDepth {
     Overview,
     Signature,
     FullBody,
-    Stale,
 }
 
 impl ReadDepth {
@@ -31,7 +39,6 @@ impl std::fmt::Display for ReadDepth {
             ReadDepth::Overview => write!(f, "overview"),
             ReadDepth::Signature => write!(f, "signature"),
             ReadDepth::FullBody => write!(f, "full"),
-            ReadDepth::Stale => write!(f, "stale"),
         }
     }
 }
@@ -41,6 +48,16 @@ pub struct ContextEntry {
     pub symbol_id: SymbolId,
     /// Aggregate depth: the maximum depth across all agents.
     pub depth: ReadDepth,
+    /// Whether the symbol's content has changed since it was last read.
+    ///
+    /// Orthogonal to `depth` — a stale symbol retains the depth it was read
+    /// at, so we can still say *how much* was read before it drifted. Set by
+    /// [`ContextLedger::mark_stale_if_changed`], cleared by any subsequent
+    /// read. Staleness is a property of the content, so it is shared by every
+    /// agent rather than tracked per-agent.
+    pub stale: bool,
+    /// Content hash as of the most recent read. Always refreshed on every
+    /// read, so it can be compared against the current tree to detect drift.
     pub content_hash_at_read: [u8; 32],
     pub timestamp: Instant,
     /// The last agent that touched this symbol.
@@ -65,8 +82,15 @@ impl ContextLedger {
     /// Record that a symbol was seen at the given depth by a specific agent.
     ///
     /// Per-agent depths are tracked independently — agent A can have `FullBody`
-    /// while agent B has `Overview` for the same symbol. The aggregate `depth`
-    /// field is always the maximum across all agents.
+    /// while agent B has `Overview` for the same symbol — and are upgrade-only.
+    /// The aggregate `depth` field is always the maximum across all agents.
+    ///
+    /// Provenance (`stale`, `content_hash_at_read`, `timestamp`, `agent_id`,
+    /// `token_count`) is refreshed on *every* read, not just on a depth
+    /// upgrade. That matters: a re-read at an unchanged depth still proves the
+    /// symbol was seen in its current form, so gating the hash refresh on a
+    /// depth increase would leave a stale hash behind and make the entry look
+    /// drifted when it isn't.
     pub fn record(
         &mut self,
         symbol_id: SymbolId,
@@ -78,6 +102,7 @@ impl ContextLedger {
         let entry = self.entries.entry(symbol_id.clone()).or_insert_with(|| ContextEntry {
             symbol_id: symbol_id.clone(),
             depth: ReadDepth::Unseen,
+            stale: false,
             content_hash_at_read: [0u8; 32],
             timestamp: Instant::now(),
             agent_id: String::new(),
@@ -87,25 +112,25 @@ impl ContextLedger {
 
         // Update per-agent depth (only upgrade, never downgrade).
         let agent_depth = entry.agent_depths.entry(agent_id.clone()).or_insert(ReadDepth::Unseen);
-        if depth == ReadDepth::Stale || depth > *agent_depth {
+        if depth > *agent_depth {
             *agent_depth = depth;
         }
 
         // Recompute aggregate depth as max across all agents.
-        let max_depth = entry
+        entry.depth = entry
             .agent_depths
             .values()
             .copied()
             .max()
             .unwrap_or(ReadDepth::Unseen);
 
-        if max_depth == ReadDepth::Stale || max_depth > entry.depth {
-            entry.depth = max_depth;
-            entry.content_hash_at_read = content_hash;
-            entry.timestamp = Instant::now();
-            entry.agent_id = agent_id;
-            entry.token_count = token_count;
-        }
+        // A read always re-establishes provenance: we have just seen this
+        // symbol at its current content, so it is by definition not stale.
+        entry.stale = false;
+        entry.content_hash_at_read = content_hash;
+        entry.timestamp = Instant::now();
+        entry.agent_id = agent_id;
+        entry.token_count = token_count;
     }
 
     /// Get the read depth for a symbol, defaulting to Unseen.
@@ -116,17 +141,29 @@ impl ContextLedger {
             .unwrap_or(ReadDepth::Unseen)
     }
 
-    /// Mark all entries whose content hash no longer matches as Stale.
-    /// Propagates the stale marker to all per-agent depth entries as well.
+    /// Flag a seen entry as stale when its content hash no longer matches.
+    ///
+    /// Depth is left untouched — we still know how much was read, we just know
+    /// it no longer describes the current content. The flag is per-entry
+    /// rather than per-agent because content drift affects every agent that
+    /// read it equally.
     pub fn mark_stale_if_changed(&mut self, symbol_id: &str, current_hash: [u8; 32]) {
         if let Some(entry) = self.entries.get_mut(symbol_id) {
-            if entry.depth != ReadDepth::Unseen && entry.content_hash_at_read != current_hash {
-                entry.depth = ReadDepth::Stale;
-                for depth in entry.agent_depths.values_mut() {
-                    *depth = ReadDepth::Stale;
-                }
+            if entry.depth.is_seen() && entry.content_hash_at_read != current_hash {
+                entry.stale = true;
             }
         }
+    }
+
+    /// Whether the symbol has been read and has since drifted. `false` for
+    /// untracked symbols.
+    pub fn is_stale(&self, symbol_id: &str) -> bool {
+        self.entries.get(symbol_id).map(|e| e.stale).unwrap_or(false)
+    }
+
+    /// Count of seen entries currently flagged stale.
+    pub fn total_stale(&self) -> usize {
+        self.entries.values().filter(|e| e.stale && e.depth.is_seen()).count()
     }
 
     pub fn total_seen(&self) -> usize {
@@ -251,14 +288,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_overrides_everything() {
-        let mut ledger = ContextLedger::new();
-        ledger.record("s1".into(), ReadDepth::FullBody, hash("a"), "ag".into(), 10);
-        ledger.record("s1".into(), ReadDepth::Stale, hash("b"), "ag".into(), 10);
-        assert_eq!(ledger.depth_of("s1"), ReadDepth::Stale);
-    }
-
-    #[test]
     fn mark_stale_if_changed() {
         let mut ledger = ContextLedger::new();
         let h1 = hash("v1");
@@ -267,11 +296,68 @@ mod tests {
 
         // Same hash — no change.
         ledger.mark_stale_if_changed("s1", h1);
+        assert!(!ledger.is_stale("s1"));
         assert_eq!(ledger.depth_of("s1"), ReadDepth::FullBody);
 
-        // Different hash — becomes stale.
+        // Different hash — flagged stale, but the depth is retained: we still
+        // know how much was read, just not that it's current.
         ledger.mark_stale_if_changed("s1", h2);
-        assert_eq!(ledger.depth_of("s1"), ReadDepth::Stale);
+        assert!(ledger.is_stale("s1"));
+        assert_eq!(ledger.depth_of("s1"), ReadDepth::FullBody);
+    }
+
+    /// Regression: staleness used to be the maximum `ReadDepth` variant, which
+    /// made it absorbing — `FullBody > Stale` is false, so a genuine re-read
+    /// could never clear it and the symbol stayed stale forever.
+    #[test]
+    fn re_read_after_drift_clears_stale() {
+        let mut ledger = ContextLedger::new();
+        let h1 = hash("v1");
+        let h2 = hash("v2");
+
+        ledger.record("s1".into(), ReadDepth::FullBody, h1, "ag".into(), 10);
+        ledger.mark_stale_if_changed("s1", h2);
+        assert!(ledger.is_stale("s1"));
+
+        // The agent re-reads the changed symbol.
+        ledger.record("s1".into(), ReadDepth::FullBody, h2, "ag".into(), 10);
+        assert!(!ledger.is_stale("s1"));
+        assert_eq!(ledger.depth_of("s1"), ReadDepth::FullBody);
+        assert_eq!(ledger.depth_of_for_agent("s1", "ag"), ReadDepth::FullBody);
+    }
+
+    /// Regression: `content_hash_at_read` used to refresh only on a strict
+    /// depth increase, so re-reading at an unchanged depth left the old hash
+    /// behind and the entry looked drifted when it wasn't.
+    #[test]
+    fn same_depth_re_read_refreshes_content_hash() {
+        let mut ledger = ContextLedger::new();
+        let h1 = hash("v1");
+        let h2 = hash("v2");
+
+        ledger.record("s1".into(), ReadDepth::Overview, h1, "ag".into(), 10);
+        // File edited and re-read at the *same* depth.
+        ledger.record("s1".into(), ReadDepth::Overview, h2, "ag".into(), 10);
+
+        assert_eq!(ledger.entries["s1"].content_hash_at_read, h2);
+        // Comparing against the current content must now agree.
+        ledger.mark_stale_if_changed("s1", h2);
+        assert!(!ledger.is_stale("s1"));
+    }
+
+    /// A lower-depth re-read must not downgrade the recorded depth, but must
+    /// still refresh provenance.
+    #[test]
+    fn lower_depth_re_read_refreshes_hash_without_downgrading() {
+        let mut ledger = ContextLedger::new();
+        let h1 = hash("v1");
+        let h2 = hash("v2");
+
+        ledger.record("s1".into(), ReadDepth::FullBody, h1, "ag".into(), 10);
+        ledger.record("s1".into(), ReadDepth::NameOnly, h2, "ag".into(), 10);
+
+        assert_eq!(ledger.depth_of("s1"), ReadDepth::FullBody);
+        assert_eq!(ledger.entries["s1"].content_hash_at_read, h2);
     }
 
     #[test]
@@ -346,8 +432,11 @@ mod tests {
         assert!(ledger.agents_for_symbol("nonexistent").is_empty());
     }
 
+    /// Staleness is a property of the content, so it is recorded once per
+    /// entry and applies to every agent that read it — while each agent's own
+    /// depth is left intact.
     #[test]
-    fn mark_stale_propagates_to_agent_depths() {
+    fn staleness_is_shared_across_agents_and_preserves_their_depths() {
         let mut ledger = ContextLedger::new();
         let h1 = hash("v1");
         let h2 = hash("v2");
@@ -355,13 +444,13 @@ mod tests {
         ledger.record("s1".into(), ReadDepth::FullBody, h1, "agent_a".into(), 10);
         ledger.record("s1".into(), ReadDepth::Overview, h1, "agent_b".into(), 5);
 
-        // Mark stale with changed hash.
         ledger.mark_stale_if_changed("s1", h2);
 
-        // Both aggregate and per-agent depths should be stale.
-        assert_eq!(ledger.depth_of("s1"), ReadDepth::Stale);
-        assert_eq!(ledger.depth_of_for_agent("s1", "agent_a"), ReadDepth::Stale);
-        assert_eq!(ledger.depth_of_for_agent("s1", "agent_b"), ReadDepth::Stale);
+        assert!(ledger.is_stale("s1"));
+        assert_eq!(ledger.total_stale(), 1);
+        assert_eq!(ledger.depth_of("s1"), ReadDepth::FullBody);
+        assert_eq!(ledger.depth_of_for_agent("s1", "agent_a"), ReadDepth::FullBody);
+        assert_eq!(ledger.depth_of_for_agent("s1", "agent_b"), ReadDepth::Overview);
     }
 
     #[test]

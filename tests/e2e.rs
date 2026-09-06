@@ -262,9 +262,10 @@ fn stale_detection() {
     ledger.record("s1".into(), ReadDepth::FullBody, h1, "ag".into(), 10);
     assert_eq!(ledger.depth_of("s1"), ReadDepth::FullBody);
 
-    // Content changed — mark stale.
+    // Content changed — flagged stale, depth retained.
     ledger.mark_stale_if_changed("s1", h2);
-    assert_eq!(ledger.depth_of("s1"), ReadDepth::Stale);
+    assert!(ledger.is_stale("s1"));
+    assert_eq!(ledger.depth_of("s1"), ReadDepth::FullBody);
 
     // Stale still counts as "seen" in coverage.
     let sym = sym("s1", "s1");

@@ -30,8 +30,12 @@ use crate::symbols::{ProjectTree, SymbolNode};
 use crate::tracking::ReadDepth;
 
 /// Ordinal encoding of [`ReadDepth`] used for alignment comparisons.
-/// `Unseen=0 .. FullBody=4`, with `Stale=5` sorted above `FullBody` so it
-/// never spuriously compares equal to a non-stale depth.
+/// `Unseen=0 .. FullBody=4`.
+///
+/// Staleness is not represented here. It is a property of the *content*, so
+/// it applies identically to both agents in a pair and therefore cannot
+/// change how their depths compare. (Note that the staleness paths in
+/// `src/tui.rs` never fed this cache anyway — see the module docs.)
 fn depth_ordinal(depth: ReadDepth) -> u8 {
     match depth {
         ReadDepth::Unseen => 0,
@@ -39,7 +43,6 @@ fn depth_ordinal(depth: ReadDepth) -> u8 {
         ReadDepth::Overview => 2,
         ReadDepth::Signature => 3,
         ReadDepth::FullBody => 4,
-        ReadDepth::Stale => 5,
     }
 }
 
@@ -47,10 +50,8 @@ fn depth_ordinal(depth: ReadDepth) -> u8 {
 ///
 /// This is the actual FR2 cache: populated incrementally at ingestion time
 /// (see module docs), not derived from `ContextLedger` on demand. Depths are
-/// upgrade-only per `(symbol, agent)` pair — mirroring
-/// `ContextLedger::record`'s own upgrade-only semantics for per-agent
-/// depth — except `Stale`, which always overwrites (matching
-/// `ContextLedger`'s "Stale overrides everything" rule).
+/// upgrade-only per `(symbol, agent)` pair, mirroring `ContextLedger::record`'s
+/// own upgrade-only semantics for per-agent depth.
 #[derive(Debug, Clone, Default)]
 pub struct DepthOrdinalCache {
     map: HashMap<(String, String), u8>,
@@ -62,12 +63,12 @@ impl DepthOrdinalCache {
     }
 
     /// Record that `agent_id` read `symbol_id` at `depth`. Only upgrades the
-    /// cached ordinal (never downgrades), except `Stale` which always wins.
+    /// cached ordinal, never downgrades.
     pub fn record(&mut self, symbol_id: &str, agent_id: &str, depth: ReadDepth) {
         let ordinal = depth_ordinal(depth);
         let key = (symbol_id.to_string(), agent_id.to_string());
         let entry = self.map.entry(key).or_insert(0);
-        if depth == ReadDepth::Stale || ordinal > *entry {
+        if ordinal > *entry {
             *entry = ordinal;
         }
     }
@@ -549,10 +550,8 @@ mod tests {
     }
 
     #[test]
-    fn cache_stale_always_overrides() {
-        let mut cache = DepthOrdinalCache::new();
-        cache.record("s1", "agent_a", ReadDepth::FullBody);
-        cache.record("s1", "agent_a", ReadDepth::Stale);
-        assert_eq!(cache.get("s1", "agent_a"), depth_ordinal(ReadDepth::Stale));
+    fn cache_get_defaults_to_unseen_for_untracked() {
+        let cache = DepthOrdinalCache::new();
+        assert_eq!(cache.get("nope", "agent_a"), depth_ordinal(ReadDepth::Unseen));
     }
 }

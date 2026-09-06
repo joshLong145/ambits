@@ -185,7 +185,11 @@ pub fn count_symbols(
         if depth.is_seen() {
             seen += 1;
         }
-        if depth == ReadDepth::FullBody {
+        // A drifted symbol still counts as "seen" — the agent did look at it —
+        // but not as "full": whatever it read no longer describes the current
+        // body. Staleness is a property of the content, so it applies
+        // regardless of `agent_filter`.
+        if depth == ReadDepth::FullBody && !ledger.is_stale(&sym.id) {
             full += 1;
         }
 

@@ -34,7 +34,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 "  "
             };
 
-            let color = depth_color(row.read_depth);
+            let color = depth_color(row.read_depth, row.stale);
 
             let mut spans = vec![
                 Span::raw(indent),
@@ -88,14 +88,19 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn depth_color(depth: ReadDepth) -> Color {
+/// Stale symbols get the stale color regardless of how deeply they were read —
+/// "what you know is out of date" is the more urgent fact than "how much of it
+/// you read".
+fn depth_color(depth: ReadDepth, stale: bool) -> Color {
+    if stale && depth.is_seen() {
+        return colors::DEPTH_STALE;
+    }
     match depth {
         ReadDepth::Unseen => colors::DEPTH_UNSEEN,
         ReadDepth::NameOnly => colors::DEPTH_NAME_ONLY,
         ReadDepth::Overview => colors::DEPTH_OVERVIEW,
         ReadDepth::Signature => colors::DEPTH_SIGNATURE,
         ReadDepth::FullBody => colors::DEPTH_FULL_BODY,
-        ReadDepth::Stale => colors::DEPTH_STALE,
     }
 }
 
@@ -158,12 +163,19 @@ mod tests {
 
     #[test]
     fn depth_color_variants() {
-        assert_eq!(depth_color(ReadDepth::Unseen), colors::DEPTH_UNSEEN);
-        assert_eq!(depth_color(ReadDepth::NameOnly), colors::DEPTH_NAME_ONLY);
-        assert_eq!(depth_color(ReadDepth::Overview), colors::DEPTH_OVERVIEW);
-        assert_eq!(depth_color(ReadDepth::Signature), colors::DEPTH_SIGNATURE);
-        assert_eq!(depth_color(ReadDepth::FullBody), colors::DEPTH_FULL_BODY);
-        assert_eq!(depth_color(ReadDepth::Stale), colors::DEPTH_STALE);
+        assert_eq!(depth_color(ReadDepth::Unseen, false), colors::DEPTH_UNSEEN);
+        assert_eq!(depth_color(ReadDepth::NameOnly, false), colors::DEPTH_NAME_ONLY);
+        assert_eq!(depth_color(ReadDepth::Overview, false), colors::DEPTH_OVERVIEW);
+        assert_eq!(depth_color(ReadDepth::Signature, false), colors::DEPTH_SIGNATURE);
+        assert_eq!(depth_color(ReadDepth::FullBody, false), colors::DEPTH_FULL_BODY);
+    }
+
+    #[test]
+    fn stale_overrides_depth_color_for_seen_symbols() {
+        assert_eq!(depth_color(ReadDepth::FullBody, true), colors::DEPTH_STALE);
+        assert_eq!(depth_color(ReadDepth::NameOnly, true), colors::DEPTH_STALE);
+        // An unseen symbol can't be stale; don't let a bad flag recolor it.
+        assert_eq!(depth_color(ReadDepth::Unseen, true), colors::DEPTH_UNSEEN);
     }
 
     #[test]

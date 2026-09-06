@@ -43,6 +43,8 @@ pub struct TreeRow {
     pub line_range: String,
     pub token_count: usize,
     pub read_depth: ReadDepth,
+    /// Content changed since this symbol was read. Orthogonal to `read_depth`.
+    pub stale: bool,
     pub coverage_status: Option<FileCoverageStatus>,
     pub file_coverage_seen: usize,
     pub file_coverage_total: usize,
@@ -331,6 +333,8 @@ impl App {
                 line_range: format!("{} lines", file.total_lines),
                 token_count: 0,
                 read_depth: file_read_depth,
+                // File rows are colored by coverage status, not depth/staleness.
+                stale: false,
                 coverage_status: Some(status),
                 file_coverage_seen: seen,
                 file_coverage_total: total,
@@ -815,6 +819,7 @@ fn flatten_symbol(
         line_range: format!("L{}-{}", sym.line_range.start, sym.line_range.end),
         token_count: sym.estimated_tokens as usize,
         read_depth,
+        stale: ledger.is_stale(&sym.id),
         coverage_status: None,
         file_coverage_seen: 0,
         file_coverage_total: 0,

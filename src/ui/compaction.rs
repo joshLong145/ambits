@@ -197,7 +197,6 @@ fn format_tokens(n: u64) -> String {
 fn depth_label(d: ReadDepth) -> &'static str {
     match d {
         ReadDepth::Unseen => "Unseen",
-        ReadDepth::Stale => "Stale",
         ReadDepth::NameOnly => "NameOnly",
         ReadDepth::Overview => "Overview",
         ReadDepth::Signature => "Signature",
@@ -208,7 +207,6 @@ fn depth_label(d: ReadDepth) -> &'static str {
 fn depth_color(d: ReadDepth) -> Color {
     match d {
         ReadDepth::Unseen => Color::DarkGray,
-        ReadDepth::Stale => Color::Red,
         ReadDepth::NameOnly => Color::Gray,
         ReadDepth::Overview => Color::Cyan,
         ReadDepth::Signature => Color::Blue,
