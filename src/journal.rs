@@ -18,18 +18,31 @@
 //! read-state changed:
 //!
 //! ```text
-//! {"kind":"header","schema_version":1,...}
-//! {"kind":"read","sym":"src/app.rs::App/record","h":"b3:1a2b…","d":"full_body"}
+//! {"kind":"header","schema_version":2,...}
+//! {"kind":"read","sym":"src/app.rs::App/record","h":"b3:1a2b…","d":"full_body","a":"agent-3f9c"}
 //! ```
 //!
 //! ## Written by diffing the ledger
 //!
 //! Rather than intercepting every read, [`Journal::sync`] walks
-//! [`ContextLedger`] and appends only entries whose `(hash, depth)` differs from
-//! what has already been journaled. That yields exactly one record per
-//! read-set change, with no plumbing through the recursive symbol-marking hot
-//! path. It is sound only because `ContextLedger::record` refreshes
-//! `content_hash_at_read` on *every* read — see its docs; it did not always.
+//! [`ContextLedger`] and appends only `(symbol, agent)` pairs whose
+//! `(hash, depth)` differs from what has already been journaled. That yields
+//! exactly one record per read-set change, with no plumbing through the
+//! recursive symbol-marking hot path. It is sound only because
+//! `ContextLedger::record` refreshes `content_hash_at_read` on *every* read —
+//! see its docs; it did not always.
+//!
+//! ## Agent attribution and portability
+//!
+//! Everything that decides *whether a read is still valid* is
+//! machine-independent by construction: symbol ids are project-relative and
+//! hashes are content-derived, so a journal means the same thing on any host
+//! with the same source. Agent ids are the exception — Claude Code mints them
+//! per session — so they are recorded for fidelity (restoring agent-filtered
+//! coverage and alignment) while the header carries the `host` they came from.
+//! A consumer on another machine can therefore either use them as opaque
+//! labels or remap them, and dropping them entirely still leaves a usable
+//! symbol-level read set.
 //!
 //! Stale entries are skipped rather than rewritten, so a symbol that drifts
 //! simply keeps its last-known-good hash on disk and fails the comparison at
@@ -63,7 +76,19 @@ use crate::tracking::{ContextLedger, ReadDepth};
 /// Journal format version. Bumped on any breaking change to the on-disk
 /// shape; readers refuse newer files rather than misinterpret them. Mirrors
 /// `ToolMappingConfig::SUPPORTED_VERSION`'s role for tool configs.
-pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+///
+/// - **v1** — one record per symbol, no agent attribution.
+/// - **v2** — one record per `(symbol, agent)`, plus `host` in the manifest.
+///
+/// Older versions stay readable: `a` is optional and the manifest fields are
+/// `#[serde(default)]`, so a v1 file folds into the same symbol-level view and
+/// only loses per-agent detail. See [`MIN_READABLE_SCHEMA_VERSION`].
+pub const SUPPORTED_SCHEMA_VERSION: u32 = 2;
+
+/// Oldest on-disk version this build can still fold. Reading an older journal
+/// is always preferable to discarding it — the symbol-level read set, which is
+/// what `restore-context` needs, is present in every version.
+pub const MIN_READABLE_SCHEMA_VERSION: u32 = 1;
 
 /// Directory, relative to the project root, holding per-session journals.
 pub const JOURNAL_SUBDIR: &str = ".ambit/coverage";
@@ -140,6 +165,15 @@ pub struct EnvironmentManifest {
     pub filter: Option<String>,
     pub os: String,
     pub arch: String,
+    /// Machine the reads happened on.
+    ///
+    /// Nothing in restore consults this — the read set itself is entirely
+    /// host-independent (project-relative symbol ids, content hashes). It is
+    /// here so that agent ids, which *are* machine-scoped, can be traced back
+    /// to where they were minted when a journal is carried to another host.
+    /// Absent in v1 journals, hence `default`.
+    #[serde(default)]
+    pub host: String,
 }
 
 impl EnvironmentManifest {
@@ -161,8 +195,41 @@ impl EnvironmentManifest {
             filter,
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
+            host: hostname(),
         }
     }
+}
+
+/// Best-effort machine name, without taking on a dependency for it.
+///
+/// Diagnostic only (see [`EnvironmentManifest::host`]), so every source is
+/// allowed to fail and `"unknown"` is an acceptable answer. Runs once per
+/// session, at journal open.
+fn hostname() -> String {
+    let from_env = ["HOSTNAME", "HOST", "COMPUTERNAME"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok())
+        .filter(|h| !h.is_empty());
+    if let Some(h) = from_env {
+        return h;
+    }
+
+    if let Some(h) = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return h;
+    }
+
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// The journal's first line: what this session's reads mean.
@@ -183,8 +250,8 @@ pub struct HeaderRecord {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Record {
     Header(Box<HeaderRecord>),
-    /// A symbol's read-state changed: it was read for the first time, or
-    /// re-read after its content changed.
+    /// One agent's read-state for one symbol changed: it was read for the
+    /// first time, re-read deeper, or re-read after its content changed.
     Read {
         #[serde(rename = "sym")]
         symbol_id: String,
@@ -192,6 +259,14 @@ pub enum Record {
         hash: String,
         #[serde(rename = "d")]
         depth: DepthDto,
+        /// Which agent read it.
+        ///
+        /// Machine-scoped (Claude Code mints these per session), which is why
+        /// the manifest records a `host` to trace them back. Absent in v1
+        /// journals and in any record we cannot attribute, in which case the
+        /// read still counts — it just cannot be filtered by agent.
+        #[serde(rename = "a", default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
     },
 }
 
@@ -249,12 +324,24 @@ pub fn decode_hash(s: &str) -> Option<[u8; 32]> {
 // Reading
 // ---------------------------------------------------------------------------
 
+/// A journaled read, keyed by the agent that performed it.
+pub type AgentReadKey = (String, String);
+
 /// Everything recovered from a journal file, plus any non-fatal complaints.
 #[derive(Debug, Default)]
 pub struct JournalContents {
     pub header: Option<(u32, EnvironmentManifest)>,
-    /// Last-write-wins per symbol, matching how a reader should fold them.
+    /// Symbol-level view: what was read, and what it looked like.
+    ///
+    /// Folded to mirror `ContextLedger`'s own semantics rather than by naive
+    /// last-write-wins. A record carrying a *new* hash supersedes what came
+    /// before (the content moved on, so earlier depths describe a version that
+    /// no longer exists); a record carrying the *same* hash contributes its
+    /// depth to the maximum, which is how the ledger aggregates across agents.
     pub reads: HashMap<String, ([u8; 32], ReadDepth)>,
+    /// Per-`(symbol, agent)` view, for restoring agent-filtered coverage.
+    /// Empty for v1 journals, which carried no attribution.
+    pub agent_reads: HashMap<AgentReadKey, ([u8; 32], ReadDepth)>,
     pub warnings: Vec<String>,
 }
 
@@ -298,11 +385,14 @@ pub fn read_journal(path: &Path) -> JournalContents {
 
         match record {
             Record::Header(header) => {
-                if header.schema_version > SUPPORTED_SCHEMA_VERSION {
+                if header.schema_version > SUPPORTED_SCHEMA_VERSION
+                    || header.schema_version < MIN_READABLE_SCHEMA_VERSION
+                {
                     out.warnings.push(format!(
-                        "{}: schema version {} is newer than supported {}; ignoring journal",
+                        "{}: schema version {} is outside the readable range {}..={}; ignoring journal",
                         path.display(),
                         header.schema_version,
+                        MIN_READABLE_SCHEMA_VERSION,
                         SUPPORTED_SCHEMA_VERSION
                     ));
                     return JournalContents {
@@ -316,9 +406,32 @@ pub fn read_journal(path: &Path) -> JournalContents {
                 symbol_id,
                 hash,
                 depth,
+                agent,
             } => match decode_hash(&hash) {
                 Some(h) => {
-                    out.reads.insert(symbol_id, (h, depth.into()));
+                    let depth: ReadDepth = depth.into();
+                    out.reads
+                        .entry(symbol_id.clone())
+                        .and_modify(|slot| {
+                            if slot.0 == h {
+                                slot.1 = slot.1.max(depth);
+                            } else {
+                                *slot = (h, depth);
+                            }
+                        })
+                        .or_insert((h, depth));
+                    if let Some(agent) = agent {
+                        out.agent_reads
+                            .entry((symbol_id, agent))
+                            .and_modify(|slot| {
+                                if slot.0 == h {
+                                    slot.1 = slot.1.max(depth);
+                                } else {
+                                    *slot = (h, depth);
+                                }
+                            })
+                            .or_insert((h, depth));
+                    }
                 }
                 None => out.warnings.push(format!(
                     "{}:{}: malformed hash {hash:?}",
@@ -342,7 +455,14 @@ pub struct Journal {
     path: PathBuf,
     file: Option<File>,
     /// What is already on disk, so a diff can skip unchanged entries.
-    journaled: HashMap<String, ([u8; 32], ReadDepth)>,
+    ///
+    /// Keyed by `(symbol, agent)` since v2: two agents reading the same symbol
+    /// are two facts, and collapsing them would let the first read suppress
+    /// the second.
+    journaled: HashMap<AgentReadKey, ([u8; 32], ReadDepth)>,
+    /// Distinct symbols on disk, for [`Journal::len`]. Tracked separately so
+    /// the count stays a symbol count rather than a record count.
+    symbols: std::collections::HashSet<String>,
     interval: Duration,
     last_sync: Instant,
     /// Set when writing fails. Journaling then stops for the rest of the run
@@ -372,6 +492,7 @@ impl Journal {
             path: path.clone(),
             file: None,
             journaled: HashMap::new(),
+            symbols: std::collections::HashSet::new(),
             interval,
             last_sync: Instant::now(),
             error: None,
@@ -386,7 +507,12 @@ impl Journal {
         let existing = read_journal(&path);
         journal.warnings.extend(existing.warnings);
         let had_header = existing.header.is_some();
-        journal.journaled = existing.reads;
+        journal.symbols = existing.reads.keys().cloned().collect();
+        // Seeded from the attributed view only. A v1 journal has none, so its
+        // reads are re-appended once, in v2 form, on the first sync — a
+        // one-time cost that upgrades the file in place rather than stranding
+        // its history behind a version gate.
+        journal.journaled = existing.agent_reads;
 
         let file = match OpenOptions::new().create(true).append(true).open(&path) {
             Ok(f) => f,
@@ -397,7 +523,18 @@ impl Journal {
         };
         journal.file = Some(file);
 
-        if !had_header {
+        // Append a fresh header when the file has none, or when its header
+        // declares an older format than we are about to write. The file is
+        // append-only so the old line stays, but readers take the last header
+        // they see — which keeps the declared version honest once `sync` has
+        // upgraded the records below it. Without this, an upgraded file would
+        // still claim v1 and be discarded the day v1 leaves the readable
+        // range, despite containing perfectly current records.
+        let stale_header = existing
+            .header
+            .as_ref()
+            .is_some_and(|(v, _)| *v < SUPPORTED_SCHEMA_VERSION);
+        if !had_header || stale_header {
             let header = Record::Header(Box::new(HeaderRecord {
                 schema_version: SUPPORTED_SCHEMA_VERSION,
                 created_at: timestamp(),
@@ -419,13 +556,13 @@ impl Journal {
         &self.warnings
     }
 
-    /// Number of symbols currently recorded on disk.
+    /// Number of distinct symbols currently recorded on disk.
     pub fn len(&self) -> usize {
-        self.journaled.len()
+        self.symbols.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.journaled.is_empty()
+        self.symbols.is_empty()
     }
 
     /// Diff against the ledger if the flush interval has elapsed.
@@ -441,38 +578,51 @@ impl Journal {
     ///
     /// Skips unseen and stale entries: we only ever journal reads we currently
     /// believe describe the file as it is on disk.
+    ///
+    /// One record per `(symbol, agent)` whose depth or hash moved. The content
+    /// hash is a property of the symbol, not of the reader, so every agent's
+    /// record for a symbol carries the same hash — what differs is how deeply
+    /// each one read it.
     pub fn sync(&mut self, ledger: &ContextLedger) -> usize {
         self.last_sync = Instant::now();
         if self.error.is_some() {
             return 0;
         }
 
-        let mut pending: Vec<(String, [u8; 32], ReadDepth)> = Vec::new();
+        let mut pending: Vec<(String, String, [u8; 32], ReadDepth)> = Vec::new();
         for (id, entry) in &ledger.entries {
             if !entry.depth.is_seen() || entry.stale {
                 continue;
             }
-            let current = (entry.content_hash_at_read, entry.depth);
-            if self.journaled.get(id) != Some(&current) {
-                pending.push((id.clone(), current.0, current.1));
+            for (agent, depth) in &entry.agent_depths {
+                if !depth.is_seen() {
+                    continue;
+                }
+                let current = (entry.content_hash_at_read, *depth);
+                let key = (id.clone(), agent.clone());
+                if self.journaled.get(&key) != Some(&current) {
+                    pending.push((id.clone(), agent.clone(), current.0, current.1));
+                }
             }
         }
 
         // Deterministic order keeps golden-file tests stable; HashMap
         // iteration order is not.
-        pending.sort_by(|a, b| a.0.cmp(&b.0));
+        pending.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
 
         let mut written = 0;
-        for (id, hash, depth) in pending {
+        for (id, agent, hash, depth) in pending {
             let record = Record::Read {
                 symbol_id: id.clone(),
                 hash: encode_hash(&hash),
                 depth: depth.into(),
+                agent: Some(agent.clone()),
             };
             if !self.write(&record) {
                 break;
             }
-            self.journaled.insert(id, (hash, depth));
+            self.journaled.insert((id.clone(), agent), (hash, depth));
+            self.symbols.insert(id);
             written += 1;
         }
         written
@@ -542,6 +692,7 @@ mod tests {
             filter: None,
             os: "testos".into(),
             arch: "testarch".into(),
+            host: "testhost".into(),
         }
     }
 
@@ -586,6 +737,121 @@ mod tests {
         assert!(lines[0].contains("\"kind\":\"header\""));
         assert!(lines[1].contains("a.rs::x"));
         assert!(lines[1].contains("full_body"));
+    }
+
+    /// Two agents reading the same symbol are two facts. Collapsing them
+    /// would let whichever synced first suppress the other, and agent-filtered
+    /// coverage would come back wrong.
+    #[test]
+    fn each_agent_gets_its_own_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = ContextLedger::new();
+        let h = content_hash("body");
+        ledger.record("a.rs::x".into(), ReadDepth::FullBody, h, "parent".into(), 5);
+        ledger.record("a.rs::x".into(), ReadDepth::Signature, h, "child".into(), 5);
+
+        let mut j = journal_in(dir.path());
+        assert_eq!(j.sync(&ledger), 2, "one record per agent");
+        assert_eq!(j.len(), 1, "but still one distinct symbol");
+
+        let contents = read_journal(j.path());
+        assert_eq!(
+            contents.agent_reads[&("a.rs::x".to_string(), "parent".to_string())].1,
+            ReadDepth::FullBody
+        );
+        assert_eq!(
+            contents.agent_reads[&("a.rs::x".to_string(), "child".to_string())].1,
+            ReadDepth::Signature
+        );
+        assert_eq!(
+            contents.reads["a.rs::x"].1,
+            ReadDepth::FullBody,
+            "the symbol-level fold takes the deepest read, as the ledger does"
+        );
+    }
+
+    /// A v1 journal predates attribution. It must still restore — losing the
+    /// agent breakdown is a far smaller loss than discarding the read set.
+    #[test]
+    fn v1_journals_without_agents_still_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.ndjson");
+        let header = r#"{"kind":"header","schema_version":1,"created_at":"0","session_id":"s","project_root":"/p","tree_fingerprint":"b3:00","ambit_version":"0.17.0","backend":"tree-sitter","os":"linux","arch":"x86_64"}"#;
+        let read = format!(
+            r#"{{"kind":"read","sym":"a.rs::x","h":"{}","d":"full_body"}}"#,
+            encode_hash(&[1u8; 32])
+        );
+        std::fs::write(&path, format!("{header}\n{read}\n")).unwrap();
+
+        let contents = read_journal(&path);
+        assert_eq!(contents.header.unwrap().0, 1);
+        assert_eq!(contents.reads["a.rs::x"].1, ReadDepth::FullBody);
+        assert!(
+            contents.agent_reads.is_empty(),
+            "no attribution existed to recover"
+        );
+        assert!(contents.warnings.is_empty(), "an old version is not a fault");
+    }
+
+    /// A record carrying a new hash supersedes earlier depths rather than
+    /// maxing with them: those depths describe a version of the symbol that no
+    /// longer exists.
+    #[test]
+    fn a_new_hash_supersedes_rather_than_accumulates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.ndjson");
+        let deep = format!(
+            r#"{{"kind":"read","sym":"a.rs::x","h":"{}","d":"full_body","a":"ag"}}"#,
+            encode_hash(&[1u8; 32])
+        );
+        let shallow_but_newer = format!(
+            r#"{{"kind":"read","sym":"a.rs::x","h":"{}","d":"signature","a":"ag"}}"#,
+            encode_hash(&[2u8; 32])
+        );
+        std::fs::write(&path, format!("{deep}\n{shallow_but_newer}\n")).unwrap();
+
+        let contents = read_journal(&path);
+        assert_eq!(contents.reads["a.rs::x"], ([2u8; 32], ReadDepth::Signature));
+    }
+
+    /// Opening a v1 journal with a v2 writer: the existing history stays
+    /// readable and countable, no second header is written, and the reads are
+    /// re-appended once in attributed form. That one-time growth is the cost
+    /// of upgrading the file in place instead of stranding it.
+    #[test]
+    fn a_v1_journal_is_upgraded_in_place_on_first_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let coverage = dir.path().join(JOURNAL_SUBDIR);
+        std::fs::create_dir_all(&coverage).unwrap();
+        let path = coverage.join("sess.ndjson");
+
+        let h = content_hash("body");
+        let header = r#"{"kind":"header","schema_version":1,"created_at":"0","session_id":"sess","project_root":"/p","tree_fingerprint":"b3:00","ambit_version":"0.16.0","backend":"tree-sitter","os":"linux","arch":"x86_64"}"#;
+        let read = format!(
+            r#"{{"kind":"read","sym":"a.rs::x","h":"{}","d":"full_body"}}"#,
+            encode_hash(&h)
+        );
+        std::fs::write(&path, format!("{header}\n{read}\n")).unwrap();
+
+        let mut ledger = ContextLedger::new();
+        ledger.record("a.rs::x".into(), ReadDepth::FullBody, h, "ag".into(), 5);
+
+        let mut j = journal_in(dir.path());
+        assert_eq!(j.len(), 1, "the v1 history is visible immediately");
+        assert_eq!(j.sync(&ledger), 1, "re-appended once, now attributed");
+        assert_eq!(j.sync(&ledger), 0, "and not again");
+
+        let contents = read_journal(&path);
+        assert_eq!(
+            contents.header.unwrap().0,
+            SUPPORTED_SCHEMA_VERSION,
+            "the upgraded file declares the version it now actually holds"
+        );
+        assert_eq!(
+            contents.agent_reads[&("a.rs::x".to_string(), "ag".to_string())].1,
+            ReadDepth::FullBody,
+            "attribution is now recoverable"
+        );
     }
 
     #[test]
@@ -684,6 +950,7 @@ mod tests {
             symbol_id: "a.rs::x".into(),
             hash: encode_hash(&[1u8; 32]),
             depth: DepthDto::FullBody,
+            agent: Some("agent-1".into()),
         })
         .unwrap();
         std::fs::write(&path, format!("not json\n{good}\n")).unwrap();
@@ -708,6 +975,7 @@ mod tests {
             symbol_id: "a.rs::x".into(),
             hash: encode_hash(&[1u8; 32]),
             depth: DepthDto::FullBody,
+            agent: Some("agent-1".into()),
         })
         .unwrap();
         std::fs::write(&path, format!("{header}\n{read}\n")).unwrap();
