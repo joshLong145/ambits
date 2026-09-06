@@ -114,6 +114,20 @@ That adds a `SessionStart` hook with `matcher: "compact"` to
 result the moment a compaction completes. It merges into existing settings and
 is safe to re-run. When there is nothing to restore it emits nothing.
 
+### Inspecting the journal
+
+```bash
+ambits -p . cache status        # sessions, symbols, size on disk
+ambits -p . cache clear --session <id>
+ambits -p . cache clear --all
+```
+
+Nothing is deleted automatically. A journal is the only record of what a
+session read *and what the code looked like at the time*, so removing one
+silently downgrades any later restore of that session to `UNVERIFIED`.
+Journals are small — one entry per symbol read, bounded by what an agent can
+read in a session, not by repository size.
+
 ## Bash Fallback
 
 If MCP tools are unavailable:

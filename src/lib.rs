@@ -1,4 +1,5 @@
 pub mod app;
+pub mod cache;
 pub mod coverage;
 pub mod digest;
 pub mod filter;
