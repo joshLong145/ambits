@@ -95,9 +95,17 @@ pub(crate) struct MatchDto<'a> {
     label: &'a str,
     estimated_tokens: u32,
     /// Immediate children, so a caller can walk into a container without a
-    /// second scan.
+    /// second scan. Carried by `show`, which fetches one symbol at a time.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     children: Vec<&'a str>,
+    /// Child count, for callers that summarize instead of listing.
+    ///
+    /// `find` uses this: a search returning a hundred symbols would otherwise
+    /// spend most of its output on child ids, and against this repo
+    /// `find test` was 72% children by byte — largely ids already present as
+    /// results in their own right.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    children_count: Option<usize>,
     /// The definition source. Omitted under `--no-body`.
     #[serde(skip_serializing_if = "Option::is_none")]
     definition: Option<String>,
@@ -142,8 +150,19 @@ pub(crate) fn describe<'a>(file: &'a Path, node: &'a SymbolNode) -> MatchDto<'a>
         label: node.label,
         estimated_tokens: node.estimated_tokens,
         children: node.children.iter().map(|c| c.id.as_str()).collect(),
+        children_count: None,
         definition: None,
         truncated: false,
+    }
+}
+
+/// Describe a symbol with its children summarized as a count rather than
+/// listed. Same fields otherwise, so ids still compose into `show`.
+pub(crate) fn describe_summary<'a>(file: &'a Path, node: &'a SymbolNode) -> MatchDto<'a> {
+    MatchDto {
+        children: Vec::new(),
+        children_count: (!node.children.is_empty()).then_some(node.children.len()),
+        ..describe(file, node)
     }
 }
 

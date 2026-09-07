@@ -67,8 +67,9 @@ every `tests/…` child matches through its parent. Writing `::App/` opts into
 path matching deliberately, which is how you ask for a type's members.
 
 Results are capped at 100 per pattern (`--limit`), and a truncated result says
-how many it withheld. `--format json` emits match objects shaped exactly like
-`show --no-body`, so `find` feeds straight into `show`.
+how many it withheld. `--format json` emits the same fields as `show --no-body`, so `find` feeds
+straight into `show` — except that `children` comes back as a `children_count`,
+since listing them made a broad search 72% child ids by byte.
 
 Unlike grep, results carry their kind — `struct`, `impl`, `fn` — so a name that
 appears as a type, its impl block, and a method inside it comes back as three

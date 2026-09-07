@@ -140,8 +140,8 @@ case-insensitive. The path half matches whole path components, so `ui` matches
 your pattern contains `/`, in which case it matches the whole name path — which
 is what makes `::App/` return App's members.
 
-`--format json` emits match objects shaped exactly like `show --no-body`, so
-`find` output feeds straight into `show`. Capped at 100 per pattern; a
+`--format json` emits the same fields as `show --no-body`, so `find` output
+feeds straight into `show`; `children` is summarized as `children_count`. Capped at 100 per pattern; a
 truncated result says how many it withheld.
 
 **This searches definitions, not usages.** A method call is not a symbol, so

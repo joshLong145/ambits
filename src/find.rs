@@ -183,7 +183,7 @@ pub fn run(tree: &ProjectTree, queries: &[String], limit: usize, json: bool) -> 
                     truncated: total > hits.len(),
                     matches: hits
                         .into_iter()
-                        .map(|(file, node)| crate::lookup::describe(file, node))
+                        .map(|(file, node)| crate::lookup::describe_summary(file, node))
                         .collect(),
                 }
             })
@@ -345,6 +345,28 @@ mod tests {
         let (hits, total) = search(&t, &Pattern::parse("render"), 2);
         assert_eq!(hits.len(), 2);
         assert_eq!(total, 3, "the total counts what was withheld");
+    }
+
+    /// A search returning many symbols must not spend most of its bytes on
+    /// child ids — and for a search over test modules those ids are largely
+    /// results in their own right, listed twice.
+    #[test]
+    fn children_are_summarized_rather_than_listed() {
+        let t = tree();
+        let (hits, _) = search(&t, &Pattern::parse("App"), DEFAULT_LIMIT);
+        let (file, node) = hits[0];
+        let dto = crate::lookup::describe_summary(file, node);
+        let v = serde_json::to_value(&dto).unwrap();
+
+        assert_eq!(v["children_count"], 1, "the count survives");
+        assert!(
+            v.get("children").is_none(),
+            "the list itself does not, or find output balloons"
+        );
+        assert_eq!(
+            v["id"], "src/ui/stats.rs::App",
+            "the id is unchanged, so it still composes into `show`"
+        );
     }
 
     #[test]
