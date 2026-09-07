@@ -304,6 +304,15 @@ pub fn encode_hash(hash: &[u8; 32]) -> String {
     s
 }
 
+/// The hex digits alone, without the algorithm prefix.
+///
+/// Callers that match hash *prefixes* need this; slicing `[3..]` off
+/// [`encode_hash`] at each site made the layout of that string an implicit
+/// contract between modules that never agreed to one.
+pub fn hash_hex(hash: &[u8; 32]) -> String {
+    encode_hash(hash)[3..].to_string()
+}
+
 /// Parse a `b3:<hex>` hash. Returns `None` on any malformed input.
 pub fn decode_hash(s: &str) -> Option<[u8; 32]> {
     let hex = s.strip_prefix("b3:")?;
@@ -343,6 +352,28 @@ pub struct JournalContents {
     /// Empty for v1 journals, which carried no attribution.
     pub agent_reads: HashMap<AgentReadKey, ([u8; 32], ReadDepth)>,
     pub warnings: Vec<String>,
+}
+
+/// Merge one record into whichever view is accumulating it.
+///
+/// Both views fold identically, and having written the rule twice it is worth
+/// stating once: a record carrying a *new* hash supersedes what came before,
+/// because earlier depths describe a version of the symbol that no longer
+/// exists; a record carrying the *same* hash contributes its depth to the
+/// maximum, which is how the ledger aggregates across agents.
+fn fold(
+    slot: std::collections::hash_map::Entry<'_, impl std::hash::Hash + Eq, ([u8; 32], ReadDepth)>,
+    hash: [u8; 32],
+    depth: ReadDepth,
+) {
+    slot.and_modify(|cur| {
+        if cur.0 == hash {
+            cur.1 = cur.1.max(depth);
+        } else {
+            *cur = (hash, depth);
+        }
+    })
+    .or_insert((hash, depth));
 }
 
 /// Read and fold a journal file.
@@ -410,27 +441,9 @@ pub fn read_journal(path: &Path) -> JournalContents {
             } => match decode_hash(&hash) {
                 Some(h) => {
                     let depth: ReadDepth = depth.into();
-                    out.reads
-                        .entry(symbol_id.clone())
-                        .and_modify(|slot| {
-                            if slot.0 == h {
-                                slot.1 = slot.1.max(depth);
-                            } else {
-                                *slot = (h, depth);
-                            }
-                        })
-                        .or_insert((h, depth));
+                    fold(out.reads.entry(symbol_id.clone()), h, depth);
                     if let Some(agent) = agent {
-                        out.agent_reads
-                            .entry((symbol_id, agent))
-                            .and_modify(|slot| {
-                                if slot.0 == h {
-                                    slot.1 = slot.1.max(depth);
-                                } else {
-                                    *slot = (h, depth);
-                                }
-                            })
-                            .or_insert((h, depth));
+                        fold(out.agent_reads.entry((symbol_id, agent)), h, depth);
                     }
                 }
                 None => out.warnings.push(format!(
@@ -671,13 +684,8 @@ fn timestamp() -> String {
 }
 
 #[cfg(test)]
-#[path = "../tests/helpers/mod.rs"]
-#[allow(dead_code)]
-mod helpers;
-
-#[cfg(test)]
 mod tests {
-    use super::helpers::*;
+    use crate::helpers::*;
     use super::*;
     use crate::symbols::merkle::content_hash;
 

@@ -309,14 +309,9 @@ pub fn compute_group_alignment(
 }
 
 #[cfg(test)]
-#[path = "../../tests/helpers/mod.rs"]
-#[allow(dead_code)]
-mod helpers;
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use super::helpers::*;
+    use crate::helpers::*;
 
     #[test]
     fn empty_union_defaults_to_score_zero() {

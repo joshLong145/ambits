@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use color_eyre::eyre::{Result, WrapErr};
 use serde::Serialize;
 
-use crate::journal::encode_hash;
+use crate::journal::{encode_hash, hash_hex};
 use crate::symbols::{ProjectTree, SymbolNode};
 
 /// Bumped on any breaking change to the emitted shape.
@@ -121,21 +121,6 @@ struct ShowDto<'a> {
     results: Vec<ResultDto<'a>>,
 }
 
-/// Every symbol in the tree, flattened, paired with its owning file.
-fn flatten(tree: &ProjectTree) -> Vec<(&Path, &SymbolNode)> {
-    fn walk<'a>(file: &'a Path, syms: &'a [SymbolNode], out: &mut Vec<(&'a Path, &'a SymbolNode)>) {
-        for sym in syms {
-            out.push((file, sym));
-            walk(file, &sym.children, out);
-        }
-    }
-    let mut out = Vec::new();
-    for file in &tree.files {
-        walk(&file.file_path, &file.symbols, &mut out);
-    }
-    out
-}
-
 /// Read the definition's source text out of the file.
 ///
 /// Slices by byte range rather than by line so the result is exactly the span
@@ -216,11 +201,11 @@ fn resolve<'a>(
     include_body: bool,
     max_bytes: Option<usize>,
 ) -> ShowDto<'a> {
-    let all = flatten(tree);
+    let all = tree.walk();
     // Hex once per symbol rather than once per (symbol, query).
     let hashes: Vec<String> = all
         .iter()
-        .map(|(_, s)| encode_hash(&s.content_hash)[3..].to_string())
+        .map(|(_, s)| hash_hex(&s.content_hash))
         .collect();
 
     let mut cache: HashMap<PathBuf, String> = HashMap::new();
@@ -293,13 +278,8 @@ fn resolve<'a>(
 }
 
 #[cfg(test)]
-#[path = "../tests/helpers/mod.rs"]
-#[allow(dead_code)]
-mod helpers;
-
-#[cfg(test)]
 mod tests {
-    use super::helpers::*;
+    use crate::helpers::*;
     use super::*;
 
     #[test]
@@ -346,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn flatten_descends_into_children() {
+    fn walk_descends_into_children() {
         let tree = project(vec![file(
             "a.rs",
             vec![sym_with_children(
@@ -355,7 +335,7 @@ mod tests {
                 vec![sym("a.rs::Outer/inner", "inner")],
             )],
         )]);
-        let flat = flatten(&tree);
+        let flat = tree.walk();
         assert_eq!(flat.len(), 2);
         assert!(flat.iter().any(|(_, s)| s.id == "a.rs::Outer/inner"));
     }

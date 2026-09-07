@@ -944,46 +944,9 @@ fn mark_selected_symbols(
     ledger: &mut ContextLedger,
     depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
 ) {
-    fn walk(
-        syms: &[SymbolNode],
-        event: &AgentToolCall,
-        hashes: &[(String, ReadDepth)],
-        ids: &[(&str, ReadDepth)],
-        ledger: &mut ContextLedger,
-        depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
-    ) {
-        for sym in syms {
-            let hex = crate::journal::encode_hash(&sym.content_hash);
-            // A symbol named by more than one selector in the same command
-            // takes the deepest of them; `record` is upgrade-only anyway, but
-            // resolving it here keeps the credit independent of iteration
-            // order.
-            let by_id = ids
-                .iter()
-                .filter(|(id, _)| *id == sym.id)
-                .map(|(_, d)| *d);
-            let by_hash = hashes
-                .iter()
-                .filter(|(h, _)| hex[3..].starts_with(h.as_str()))
-                .map(|(_, d)| *d);
-            let depth = by_id.chain(by_hash).max();
-            if let Some(depth) = depth {
-                ledger.record(
-                    sym.id.clone(),
-                    depth,
-                    sym.content_hash,
-                    event.agent_id.to_string(),
-                    sym.estimated_tokens as usize,
-                );
-                depth_cache.record(&sym.id, &event.agent_id, depth);
-            }
-            walk(&sym.children, event, hashes, ids, ledger, depth_cache);
-        }
-    }
-
     // Split once rather than re-parsing each selector per symbol.
-    let mut hashes = Vec::new();
-    let mut ids = Vec::new();
+    let mut hashes: Vec<(String, ReadDepth)> = Vec::new();
+    let mut ids: Vec<(&str, ReadDepth)> = Vec::new();
     for (sel, depth) in &event.target_selectors {
         match crate::lookup::parse_selector(sel) {
             crate::lookup::Selector::Hash(h) => hashes.push((h, *depth)),
@@ -992,15 +955,29 @@ fn mark_selected_symbols(
         }
     }
 
-    for file in &tree.files {
-        walk(
-            &file.symbols,
-            event,
-            &hashes,
-            &ids,
-            ledger,
-            depth_cache,
-        );
+    for (_, sym) in tree.walk() {
+        let hex = crate::journal::hash_hex(&sym.content_hash);
+        // A symbol named by more than one selector in the same command takes
+        // the deepest of them; `record` is upgrade-only anyway, but resolving
+        // it here keeps the credit independent of iteration order.
+        let by_id = ids
+            .iter()
+            .filter(|(id, _)| *id == sym.id)
+            .map(|(_, d)| *d);
+        let by_hash = hashes
+            .iter()
+            .filter(|(h, _)| hex.starts_with(h.as_str()))
+            .map(|(_, d)| *d);
+        if let Some(depth) = by_id.chain(by_hash).max() {
+            ledger.record(
+                sym.id.clone(),
+                depth,
+                sym.content_hash,
+                event.agent_id.to_string(),
+                sym.estimated_tokens as usize,
+            );
+            depth_cache.record(&sym.id, &event.agent_id, depth);
+        }
     }
 }
 
@@ -1247,14 +1224,9 @@ fn coverage_status_from_counts(total: usize, seen: usize, full: usize) -> FileCo
 }
 
 #[cfg(test)]
-#[path = "../tests/helpers/mod.rs"]
-#[allow(dead_code)]
-mod helpers;
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use super::helpers::*;
+    use crate::helpers::*;
     use crate::symbols::FileSymbols;
     use std::path::Path;
 
@@ -1744,7 +1716,7 @@ mod tests {
 
     #[test]
     fn handle_mouse_scroll_routes_by_focus() {
-        use crossterm::event::{MouseEvent, MouseEventKind, MouseButton};
+        use crossterm::event::{MouseEvent, MouseEventKind};
 
         let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::a", "a")])]);
 
@@ -2194,7 +2166,6 @@ mod tests {
     fn reset_session_clears_ledger_and_agents() {
         use crate::ingest::AgentToolCall;
         use crate::tracking::ReadDepth;
-        use std::path::PathBuf;
 
         let mut app = test_app(vec![]);
 

@@ -155,11 +155,11 @@ pub fn install(global: bool, project: Option<PathBuf>) -> Result<()> {
     println!("  {}", hook_command(&project_root));
     println!();
     println!("After a compaction, Claude Code will run this and inject the symbols");
-    println!("that were read earlier and are still unchanged.");
+    println!("this session has already read.");
     println!();
     println!("Requires `ambits` on PATH. Coverage must have been journaled by the");
-    println!("TUI for this session, otherwise the digest falls back to session logs");
-    println!("and is labelled UNVERIFIED.");
+    println!("TUI for this session, otherwise the digest is reconstructed from");
+    println!("session logs and says so.");
 
     Ok(())
 }

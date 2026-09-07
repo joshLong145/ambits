@@ -875,11 +875,6 @@ impl EventTailer for LogTailer {
 }
 
 #[cfg(test)]
-#[path = "../../tests/helpers/mod.rs"]
-#[allow(dead_code)]
-mod helpers;
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -1019,7 +1014,7 @@ mod tests {
 
     // --- map_tool_call coverage tests (via parse_jsonl_line) ---
 
-    use super::helpers::{jsonl_assistant, jsonl_user_msg};
+    use crate::helpers::{jsonl_assistant, jsonl_user_msg};
 
     #[test]
     fn map_edit_tool() {

@@ -14,11 +14,10 @@
 //! directory in the hot path. A thousand stale journals are inert bytes.
 //!
 //! Against that, deleting one is genuinely lossy. A journal is the only record
-//! of what a session read *and what the code looked like at the time*. Claude
-//! Code keeps session transcripts and can resume them; a resumed session whose
-//! journal was pruned silently falls back to replaying logs, which cannot
-//! detect drift, and the user is told nothing. Reclaiming megabytes is not
-//! worth downgrading a restore from verified to unverified without asking.
+//! of what a session read, recorded as it happened. Claude Code keeps session
+//! transcripts and can resume them; a resumed session whose journal was pruned
+//! falls back to reconstructing that history from logs, and the user is told
+//! nothing. Reclaiming megabytes is not worth quietly degrading a restore.
 //!
 //! So removal stays explicit: [`clear`] requires naming a session or passing
 //! `--all`, and [`status`] exists so anyone who does hit a size problem can see
@@ -111,7 +110,7 @@ pub fn status(project_root: &Path) -> Result<()> {
         println!("No coverage journals in {}", dir.display());
         println!();
         println!("Journals are written by the TUI. Without one, `restore-context`");
-        println!("falls back to replaying session logs and cannot detect drift.");
+        println!("reconstructs the read history from session logs instead.");
         return Ok(());
     }
 
@@ -127,7 +126,7 @@ pub fn status(project_root: &Path) -> Result<()> {
             s.session_id,
             s.symbols,
             s.records,
-            human_bytes(s.bytes),
+            crate::fmt::bytes(s.bytes),
             s.schema_version
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "?".into()),
@@ -143,7 +142,7 @@ pub fn status(project_root: &Path) -> Result<()> {
         "{} journal{}, {} on disk",
         stats.len(),
         if stats.len() == 1 { "" } else { "s" },
-        human_bytes(total_bytes)
+        crate::fmt::bytes(total_bytes)
     );
 
     Ok(())
@@ -188,20 +187,8 @@ pub fn clear(project_root: &Path, session: Option<&str>, all: bool) -> Result<()
         "Removed {removed} journal{}.",
         if removed == 1 { "" } else { "s" }
     );
-    println!("Restores for those sessions now fall back to session logs (UNVERIFIED).");
+    println!("Restores for those sessions now reconstruct from session logs instead.");
     Ok(())
-}
-
-fn human_bytes(n: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    if n >= MB {
-        format!("{:.1} MB", n as f64 / MB as f64)
-    } else if n >= KB {
-        format!("{:.1} KB", n as f64 / KB as f64)
-    } else {
-        format!("{n} B")
-    }
 }
 
 #[cfg(test)]

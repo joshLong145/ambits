@@ -13,7 +13,7 @@ use super::stats::short_id;
 /// Render the sub-agent alignment popup over `area`. The caller must verify
 /// `app.show_alignment_overlay` before calling.
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let popup_area = centered_rect(area, 80, 70);
+    let popup_area = super::centered_rect(area, 80, 70);
     f.render_widget(Clear, popup_area);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -116,11 +116,3 @@ fn score_color(score: f64) -> Color {
     }
 }
 
-/// Compute a centered subrect taking `percent_x` × `percent_y` of `area`.
-fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let w = area.width * percent_x / 100;
-    let h = area.height * percent_y / 100;
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    Rect { x, y, width: w, height: h }
-}

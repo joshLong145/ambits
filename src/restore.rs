@@ -275,13 +275,6 @@ pub fn split_symbol_id(id: &str) -> Option<(&str, &str)> {
 }
 
 /// Recursively index every symbol in the tree by id, including nested children.
-fn index_symbols<'a>(symbols: &'a [SymbolNode], out: &mut HashMap<&'a str, Vec<&'a SymbolNode>>) {
-    for sym in symbols {
-        out.entry(sym.id.as_str()).or_default().push(sym);
-        index_symbols(&sym.children, out);
-    }
-}
-
 /// Build an id → symbols index over the whole project tree.
 ///
 /// The value is a `Vec` because **symbol ids are not unique**. Ids are
@@ -296,9 +289,9 @@ fn index_symbols<'a>(symbols: &'a [SymbolNode], out: &mut HashMap<&'a str, Vec<&
 /// touched. Since almost every Rust type has an impl block, that would be the
 /// common case rather than an edge case.
 pub fn index_tree(tree: &ProjectTree) -> HashMap<&str, Vec<&SymbolNode>> {
-    let mut out = HashMap::new();
-    for file in &tree.files {
-        index_symbols(&file.symbols, &mut out);
+    let mut out: HashMap<&str, Vec<&SymbolNode>> = HashMap::new();
+    for (_, sym) in tree.walk() {
+        out.entry(sym.id.as_str()).or_default().push(sym);
     }
     out
 }
@@ -310,15 +303,9 @@ pub fn index_tree(tree: &ProjectTree) -> HashMap<&str, Vec<&SymbolNode>> {
 /// Measured on this repo, ~1% of hashes name more than one symbol, which is
 /// exactly why the move rescue demands a unique match.
 pub fn index_tree_by_hash(tree: &ProjectTree) -> HashMap<[u8; 32], Vec<&SymbolNode>> {
-    fn walk<'a>(syms: &'a [SymbolNode], out: &mut HashMap<[u8; 32], Vec<&'a SymbolNode>>) {
-        for sym in syms {
-            out.entry(sym.content_hash).or_default().push(sym);
-            walk(&sym.children, out);
-        }
-    }
-    let mut out = HashMap::new();
-    for file in &tree.files {
-        walk(&file.symbols, &mut out);
+    let mut out: HashMap<[u8; 32], Vec<&SymbolNode>> = HashMap::new();
+    for (_, sym) in tree.walk() {
+        out.entry(sym.content_hash).or_default().push(sym);
     }
     out
 }
@@ -638,13 +625,8 @@ pub fn refresh_staleness(ledger: &mut crate::tracking::ContextLedger, tree: &Pro
 }
 
 #[cfg(test)]
-#[path = "../tests/helpers/mod.rs"]
-#[allow(dead_code)]
-mod helpers;
-
-#[cfg(test)]
 mod tests {
-    use super::helpers::*;
+    use crate::helpers::*;
     use super::*;
     use crate::symbols::merkle::content_hash;
 

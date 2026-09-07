@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub mod merkle;
@@ -143,6 +143,34 @@ pub struct ProjectTree {
 }
 
 impl ProjectTree {
+    /// Every symbol in the tree, depth-first, paired with its owning file.
+    ///
+    /// The single descent through `SymbolNode::children`. Four had accumulated
+    /// — one each for flattening, indexing by id, indexing by content hash,
+    /// and marking reads — all structurally identical and each an opportunity
+    /// to forget the recursive step and silently skip nested symbols.
+    ///
+    /// Returns a `Vec` rather than an iterator because every caller collects or
+    /// folds immediately, and a borrowing recursive iterator would cost more in
+    /// complexity than the allocation saves.
+    pub fn walk(&self) -> Vec<(&Path, &SymbolNode)> {
+        fn descend<'a>(
+            file: &'a Path,
+            syms: &'a [SymbolNode],
+            out: &mut Vec<(&'a Path, &'a SymbolNode)>,
+        ) {
+            for sym in syms {
+                out.push((file, sym));
+                descend(file, &sym.children, out);
+            }
+        }
+        let mut out = Vec::new();
+        for file in &self.files {
+            descend(&file.file_path, &file.symbols, &mut out);
+        }
+        out
+    }
+
     pub fn total_symbols(&self) -> usize {
         self.files.iter().map(|f| f.total_symbols()).sum()
     }

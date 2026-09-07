@@ -141,14 +141,6 @@ fn fit_names(names: &[String], budget: usize) -> (String, usize) {
 }
 
 
-fn format_tokens(n: u64) -> String {
-    if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
 /// Markdown digest, intended to be pasted or piped straight into a session.
 #[derive(Debug, Clone, Default)]
 pub struct MarkdownFormatter;
@@ -193,7 +185,7 @@ impl DigestFormatter for MarkdownFormatter {
                 group.path.display(),
                 group.symbols.len(),
                 if group.symbols.len() == 1 { "" } else { "s" },
-                format_tokens(group.source_tokens),
+                crate::fmt::tokens(group.source_tokens),
             );
 
             // Always emit at least one file: a digest that fits perfectly but

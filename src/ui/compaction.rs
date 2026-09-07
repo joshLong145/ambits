@@ -12,7 +12,7 @@ use ambits::tracking::ReadDepth;
 /// `app.show_compaction_overlay` and that `compaction_history` is non-empty
 /// before calling.
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let popup_area = centered_rect(area, 80, 70);
+    let popup_area = super::centered_rect(area, 80, 70);
     f.render_widget(Clear, popup_area);
 
     let Some(ev) = app
@@ -29,8 +29,8 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             ev.sequence,
             app.compaction_history.len(),
             ev.timestamp,
-            format_tokens(m.pre_tokens),
-            format_tokens(m.post_tokens),
+            ambits::fmt::tokens(m.pre_tokens),
+            ambits::fmt::tokens(m.post_tokens),
             m.trigger,
         ),
         None => format!(
@@ -184,16 +184,6 @@ fn files_after_compaction(app: &App, ev: &CompactionEvent) -> Vec<(String, ReadD
 }
 
 /// Format a token count in compact form: `1234` → `1.2k`, `1234567` → `1.2M`.
-fn format_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
 fn depth_label(d: ReadDepth) -> &'static str {
     match d {
         ReadDepth::Unseen => "Unseen",
@@ -238,11 +228,3 @@ fn wrap_summary(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// Compute a centered subrect taking `percent_x` × `percent_y` of `area`.
-fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let w = area.width * percent_x / 100;
-    let h = area.height * percent_y / 100;
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    Rect { x, y, width: w, height: h }
-}
