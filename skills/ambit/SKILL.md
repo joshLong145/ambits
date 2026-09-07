@@ -144,6 +144,11 @@ is what makes `::App/` return App's members.
 feeds straight into `show`; `children` is summarized as `children_count`. Capped at 100 per pattern; a
 truncated result says how many it withheld.
 
+Results show what you have already read — a depth column (`full`, `signature`,
+…) with `—` for unread, plus a per-query count. Use it before reading: a match
+marked `full` needs no `show`. The column is absent entirely when no coverage
+journal exists, which means *unknown*, not unread.
+
 **This searches definitions, not usages.** A method call is not a symbol, so
 `find is_none_or` returns nothing. Use grep for call sites.
 

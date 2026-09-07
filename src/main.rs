@@ -402,6 +402,12 @@ fn main() -> Result<()> {
             .and_then(|d| ingester.find_latest_session(d))
     });
 
+    // Coverage context for `find` and `show`. Loaded once, from the journal
+    // the TUI maintains, so both can report whether a symbol has already been
+    // read. `None` when there is no session or no journal — which callers must
+    // not confuse with "nothing has been read".
+    let coverage_index = ambits::restore::CoverageIndex::load(&project_path, session_id.as_deref());
+
     if let Some(Commands::Show {
         selector,
         no_body,
@@ -417,6 +423,7 @@ fn main() -> Result<()> {
             selector,
             !no_body,
             *max_bytes,
+            coverage_index.as_ref(),
         );
     }
 
@@ -434,6 +441,7 @@ fn main() -> Result<()> {
             pattern,
             *limit,
             matches!(format, FindFormat::Json),
+            coverage_index.as_ref(),
         );
     }
 

@@ -46,7 +46,7 @@ use serde::Serialize;
 use crate::symbols::{ProjectTree, SymbolNode};
 
 /// Bumped on any breaking change to the emitted shape.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Results reported per query before truncating.
 ///
@@ -159,11 +159,17 @@ struct ResultDto<'a> {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     truncated: bool,
     matches: Vec<crate::lookup::MatchDto<'a>>,
+    /// How many of the reported matches have a recorded read. Absent without a
+    /// coverage journal, which is not the same as zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    read: Option<usize>,
 }
 
 #[derive(Serialize)]
 struct FindDto<'a> {
     schema_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage: Option<crate::lookup::CoverageDto<'a>>,
     results: Vec<ResultDto<'a>>,
 }
 
@@ -171,20 +177,34 @@ struct FindDto<'a> {
 ///
 /// Exits successfully when nothing matches, for the same reason `show` does:
 /// "no symbol is named that" is an answer, not a failure.
-pub fn run(tree: &ProjectTree, queries: &[String], limit: usize, json: bool) -> Result<()> {
+pub fn run(
+    tree: &ProjectTree,
+    queries: &[String],
+    limit: usize,
+    json: bool,
+    coverage: Option<&crate::restore::CoverageIndex>,
+) -> Result<()> {
     if json {
         let results: Vec<ResultDto> = queries
             .iter()
             .map(|q| {
                 let (hits, total) = search(tree, &Pattern::parse(q), limit);
+                let read = coverage.map(|c| {
+                    hits.iter()
+                        .filter(|(_, n)| c.depth_of(&n.id).is_some())
+                        .count()
+                });
                 ResultDto {
                     query: q,
                     matched: total,
                     truncated: total > hits.len(),
                     matches: hits
                         .into_iter()
-                        .map(|(file, node)| crate::lookup::describe_summary(file, node))
+                        .map(|(file, node)| {
+                            crate::lookup::describe_summary(file, node, coverage)
+                        })
                         .collect(),
+                    read,
                 }
             })
             .collect();
@@ -192,6 +212,7 @@ pub fn run(tree: &ProjectTree, queries: &[String], limit: usize, json: bool) -> 
             "{}",
             serde_json::to_string(&FindDto {
                 schema_version: SCHEMA_VERSION,
+                coverage: crate::lookup::CoverageDto::of(coverage),
                 results,
             })
             .wrap_err("serializing find results")?
@@ -208,7 +229,18 @@ pub fn run(tree: &ProjectTree, queries: &[String], limit: usize, json: bool) -> 
             println!("{query} — no matches");
             continue;
         }
-        println!("{query} — {total} match{}", if total == 1 { "" } else { "es" });
+        let read = coverage.map(|c| {
+            hits.iter()
+                .filter(|(_, n)| c.depth_of(&n.id).is_some())
+                .count()
+        });
+        match read {
+            Some(r) => println!(
+                "{query} — {total} match{} ({r} read)",
+                if total == 1 { "" } else { "es" }
+            ),
+            None => println!("{query} — {total} match{}", if total == 1 { "" } else { "es" }),
+        }
 
         let width = hits
             .iter()
@@ -216,13 +248,23 @@ pub fn run(tree: &ProjectTree, queries: &[String], limit: usize, json: bool) -> 
             .max()
             .unwrap_or(0);
         for (file, sym) in &hits {
+            // The depth column is omitted entirely without a journal: an empty
+            // column would read as "unread" when the truth is "unknown".
+            let depth = match coverage {
+                Some(c) => match c.depth_of(&sym.id) {
+                    Some(d) => format!("  {d}"),
+                    None => "  —".to_string(),
+                },
+                None => String::new(),
+            };
             println!(
-                "  [{:width$}] {}::{}  L{}-{}",
+                "  [{:width$}] {}::{}  L{}-{}{}",
                 sym.label,
                 file.display(),
                 sym.name_path(),
                 sym.line_range.start,
                 sym.line_range.end,
+                depth,
             );
         }
         if total > hits.len() {
@@ -236,6 +278,7 @@ pub fn run(tree: &ProjectTree, queries: &[String], limit: usize, json: bool) -> 
 mod tests {
     use super::*;
     use crate::helpers::*;
+    use crate::tracking::ReadDepth;
 
     fn tree() -> ProjectTree {
         project(vec![
@@ -355,7 +398,7 @@ mod tests {
         let t = tree();
         let (hits, _) = search(&t, &Pattern::parse("App"), DEFAULT_LIMIT);
         let (file, node) = hits[0];
-        let dto = crate::lookup::describe_summary(file, node);
+        let dto = crate::lookup::describe_summary(file, node, None);
         let v = serde_json::to_value(&dto).unwrap();
 
         assert_eq!(v["children_count"], 1, "the count survives");
@@ -367,6 +410,55 @@ mod tests {
             v["id"], "src/ui/stats.rs::App",
             "the id is unchanged, so it still composes into `show`"
         );
+    }
+
+    fn coverage_for(ids: &[(&str, ReadDepth)]) -> crate::restore::CoverageIndex {
+        let reads = ids
+            .iter()
+            .map(|(id, d)| (id.to_string(), ([0u8; 32], *d)))
+            .collect();
+        crate::restore::CoverageIndex::from_read_set(reads, "test-session")
+    }
+
+    fn dto_of(cov: Option<&crate::restore::CoverageIndex>) -> serde_json::Value {
+        let t = tree();
+        let (hits, _) = search(&t, &Pattern::parse("render"), DEFAULT_LIMIT);
+        let (file, node) = hits
+            .iter()
+            .find(|(_, n)| n.id == "src/app.rs::render")
+            .copied()
+            .unwrap();
+        serde_json::to_value(crate::lookup::describe_summary(file, node, cov)).unwrap()
+    }
+
+    /// The point of the annotation: a caller can tell, from a search alone,
+    /// whether it needs to read the result.
+    #[test]
+    fn a_read_symbol_reports_the_depth_it_was_read_at() {
+        let cov = coverage_for(&[("src/app.rs::render", ReadDepth::FullBody)]);
+        assert_eq!(dto_of(Some(&cov))["read_depth"], "full");
+    }
+
+    #[test]
+    fn an_unread_symbol_carries_no_depth() {
+        let cov = coverage_for(&[("src/other.rs::thing", ReadDepth::FullBody)]);
+        assert!(dto_of(Some(&cov)).get("read_depth").is_none());
+    }
+
+    /// Without a journal there is no coverage context at all, and that must
+    /// not be reported the same way as "read nothing" — an agent told a symbol
+    /// is unread will go read it; one told nothing is known should not.
+    #[test]
+    fn no_journal_is_distinguishable_from_nothing_read() {
+        let unread = coverage_for(&[("src/other.rs::thing", ReadDepth::FullBody)]);
+
+        // Both omit `read_depth` on the match itself…
+        assert!(dto_of(Some(&unread)).get("read_depth").is_none());
+        assert!(dto_of(None).get("read_depth").is_none());
+
+        // …so the envelope is what distinguishes them.
+        assert!(crate::lookup::CoverageDto::of(Some(&unread)).is_some());
+        assert!(crate::lookup::CoverageDto::of(None).is_none());
     }
 
     #[test]

@@ -66,6 +66,25 @@ on this repo `test` matches 42 symbols by leaf but 486 by full path, since
 every `tests/…` child matches through its parent. Writing `::App/` opts into
 path matching deliberately, which is how you ask for a type's members.
 
+Results carry **coverage context** when the TUI has been running: a depth
+column showing what this session already read, `—` for unread, and a per-query
+count. That answers the question a search is usually a step toward — do I need
+to read this?
+
+```
+fmt:: — 6 matches (5 read)
+  [fn ] src/fmt.rs::tokens  L10-18  full
+  [mod] src/fmt.rs::tests  L36-62  full
+
+parser/typescript::extract — 5 matches (0 read)
+  [fn] src/parser/typescript.rs::extract_symbols  L157-245  —
+```
+
+Without a coverage journal the column is omitted entirely rather than shown
+empty — "unknown" and "unread" are different answers, and only one of them
+means go read it. In JSON, a `coverage` object on the envelope is what
+distinguishes them; `show` carries the same annotation per match.
+
 Results are capped at 100 per pattern (`--limit`), and a truncated result says
 how many it withheld. `--format json` emits the same fields as `show --no-body`, so `find` feeds
 straight into `show` — except that `children` comes back as a `children_count`,

@@ -39,7 +39,7 @@ use crate::journal::{encode_hash, hash_hex};
 use crate::symbols::{ProjectTree, SymbolNode};
 
 /// Bumped on any breaking change to the emitted shape.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Shortest hash prefix accepted. Below this, a "match" says more about the
 /// prefix being short than about the symbol.
@@ -113,6 +113,13 @@ pub(crate) struct MatchDto<'a> {
     /// definition is not valid source, so this is never left implicit.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     truncated: bool,
+    /// Depth this symbol was read at during the session.
+    ///
+    /// Absent means *either* unread *or* no coverage journal to consult. The
+    /// envelope's `coverage` object distinguishes those: present means the
+    /// journal was read and an absent depth here really does mean unread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    read_depth: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -126,9 +133,28 @@ struct ResultDto<'a> {
     matches: Vec<MatchDto<'a>>,
 }
 
+/// Present only when a coverage journal was loaded. Its absence is what tells
+/// a consumer that a missing `read_depth` means "unknown" rather than "unread".
+#[derive(Serialize)]
+pub(crate) struct CoverageDto<'a> {
+    pub session_id: &'a str,
+    pub symbols_read: usize,
+}
+
+impl<'a> CoverageDto<'a> {
+    pub fn of(index: Option<&'a crate::restore::CoverageIndex>) -> Option<Self> {
+        index.map(|c| CoverageDto {
+            session_id: c.session_id(),
+            symbols_read: c.len(),
+        })
+    }
+}
+
 #[derive(Serialize)]
 struct ShowDto<'a> {
     schema_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage: Option<CoverageDto<'a>>,
     results: Vec<ResultDto<'a>>,
 }
 
@@ -139,7 +165,11 @@ struct ShowDto<'a> {
 /// commonly asks for several symbols from one file.
 /// Describe a symbol without its source. The body-bearing fields stay `None`,
 /// which is exactly what `--no-body` and `find` both want.
-pub(crate) fn describe<'a>(file: &'a Path, node: &'a SymbolNode) -> MatchDto<'a> {
+pub(crate) fn describe<'a>(
+    file: &'a Path,
+    node: &'a SymbolNode,
+    coverage: Option<&crate::restore::CoverageIndex>,
+) -> MatchDto<'a> {
     MatchDto {
         id: &node.id,
         name: &node.name,
@@ -153,16 +183,23 @@ pub(crate) fn describe<'a>(file: &'a Path, node: &'a SymbolNode) -> MatchDto<'a>
         children_count: None,
         definition: None,
         truncated: false,
+        read_depth: coverage
+            .and_then(|c| c.depth_of(&node.id))
+            .map(|d| d.to_string()),
     }
 }
 
 /// Describe a symbol with its children summarized as a count rather than
 /// listed. Same fields otherwise, so ids still compose into `show`.
-pub(crate) fn describe_summary<'a>(file: &'a Path, node: &'a SymbolNode) -> MatchDto<'a> {
+pub(crate) fn describe_summary<'a>(
+    file: &'a Path,
+    node: &'a SymbolNode,
+    coverage: Option<&crate::restore::CoverageIndex>,
+) -> MatchDto<'a> {
     MatchDto {
         children: Vec::new(),
         children_count: (!node.children.is_empty()).then_some(node.children.len()),
-        ..describe(file, node)
+        ..describe(file, node, coverage)
     }
 }
 
@@ -221,8 +258,9 @@ pub fn run(
     queries: &[String],
     include_body: bool,
     max_bytes: Option<usize>,
+    coverage: Option<&crate::restore::CoverageIndex>,
 ) -> Result<()> {
-    let out = resolve(project_root, tree, queries, include_body, max_bytes);
+    let out = resolve(project_root, tree, queries, include_body, max_bytes, coverage);
     // Single line, like the other JSON surfaces, so it survives being piped
     // through line-oriented tooling.
     println!(
@@ -240,6 +278,7 @@ fn resolve<'a>(
     queries: &'a [String],
     include_body: bool,
     max_bytes: Option<usize>,
+    coverage: Option<&'a crate::restore::CoverageIndex>,
 ) -> ShowDto<'a> {
     let all = tree.walk();
     // Hex once per symbol rather than once per (symbol, query).
@@ -287,7 +326,7 @@ fn resolve<'a>(
                 MatchDto {
                     definition,
                     truncated,
-                    ..describe(file, node)
+                    ..describe(file, node, coverage)
                 }
             })
             .collect();
@@ -305,6 +344,7 @@ fn resolve<'a>(
 
     ShowDto {
         schema_version: SCHEMA_VERSION,
+        coverage: CoverageDto::of(coverage),
         results,
     }
 }
@@ -385,7 +425,7 @@ mod tests {
 
     fn show(root: &Path, tree: &ProjectTree, q: &[&str], body: bool) -> serde_json::Value {
         let queries: Vec<String> = q.iter().map(|s| s.to_string()).collect();
-        serde_json::to_value(resolve(root, tree, &queries, body, None)).unwrap()
+        serde_json::to_value(resolve(root, tree, &queries, body, None, None)).unwrap()
     }
 
     /// The definition must be the exact source span, not an approximation

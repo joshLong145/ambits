@@ -201,6 +201,78 @@ pub fn load_from_journal(
     Some((contents.reads, contents.warnings))
 }
 
+/// What this session has already read, for annotating other commands.
+///
+/// `find` and `show` answer "where is this and what does it say". This adds
+/// "and do you already know it" — the question that decides whether the
+/// caller needs to read anything at all.
+///
+/// ## Deliberately reports depth, not currency
+///
+/// The underlying [`ReadSet`] holds `(hash_at_read, depth)`, so comparing the
+/// recorded hash against the live symbol would also answer "and has it changed
+/// since". That is drift detection, which is being reconsidered, so it is not
+/// reported here — but the hash is retained rather than discarded precisely so
+/// that check can be added later without changing how this is loaded or
+/// threaded through. See [`Self::hash_at_read`].
+pub struct CoverageIndex {
+    reads: ReadSet,
+    session_id: String,
+}
+
+impl CoverageIndex {
+    /// Load the journal for `session_id`. `None` when there is no session, no
+    /// journal, or an empty one — all of which mean "no coverage context",
+    /// which callers must distinguish from "read nothing".
+    pub fn load(project_root: &Path, session_id: Option<&str>) -> Option<Self> {
+        let session_id = session_id?;
+        let (reads, _warnings) = load_from_journal(project_root, session_id)?;
+        Some(CoverageIndex {
+            reads,
+            session_id: session_id.to_string(),
+        })
+    }
+
+    /// Build directly from a read set.
+    ///
+    /// The journal is the only source today, but the session-log fallback in
+    /// [`replay_session_logs`] produces the same shape, so a caller could
+    /// supply coverage for a session the TUI never watched.
+    pub fn from_read_set(reads: ReadSet, session_id: impl Into<String>) -> Self {
+        CoverageIndex {
+            reads,
+            session_id: session_id.into(),
+        }
+    }
+
+    /// Depth this symbol was read at, or `None` if it was never read.
+    pub fn depth_of(&self, symbol_id: &str) -> Option<ReadDepth> {
+        self.reads.get(symbol_id).map(|(_, d)| *d)
+    }
+
+    /// The content hash recorded when the symbol was read.
+    ///
+    /// Unused today. It is the whole input a currency check would need:
+    /// compare it against the live `SymbolNode::content_hash` and the answer
+    /// is whether the recorded read still describes the code.
+    pub fn hash_at_read(&self, symbol_id: &str) -> Option<[u8; 32]> {
+        self.reads.get(symbol_id).map(|(h, _)| *h)
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Distinct symbols with a recorded read.
+    pub fn len(&self) -> usize {
+        self.reads.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.reads.is_empty()
+    }
+}
+
 /// Rebuild a ledger by replaying a session's logs.
 ///
 /// The fallback path for sessions with no journal. Compaction is deliberately
