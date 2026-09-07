@@ -698,10 +698,18 @@ pub fn dump_tree(
 /// Print a single symbol and its children recursively with indentation.
 pub fn print_symbol(sym: &SymbolNode, indent: usize) {
     let pad = " ".repeat(indent);
+    // An inherent impl is named `impl Foo` so its id stays distinct from the
+    // type's, which would otherwise render as "impl impl Foo" here.
+    let kind = sym
+        .name
+        .strip_prefix(sym.label)
+        .and_then(|rest| rest.starts_with(' ').then_some(""))
+        .unwrap_or(sym.label);
     println!(
-        "{}{} {} [L{}-{}] (~{} tokens)",
+        "{}{}{}{} [L{}-{}] (~{} tokens)",
         pad,
-        sym.label,
+        kind,
+        if kind.is_empty() { "" } else { " " },
         sym.name,
         sym.line_range.start,
         sym.line_range.end,
