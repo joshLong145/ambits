@@ -525,6 +525,9 @@ pub struct RehydrateStats {
     /// Entries the post-overlay comparison found no longer match the tree.
     /// Without the overlay these would all have looked fresh.
     pub drifted: usize,
+    /// Symbols re-keyed to a new id because they moved. Counted separately
+    /// from `corrected`: nothing about the read changed, only its address.
+    pub moved: usize,
 }
 
 /// Fold the journal into a freshly replayed ledger, then re-derive staleness.
@@ -559,8 +562,33 @@ pub fn rehydrate_ledger(
 ) -> RehydrateStats {
     let mut stats = RehydrateStats::default();
 
+    // Resolve moves through `classify`, so the ledger and the digest agree on
+    // where a symbol lives. Doing it any other way would let the TUI and
+    // `restore-context` disagree about the same journal.
+    //
+    // A journaled id that no longer exists is dead weight in the ledger: the
+    // tree view renders from `project_tree`, so an entry keyed to a vanished
+    // id is invisible, and `refresh_staleness` would mark it stale for good
+    // measure. Re-keying puts the coverage back where the code actually is.
+    // Owned rather than borrowed: the new id exists only in the tree and the
+    // classification, never in the journal we are reading from.
+    let remap: HashMap<String, String> = classify(&contents.reads, tree)
+        .restored
+        .into_iter()
+        .filter_map(|s| s.moved_from.map(|old| (old, s.symbol_id)))
+        .collect();
+    stats.moved = remap.len();
+
+    let resolve = |id: &str| -> String {
+        remap.get(id).cloned().unwrap_or_else(|| id.to_string())
+    };
+
+    // The hash needs no adjustment when an id is re-keyed: a move is *defined*
+    // by the body being byte-identical, which is how it was found. So the
+    // journaled hash still matches the node at the new address, and
+    // `refresh_staleness` below correctly leaves it fresh.
     for ((symbol_id, agent), (hash, depth)) in &contents.agent_reads {
-        if ledger.rehydrate(symbol_id.clone(), *depth, *hash, agent.clone()) {
+        if ledger.rehydrate(resolve(symbol_id), *depth, *hash, agent.clone()) {
             stats.inserted += 1;
         } else {
             stats.corrected += 1;
@@ -579,7 +607,7 @@ pub fn rehydrate_ledger(
         if attributed.contains(symbol_id.as_str()) {
             continue;
         }
-        if ledger.rehydrate(symbol_id.clone(), *depth, *hash, fallback_agent.to_string()) {
+        if ledger.rehydrate(resolve(symbol_id), *depth, *hash, fallback_agent.to_string()) {
             stats.inserted += 1;
         } else {
             stats.corrected += 1;
@@ -927,6 +955,97 @@ mod tests {
         assert_eq!(stats.drifted, 1);
         assert_eq!(stats.corrected, 1);
         assert_eq!(stats.inserted, 0);
+    }
+
+    /// A symbol that moved must land in the ledger at its *new* id. Keyed to
+    /// the dead id it is invisible — the tree view renders from the project
+    /// tree, so nothing would show at either address.
+    #[test]
+    fn rehydrate_re_keys_a_moved_symbol_to_its_current_id() {
+        let mut moved = sym_hashed("src/util.rs::helper", "helper", "fn body");
+        moved.line_range = 12..18;
+        let tree = project(vec![file("src/util.rs", vec![moved])]);
+        let hash = content_hash("fn body");
+
+        let mut contents = JournalContents::default();
+        contents
+            .reads
+            .insert("src/old.rs::helper".into(), (hash, ReadDepth::FullBody));
+        contents.agent_reads.insert(
+            ("src/old.rs::helper".into(), "agent-1".into()),
+            (hash, ReadDepth::FullBody),
+        );
+
+        let mut ledger = ContextLedger::new();
+        let stats = rehydrate_ledger(&mut ledger, &contents, "sess", &tree);
+
+        assert_eq!(stats.moved, 1);
+        assert_eq!(
+            ledger.depth_of("src/util.rs::helper"),
+            ReadDepth::FullBody,
+            "coverage lands where the code now lives"
+        );
+        assert!(
+            !ledger.is_stale("src/util.rs::helper"),
+            "a move is byte-identical by definition, so nothing drifted"
+        );
+        assert_eq!(
+            ledger.depth_of("src/old.rs::helper"),
+            ReadDepth::Unseen,
+            "and nothing is stranded at the dead address"
+        );
+        assert_eq!(
+            ledger.depth_of_for_agent("src/util.rs::helper", "agent-1"),
+            ReadDepth::FullBody,
+            "attribution follows the move"
+        );
+    }
+
+    /// The unattributed v1 path has to re-key too, or old journals lose moved
+    /// symbols that the digest would happily report.
+    #[test]
+    fn rehydrate_re_keys_unattributed_reads_as_well() {
+        let moved = sym_hashed("src/util.rs::helper", "helper", "fn body");
+        let tree = project(vec![file("src/util.rs", vec![moved])]);
+
+        let mut contents = JournalContents::default();
+        contents.reads.insert(
+            "src/old.rs::helper".into(),
+            (content_hash("fn body"), ReadDepth::FullBody),
+        );
+
+        let mut ledger = ContextLedger::new();
+        let stats = rehydrate_ledger(&mut ledger, &contents, "sess-9", &tree);
+
+        assert_eq!(stats.moved, 1);
+        assert_eq!(
+            ledger.depth_of_for_agent("src/util.rs::helper", "sess-9"),
+            ReadDepth::FullBody
+        );
+    }
+
+    /// The ledger and the digest must not disagree about the same journal.
+    #[test]
+    fn rehydrate_and_classify_agree_on_where_a_symbol_lives() {
+        let moved = sym_hashed("src/util.rs::helper", "helper", "fn body");
+        let tree = project(vec![file("src/util.rs", vec![moved])]);
+        let hash = content_hash("fn body");
+
+        let mut contents = JournalContents::default();
+        contents
+            .reads
+            .insert("src/old.rs::helper".into(), (hash, ReadDepth::FullBody));
+
+        let mut ledger = ContextLedger::new();
+        rehydrate_ledger(&mut ledger, &contents, "sess", &tree);
+        let outcome = classify(&contents.reads, &tree);
+
+        assert_eq!(outcome.restored.len(), 1);
+        let id = &outcome.restored[0].symbol_id;
+        assert!(
+            ledger.depth_of(id).is_seen(),
+            "the digest points at {id}, so the ledger must have it there too"
+        );
     }
 
     /// Precision: correcting one symbol must not evict its neighbours.

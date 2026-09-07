@@ -399,10 +399,10 @@ fn main() -> Result<()> {
     let journal_enabled = !cli.no_journal && cache_cfg.enabled.unwrap_or(true);
     if journal_enabled {
         if let Some(stats) = app.rehydrate_from_journal() {
-            if stats.drifted > 0 || stats.inserted > 0 {
+            if stats.drifted > 0 || stats.inserted > 0 || stats.moved > 0 {
                 eprintln!(
-                    "[ambit] rehydrated from journal: {} corrected, {} recovered, {} stale",
-                    stats.corrected, stats.inserted, stats.drifted
+                    "[ambit] rehydrated from journal: {} corrected, {} recovered, {} moved, {} stale",
+                    stats.corrected, stats.inserted, stats.moved, stats.drifted
                 );
             }
         }
