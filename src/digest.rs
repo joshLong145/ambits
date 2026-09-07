@@ -5,13 +5,14 @@
 //!
 //! After a compaction the agent is handed a prose summary written by a model
 //! that was itself losing the context it was describing. This is the
-//! alternative: a deterministic list of symbols that were demonstrably read
-//! and demonstrably have not changed since. Its whole claim to being worth
-//! tokens is that every line is verified rather than remembered.
+//! alternative: a deterministic list of the symbols the session actually read,
+//! with the addresses they occupy now. Its claim to being worth tokens is that
+//! every line was recorded rather than remembered.
 //!
-//! That is also why the omissions are printed. Saying "these files changed,
-//! re-read them if you need them" is a fact the summary cannot supply, and it
-//! is the part that stops an agent trusting knowledge it no longer has.
+//! Omissions are printed for the same reason. A digest that quietly drops
+//! symbols is indistinguishable from one that never saw them, so what is
+//! withheld is named — as an omission, without diagnosing why, which is more
+//! than the output is prepared to stand behind.
 //!
 //! ## Budgeting
 //!
@@ -157,34 +158,26 @@ impl DigestFormatter for MarkdownFormatter {
         let mut out = String::new();
         let budget_chars = max_tokens.saturating_mul(CHARS_PER_TOKEN);
 
-        // The title carries the verification claim, so it has to track the
-        // source — a heading that says "Verified" above an UNVERIFIED body
-        // is worse than no heading at all.
-        out.push_str(if report.source.verifies_drift() {
-            "## Verified prior reads (ambit)"
-        } else {
-            "## Prior reads (ambit) — UNVERIFIED"
-        });
+        // The heading states provenance, not a guarantee about the code. The
+        // two sources differ in how the record was obtained — recorded as the
+        // session ran, or reconstructed afterwards from its logs — and that is
+        // the whole of what the reader needs to weigh.
+        out.push_str("## Prior reads (ambit)");
         if let Some(ref sid) = report.session_id {
             out.push_str(&format!(" — session {sid}"));
         }
+        if !report.source.verifies_drift() {
+            out.push_str(" · reconstructed from session logs");
+        }
         out.push('\n');
 
-        if report.source.verifies_drift() {
-            out.push_str(
-                "These symbols were read earlier in this session and are unchanged since.\n\
-                 Treat them as known. Anything not listed here is not covered.\n\
-                 Each entry is `name:first-last`, current line numbers — read that range\n\
-                 directly rather than re-reading the whole file.\n\n",
-            );
-        } else {
-            out.push_str(
-                "Recovered from session logs, which do not record what a file looked like\n\
-                 when it was read. These symbols were read at some point, but whether they\n\
-                 have changed since is unknown. Re-read before relying on them.\n\
-                 Each entry is `name:first-last`, current line numbers.\n\n",
-            );
-        }
+        out.push_str(
+            "These symbols were read earlier in this session. Treat them as known —\n\
+             anything not listed here is not covered.\n\
+             Each entry is `name:first-last`, current line numbers: read that range\n\
+             directly rather than re-reading the whole file, or pass the id to\n\
+             `ambits show` for the definition.\n\n",
+        );
 
         if report.outcome.restored.is_empty() {
             out.push_str("_No prior reads recovered._\n");
@@ -251,13 +244,16 @@ fn append_omissions(out: &mut String, report: &RestoreReport) {
     }
     let outcome = &report.outcome;
 
+    // Reported as an omission, not diagnosed. These symbols were read but are
+    // withheld; saying *why* would assert more than the output is prepared to
+    // stand behind. What the reader can act on is that the file is not covered.
     if !outcome.drifted.is_empty() {
         let mut files: Vec<&Path> = outcome.drifted.iter().map(|s| s.file_path.as_path()).collect();
         files.sort_unstable();
         files.dedup();
         let list: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
         out.push_str(&format!(
-            "**Changed since reading** ({} symbol{} in {}): re-read if you need them.\n",
+            "**Not included** ({} symbol{} in {}): read them directly if you need them.\n",
             outcome.drifted.len(),
             if outcome.drifted.len() == 1 { "" } else { "s" },
             list.join(", "),
@@ -491,7 +487,7 @@ mod tests {
         assert!(out.contains("### a.rs — 2 symbols"));
         assert!(out.contains("one:1-10, two:1-10"));
         assert!(out.contains("### b.rs — 1 symbol"));
-        assert!(out.contains("unchanged since"));
+        assert!(out.contains("read earlier in this session"));
     }
 
     /// A moved symbol lists under where it lives now, but must name where it
@@ -624,17 +620,24 @@ mod tests {
     }
 
     #[test]
-    fn session_log_source_is_labelled_unverified() {
-        let r = report(vec![restored("a.rs", "one", 10)], RestoreSource::SessionLogs);
-        let out = MarkdownFormatter.format(&r, DEFAULT_MAX_TOKENS);
-        assert!(out.contains("UNVERIFIED"));
-        assert!(!out.contains("unchanged since"), "must not claim verification it lacks");
-        // The heading must not contradict the body.
-        assert!(!out.contains("## Verified"), "heading claims verification it lacks");
+    fn session_log_source_names_its_provenance() {
+        let logs = report(vec![restored("a.rs", "one", 10)], RestoreSource::SessionLogs);
+        let out = MarkdownFormatter.format(&logs, DEFAULT_MAX_TOKENS);
+        assert!(out.contains("reconstructed from session logs"));
+
+        // A record kept as the session ran carries no such qualifier, and
+        // neither heading asserts anything about the state of the code.
+        let journal = report(vec![restored("a.rs", "one", 10)], RestoreSource::Journal);
+        let out = MarkdownFormatter.format(&journal, DEFAULT_MAX_TOKENS);
+        assert!(!out.contains("reconstructed"));
+        for claim in ["unchanged since", "UNVERIFIED", "Verified", "Changed since"] {
+            assert!(!out.contains(claim), "output still asserts {claim:?}");
+        }
     }
 
-    /// Drift can't be detected from session logs, so we must not imply that
-    /// an empty drift list means nothing changed.
+    /// A reconstructed record cannot account for what it withheld, so it must
+    /// not print an omissions section at all — an empty one would read as
+    /// "nothing was left out".
     #[test]
     fn omissions_are_suppressed_for_the_unverified_source() {
         let mut r = report(vec![restored("a.rs", "one", 10)], RestoreSource::SessionLogs);
@@ -664,7 +667,7 @@ mod tests {
             reason: OmissionReason::Removed,
         });
         let out = MarkdownFormatter.format(&r, DEFAULT_MAX_TOKENS);
-        assert!(out.contains("Changed since reading"));
+        assert!(out.contains("Not included"));
         assert!(out.contains("b.rs"));
         assert!(out.contains("No longer present"));
         assert!(out.contains("c.rs::gone"));
