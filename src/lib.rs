@@ -5,6 +5,7 @@ pub mod digest;
 pub mod filter;
 pub mod ingest;
 pub mod journal;
+pub mod lookup;
 pub mod parser;
 pub mod restore;
 pub mod symbols;

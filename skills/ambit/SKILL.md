@@ -124,6 +124,32 @@ That adds a `SessionStart` hook with `matcher: "compact"` to
 result the moment a compaction completes. It merges into existing settings and
 is safe to re-run. When there is nothing to restore it emits nothing.
 
+### Fetching a definition
+
+To get the source of something the digest listed, without a `Read` or a
+`find_symbol` round-trip:
+
+```bash
+ambits -p . show 'src/app.rs::App/process_compaction'
+ambits -p . show b3:5a60f75c 'src/digest.rs::grouped'   # batched
+```
+
+Selectors are either a symbol id (`<path>::<name-path>` — the `###` heading
+plus the entry name, which is what the digest already gives you) or a content
+hash, full or an 8+ character prefix. `--format json` on `restore-context`
+emits `content_hash` per symbol for exactly this.
+
+Returns JSON: `id`, `file`, `lines`, `bytes`, `content_hash`, `label`, and
+`definition` (the exact source span). Add `--no-body` for metadata only, or
+`--max-bytes N` to cap each definition — a capped one is flagged
+`"truncated": true`, since it is no longer valid source.
+
+**Ambiguity is reported, not resolved.** `matches` is an array: a symbol id
+names both `struct Foo` and `impl Foo`, so it can hold more than one entry.
+Prefer the hash when you need exactly one. An empty `matches` means no such
+symbol; `"selector": "unrecognized"` means the query was neither an id nor a
+hash.
+
 ### Inspecting the journal
 
 ```bash

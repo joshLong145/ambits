@@ -334,6 +334,8 @@ struct SymbolDto<'a> {
     lines: [u32; 2],
     depth: String,
     tokens: u32,
+    /// Exact selector for `ambits show`, which an id cannot always be.
+    content_hash: String,
     /// Present only when the symbol was located by content hash under a
     /// different id — see `RestoredSymbol::moved_from`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -386,6 +388,7 @@ impl DigestFormatter for JsonFormatter {
                     lines: [s.line_range.start, s.line_range.end],
                     depth: s.depth.to_string(),
                     tokens: s.estimated_tokens,
+                    content_hash: crate::journal::encode_hash(&s.content_hash),
                     moved_from: s.moved_from.as_deref(),
                 })
                 .collect();
@@ -456,6 +459,7 @@ mod tests {
             depth: ReadDepth::FullBody,
             line_range: 1..10,
             estimated_tokens: tokens,
+            content_hash: [0u8; 32],
             moved_from: None,
         }
     }

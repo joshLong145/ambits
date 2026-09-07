@@ -146,6 +146,29 @@ enum Commands {
         format: DigestFormat,
     },
 
+    /// Print a symbol's definition as JSON, looked up by content hash or id.
+    ///
+    /// Intended as the follow-up to `restore-context`: that names what is
+    /// known and where it lives, this hands back the source. Accepts several
+    /// selectors at once so a batch of lookups costs one process, and reports
+    /// every match rather than guessing when a selector is ambiguous.
+    Show {
+        /// Content hash (`b3:<hex>`, or at least 8 hex characters) or symbol
+        /// id (`<path>::<name-path>`). Repeatable.
+        #[arg(required = true)]
+        selector: Vec<String>,
+
+        /// Omit the `definition` field and return only location metadata.
+        #[arg(long)]
+        no_body: bool,
+
+        /// Truncate each definition to this many bytes, flagging it with
+        /// `"truncated": true`. Unlimited by default — a cut definition is not
+        /// valid source, so shortening one is the caller's decision to make.
+        #[arg(long)]
+        max_bytes: Option<usize>,
+    },
+
     /// Inspect or remove the coverage journals under .ambit/coverage.
     Cache {
         #[command(subcommand)]
@@ -330,6 +353,24 @@ fn main() -> Result<()> {
             .as_ref()
             .and_then(|d| ingester.find_latest_session(d))
     });
+
+    if let Some(Commands::Show {
+        selector,
+        no_body,
+        max_bytes,
+    }) = &command
+    {
+        for w in &config_warnings {
+            eprintln!("[ambit warning] {w}");
+        }
+        return ambits::lookup::run(
+            &project_path,
+            &project_tree,
+            selector,
+            !no_body,
+            *max_bytes,
+        );
+    }
 
     if let Some(Commands::RestoreContext { max_tokens, format }) = command {
         for w in &config_warnings {

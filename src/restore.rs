@@ -55,6 +55,10 @@ pub struct RestoredSymbol {
     pub line_range: Range<u32>,
     /// Cost of re-reading this symbol, if the agent decides to.
     pub estimated_tokens: u32,
+    /// Hash of the matched node. Unlike an id this is unique to the body, so
+    /// it is the selector to hand `ambits show` when an id is ambiguous —
+    /// `<path>::Foo` names both `struct Foo` and `impl Foo`, this does not.
+    pub content_hash: [u8; 32],
     /// The id this symbol had when it was read, when that differs from where
     /// it lives now — i.e. it was located by content hash rather than by id.
     ///
@@ -392,6 +396,7 @@ pub fn classify(
                     depth: *depth,
                     line_range: sym.line_range.clone(),
                     estimated_tokens: sym.estimated_tokens,
+                    content_hash: sym.content_hash,
                     moved_from: None,
                 });
             }
@@ -491,6 +496,7 @@ fn follow_moves(
                     depth,
                     line_range: node.line_range.clone(),
                     estimated_tokens: node.estimated_tokens,
+                    content_hash: node.content_hash,
                     moved_from: Some(old_id.clone()),
                 });
             }
