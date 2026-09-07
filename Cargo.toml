@@ -2,6 +2,8 @@
 name = "ambits"
 version = "0.17.0"
 edition = "2021"
+# `Option::is_none_or` (src/ui/activity.rs) stabilized here.
+rust-version = "1.82"
 description = "command line utility for symbols used by Claude agents"
 repository = "https://github.com/joshLong145/ambits"
 license = "MIT"

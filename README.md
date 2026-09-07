@@ -195,6 +195,7 @@ File                                      Symbols    Seen    Full   Seen%   Full
 src/events.rs                                   3       3       3    100%    100%
 src/parser/mod.rs                               8       8       1    100%     12%
 src/app.rs                                     89      89      85    100%     95%
+…
 ─────────────────────────────────────────────────────────────────────────────
 TOTAL                                         214     182     175     85%     82%
 ```
@@ -324,7 +325,7 @@ Installs a [skill](https://code.claude.com/docs/en/skills) that teaches the agen
 
 # Building from source
 
-Requires Rust 1.70+.
+Requires Rust 1.82+ (declared as `rust-version` in `Cargo.toml`).
 
 ```bash
 cargo build --release
