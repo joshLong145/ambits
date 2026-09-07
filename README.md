@@ -3,116 +3,212 @@
 [![e2e](https://github.com/joshLong145/ambits/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/joshLong145/ambits/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/joshLong145/ambits/graph/badge.svg?token=9Q8GWA8H6Y)](https://codecov.io/gh/joshLong145/ambits)
 
-When an AI coding agent works on your project, it reads files, greps for patterns, and inspects symbols — but you have no way to see what it actually looked at. **ambits** gives you that visibility.
+**A code-reading tool for AI agents, and a memory of what they have read.**
 
-It's a real-time TUI that watches Claude Code session logs and paints every function, struct, and class in your codebase by how deeply the agent has read it. At a glance you can see blind spots the agent missed, stale reads that are out of date, and exactly how much of your project the agent actually understands.
+Coding agents read whole files to find one function, re-read code they already know, and lose all of it the moment the context window compacts. ambits addresses both halves of that:
+
+- **Reading** — `ambits show` returns a symbol's definition as structured JSON, addressed by name or by content hash. The agent asks for `App/process_compaction`, not for 2,000 lines of `app.rs`.
+- **Remembering** — ambits records every symbol the agent reads, at what depth, throughout the session. After a compaction it can hand that history back, so the agent knows what it already understands instead of rediscovering it.
+
+Both surfaces are plain text and JSON with no vendor coupling, so the record can be handed between agents, or between providers. Ingestion is currently built and tested against Claude Code.
+
+There is also a live TUI, for when you want to watch what your agent is actually looking at.
 
 ![screenshot](./images/screenshot.png)
 
-## Features
-
-- **Real-time session monitoring** — Tails Claude Code's JSONL session logs as the agent works, updating the display live
-- **Depth-aware coverage** — Every symbol is color-coded by read depth: unseen, name-only, overview, signature, or full body
-- **Staleness detection** — When source files change on disk, previously-read symbols are automatically marked stale so you know what needs a re-read
-- **Coverage reports** — Generate tabular per-file coverage summaries for CI or quick audits
-- **Per-file coverage counts** — Each file shows a `seen/total` symbol count so you can tell at a glance how much of it the agent has inspected
-- **Sortable tree view** — Toggle between alphabetical and coverage-grouped ordering to surface partially-covered files first
-- **Multi-agent coverage** — When a session spawns sub-agents, ambits tracks each one independently. See which parts of your codebase each agent examined, filter the tree and activity feed by agent, and compare per-agent coverage side by side
-- **Multiple parsing backends** — Tree-sitter for fast local parsing, or [Serena MCP](https://github.com/oraios/serena) for richer LSP-based symbol data across more languages
-
-## Supported Languages
-
-| Backend | Languages |
-|---|---|
-| Tree-sitter | Rust, Python, TypeScript |
-| Serena MCP | Any language Serena supports |
-
-## Roadmap
-
-- Multi-session comparison
-
-## Building from source
-
-Requires Rust 1.70+.
-
-```
-cargo build --release
-```
-
-## Installing through Cargo
-
-```
-cargo install ambits
-```
-
-## Usage
-
-```
-ambits --project <path>
-```
-
-### Flags
-
-| Flag | Description |
-|---|---|
-| `--project`, `-p` | Path to the project root (required) |
-| `--session`, `-s` | Session ID to track (auto-detects latest) |
-| `--agent`, `-a` | Filter coverage to a specific agent ID (supports prefix matching) |
-| `--dump` | Print symbol tree to stdout and exit |
-| `--coverage` | Print coverage report to stdout and exit |
-| `--format` | Coverage output format: `table` (default) or `json` |
-| `--serena` | Use Serena's LSP symbol cache instead of tree-sitter |
-| `--log-dir` | Path to Claude Code log directory (auto-derived) |
-| `--log-output` | Output directory for event logs |
-
-### Examples
+## Quick start
 
 ```bash
-# Launch TUI for current project
+cargo install ambits
+
+# Read a symbol instead of a file
+ambits -p . show 'src/app.rs::App/process_compaction'
+
+# What has this session read so far?
+ambits -p . restore-context
+
+# Hand that history back automatically after every compaction
+ambits hook install --project .
+
+# Watch it live
 ambits -p .
+```
 
-# Dump symbol tree without TUI
-ambits -p . --dump
+---
 
-# Print coverage report
+# For the agent
+
+## Reading code by symbol
+
+```bash
+ambits -p . show 'src/digest.rs::format_tokens'
+```
+
+```json
+{"schema_version":1,"results":[{"query":"src/digest.rs::format_tokens","selector":"id",
+"matches":[{"id":"src/digest.rs::format_tokens","name":"format_tokens","file":"src/digest.rs",
+"lines":[143,149],"bytes":[5621,5766],"content_hash":"b3:178ab30e…","label":"fn",
+"estimated_tokens":56,"definition":"fn format_tokens(n: u64) -> String {\n …"}]}]}
+```
+
+A selector is either a **symbol id** — `<path>::<name-path>`, exactly what `restore-context` prints — or a **content hash**, full or an 8-character prefix. Several resolve per invocation, so a batch of lookups costs one process:
+
+```bash
+ambits -p . show b3:5a60f75c 'src/digest.rs::grouped' 'src/app.rs::App/handle_key'
+```
+
+`definition` is the exact source span, sliced by byte offset rather than reconstructed from line numbers. `--no-body` returns location metadata only; `--max-bytes N` caps each definition and flags it `"truncated": true`, since a cut definition is no longer valid source.
+
+**Ambiguity is reported, not resolved.** `matches` is an array. A symbol id names both `struct Foo` and `impl Foo`, so it can return two entries — a content hash tells them apart. Empty `matches` means no such symbol; `"selector": "unrecognized"` means the query was neither an id nor a hash. The command exits `0` either way: "nothing matches" is an answer, not a failure.
+
+In practice this is a large saving. Reading the six implementation symbols of a 316-line module costs ~630 tokens against ~3,500 for the file.
+
+## Knowing what it has already read
+
+Every read is tracked per symbol and per agent, at the depth the tool implies — a `Read` gives full body, a grep match gives overview, a glob gives name only. `restore-context` reports that history:
+
+```bash
+ambits -p . restore-context
+```
+
+```
+### src/app.rs — 85 symbols (~40.4k tok)
+App/process_compaction:340-388, App/rebuild_tree_rows:391-458,
+App/handle_key:460-533, …
+
+### src/digest.rs — 43 symbols (~11.6k tok)
+format_tokens:143-149 (was src/ui/stats.rs), grouped:63-83, …
+```
+
+Entries are `name:first-last`. Line numbers come from a fresh scan at print time rather than from storage, so they stay correct in files edited since the read — the agent can read that range directly instead of pulling the file.
+
+`(was src/ui/stats.rs)` marks a symbol that moved between files. ambits identifies symbols by content as well as by path, so hoisting a helper into a shared module does not lose it.
+
+`--max-tokens N` fits a budget (default 3000). `--format json` gives the same data structurally, including each symbol's `content_hash` for exact `show` lookups.
+
+### Automatic hand-back after compaction
+
+```bash
+ambits hook install --project .
+```
+
+Registers a `SessionStart` hook with `matcher: "compact"` in `.claude/settings.json`, so Claude Code runs `restore-context` and injects the result the moment a compaction completes. It merges into existing settings, is safe to re-run, and emits nothing when there is nothing to restore.
+
+### Lookups count as reads
+
+ambits parses `show` invocations out of the session log and credits the symbols they name, so reading efficiently costs nothing in coverage versus a plain `Read`. (`--no-body` credits name-level only — the agent learned where a symbol is, not what it says.)
+
+Credit is best-effort: it is reconstructed from the logged command text, so a selector passed through a shell variable or command substitution is not visible. It fails toward under-reporting, never over.
+
+## Portability
+
+Nothing in the record is tied to a vendor or a machine:
+
+| Piece | Form |
+|---|---|
+| Symbol ids | `<project-relative-path>::<name-path>` |
+| Content hashes | BLAKE3 over whitespace-normalized source |
+| Digest | Markdown, or schema-versioned JSON |
+| `show` output | Schema-versioned JSON |
+| Journal | NDJSON, one record per read |
+
+The same digest means the same thing on another checkout, another machine, or in front of another model. Any agent that can run a command and read text can consume it — no MCP server, no SDK, no wire protocol.
+
+What *is* provider-shaped, and where the seams are:
+
+- **Session ingestion** is Claude Code's JSONL format today. `SessionIngester` is the extension point — "implement this to add support for a new LLM session format."
+- **Tool mappings** are data, not code. Another provider's tool names are taught in `.ambit/tools.toml` rather than patched in; `ToolCallMapper` exists to "plug in alternative tool-name conventions."
+- **`--format hook`** emits Claude Code's `SessionStart` envelope specifically. `--format markdown` and `--format json` carry the same content with no envelope.
+
+Claude Code is what this is built and tested against. The formats are deliberately boring so that need not stay true.
+
+---
+
+# For you
+
+## The TUI
+
+```bash
+ambits -p .
+```
+
+Tails the session log and updates live. Three panels — symbol tree, coverage stats, activity feed — cycled with `Tab`.
+
+- **Depth-aware coloring** — every symbol shaded by how deeply it was read
+- **Per-file counts** — `seen/total` on each file header, so partial coverage shows without expanding
+- **Sortable tree** — alphabetical, or grouped by coverage to surface half-read files first
+- **Search** — `/` to jump to a symbol by name
+- **Compaction history** — `C` for this session's compaction boundaries
+- **Sub-agent alignment** — `d` compares two agents file by file: where they read the same code, and where only one looked
+
+Symbols carried over from before a compaction render dimmed — the read happened, but it is no longer in the agent's live context.
+
+### Keybindings
+
+| Key | Action |
+|---|---|
+| `j` / `k` | Navigate up/down (tree or agent list, depending on focus) |
+| `h` / `l` | Collapse / expand tree nodes |
+| `Enter` | Expand node, or select agent when Stats is focused |
+| `Tab` | Cycle panel focus (Tree / Stats / Activity) |
+| `/` | Search symbols |
+| `s` | Toggle sort (alphabetical / coverage) |
+| `a` / `A` | Cycle agent filter forward / backward |
+| `d` | Sub-agent alignment view |
+| `C` | Compaction history (`[` / `]` to page) |
+| `g` / `G` | Jump to first / last |
+| `PgUp` / `PgDn` | Scroll by page |
+| `q` | Quit |
+
+### Color legend
+
+**Symbols**, by read depth:
+
+| Color | Meaning |
+|---|---|
+| Dark gray | Unseen |
+| Light gray | Name only (appeared in a glob or listing) |
+| Pale blue | Overview (grep match, symbol listing) |
+| Blue | Signature seen |
+| Green | Full body read |
+
+**File headers**, by coverage:
+
+| Color | Meaning |
+|---|---|
+| White | Nothing seen |
+| Amber | Partially covered |
+| Yellow-green | All symbols seen, not all at full depth |
+| Green | Every symbol read in full |
+
+## Coverage reports
+
+```bash
 ambits -p . --coverage
-
-# Filter coverage to a specific agent (supports prefix matching)
-ambits -p . --coverage --agent a9fe23c
-ambits -p . --coverage --agent a9fe    # prefix match
-
-# Use Serena's symbol cache (more languages, finer detail)
-ambits -p . --serena
 ```
 
-### Coverage Report
-
-The `--coverage` flag prints a per-file breakdown of how much the agent has seen, useful for quick audits or piping into CI checks:
-
 ```
-Coverage Report (session: 34e212cf-a176-4059-ba12-eca94b56e43b)
+Coverage Report (session: 34e212cf-…)
 ─────────────────────────────────────────────────────────────────────────────
 File                                      Symbols    Seen    Full   Seen%   Full%
 ─────────────────────────────────────────────────────────────────────────────
-src/events.rs                                   3       0       0      0%      0%
+src/events.rs                                   3       3       3    100%    100%
 src/parser/mod.rs                               8       8       1    100%     12%
-src/app.rs                                     23      23      23    100%    100%
+src/app.rs                                     89      89      85    100%     95%
 ─────────────────────────────────────────────────────────────────────────────
 TOTAL                                         214     182     175     85%     82%
 ```
 
-- **Seen%**: Symbols the agent has any awareness of (name, overview, signature, or full body)
-- **Full%**: Symbols the agent has read completely (full body)
-
-For machine-readable output, pass `--format json` to emit a single-line, schema-versioned JSON object suitable for `jq` or other tooling:
+- **Seen%** — symbols the agent has any awareness of
+- **Full%** — symbols read completely
 
 ```bash
 ambits -p . --coverage --format json | jq '.totals.full_percent'
 ```
 
-### Multi-Agent Coverage
+## Multi-agent sessions
 
-When a Claude Code session uses the Task tool to spawn sub-agents, ambits automatically detects each agent and tracks its coverage independently. The Coverage Stats panel shows a hierarchical agent tree with per-agent seen percentages:
+When a session spawns sub-agents with the Task tool, ambits tracks each independently:
 
 ```
 Agents: 5
@@ -124,78 +220,113 @@ Agents: 5
   └─ compact-0aff      10%
 ```
 
-Use `Tab` to focus the Stats panel, then `j`/`k` to navigate the agent list and `Enter` to filter. When an agent is selected, the tree view, activity feed, and depth breakdown all update to show only that agent's coverage. Press `a` from any panel to quickly cycle through agents.
+`Tab` to the Stats panel, `j`/`k` to move, `Enter` to filter — tree, activity feed, and depth breakdown all follow. `a` cycles agents from any panel. `d` opens the alignment view, which scores each pair of agents file by file — useful for spotting sub-agents that duplicated each other's exploration.
 
-The `--agent` CLI flag lets you filter coverage reports by agent ID without launching the TUI:
+Outside the TUI:
 
 ```bash
 ambits -p . --coverage --agent a9fe23c
+ambits -p . --coverage --agent a9fe        # prefix match
 ```
 
-## Claude Code Skill
+A prefix matching no agent, or several, warns rather than guessing.
 
-ambits includes a [Claude Code skill](https://code.claude.com/docs/en/skills) so you can check coverage without leaving your editor. Type `/ambit` in any Claude Code session to get an instant coverage summary.
+---
 
-### Installing the skill
+# Configuration
+
+## The read journal
+
+While the TUI runs it maintains an append-only NDJSON record at `.ambit/coverage/<session>.ndjson` — one entry per `(symbol, agent)` read. This is what lets `restore-context` answer after the fact, and it survives restarts.
 
 ```bash
-# Install globally (available in all your projects)
-ambits skill install --global
+ambits -p . cache status              # sessions, symbols, size on disk
+ambits -p . cache clear --session <id>
+ambits -p . cache clear --all
+```
 
-# Install into the current project only
-ambits skill install
+Size is bounded by what an agent can read in one session, not by repository size — a full day of heavy work on this repo is around 150 KB. Nothing is pruned automatically, and `cache clear` requires naming a target, because a journal is the only record of what a past session read.
 
-# Install into a specific project
+Disable with `--no-journal`; tune the write interval with `--flush-interval-ms`.
+
+## Restricting scope
+
+```bash
+ambits -p . --filter src/parser              # by path component
+ambits -p . --filter-regex '^src/.*\.rs$'    # by regex
+```
+
+`--filter` matches whole path components, so `src/parser` matches `src/parser/rust.rs` but not `src/parser_extra.rs`.
+
+## Tool mappings
+
+How a tool call becomes a symbol read is data. Drop a `.ambit/tools.toml` into your project to teach ambits a tool it does not know, or to change the depth an existing one grants:
+
+```toml
+version = 1
+
+[[tool]]
+names         = ["MyCustomReader"]
+path_keys     = ["path"]
+depth         = { type = "fixed", value = "FullBody" }
+description   = "MyCustomReader {path}"
+```
+
+Project config merges over the built-in defaults; a user-global config is picked up automatically. `--tools-config` points at a specific file.
+
+## Parsing backends
+
+| Backend | Languages |
+|---|---|
+| Tree-sitter (default) | Rust, Python, TypeScript |
+| Serena MCP | Any language [Serena](https://github.com/oraios/serena) supports |
+
+```bash
+ambits -p . --serena
+```
+
+## Claude Code skill
+
+```bash
+ambits skill install --global      # all projects
+ambits skill install               # current project
 ambits skill install --project /path/to/project
 ```
 
-Global installs go to `~/.claude/skills/ambit/`. Project installs go to `.claude/skills/ambit/` within the target directory.
+Installs a [skill](https://code.claude.com/docs/en/skills) that teaches the agent when to check its own coverage and how to fetch definitions. Global installs go to `~/.claude/skills/ambit/`, project installs to `.claude/skills/ambit/`.
 
-### Using the skill
+# CLI reference
 
-Once installed, use `/ambit` in Claude Code:
+| Command | Description |
+|---|---|
+| `ambits -p <path>` | Launch the TUI |
+| `ambits … show <selector>…` | Print symbol definitions as JSON |
+| `ambits … restore-context` | Print this session's read history |
+| `ambits … --coverage` | Print a coverage report and exit |
+| `ambits … --dump` | Print the symbol tree and exit |
+| `ambits … cache status\|clear` | Inspect or remove read journals |
+| `ambits hook install` | Register the post-compaction hook |
+| `ambits skill install` | Install the Claude Code skill |
 
+| Flag | Description |
+|---|---|
+| `--project`, `-p` | Project root (required) |
+| `--session`, `-s` | Session ID (auto-detects latest) |
+| `--agent`, `-a` | Filter to one agent ID (prefix matching) |
+| `--filter` / `--filter-regex` | Restrict analysis to a subpath or regex |
+| `--format` | `table` (default) or `json` |
+| `--serena` | Use Serena's LSP symbol cache |
+| `--tools-config` | Custom tool-mapping TOML |
+| `--no-journal` | Disable the read journal |
+| `--flush-interval-ms` | Journal write interval |
+| `--log-dir` | Claude Code log directory (auto-derived) |
+| `--log-output` | Write processed events to a directory |
+
+# Building from source
+
+Requires Rust 1.70+.
+
+```bash
+cargo build --release
+cargo test
 ```
-/ambit                    # Check coverage for current project
-/ambit --session <id>     # Check a specific session
-```
-
-Claude will run the appropriate `ambits` commands and interpret the coverage results, highlighting blind spots and suggesting files to read for better understanding.
-
-### Keybindings
-
-| Key | Action |
-|---|---|
-| `j` / `k` | Navigate up/down (tree or agent list depending on focus) |
-| `h` / `l` | Collapse/expand tree nodes |
-| `Enter` | Expand tree node, or select agent when Stats panel is focused |
-| `/` | Search symbols |
-| `s` | Toggle sort (alphabetical / coverage) |
-| `a` / `A` | Cycle agent filter forward / backward |
-| `Shift+Tab` | Cycle agent filter backward |
-| `Tab` | Switch panel focus (Tree / Stats / Activity) |
-| `g` / `G` | Jump to first / last item |
-| `PgUp` / `PgDn` | Scroll by page |
-| `q` | Quit |
-
-### Color Legend
-
-**Symbol colors** (by read depth):
-
-| Color | Meaning |
-|---|---|
-| Dark gray | Unseen |
-| Light gray | Name only (appeared in glob/listing) |
-| Pale blue | Overview (grep match, symbol listing) |
-| Blue | Signature seen |
-| Green | Full body read |
-| Orange | Stale (source changed since last read) |
-
-**File header colors** (by coverage status):
-
-| Color | Meaning |
-|---|---|
-| White | No symbols seen |
-| Amber | Partially covered (some symbols seen) |
-| Yellow-green | All seen (every symbol seen, but not all at full body depth) |
-| Green | Fully covered (all symbols read at full body depth) |

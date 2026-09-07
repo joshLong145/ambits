@@ -947,24 +947,35 @@ fn mark_selected_symbols(
     fn walk(
         syms: &[SymbolNode],
         event: &AgentToolCall,
-        hashes: &[String],
-        ids: &[&str],
+        hashes: &[(String, ReadDepth)],
+        ids: &[(&str, ReadDepth)],
         ledger: &mut ContextLedger,
         depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
     ) {
         for sym in syms {
             let hex = crate::journal::encode_hash(&sym.content_hash);
-            let hit = ids.iter().any(|id| *id == sym.id)
-                || hashes.iter().any(|h| hex[3..].starts_with(h.as_str()));
-            if hit {
+            // A symbol named by more than one selector in the same command
+            // takes the deepest of them; `record` is upgrade-only anyway, but
+            // resolving it here keeps the credit independent of iteration
+            // order.
+            let by_id = ids
+                .iter()
+                .filter(|(id, _)| *id == sym.id)
+                .map(|(_, d)| *d);
+            let by_hash = hashes
+                .iter()
+                .filter(|(h, _)| hex[3..].starts_with(h.as_str()))
+                .map(|(_, d)| *d);
+            let depth = by_id.chain(by_hash).max();
+            if let Some(depth) = depth {
                 ledger.record(
                     sym.id.clone(),
-                    event.read_depth,
+                    depth,
                     sym.content_hash,
                     event.agent_id.to_string(),
                     sym.estimated_tokens as usize,
                 );
-                depth_cache.record(&sym.id, &event.agent_id, event.read_depth);
+                depth_cache.record(&sym.id, &event.agent_id, depth);
             }
             walk(&sym.children, event, hashes, ids, ledger, depth_cache);
         }
@@ -973,10 +984,10 @@ fn mark_selected_symbols(
     // Split once rather than re-parsing each selector per symbol.
     let mut hashes = Vec::new();
     let mut ids = Vec::new();
-    for sel in &event.target_selectors {
+    for (sel, depth) in &event.target_selectors {
         match crate::lookup::parse_selector(sel) {
-            crate::lookup::Selector::Hash(h) => hashes.push(h),
-            crate::lookup::Selector::Id(_) => ids.push(sel.as_str()),
+            crate::lookup::Selector::Hash(h) => hashes.push((h, *depth)),
+            crate::lookup::Selector::Id(_) => ids.push((sel.as_str(), *depth)),
             crate::lookup::Selector::Unrecognized(_) => {}
         }
     }
@@ -1554,7 +1565,7 @@ mod tests {
 
         let mut event = tool_call("Bash", "", ReadDepth::FullBody);
         event.file_path = None;
-        event.target_selectors = vec!["mock/f.rs::alpha".into()];
+        event.target_selectors = vec![("mock/f.rs::alpha".into(), ReadDepth::FullBody)];
         app.process_agent_event(event);
 
         assert_eq!(app.ledger.depth_of("mock/f.rs::alpha"), ReadDepth::FullBody);
@@ -1576,7 +1587,10 @@ mod tests {
 
         let mut event = tool_call("Bash", "", ReadDepth::FullBody);
         event.file_path = None;
-        event.target_selectors = vec!["a.rs::one".into(), "b.rs::two".into()];
+        event.target_selectors = vec![
+            ("a.rs::one".into(), ReadDepth::FullBody),
+            ("b.rs::two".into(), ReadDepth::FullBody),
+        ];
         app.process_agent_event(event);
 
         assert_eq!(app.ledger.depth_of("a.rs::one"), ReadDepth::FullBody);
@@ -1593,7 +1607,7 @@ mod tests {
 
         let mut event = tool_call("Bash", "", ReadDepth::FullBody);
         event.file_path = None;
-        event.target_selectors = vec![hex[3..11].to_string()];
+        event.target_selectors = vec![(hex[3..11].to_string(), ReadDepth::FullBody)];
         app.process_agent_event(event);
 
         assert_eq!(app.ledger.depth_of("a.rs::only"), ReadDepth::FullBody);
@@ -1607,7 +1621,7 @@ mod tests {
 
         let mut event = tool_call("Bash", "", ReadDepth::FullBody);
         event.file_path = None;
-        event.target_selectors = vec!["a.rs::nope".into()];
+        event.target_selectors = vec![("a.rs::nope".into(), ReadDepth::FullBody)];
         app.process_agent_event(event);
 
         assert_eq!(app.ledger.total_seen(), 0);

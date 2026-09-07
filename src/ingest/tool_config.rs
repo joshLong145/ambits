@@ -218,38 +218,49 @@ pub struct TargetSelectorSpec {
 }
 
 impl TargetSelectorSpec {
-    /// Pull selectors and the depth they earn out of a tool input.
-    pub fn resolve(&self, input: &serde_json::Value) -> Option<(Vec<String>, ReadDepth)> {
+    /// Pull selectors and the depth each one earns out of a tool input.
+    ///
+    /// Resolution is **per invocation**, not per command. One shell command can
+    /// hold several invocations — chained with `&&`, on separate lines, or
+    /// inside a substitution — and they need not agree about depth. Testing
+    /// `shallow_flag` against the whole command string credited every selector
+    /// in `ambits show A --no-body && ambits show B` at the shallow depth,
+    /// including `B`, which was read in full.
+    ///
+    /// Splitting on the `requires` marker separates them. The leading segment
+    /// is whatever preceded the first invocation and is discarded; a marker
+    /// that appears inside a path contributes a segment with no selectors,
+    /// which costs nothing.
+    pub fn resolve(&self, input: &serde_json::Value) -> Option<Vec<(String, ReadDepth)>> {
         let cmd = input.get(&self.key)?.as_str()?;
         if !cmd.contains(&self.requires) {
             return None;
         }
 
-        let selectors: Vec<String> = cmd
-            .split_whitespace()
-            .map(|t| t.trim_matches(|c| c == '\'' || c == '"'))
-            .filter(|t| {
-                matches!(
-                    crate::lookup::parse_selector(t),
-                    crate::lookup::Selector::Id(_) | crate::lookup::Selector::Hash(_)
-                )
-            })
-            .map(String::from)
-            .collect();
+        let full = ReadDepth::from(self.depth);
+        let shallow = self.shallow_depth.map(ReadDepth::from);
 
-        if selectors.is_empty() {
-            return None;
+        let mut out = Vec::new();
+        for segment in cmd.split(&self.requires).skip(1) {
+            let depth = match (self.shallow_flag.as_deref(), shallow) {
+                (Some(flag), Some(d)) if segment.contains(flag) => d,
+                _ => full,
+            };
+            for token in segment.split_whitespace() {
+                let token = token.trim_matches(|c| c == '\'' || c == '"');
+                if matches!(
+                    crate::lookup::parse_selector(token),
+                    crate::lookup::Selector::Id(_) | crate::lookup::Selector::Hash(_)
+                ) {
+                    out.push((token.to_string(), depth));
+                }
+            }
         }
 
-        let shallow = self
-            .shallow_flag
-            .as_deref()
-            .is_some_and(|f| cmd.contains(f));
-        let depth = match (shallow, self.shallow_depth) {
-            (true, Some(d)) => ReadDepth::from(d),
-            _ => ReadDepth::from(self.depth),
-        };
-        Some((selectors, depth))
+        if out.is_empty() {
+            return None;
+        }
+        Some(out)
     }
 }
 
@@ -584,13 +595,18 @@ mod tests {
     #[test]
     fn show_command_yields_its_selectors_at_full_body() {
         let cfg = ToolMappingConfig::builtin().unwrap();
-        let (sel, depth) = selector_spec(&cfg)
+        let got = selector_spec(&cfg)
             .resolve(&bash_input(
                 "ambits -p . show 'src/filter.rs::PathFilter/matches' 6e42b7a3",
             ))
             .expect("selectors found");
-        assert_eq!(sel, vec!["src/filter.rs::PathFilter/matches", "6e42b7a3"]);
-        assert_eq!(depth, ReadDepth::FullBody);
+        assert_eq!(
+            got,
+            vec![
+                ("src/filter.rs::PathFilter/matches".to_string(), ReadDepth::FullBody),
+                ("6e42b7a3".to_string(), ReadDepth::FullBody),
+            ]
+        );
     }
 
     /// `--no-body` returns location metadata only, so it earns a shallower
@@ -598,10 +614,10 @@ mod tests {
     #[test]
     fn a_metadata_only_lookup_earns_a_shallower_depth() {
         let cfg = ToolMappingConfig::builtin().unwrap();
-        let (_, depth) = selector_spec(&cfg)
+        let got = selector_spec(&cfg)
             .resolve(&bash_input("ambits -p . show 'a.rs::x' --no-body"))
             .unwrap();
-        assert_eq!(depth, ReadDepth::NameOnly);
+        assert_eq!(got, vec![("a.rs::x".to_string(), ReadDepth::NameOnly)]);
     }
 
     /// Flags are excluded by the selector grammar rather than by listing them,
@@ -609,10 +625,41 @@ mod tests {
     #[test]
     fn flags_and_their_values_are_not_mistaken_for_selectors() {
         let cfg = ToolMappingConfig::builtin().unwrap();
-        let (sel, _) = selector_spec(&cfg)
+        let got = selector_spec(&cfg)
             .resolve(&bash_input("ambits show a.rs::x --max-bytes 4000 --no-body"))
             .unwrap();
-        assert_eq!(sel, vec!["a.rs::x"]);
+        assert_eq!(got, vec![("a.rs::x".to_string(), ReadDepth::NameOnly)]);
+    }
+
+    /// The bug this splitting exists for: one shell command holding two
+    /// invocations, only one of which asked for metadata. Testing the flag
+    /// against the whole command credited `B` at the shallow depth too, even
+    /// though it was read in full.
+    #[test]
+    fn each_invocation_gets_its_own_depth() {
+        let cfg = ToolMappingConfig::builtin().unwrap();
+        let got = selector_spec(&cfg)
+            .resolve(&bash_input(
+                "ambits show a.rs::shallow --no-body && ambits show b.rs::deep",
+            ))
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("a.rs::shallow".to_string(), ReadDepth::NameOnly),
+                ("b.rs::deep".to_string(), ReadDepth::FullBody),
+            ]
+        );
+    }
+
+    /// The marker appearing in a path must not create a phantom invocation.
+    #[test]
+    fn a_marker_inside_a_path_contributes_nothing() {
+        let cfg = ToolMappingConfig::builtin().unwrap();
+        let got = selector_spec(&cfg)
+            .resolve(&bash_input("./target/debug/ambits -p . show a.rs::x"))
+            .unwrap();
+        assert_eq!(got, vec![("a.rs::x".to_string(), ReadDepth::FullBody)]);
     }
 
     /// The marker keeps an unrelated command that merely mentions a symbol id

@@ -670,8 +670,14 @@ pub fn map_tool_call(
         .target_selectors
         .as_ref()
         .and_then(|spec| spec.resolve(input));
+    // The event carries one depth for the activity feed; per-selector depths
+    // travel with the selectors themselves, since one command may hold both a
+    // metadata lookup and a full one.
     let (target_selectors, read_depth) = match selectors {
-        Some((sel, depth)) => (sel, depth),
+        Some(sel) => {
+            let deepest = sel.iter().map(|(_, d)| *d).max().unwrap_or(read_depth);
+            (sel, deepest)
+        }
         None => (Vec::new(), read_depth),
     };
 

@@ -29,7 +29,11 @@ pub struct AgentToolCall {
     /// against the symbol tree rather than through `file_path`, and one call
     /// can legitimately name symbols in several files. Empty for every other
     /// tool.
-    pub target_selectors: Vec<String>,
+    ///
+    /// Each carries its own depth: a single shell command may hold several
+    /// invocations, one asking for definitions and another for metadata only,
+    /// and they earn different credit.
+    pub target_selectors: Vec<(String, ReadDepth)>,
     /// Human-readable label for the agent (e.g. "Explore parser and symbol types").
     /// Falls back to agent_id if no label could be extracted from the session log.
     pub label: Arc<str>,
