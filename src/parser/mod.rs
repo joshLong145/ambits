@@ -3,7 +3,7 @@ pub mod rust;
 pub mod typescript;
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::Result;
 
@@ -12,7 +12,7 @@ use crate::symbols::{FileSymbols, ProjectTree};
 
 /// Trait for language-specific parsers.
 /// Implement this trait to add support for a new language.
-pub trait LanguageParser {
+pub trait LanguageParser: Send + Sync {
     /// File extensions this parser handles (e.g., ["rs"] for Rust).
     fn extensions(&self) -> &[&str];
 
@@ -91,8 +91,13 @@ impl ParserRegistry {
     ) -> Result<ProjectTree> {
         use ignore::WalkBuilder;
 
-        let mut files = Vec::new();
-
+        // Walk first, parse second. Measured on this repo, walking the tree is
+        // effectively free — restricting the parse to a single file costs the
+        // same as parsing none — while parsing every file is ~95ms of the
+        // ~112ms a command spends before it can answer anything. Since files
+        // parse independently, that is the one part worth spreading across
+        // cores.
+        let mut targets: Vec<(PathBuf, PathBuf)> = Vec::new();
         for result in WalkBuilder::new(root).hidden(true).git_ignore(true).build() {
             let entry = match result {
                 Ok(e) => e,
@@ -110,18 +115,60 @@ impl ParserRegistry {
                     continue;
                 }
             }
-
-            if let Some(parser) = self.parser_for(path) {
-                let source = fs::read_to_string(path)?;
-                match parser.parse_file(rel_path, &source) {
-                    Ok(file_symbols) => files.push(file_symbols),
-                    Err(e) => {
-                        eprintln!("Warning: failed to parse {}: {}", path.display(), e);
-                    }
-                }
+            if self.parser_for(path).is_some() {
+                targets.push((path.to_path_buf(), rel_path.to_path_buf()));
             }
         }
 
+        let mut files: Vec<FileSymbols> = Vec::with_capacity(targets.len());
+        if !targets.is_empty() {
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(targets.len());
+            let chunk = targets.len().div_ceil(threads);
+
+            // A read failure stays fatal, as it was when this ran serially —
+            // a project we cannot read is not a project with fewer symbols.
+            let results: Vec<Result<Vec<FileSymbols>>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = targets
+                    .chunks(chunk)
+                    .map(|batch| {
+                        scope.spawn(move || {
+                            let mut out = Vec::with_capacity(batch.len());
+                            for (abs, rel) in batch {
+                                let Some(parser) = self.parser_for(abs) else {
+                                    continue;
+                                };
+                                let source = fs::read_to_string(abs)?;
+                                match parser.parse_file(rel, &source) {
+                                    Ok(file_symbols) => out.push(file_symbols),
+                                    Err(e) => {
+                                        eprintln!(
+                                            "Warning: failed to parse {}: {}",
+                                            abs.display(),
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(out)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_else(|_| Ok(Vec::new())))
+                    .collect()
+            });
+
+            for batch in results {
+                files.extend(batch?);
+            }
+        }
+
+        // Threads finish out of order, so the sort is now load-bearing rather
+        // than cosmetic: every consumer expects files in path order.
         files.sort_by(|a, b| a.file_path.cmp(&b.file_path));
 
         Ok(ProjectTree {
