@@ -582,18 +582,16 @@ pub fn run_report(
                             known_agents.push(tc.agent_id.to_string());
                         }
                         if let Some(ref file_path) = tc.file_path {
-                            let tool_rel = crate::app::normalize_tool_path(file_path, project_path);
-                            files_accessed.insert(tool_rel.clone());
-                            for file in &project_tree.files {
-                                if file.file_path == tool_rel {
-                                    if tc.target_symbol.is_some() || tc.target_lines.is_some() {
-                                        crate::app::mark_targeted_symbols(&file.symbols, &tc, &mut ledger, &mut depth_cache);
-                                    } else {
-                                        crate::app::mark_file_symbols(&file.symbols, &tc, &mut ledger, &mut depth_cache);
-                                    }
-                                }
-                            }
+                            files_accessed
+                                .insert(crate::app::normalize_tool_path(file_path, project_path));
                         }
+                        crate::app::apply_tool_call(
+                            project_tree,
+                            project_path,
+                            &tc,
+                            &mut ledger,
+                            &mut depth_cache,
+                        );
                     }
                     SessionEvent::Compacted { summary, timestamp, metadata, .. } => {
                         let seen = ledger.total_seen();

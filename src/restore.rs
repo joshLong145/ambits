@@ -224,30 +224,13 @@ pub fn replay_session_logs(
     for log_file in ingester.session_log_files(log_dir, session_id) {
         for event in ingester.parse_log_file_with_root(&log_file, project_root) {
             match event {
-                SessionEvent::ToolCall(tc) => {
-                    let Some(ref path) = tc.file_path else { continue };
-                    let rel = crate::app::normalize_tool_path(path, project_root);
-                    for file in &project_tree.files {
-                        if file.file_path != rel {
-                            continue;
-                        }
-                        if tc.target_symbol.is_some() || tc.target_lines.is_some() {
-                            crate::app::mark_targeted_symbols(
-                                &file.symbols,
-                                &tc,
-                                &mut ledger,
-                                &mut depth_cache,
-                            );
-                        } else {
-                            crate::app::mark_file_symbols(
-                                &file.symbols,
-                                &tc,
-                                &mut ledger,
-                                &mut depth_cache,
-                            );
-                        }
-                    }
-                }
+                SessionEvent::ToolCall(tc) => crate::app::apply_tool_call(
+                    project_tree,
+                    project_root,
+                    &tc,
+                    &mut ledger,
+                    &mut depth_cache,
+                ),
                 // A `/clear` is a voluntary discard — resurrecting that
                 // context would mislead, so it is the one boundary we honor.
                 SessionEvent::SessionCleared => {

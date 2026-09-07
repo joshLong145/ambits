@@ -59,6 +59,8 @@ pub struct ToolMapping {
     pub target_symbol: Option<TargetSymbolSpec>,
     #[serde(default)]
     pub target_lines: Option<TargetLinesSpec>,
+    #[serde(default)]
+    pub target_selectors: Option<TargetSelectorSpec>,
     /// Name of a built-in stanza to inherit fields from.
     #[serde(default)]
     pub extends: Option<String>,
@@ -182,6 +184,73 @@ impl From<ReadDepthDe> for ReadDepth {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TargetSymbolSpec {
     pub key: String,
+}
+
+/// Extract symbol selectors from a free-form command string.
+///
+/// Exists because `ambits show <id-or-hash>...` reads code without naming a
+/// file, so the ordinary `path_keys` route records nothing. Without this,
+/// using ambit's own lookup makes coverage *fall*, which is precisely backwards
+/// — an agent that reads efficiently would look less informed than one that
+/// pulls whole files.
+///
+/// Only the `requires` marker and the selector grammar decide what is picked
+/// up. Flags need no special handling: `--no-body` and a numeric `--max-bytes`
+/// argument simply fail to parse as a selector and are ignored, so the spec
+/// does not have to track the command's option list.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TargetSelectorSpec {
+    /// Input key holding the command string (`command` for Bash).
+    pub key: String,
+    /// Substring the command must contain before any selector is taken.
+    /// Keeps an unrelated command that merely mentions a symbol id from
+    /// registering a read.
+    pub requires: String,
+    /// Depth credited when the command returns definitions.
+    pub depth: ReadDepthDe,
+    /// Flag that makes the command return metadata only.
+    #[serde(default)]
+    pub shallow_flag: Option<String>,
+    /// Depth credited when `shallow_flag` is present — the caller learned the
+    /// symbol exists and where it is, not what it says.
+    #[serde(default)]
+    pub shallow_depth: Option<ReadDepthDe>,
+}
+
+impl TargetSelectorSpec {
+    /// Pull selectors and the depth they earn out of a tool input.
+    pub fn resolve(&self, input: &serde_json::Value) -> Option<(Vec<String>, ReadDepth)> {
+        let cmd = input.get(&self.key)?.as_str()?;
+        if !cmd.contains(&self.requires) {
+            return None;
+        }
+
+        let selectors: Vec<String> = cmd
+            .split_whitespace()
+            .map(|t| t.trim_matches(|c| c == '\'' || c == '"'))
+            .filter(|t| {
+                matches!(
+                    crate::lookup::parse_selector(t),
+                    crate::lookup::Selector::Id(_) | crate::lookup::Selector::Hash(_)
+                )
+            })
+            .map(String::from)
+            .collect();
+
+        if selectors.is_empty() {
+            return None;
+        }
+
+        let shallow = self
+            .shallow_flag
+            .as_deref()
+            .is_some_and(|f| cmd.contains(f));
+        let depth = match (shallow, self.shallow_depth) {
+            (true, Some(d)) => ReadDepth::from(d),
+            _ => ReadDepth::from(self.depth),
+        };
+        Some((selectors, depth))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -499,6 +568,70 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use serde_json;
+
+    fn bash_input(cmd: &str) -> serde_json::Value {
+        serde_json::json!({ "command": cmd })
+    }
+
+    fn selector_spec(cfg: &ToolMappingConfig) -> &TargetSelectorSpec {
+        let idx = cfg.index["Bash"];
+        cfg.tools[idx]
+            .target_selectors
+            .as_ref()
+            .expect("Bash carries a selector spec")
+    }
+
+    #[test]
+    fn show_command_yields_its_selectors_at_full_body() {
+        let cfg = ToolMappingConfig::builtin().unwrap();
+        let (sel, depth) = selector_spec(&cfg)
+            .resolve(&bash_input(
+                "ambits -p . show 'src/filter.rs::PathFilter/matches' 6e42b7a3",
+            ))
+            .expect("selectors found");
+        assert_eq!(sel, vec!["src/filter.rs::PathFilter/matches", "6e42b7a3"]);
+        assert_eq!(depth, ReadDepth::FullBody);
+    }
+
+    /// `--no-body` returns location metadata only, so it earns a shallower
+    /// depth than a call that actually printed the source.
+    #[test]
+    fn a_metadata_only_lookup_earns_a_shallower_depth() {
+        let cfg = ToolMappingConfig::builtin().unwrap();
+        let (_, depth) = selector_spec(&cfg)
+            .resolve(&bash_input("ambits -p . show 'a.rs::x' --no-body"))
+            .unwrap();
+        assert_eq!(depth, ReadDepth::NameOnly);
+    }
+
+    /// Flags are excluded by the selector grammar rather than by listing them,
+    /// so the spec does not rot when the command grows an option.
+    #[test]
+    fn flags_and_their_values_are_not_mistaken_for_selectors() {
+        let cfg = ToolMappingConfig::builtin().unwrap();
+        let (sel, _) = selector_spec(&cfg)
+            .resolve(&bash_input("ambits show a.rs::x --max-bytes 4000 --no-body"))
+            .unwrap();
+        assert_eq!(sel, vec!["a.rs::x"]);
+    }
+
+    /// The marker keeps an unrelated command that merely mentions a symbol id
+    /// from registering a read.
+    #[test]
+    fn a_command_without_the_marker_yields_nothing() {
+        let cfg = ToolMappingConfig::builtin().unwrap();
+        assert!(selector_spec(&cfg)
+            .resolve(&bash_input("grep -n 'src/app.rs::App' notes.txt"))
+            .is_none());
+    }
+
+    #[test]
+    fn a_marker_with_no_selectors_yields_nothing() {
+        let cfg = ToolMappingConfig::builtin().unwrap();
+        assert!(selector_spec(&cfg)
+            .resolve(&bash_input("ambits -p . --coverage"))
+            .is_none());
+    }
 
     // -----------------------------------------------------------------------
     // 1. builtin_config_parses

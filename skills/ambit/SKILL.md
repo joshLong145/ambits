@@ -144,6 +144,11 @@ Returns JSON: `id`, `file`, `lines`, `bytes`, `content_hash`, `label`, and
 `--max-bytes N` to cap each definition — a capped one is flagged
 `"truncated": true`, since it is no longer valid source.
 
+Symbols fetched this way **count as read** — ambit parses the `show` command
+out of the session log and credits the selectors it names (`--no-body` credits
+name-level only, since you saw where a symbol is, not what it says). Using this
+instead of `Read` does not cost you coverage.
+
 **Ambiguity is reported, not resolved.** `matches` is an array: a symbol id
 names both `struct Foo` and `impl Foo`, so it can hold more than one entry.
 Prefer the hash when you need exactly one. An empty `matches` means no such

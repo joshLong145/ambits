@@ -847,20 +847,13 @@ impl App {
             });
         }
 
-        if let Some(ref file_path) = event.file_path {
-            // Normalize the tool call path: strip the project root to get a relative path.
-            let tool_rel = normalize_tool_path(file_path, &self.project_root);
-
-            for file in &self.project_tree.files {
-                if file.file_path == tool_rel {
-                    if event.target_symbol.is_some() || event.target_lines.is_some() {
-                        mark_targeted_symbols(&file.symbols, &event, &mut self.ledger, &mut self.depth_cache);
-                    } else {
-                        mark_file_symbols(&file.symbols, &event, &mut self.ledger, &mut self.depth_cache);
-                    }
-                }
-            }
-        }
+        apply_tool_call(
+            &self.project_tree,
+            &self.project_root,
+            &event,
+            &mut self.ledger,
+            &mut self.depth_cache,
+        );
         // Write to event log if configured.
         if let Some(ref mut writer) = self.event_log {
             let path_str = event
@@ -898,6 +891,105 @@ impl App {
             }
         }
         self.rebuild_tree_rows();
+    }
+}
+
+/// Apply one tool call to the ledger.
+///
+/// The single place that decides how a tool call becomes symbol reads. It had
+/// been open-coded at three call sites — the TUI, `coverage::run_report`, and
+/// `restore::replay_session_logs` — which is exactly how selector support came
+/// to work in the TUI and silently do nothing in the other two.
+pub fn apply_tool_call(
+    tree: &ProjectTree,
+    project_root: &Path,
+    event: &AgentToolCall,
+    ledger: &mut ContextLedger,
+    depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
+) {
+    if !event.target_selectors.is_empty() {
+        mark_selected_symbols(tree, event, ledger, depth_cache);
+    }
+
+    let Some(ref file_path) = event.file_path else {
+        return;
+    };
+    let tool_rel = normalize_tool_path(file_path, project_root);
+    for file in &tree.files {
+        if file.file_path != tool_rel {
+            continue;
+        }
+        if event.target_symbol.is_some() || event.target_lines.is_some() {
+            mark_targeted_symbols(&file.symbols, event, ledger, depth_cache);
+        } else {
+            mark_file_symbols(&file.symbols, event, ledger, depth_cache);
+        }
+    }
+}
+
+/// Mark every symbol named by `event.target_selectors`.
+///
+/// Ambiguity is credited in full rather than resolved: an id like
+/// `src/app.rs::App` names both `struct App` and `impl App`, and a lookup that
+/// returned both did in fact show the caller both. That mirrors what
+/// `ambits show` actually printed, which is the point — coverage should record
+/// what was seen, not what we wish had been asked for.
+///
+/// A selector matching nothing is silently ignored. The command may have been
+/// a miss, or may name a symbol that has since changed; either way there is
+/// no read to record.
+fn mark_selected_symbols(
+    tree: &ProjectTree,
+    event: &AgentToolCall,
+    ledger: &mut ContextLedger,
+    depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
+) {
+    fn walk(
+        syms: &[SymbolNode],
+        event: &AgentToolCall,
+        hashes: &[String],
+        ids: &[&str],
+        ledger: &mut ContextLedger,
+        depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
+    ) {
+        for sym in syms {
+            let hex = crate::journal::encode_hash(&sym.content_hash);
+            let hit = ids.iter().any(|id| *id == sym.id)
+                || hashes.iter().any(|h| hex[3..].starts_with(h.as_str()));
+            if hit {
+                ledger.record(
+                    sym.id.clone(),
+                    event.read_depth,
+                    sym.content_hash,
+                    event.agent_id.to_string(),
+                    sym.estimated_tokens as usize,
+                );
+                depth_cache.record(&sym.id, &event.agent_id, event.read_depth);
+            }
+            walk(&sym.children, event, hashes, ids, ledger, depth_cache);
+        }
+    }
+
+    // Split once rather than re-parsing each selector per symbol.
+    let mut hashes = Vec::new();
+    let mut ids = Vec::new();
+    for sel in &event.target_selectors {
+        match crate::lookup::parse_selector(sel) {
+            crate::lookup::Selector::Hash(h) => hashes.push(h),
+            crate::lookup::Selector::Id(_) => ids.push(sel.as_str()),
+            crate::lookup::Selector::Unrecognized(_) => {}
+        }
+    }
+
+    for file in &tree.files {
+        walk(
+            &file.symbols,
+            event,
+            &hashes,
+            &ids,
+            ledger,
+            depth_cache,
+        );
     }
 }
 
@@ -1450,6 +1542,75 @@ mod tests {
             }
             std::fs::write(dir.join(format!("{session}.ndjson")), out).unwrap();
         }
+    }
+
+    /// Reading through `ambits show` must count. Without this, using ambit's
+    /// own lookup makes coverage *fall* relative to a plain Read, which
+    /// inverts the incentive the tool exists to create.
+    #[test]
+    fn a_show_command_credits_the_symbols_it_names() {
+        let syms = vec![sym("mock/f.rs::alpha", "alpha"), sym("mock/f.rs::beta", "beta")];
+        let mut app = test_app(vec![file("mock/f.rs", syms)]);
+
+        let mut event = tool_call("Bash", "", ReadDepth::FullBody);
+        event.file_path = None;
+        event.target_selectors = vec!["mock/f.rs::alpha".into()];
+        app.process_agent_event(event);
+
+        assert_eq!(app.ledger.depth_of("mock/f.rs::alpha"), ReadDepth::FullBody);
+        assert_eq!(
+            app.ledger.depth_of("mock/f.rs::beta"),
+            ReadDepth::Unseen,
+            "only the named symbol is credited"
+        );
+    }
+
+    /// Selectors carry their own location, so one command can legitimately
+    /// name symbols in different files.
+    #[test]
+    fn selectors_credit_symbols_across_files() {
+        let mut app = test_app(vec![
+            file("a.rs", vec![sym("a.rs::one", "one")]),
+            file("b.rs", vec![sym("b.rs::two", "two")]),
+        ]);
+
+        let mut event = tool_call("Bash", "", ReadDepth::FullBody);
+        event.file_path = None;
+        event.target_selectors = vec!["a.rs::one".into(), "b.rs::two".into()];
+        app.process_agent_event(event);
+
+        assert_eq!(app.ledger.depth_of("a.rs::one"), ReadDepth::FullBody);
+        assert_eq!(app.ledger.depth_of("b.rs::two"), ReadDepth::FullBody);
+    }
+
+    /// A hash selector resolves the same way the lookup itself does, including
+    /// by prefix.
+    #[test]
+    fn a_hash_selector_credits_the_symbol_that_owns_it() {
+        let node = sym("a.rs::only", "only");
+        let hex = crate::journal::encode_hash(&node.content_hash);
+        let mut app = test_app(vec![file("a.rs", vec![node])]);
+
+        let mut event = tool_call("Bash", "", ReadDepth::FullBody);
+        event.file_path = None;
+        event.target_selectors = vec![hex[3..11].to_string()];
+        app.process_agent_event(event);
+
+        assert_eq!(app.ledger.depth_of("a.rs::only"), ReadDepth::FullBody);
+    }
+
+    /// A selector naming nothing is not an error and must not disturb the
+    /// ledger — the lookup may simply have missed.
+    #[test]
+    fn an_unmatched_selector_credits_nothing() {
+        let mut app = test_app(vec![file("a.rs", vec![sym("a.rs::one", "one")])]);
+
+        let mut event = tool_call("Bash", "", ReadDepth::FullBody);
+        event.file_path = None;
+        event.target_selectors = vec!["a.rs::nope".into()];
+        app.process_agent_event(event);
+
+        assert_eq!(app.ledger.total_seen(), 0);
     }
 
     #[test]
@@ -2033,6 +2194,7 @@ mod tests {
             timestamp_str: "2026-01-01T00:00:00Z".to_string(),
             target_symbol: None,
             target_lines: None,
+        target_selectors: Vec::new(),
             label: "agent-abc".into(),
         };
         app.process_agent_event(event);

@@ -20,6 +20,16 @@ pub struct AgentToolCall {
     pub target_symbol: Option<String>,
     /// Optional line range to target (1-based, e.g. 10..25).
     pub target_lines: Option<Range<u32>>,
+    /// Symbol selectors named directly by the command, for tools that read
+    /// code without naming a file — `ambits show <id-or-hash>...` being the
+    /// case this exists for.
+    ///
+    /// A selector carries its own location (a symbol id embeds the path, a
+    /// content hash identifies the body outright), so these are resolved
+    /// against the symbol tree rather than through `file_path`, and one call
+    /// can legitimately name symbols in several files. Empty for every other
+    /// tool.
+    pub target_selectors: Vec<String>,
     /// Human-readable label for the agent (e.g. "Explore parser and symbol types").
     /// Falls back to agent_id if no label could be extracted from the session log.
     pub label: Arc<str>,

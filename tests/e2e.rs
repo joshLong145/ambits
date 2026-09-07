@@ -404,6 +404,7 @@ fn journal_records_symbols_read_through_app() {
         timestamp_str: "t".into(),
         target_symbol: None,
         target_lines: None,
+        target_selectors: Vec::new(),
         label: "ag".into(),
     };
     app.process_agent_event(call.clone());
@@ -450,6 +451,7 @@ fn journal_survives_compaction() {
         timestamp_str: "t".into(),
         target_symbol: None,
         target_lines: None,
+        target_selectors: Vec::new(),
         label: "ag".into(),
     });
     app.process_compaction("summary".into(), "ts".into(), "ag".into(), None);
@@ -475,6 +477,7 @@ fn read_call(root: &std::path::Path, rel: &str) -> AgentToolCall {
         timestamp_str: "t".into(),
         target_symbol: None,
         target_lines: None,
+        target_selectors: Vec::new(),
         label: "ag".into(),
     }
 }

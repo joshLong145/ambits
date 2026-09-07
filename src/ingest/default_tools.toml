@@ -129,6 +129,12 @@ depth         = { type = "pattern_match", key = "command", default = "NameOnly",
     { prefix = "git ",   depth = "Unseen"    },
 ] }
 description   = "Bash {pattern|cmd}"
+# `ambits show` reads code without naming a file, so the path_keys route above
+# records nothing for it. Without this, using ambit's own lookup would make
+# coverage fall — an agent reading efficiently would look less informed than one
+# pulling whole files. Tokens that do not parse as a symbol id or content hash
+# are ignored, so flags need no listing here.
+target_selectors = { key = "command", requires = "ambits", depth = "FullBody", shallow_flag = "--no-body", shallow_depth = "NameOnly" }
 
 [[tool]]
 names         = ["TodoWrite"]

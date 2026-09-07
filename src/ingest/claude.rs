@@ -497,6 +497,7 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
                 timestamp_str: timestamp_str.clone(),
                 target_symbol: None,
                 target_lines: None,
+        target_selectors: Vec::new(),
                 label: agent_id.clone(),
             });
         events.push(event);
@@ -662,6 +663,18 @@ pub fn map_tool_call(
         .as_ref()
         .and_then(|spec| input.get(&spec.key)?.as_str().map(String::from));
 
+    // Extract symbol selectors named directly by the command. When present
+    // they also override the depth, because the pattern-matched depth for a
+    // generic Bash command says nothing about what a lookup actually returned.
+    let selectors = mapping
+        .target_selectors
+        .as_ref()
+        .and_then(|spec| spec.resolve(input));
+    let (target_selectors, read_depth) = match selectors {
+        Some((sel, depth)) => (sel, depth),
+        None => (Vec::new(), read_depth),
+    };
+
     // Extract target_lines.
     let target_lines = mapping.target_lines.as_ref().and_then(|spec| {
         let offset = input.get(&spec.offset_key)?.as_u64()? as u32;
@@ -681,6 +694,7 @@ pub fn map_tool_call(
         timestamp_str: timestamp_str.to_string(),
         target_symbol,
         target_lines,
+        target_selectors,
         label: agent_arc,
     })
 }

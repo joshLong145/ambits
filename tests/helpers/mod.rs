@@ -89,6 +89,7 @@ pub fn tool_call(tool: &str, path: &str, depth: ReadDepth) -> AgentToolCall {
         timestamp_str: "2025-01-01T00:00:00Z".to_string(),
         target_symbol: None,
         target_lines: None,
+        target_selectors: Vec::new(),
         label: "agent-1".into(),
     }
 }

@@ -164,6 +164,7 @@ mod tests {
             timestamp_str: "2025-01-01T00:00:00Z".into(),
             target_symbol: None,
             target_lines: None,
+        target_selectors: Vec::new(),
             label: "agent-abc123".into(),
         });
 
