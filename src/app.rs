@@ -244,6 +244,11 @@ impl App {
 
         for ((symbol_id, agent), (_, depth)) in &contents.agent_reads {
             self.depth_cache.record(symbol_id, agent, *depth);
+            // The journal outlives the logs it was built from, so it can name
+            // an agent this run's replay never produced an event for. Register
+            // it: the panel lists agents, not ledger keys, and coverage the
+            // panel cannot attribute to a row still lands in "[All]".
+            self.register_agent(agent, agent);
         }
 
         self.rebuild_tree_rows();
@@ -614,22 +619,36 @@ impl App {
         }
     }
 
+    /// The agent ids the stats panel lists, in the order it lists them.
+    ///
+    /// `agents_seen` is *not* that list: it only holds agents that emitted a
+    /// tool call, while the panel renders [`Self::flattened_agents`], which
+    /// also carries the root seeded from the session id (see
+    /// [`Self::seed_agent_tree_root`]) — an orchestrator that only dispatches
+    /// `Task` calls never reads a file of its own and so never lands in
+    /// `agents_seen`. Every cursor, bound, and count that has to line up with
+    /// what is on screen must come from here.
+    fn agent_list(&self) -> Vec<String> {
+        self.flattened_agents().into_iter().map(|(id, _)| id).collect()
+    }
+
     fn cycle_agent_filter(&mut self) {
-        if self.agents_seen.is_empty() {
+        let agents = self.agent_list();
+        if agents.is_empty() {
             self.agent_filter = None;
             self.agent_selection_index = 0;
             return;
         }
         match &self.agent_filter {
             None => {
-                self.agent_filter = Some(self.agents_seen[0].clone());
+                self.agent_filter = Some(agents[0].clone());
                 self.agent_selection_index = 1;
             }
             Some(current) => {
-                let idx = self.agents_seen.iter().position(|a| a == current);
+                let idx = agents.iter().position(|a| a == current);
                 match idx {
-                    Some(i) if i + 1 < self.agents_seen.len() => {
-                        self.agent_filter = Some(self.agents_seen[i + 1].clone());
+                    Some(i) if i + 1 < agents.len() => {
+                        self.agent_filter = Some(agents[i + 1].clone());
                         self.agent_selection_index = i + 2;
                     }
                     _ => {
@@ -643,26 +662,27 @@ impl App {
     }
 
     fn cycle_agent_filter_backward(&mut self) {
-        if self.agents_seen.is_empty() {
+        let agents = self.agent_list();
+        if agents.is_empty() {
             self.agent_filter = None;
             self.agent_selection_index = 0;
             return;
         }
         match &self.agent_filter {
             None => {
-                let last = self.agents_seen.len() - 1;
-                self.agent_filter = Some(self.agents_seen[last].clone());
-                self.agent_selection_index = self.agents_seen.len();
+                let last = agents.len() - 1;
+                self.agent_filter = Some(agents[last].clone());
+                self.agent_selection_index = agents.len();
             }
             Some(current) => {
-                let idx = self.agents_seen.iter().position(|a| a == current);
+                let idx = agents.iter().position(|a| a == current);
                 match idx {
                     Some(0) => {
                         self.agent_filter = None;
                         self.agent_selection_index = 0;
                     }
                     Some(i) => {
-                        self.agent_filter = Some(self.agents_seen[i - 1].clone());
+                        self.agent_filter = Some(agents[i - 1].clone());
                         self.agent_selection_index = i;
                     }
                     _ => {
@@ -725,7 +745,11 @@ impl App {
     }
 
     fn move_agent_selection(&mut self, delta: i32) {
-        let total = self.agents_seen.len() + 1; // +1 for "All"
+        // Bound the cursor by the rendered list, not by `agents_seen` — see
+        // `agent_list`. `apply_agent_selection` resolves the index against
+        // the rendered list, so bounding it against a shorter one silently
+        // maps rows onto the wrong agents and hides the tail of the list.
+        let total = self.agent_list().len() + 1; // +1 for "All"
         if total == 0 {
             return;
         }
@@ -805,47 +829,56 @@ impl App {
         }
     }
 
+    /// Record `agent_id` as an agent of this session, placing it in the agent
+    /// hierarchy. Idempotent.
+    ///
+    /// Every source of ledger attribution has to come through here, because
+    /// the stats panel's per-agent rows are built from the hierarchy: an
+    /// agent that holds coverage but was never registered makes "[All]" count
+    /// reads that no row can account for.
+    ///
+    /// NOTE: sub-agent JSONL *filenames* are prefixed `agent-<hash>`, but the
+    /// `agentId` field *inside* each line — which `parse_jsonl_line`
+    /// (src/ingest/claude.rs) prefers over the filename/session-derived
+    /// fallback — carries no such prefix (e.g. `"a63c858997b4e6124"`, not
+    /// `"agent-a63c858997b4e6124"`). A `starts_with("agent-")` check
+    /// therefore never matches real sub-agent events; only hand-constructed
+    /// test fixtures that bake the prefix into `agent_id` happened to pass.
+    /// Don't repeat that mistake in future tests — use realistic unprefixed
+    /// ids.
+    ///
+    /// Now that `self.session_id` is deterministically known before any
+    /// events are processed (see `set_session_id` / `seed_agent_tree_root`),
+    /// identity is the correct and only check we need: the root's own events
+    /// carry `agent_id == session_id` (and must NOT be re-parented to
+    /// themselves); every other `agent_id` is a child of the root. Fall back
+    /// to the old prefix heuristic only when no session_id is known (e.g.
+    /// test paths that skip `set_session_id`), preserving prior behavior
+    /// there.
+    fn register_agent(&mut self, agent_id: &str, label: &str) {
+        if self.agents_seen.iter().any(|a| a == agent_id) {
+            return;
+        }
+        self.agents_seen.push(agent_id.to_string());
+
+        let parent_id = match self.session_id.as_deref() {
+            Some(root) if agent_id == root => None,
+            Some(root) => Some(root.to_string()),
+            None if agent_id.starts_with("agent-") => self.agent_tree.root_id.clone(),
+            None => None,
+        };
+        self.agent_tree.add_agent(AgentNode {
+            id: agent_id.to_string(),
+            parent_id,
+            session_file: PathBuf::new(),
+            label: label.to_string(),
+        });
+    }
+
     /// Process an agent tool call event and update the ledger.
     pub fn process_agent_event(&mut self, event: AgentToolCall) {
         self.compaction_call_count += 1;
-        // Track unique agents.
-        if !self.agents_seen.iter().any(|a| a.as_str() == &*event.agent_id) {
-            self.agents_seen.push(event.agent_id.to_string());
-
-            // Register in the agent hierarchy tree.
-            //
-            // NOTE: sub-agent JSONL *filenames* are prefixed `agent-<hash>`,
-            // but the `agentId` field *inside* each line — which
-            // `parse_jsonl_line` (src/ingest/claude.rs) prefers over the
-            // filename/session-derived fallback — carries no such prefix
-            // (e.g. `"a63c858997b4e6124"`, not `"agent-a63c858997b4e6124"`).
-            // A `starts_with("agent-")` check therefore never matches real
-            // sub-agent events; only hand-constructed test fixtures that
-            // bake the prefix into `agent_id` happened to pass. Don't repeat
-            // that mistake in future tests — use realistic unprefixed ids.
-            //
-            // Now that `self.session_id` is deterministically known before
-            // any events are processed (see `set_session_id` /
-            // `seed_agent_tree_root`), identity is the correct and only
-            // check we need: the root's own events carry `agent_id ==
-            // session_id` (and must NOT be re-parented to themselves);
-            // every other `agent_id` is a child of the root. Fall back to
-            // the old prefix heuristic only when no session_id is known
-            // (e.g. test paths that skip `set_session_id`), preserving
-            // prior behavior there.
-            let parent_id = match self.session_id.as_deref() {
-                Some(root) if event.agent_id.as_ref() == root => None,
-                Some(root) => Some(root.to_string()),
-                None if event.agent_id.starts_with("agent-") => self.agent_tree.root_id.clone(),
-                None => None,
-            };
-            self.agent_tree.add_agent(AgentNode {
-                id: event.agent_id.to_string(),
-                parent_id,
-                session_file: PathBuf::new(),
-                label: event.label.to_string(),
-            });
-        }
+        self.register_agent(&event.agent_id, &event.label);
 
         apply_tool_call(
             &self.project_tree,
@@ -1701,6 +1734,108 @@ mod tests {
         assert_eq!(app.agent_selection_index, 0);
         app.apply_agent_selection();
         assert_eq!(app.agent_filter, None);
+    }
+
+    /// The stats panel's agent list and its selection cursor must be indexed
+    /// off the *same* list. `flattened_agents` walks the hierarchy — which
+    /// includes the seeded root even when the orchestrator never read a file
+    /// itself — while `agents_seen` holds only agents that emitted an event.
+    /// When those lengths differ, row `n` on screen and the agent that row
+    /// `n` selects are two different agents.
+    #[test]
+    fn agent_selection_indexes_the_list_the_panel_renders() {
+        let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::a", "a")])]);
+        app.set_session_id(Some("session-main".to_string()));
+
+        // Orchestrator-only session: the root dispatches one sub-agent and
+        // never reads a file itself.
+        let mut e = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::FullBody);
+        e.agent_id = "a63c858997b4e6124".into();
+        app.process_agent_event(e);
+
+        let flat = app.flattened_agents();
+        assert_eq!(flat.len(), 2, "root plus its one sub-agent");
+
+        // Step the cursor through every agent row and apply it; each row must
+        // resolve to the agent rendered on that row.
+        app.focus = FocusPanel::Stats;
+        for (i, (agent_id, _)) in flat.iter().enumerate() {
+            app.move_agent_selection(1);
+            app.apply_agent_selection();
+            assert_eq!(
+                app.agent_filter.as_deref(),
+                Some(agent_id.as_str()),
+                "row {i} renders {agent_id} but selects {:?}",
+                app.agent_filter,
+            );
+        }
+
+        // And one more step wraps back to "[All]".
+        app.move_agent_selection(1);
+        app.apply_agent_selection();
+        assert_eq!(app.agent_selection_index, 0);
+        assert_eq!(app.agent_filter, None);
+    }
+
+    /// "[All]" is the union of the agent rows beneath it, so every read it
+    /// counts has to be reachable by selecting *some* agent in the list — and
+    /// when the list holds a single agent, that agent's numbers must equal
+    /// "[All]"'s exactly.
+    ///
+    /// `rehydrate_from_journal` is the path that can break this: it installs
+    /// per-agent reads straight into the ledger under whatever agent id the
+    /// journal recorded, while the panel lists only agents this run replayed
+    /// an event for. A sub-agent whose own log file is gone survives in the
+    /// journal but not in the replay, and its coverage then shows up in
+    /// "[All]" with no row that can account for it.
+    #[test]
+    fn all_counts_only_coverage_the_panel_can_attribute() {
+        use ambits_journal_test_support::*;
+
+        let dir = tempfile::tempdir().unwrap();
+        let syms = vec![
+            sym("mock/f.rs::alpha", "alpha"),
+            sym("mock/f.rs::beta", "beta"),
+        ];
+        let tree = project(vec![file("mock/f.rs", syms)]);
+        let beta_hash = tree.files[0].symbols[1].content_hash;
+
+        let mut app = App::new(tree, dir.path().to_path_buf(), None);
+        app.set_session_id(Some("sess-1".into()));
+
+        // The live replay only produces the root session's own read of alpha.
+        let mut e = tool_call("Read", "mock/f.rs", ReadDepth::FullBody);
+        e.agent_id = "sess-1".into();
+        e.target_symbol = Some("alpha".into());
+        app.process_agent_event(e);
+
+        // The journal remembers a sub-agent's read of beta that this run's
+        // replay could not reproduce.
+        write_journal(
+            dir.path(),
+            "sess-1",
+            &[("mock/f.rs::beta", "a63c858997b4e6124", beta_hash)],
+        );
+        app.rehydrate_from_journal().expect("journal was found");
+        assert_eq!(app.ledger.total_seen(), 2, "[All] sees both reads");
+
+        let listed = app.flattened_agents();
+        let attributable = app
+            .ledger
+            .entries
+            .values()
+            .filter(|e| {
+                listed.iter().any(|(id, _)| {
+                    e.agent_depths.get(id).copied().unwrap_or(ReadDepth::Unseen).is_seen()
+                })
+            })
+            .count();
+        assert_eq!(
+            attributable,
+            app.ledger.total_seen(),
+            "[All] counts a read no listed agent can account for; listed: {:?}",
+            listed,
+        );
     }
 
     #[test]

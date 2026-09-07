@@ -141,12 +141,15 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    // Agents section.
-    if !app.agents_seen.is_empty() {
+    // Agents section. Counted off the same list that is rendered and
+    // selected from — `agents_seen` omits an orchestrator that only
+    // dispatched sub-agents, so using it here undercounts the rows below.
+    let flat = app.flattened_agents();
+    if !flat.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  Agents: {} ", app.agents_seen.len()),
+                format!("  Agents: {} ", flat.len()),
                 Style::default().fg(Color::White),
             ),
         ]));
@@ -172,7 +175,6 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         ]));
 
         // Per-agent entries in hierarchy order
-        let flat = app.flattened_agents();
         for (i, (agent_id, indent)) in flat.iter().enumerate() {
             let is_active = app.agent_filter.as_deref() == Some(agent_id.as_str());
             let is_cursor = stats_focused && app.agent_selection_index == i + 1;
@@ -236,10 +238,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
     // Scroll to keep the selected agent visible when the panel is focused.
     let visible_height = area.height.saturating_sub(2) as usize; // -2 for borders
-    let scroll_offset = if app.focus == FocusPanel::Stats && !app.agents_seen.is_empty() {
+    let scroll_offset = if app.focus == FocusPanel::Stats && !flat.is_empty() {
         // The agent list starts after the fixed header lines.
         // "All" entry is at header_lines, agents start at header_lines + 1.
-        let header_lines = lines.len().saturating_sub(app.flattened_agents().len() + 1); // +1 for "All"
+        let header_lines = lines.len().saturating_sub(flat.len() + 1); // +1 for "All"
         let cursor_line = header_lines + app.agent_selection_index;
         if cursor_line >= visible_height {
             (cursor_line - visible_height + 1) as u16
