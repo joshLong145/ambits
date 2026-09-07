@@ -169,6 +169,28 @@ enum Commands {
         max_bytes: Option<usize>,
     },
 
+    /// Search the symbol index by `[path]::[name]` pattern.
+    ///
+    /// Answers the questions `show` cannot: what is in this file, where is
+    /// this name defined, what hangs off this type. Both halves are optional
+    /// and case-insensitive — `src/app.rs::` enumerates a file, `::new` finds
+    /// one name everywhere, `ui::render` scopes to a directory.
+    ///
+    /// Searches definitions, not usages: a method call is not a symbol here.
+    Find {
+        /// `[path]::[name]`, or a bare name. Repeatable.
+        #[arg(required = true)]
+        pattern: Vec<String>,
+
+        /// Maximum matches reported per pattern.
+        #[arg(long, default_value_t = ambits::find::DEFAULT_LIMIT)]
+        limit: usize,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value = "text")]
+        format: FindFormat,
+    },
+
     /// Inspect or remove the coverage journals under .ambit/coverage.
     Cache {
         #[command(subcommand)]
@@ -196,6 +218,15 @@ enum CacheCommands {
         #[arg(long)]
         all: bool,
     },
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum FindFormat {
+    /// Aligned listing, one symbol per line (default).
+    Text,
+    /// Schema-versioned JSON. Match objects are shaped exactly like
+    /// `show --no-body`, so `find` output feeds straight into `show`.
+    Json,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -369,6 +400,23 @@ fn main() -> Result<()> {
             selector,
             !no_body,
             *max_bytes,
+        );
+    }
+
+    if let Some(Commands::Find {
+        pattern,
+        limit,
+        format,
+    }) = &command
+    {
+        for w in &config_warnings {
+            eprintln!("[ambit warning] {w}");
+        }
+        return ambits::find::run(
+            &project_tree,
+            pattern,
+            *limit,
+            matches!(format, FindFormat::Json),
         );
     }
 

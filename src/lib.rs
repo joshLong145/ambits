@@ -12,6 +12,7 @@ pub mod cache;
 pub mod coverage;
 pub mod digest;
 pub mod filter;
+pub mod find;
 pub mod fmt;
 pub mod ingest;
 pub mod journal;

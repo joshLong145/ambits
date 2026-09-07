@@ -38,6 +38,43 @@ ambits -p .
 
 # For the agent
 
+## Finding symbols
+
+```bash
+ambits -p . find 'parse_selector'     # where is this defined?
+ambits -p . find 'src/app.rs::'       # everything in a file
+ambits -p . find '::App/'             # every member of a type
+ambits -p . find 'ui::render'         # scoped to a directory
+```
+
+```
+restore::classify — 2 matches
+  [fn] src/restore.rs::classify  L336-404
+  [fn] src/restore.rs::tests/rehydrate_and_classify_agree_on_where_a_symbol_lives  L1000-1020
+```
+
+The pattern is `[path]::[name]`, or a bare name; both halves are optional and
+case-insensitive.
+
+The path half matches whole **components**, not substrings — so `ui` matches
+`src/ui/` but not `src/tui.rs`, while `app` still matches `app.rs` and
+`ui/stats` matches `src/ui/stats.rs`.
+
+The name half matches the **leaf** name, unless the pattern contains `/`, in
+which case it matches the whole name path. That distinction matters at scale:
+on this repo `test` matches 42 symbols by leaf but 486 by full path, since
+every `tests/…` child matches through its parent. Writing `::App/` opts into
+path matching deliberately, which is how you ask for a type's members.
+
+Results are capped at 100 per pattern (`--limit`), and a truncated result says
+how many it withheld. `--format json` emits match objects shaped exactly like
+`show --no-body`, so `find` feeds straight into `show`.
+
+Unlike grep, results carry their kind — `struct`, `impl`, `fn` — so a name that
+appears as a type, its impl block, and a method inside it comes back as three
+labelled, distinguishable entries. But this searches **definitions, not
+usages**: a method call is not a symbol, so `find is_none_or` returns nothing.
+
 ## Reading code by symbol
 
 ```bash
@@ -301,6 +338,7 @@ Installs a [skill](https://code.claude.com/docs/en/skills) that teaches the agen
 | Command | Description |
 |---|---|
 | `ambits -p <path>` | Launch the TUI |
+| `ambits … find <pattern>…` | Search symbols by `[path]::[name]` |
 | `ambits … show <selector>…` | Print symbol definitions as JSON |
 | `ambits … restore-context` | Print this session's read history |
 | `ambits … --coverage` | Print a coverage report and exit |

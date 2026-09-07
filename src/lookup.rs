@@ -77,8 +77,11 @@ pub fn parse_selector(query: &str) -> Selector {
     }
 }
 
+/// One matched symbol. Shared with `ambits find` so both commands describe a
+/// symbol identically and their output composes — `find` locates, `show`
+/// reads, and a caller can hand the `id` straight from one to the other.
 #[derive(Serialize)]
-struct MatchDto<'a> {
+pub(crate) struct MatchDto<'a> {
     id: &'a str,
     name: &'a str,
     file: String,
@@ -126,6 +129,24 @@ struct ShowDto<'a> {
 /// Slices by byte range rather than by line so the result is exactly the span
 /// the parser identified. Files are cached because a single invocation
 /// commonly asks for several symbols from one file.
+/// Describe a symbol without its source. The body-bearing fields stay `None`,
+/// which is exactly what `--no-body` and `find` both want.
+pub(crate) fn describe<'a>(file: &'a Path, node: &'a SymbolNode) -> MatchDto<'a> {
+    MatchDto {
+        id: &node.id,
+        name: &node.name,
+        file: file.display().to_string(),
+        lines: [node.line_range.start, node.line_range.end],
+        bytes: [node.byte_range.start, node.byte_range.end],
+        content_hash: encode_hash(&node.content_hash),
+        label: node.label,
+        estimated_tokens: node.estimated_tokens,
+        children: node.children.iter().map(|c| c.id.as_str()).collect(),
+        definition: None,
+        truncated: false,
+    }
+}
+
 fn definition_of(
     root: &Path,
     file: &Path,
@@ -245,17 +266,9 @@ fn resolve<'a>(
                     (None, false)
                 };
                 MatchDto {
-                    id: &node.id,
-                    name: &node.name,
-                    file: file.display().to_string(),
-                    lines: [node.line_range.start, node.line_range.end],
-                    bytes: [node.byte_range.start, node.byte_range.end],
-                    content_hash: encode_hash(&node.content_hash),
-                    label: node.label,
-                    estimated_tokens: node.estimated_tokens,
-                    children: node.children.iter().map(|c| c.id.as_str()).collect(),
                     definition,
                     truncated,
+                    ..describe(file, node)
                 }
             })
             .collect();

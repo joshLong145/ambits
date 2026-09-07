@@ -83,20 +83,19 @@ in your allowed tools):
 
 When context has just been compacted, the summary describes what a model
 *remembered* while it was losing that context. `restore-context` instead
-reports what was demonstrably read and demonstrably has not changed since:
+reports what this session demonstrably read:
 
 ```bash
 ambits -p . restore-context
 ```
 
 Treat the symbols it lists as known — no need to re-read them. Anything it does
-not list is not covered, and it names the files that changed since they were
-read so you can re-read only those.
+not list is not covered, and a `Not included` line names files holding symbols
+it withheld, so you can read those directly.
 
-If the output is labelled `UNVERIFIED`, it was recovered from session logs
-rather than the coverage journal. Those logs do not record what a file looked
-like when it was read, so drift cannot be detected there — re-read before
-relying on it.
+A heading marked `reconstructed from session logs` means the coverage journal
+was unavailable and the history was rebuilt from the logs afterwards, rather
+than recorded as the session ran.
 
 Entries are listed as `name:first-last` — current line numbers, taken from a
 fresh scan rather than stored, so they are accurate even for files edited since
@@ -123,6 +122,30 @@ That adds a `SessionStart` hook with `matcher: "compact"` to
 `.claude/settings.json`, so Claude Code runs `restore-context` and injects the
 result the moment a compaction completes. It merges into existing settings and
 is safe to re-run. When there is nothing to restore it emits nothing.
+
+### Finding symbols
+
+To locate something without knowing its exact id:
+
+```bash
+ambits -p . find 'parse_selector'          # where is this defined?
+ambits -p . find 'src/app.rs::'            # everything in a file
+ambits -p . find '::App/'                  # every member of a type
+ambits -p . find 'ui::render'              # scoped to a directory
+```
+
+The pattern is `[path]::[name]`, or a bare name. Both halves are optional and
+case-insensitive. The path half matches whole path components, so `ui` matches
+`src/ui/` but not `src/tui.rs`. The name half matches the **leaf** name unless
+your pattern contains `/`, in which case it matches the whole name path — which
+is what makes `::App/` return App's members.
+
+`--format json` emits match objects shaped exactly like `show --no-body`, so
+`find` output feeds straight into `show`. Capped at 100 per pattern; a
+truncated result says how many it withheld.
+
+**This searches definitions, not usages.** A method call is not a symbol, so
+`find is_none_or` returns nothing. Use grep for call sites.
 
 ### Fetching a definition
 
@@ -165,7 +188,8 @@ ambits -p . cache clear --all
 
 Nothing is deleted automatically. A journal is the only record of what a
 session read *and what the code looked like at the time*, so removing one
-silently downgrades any later restore of that session to `UNVERIFIED`.
+means any later restore of that session must be reconstructed from logs
+instead.
 Journals are small — one entry per symbol read, bounded by what an agent can
 read in a session, not by repository size.
 
