@@ -62,6 +62,14 @@ impl LanguageParser for TypescriptParser {
         &["ts"]
     }
 
+    fn language(&self) -> tree_sitter::Language {
+        tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+    }
+
+    fn tags_query(&self) -> &'static str {
+        tree_sitter_typescript::TAGS_QUERY
+    }
+
     fn parse_file(&self, path: &Path, source: &str) -> color_eyre::Result<FileSymbols> {
         let mut parser = Parser::new();
         let language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT;

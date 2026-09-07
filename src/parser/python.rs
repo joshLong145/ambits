@@ -59,6 +59,14 @@ impl LanguageParser for PythonParser {
         &["py"]
     }
 
+    fn language(&self) -> tree_sitter::Language {
+        tree_sitter_python::LANGUAGE.into()
+    }
+
+    fn tags_query(&self) -> &'static str {
+        tree_sitter_python::TAGS_QUERY
+    }
+
     fn parse_file(&self, path: &Path, source: &str) -> color_eyre::Result<FileSymbols> {
         let mut parser = Parser::new();
         let language = tree_sitter_python::LANGUAGE;

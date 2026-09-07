@@ -18,6 +18,27 @@ pub trait LanguageParser {
 
     /// Parse a source file into a hierarchical symbol tree.
     fn parse_file(&self, path: &Path, source: &str) -> color_eyre::Result<FileSymbols>;
+
+    /// The grammar, for callers that want to run their own queries against it.
+    fn language(&self) -> tree_sitter::Language;
+
+    /// The grammar's shipped tags query, which already defines
+    /// `@reference.call` among other captures.
+    ///
+    /// These come with the grammar crates, so reference extraction needs no
+    /// per-language rules of our own — but see [`Self::tags_supplement`],
+    /// because shipped is not the same as complete.
+    fn tags_query(&self) -> &'static str;
+
+    /// Extra `@reference.call` patterns appended to the shipped query.
+    ///
+    /// Empty by default. A grammar's own tags query is written for tagging and
+    /// navigation, not for exhaustive reference finding, and it shows: Rust's
+    /// captures a bare `foo()` but not `some::path::foo()`, which in Rust is
+    /// most calls to anything not in scope.
+    fn tags_supplement(&self) -> &'static str {
+        ""
+    }
 }
 
 /// Registry of all available language parsers.

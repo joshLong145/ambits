@@ -24,6 +24,36 @@ impl LanguageParser for RustParser {
         &["rs"]
     }
 
+    fn language(&self) -> tree_sitter::Language {
+        tree_sitter_rust::LANGUAGE.into()
+    }
+
+    fn tags_query(&self) -> &'static str {
+        tree_sitter_rust::TAGS_QUERY
+    }
+
+    /// Rust calls things through paths constantly — `crate::journal::foo()`,
+    /// `super::helper()`, `Type::new()` — and the shipped query captures none
+    /// of them, because it only matches a bare `(identifier)` in function
+    /// position. Testing against this repo, that missed both call sites of
+    /// `centered_rect` and one of two for `hash_hex`.
+    fn tags_supplement(&self) -> &'static str {
+        r#"
+        (call_expression
+            function: (scoped_identifier
+                name: (identifier) @name)) @reference.call
+
+        (call_expression
+            function: (generic_function
+                function: (identifier) @name)) @reference.call
+
+        (call_expression
+            function: (generic_function
+                function: (scoped_identifier
+                    name: (identifier) @name))) @reference.call
+        "#
+    }
+
     fn parse_file(&self, path: &Path, source: &str) -> color_eyre::Result<FileSymbols> {
         let mut parser = Parser::new();
         let language = tree_sitter_rust::LANGUAGE;

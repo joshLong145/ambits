@@ -147,6 +147,20 @@ truncated result says how many it withheld.
 **This searches definitions, not usages.** A method call is not a symbol, so
 `find is_none_or` returns nothing. Use grep for call sites.
 
+### Finding callers
+
+```bash
+ambits -p . callers centered_rect
+```
+
+Reports each call site and the symbol containing it, as an id you can pass to
+`show`. Comments and string literals are never reported, because the answer
+comes from parsed call nodes rather than text.
+
+Matching is by callee **name** — tree-sitter does not resolve which definition
+a call binds to. Most names are unique, but `callers new` returns calls to
+every `new`. `--format json` marks this with `name_matched_only: true`.
+
 ### Fetching a definition
 
 To get the source of something the digest listed, without a `Read` or a

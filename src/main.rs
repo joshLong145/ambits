@@ -191,6 +191,23 @@ enum Commands {
         format: FindFormat,
     },
 
+    /// List the call sites of a function, and which symbol each sits in.
+    ///
+    /// Call sites come from the grammar's own tags query, so a mention in a
+    /// comment or inside a string literal is not reported — unlike a text
+    /// search. Matching is by callee *name*: tree-sitter does not resolve
+    /// which definition a call binds to, so a name shared by several
+    /// definitions returns all of their call sites together.
+    Callers {
+        /// Function name, exactly as written at the call site. Repeatable.
+        #[arg(required = true)]
+        name: Vec<String>,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value = "text")]
+        format: FindFormat,
+    },
+
     /// Inspect or remove the coverage journals under .ambit/coverage.
     Cache {
         #[command(subcommand)]
@@ -416,6 +433,19 @@ fn main() -> Result<()> {
             &project_tree,
             pattern,
             *limit,
+            matches!(format, FindFormat::Json),
+        );
+    }
+
+    if let Some(Commands::Callers { name, format }) = &command {
+        for w in &config_warnings {
+            eprintln!("[ambit warning] {w}");
+        }
+        return ambits::callers::run(
+            &project_path,
+            &project_tree,
+            &registry,
+            name,
             matches!(format, FindFormat::Json),
         );
     }

@@ -50,6 +50,7 @@ dependencies = [
  "serde",
  "serde-pickle",
  "serde_json",
+ "streaming-iterator",
  "tempfile",
  "toml",
  "tree-sitter",

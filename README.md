@@ -76,6 +76,34 @@ appears as a type, its impl block, and a method inside it comes back as three
 labelled, distinguishable entries. But this searches **definitions, not
 usages**: a method call is not a symbol, so `find is_none_or` returns nothing.
 
+## Finding callers
+
+```bash
+ambits -p . callers centered_rect
+```
+
+```
+centered_rect — 2 call sites in 2 callers
+  src/ui/alignment.rs::render  (src/ui/alignment.rs:16)
+  src/ui/compaction.rs::render  (src/ui/compaction.rs:15)
+```
+
+Call sites come from the grammar's own tags query, so a mention in a comment or
+inside a string literal is never reported — the answer is a call node or it is
+not there. Each site is attributed to the innermost symbol containing it, and
+that id goes straight into `show`.
+
+**Matching is by name, not by resolution.** tree-sitter parses; it does not do
+type inference, so a call to `new()` cannot be tied to one of the twelve
+definitions named `new`. On this repo 838 of 916 function names are unique, so
+most answers are exact — but `callers new` returns every call to anything named
+`new`. `--format json` sets `name_matched_only: true` so a consumer cannot
+mistake this for a resolved call graph.
+
+References are extracted on demand rather than stored, so `find`, `show`, and
+the TUI pay nothing for this. It costs about 0.8s on this repo against 0.1s for
+`find`.
+
 ## Reading code by symbol
 
 ```bash
@@ -340,6 +368,7 @@ Installs a [skill](https://code.claude.com/docs/en/skills) that teaches the agen
 |---|---|
 | `ambits -p <path>` | Launch the TUI |
 | `ambits … find <pattern>…` | Search symbols by `[path]::[name]` |
+| `ambits … callers <name>…` | List call sites and their enclosing symbol |
 | `ambits … show <selector>…` | Print symbol definitions as JSON |
 | `ambits … restore-context` | Print this session's read history |
 | `ambits … --coverage` | Print a coverage report and exit |
