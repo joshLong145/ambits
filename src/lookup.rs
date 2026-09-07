@@ -462,14 +462,37 @@ mod tests {
     /// silent lie about which symbol the caller got.
     #[test]
     fn every_match_for_an_ambiguous_id_is_returned() {
+        // Naming inherent impls `impl Foo` separated them from `struct Foo`,
+        // but ids are still not guaranteed unique: Rust allows a type several
+        // inherent impl blocks in one file, and they are indistinguishable by
+        // name. Reporting both is the contract that matters here.
+        let (dir, tree) = tmp_project(&[(
+            "a.rs",
+            "struct Foo;\n\nimpl Foo {\n    fn a(&self) {}\n}\n\nimpl Foo {\n    fn b(&self) {}\n}\n",
+        )]);
+        let v = show(dir.path(), &tree, &["a.rs::impl Foo"], false);
+        let matches = v["results"][0]["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 2, "two inherent impl blocks share an id");
+        assert!(matches[0]["lines"][0].as_u64() < matches[1]["lines"][0].as_u64());
+    }
+
+    /// The collision this fix removes: a type and its inherent impl used to
+    /// land on one id, so a three-line struct and a two-hundred-line impl
+    /// shared a single coverage entry and could never differ.
+    #[test]
+    fn a_type_and_its_inherent_impl_no_longer_share_an_id() {
         let (dir, tree) = tmp_project(&[(
             "a.rs",
             "struct Foo { a: u8 }\n\nimpl Foo {\n    fn go(&self) {}\n}\n",
         )]);
-        let v = show(dir.path(), &tree, &["a.rs::Foo"], false);
-        let matches = v["results"][0]["matches"].as_array().unwrap();
-        assert_eq!(matches.len(), 2, "struct Foo and impl Foo share an id");
-        assert!(matches[0]["lines"][0].as_u64() < matches[1]["lines"][0].as_u64());
+        assert_eq!(
+            show(dir.path(), &tree, &["a.rs::Foo"], false)["results"][0]["matches"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "the bare id now names only the type"
+        );
     }
 
     /// A miss and a malformed selector are different answers, and a caller

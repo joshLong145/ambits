@@ -144,7 +144,10 @@ ambits -p . show b3:5a60f75c 'src/digest.rs::grouped' 'src/app.rs::App/handle_ke
 
 `definition` is the exact source span, sliced by byte offset rather than reconstructed from line numbers. `--no-body` returns location metadata only; `--max-bytes N` caps each definition and flags it `"truncated": true`, since a cut definition is no longer valid source.
 
-**Ambiguity is reported, not resolved.** `matches` is an array. A symbol id names both `struct Foo` and `impl Foo`, so it can return two entries — a content hash tells them apart. Empty `matches` means no such symbol; `"selector": "unrecognized"` means the query was neither an id nor a hash. The command exits `0` either way: "nothing matches" is an answer, not a failure.
+**Ambiguity is reported, not resolved.** `matches` is an array, because ids are
+not guaranteed unique — Rust allows a type several inherent impl blocks in one
+file, and nothing in the name distinguishes them. A content hash always names
+exactly one symbol. Empty `matches` means no such symbol; `"selector": "unrecognized"` means the query was neither an id nor a hash. The command exits `0` either way: "nothing matches" is an answer, not a failure.
 
 In practice this is a large saving. Reading the six implementation symbols of a 316-line module costs ~630 tokens against ~3,500 for the file.
 

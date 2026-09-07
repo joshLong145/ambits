@@ -119,6 +119,18 @@ impl SymbolNode {
         self.estimated_tokens as usize
             + self.children.iter().map(|c| c.total_tokens()).sum::<usize>()
     }
+
+    /// The nesting path within the file, e.g. `App/process_compaction`.
+    ///
+    /// `name` is only the leaf, and the full path lives in `id` behind the
+    /// `<file>::` prefix. Deriving it here keeps the id's shape from being
+    /// re-implemented by every caller that needs the other half.
+    pub fn name_path(&self) -> &str {
+        match self.id.split_once("::") {
+            Some((_, name)) => name,
+            None => &self.id,
+        }
+    }
 }
 
 /// A file's worth of symbols, organized hierarchically.
@@ -140,20 +152,6 @@ impl FileSymbols {
 pub struct ProjectTree {
     pub root: PathBuf,
     pub files: Vec<FileSymbols>,
-}
-
-impl SymbolNode {
-    /// The nesting path within the file, e.g. `App/process_compaction`.
-    ///
-    /// `name` is only the leaf, and the full path lives in `id` behind the
-    /// `<file>::` prefix. Deriving it here keeps the id's shape from being
-    /// re-implemented by every caller that needs the other half.
-    pub fn name_path(&self) -> &str {
-        match self.id.split_once("::") {
-            Some((_, name)) => name,
-            None => &self.id,
-        }
-    }
 }
 
 impl ProjectTree {

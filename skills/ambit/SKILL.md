@@ -191,8 +191,9 @@ out of the session log and credits the selectors it names (`--no-body` credits
 name-level only, since you saw where a symbol is, not what it says). Using this
 instead of `Read` does not cost you coverage.
 
-**Ambiguity is reported, not resolved.** `matches` is an array: a symbol id
-names both `struct Foo` and `impl Foo`, so it can hold more than one entry.
+**Ambiguity is reported, not resolved.** `matches` is an array: ids are not
+guaranteed unique, since a type may have several inherent impl blocks in one
+file.
 Prefer the hash when you need exactly one. An empty `matches` means no such
 symbol; `"selector": "unrecognized"` means the query was neither an id nor a
 hash.

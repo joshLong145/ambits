@@ -162,7 +162,15 @@ fn extract_symbols(
                 || meta.label == "trait"
             {
                 if let Some(body) = child_by_kind(&child, "declaration_list") {
-                    extract_body_children(body, src, file_path, names, path_prefix, &name_path, &mut sym.children);
+                    // Members hang off the type, not the impl block, so the
+                    // `impl ` added above is dropped for their prefix. Trait
+                    // impls keep their full `Trait for Type` qualification —
+                    // two traits can give one type the same method name, and
+                    // only the qualification keeps those apart.
+                    let child_prefix = name_path
+                        .strip_prefix("impl ")
+                        .unwrap_or(&name_path);
+                    extract_body_children(body, src, file_path, names, path_prefix, child_prefix, &mut sym.children);
                 }
             }
 
@@ -247,7 +255,24 @@ fn impl_symbol(node: &Node, src: &[u8]) -> Option<(String, SymbolMeta)> {
         return None;
     }
 
-    Some((parts.join(" "), IMPL))
+    // A trait impl is already distinguishable — `Display for Foo` can collide
+    // with nothing. An inherent impl is not: bare `Foo` is the same name the
+    // type declaration produces, so `struct Foo` and `impl Foo` end up with
+    // one id, one ledger entry, and one coverage number between them. On this
+    // repo that conflated 28 pairs, including a 3-line struct with a 259-line
+    // impl.
+    //
+    // Naming it `impl Foo` separates them. Their methods deliberately keep the
+    // `Foo/method` path — see the child prefix in `extract_symbols` — because a
+    // method belongs to the type, which is how Rust itself writes it:
+    // `App::new`, never `impl App::new`.
+    let name = parts.join(" ");
+    let name = if name.contains(" for ") {
+        name
+    } else {
+        format!("impl {name}")
+    };
+    Some((name, IMPL))
 }
 
 /// Find the first `identifier` or `type_identifier` child and return its text.
@@ -295,10 +320,35 @@ mod tests {
         assert_eq!(syms.len(), 2);
         assert_eq!(syms[0].name.as_ref(), "Point");
         assert_eq!(syms[0].category, SymbolCategory::Type);
-        assert_eq!(syms[1].name.as_ref(), "Point");
+
+        // The impl is named apart from the type it implements, or the two
+        // share an id and therefore a single coverage entry.
+        assert_eq!(syms[1].name.as_ref(), "impl Point");
         assert_eq!(syms[1].category, SymbolCategory::Implementation);
+        assert_ne!(syms[0].id, syms[1].id, "a type and its impl are distinct");
+
+        // Its members still hang off the type, the way Rust names them.
         assert_eq!(syms[1].children.len(), 1);
         assert_eq!(syms[1].children[0].name.as_ref(), "new");
+        assert!(
+            syms[1].children[0].id.ends_with("::Point/new"),
+            "got {}",
+            syms[1].children[0].id
+        );
+    }
+
+    /// A trait impl was never ambiguous, and its members must keep the full
+    /// qualification: two traits can give one type the same method name, and
+    /// only `Trait for Type/method` keeps those apart.
+    #[test]
+    fn a_trait_impl_keeps_its_qualified_name() {
+        let syms = parse("struct P;
+impl Display for P {
+    fn fmt(&self) {}
+}");
+        let imp = syms.iter().find(|s| s.category == SymbolCategory::Implementation).unwrap();
+        assert_eq!(imp.name.as_ref(), "Display for P");
+        assert!(imp.children[0].id.ends_with("::Display for P/fmt"));
     }
 
     #[test]
