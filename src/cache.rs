@@ -80,15 +80,12 @@ pub fn collect(project_root: &Path) -> Vec<JournalStat> {
             .map(|d| d.as_secs() / 86_400);
 
         let contents = read_journal(&path);
-        let records = std::fs::read_to_string(&path)
-            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
-            .unwrap_or(0);
 
         out.push(JournalStat {
             session_id: session_id.to_string(),
             path,
             bytes: meta.len(),
-            records,
+            records: contents.records,
             symbols: contents.reads.len(),
             age_days,
             schema_version: contents.header.map(|(v, _)| v),

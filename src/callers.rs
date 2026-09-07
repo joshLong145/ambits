@@ -73,6 +73,21 @@ pub struct CallSite {
 /// query: a language we cannot introspect should narrow the answer, not abort
 /// the command.
 pub fn call_sites(registry: &ParserRegistry, path: &Path, source: &str) -> Vec<(String, u32, u32)> {
+    call_sites_filtered(registry, path, source, None)
+}
+
+/// As [`call_sites`], but skipping macro bodies that cannot contain any of
+/// `wanted`.
+///
+/// Re-parsing macro token trees is the bulk of this module's cost — Rust code
+/// is dense with `println!`, `format!` and `assert_eq!` — and a body whose
+/// text lacks the name outright cannot hold a call to it.
+pub fn call_sites_filtered(
+    registry: &ParserRegistry,
+    path: &Path,
+    source: &str,
+    wanted: Option<&[String]>,
+) -> Vec<(String, u32, u32)> {
     let Some(parser_impl) = registry.parser_for(path) else {
         return Vec::new();
     };
@@ -118,6 +133,10 @@ pub fn call_sites(registry: &ParserRegistry, path: &Path, source: &str) -> Vec<(
     // compound as it descends. Bounded so a pathological nesting cannot spin.
     let mut queue = Vec::new();
     collect_macro_bodies(tree.root_node(), src, 0, 0, &mut queue);
+    let keep = |text: &str| {
+        wanted.is_none_or(|names| names.iter().any(|n| text.contains(n.as_str())))
+    };
+    queue.retain(|(_, _, text)| keep(text));
     let mut depth = 0;
     while let Some((start_byte, start_row, text)) = queue.pop() {
         if depth > MAX_MACRO_DEPTH * 64 {
@@ -135,7 +154,12 @@ pub fn call_sites(registry: &ParserRegistry, path: &Path, source: &str) -> Vec<(
             start_row,
             &mut out,
         );
+        let before = queue.len();
         collect_macro_bodies(sub.root_node(), text.as_bytes(), start_byte, start_row, &mut queue);
+        // Nested bodies get the same treatment as the outer ones.
+        let mut added: Vec<_> = queue.split_off(before);
+        added.retain(|(_, _, t)| keep(t));
+        queue.extend(added);
     }
 
     out.sort_by_key(|(_, line, byte)| (*line, *byte));
@@ -248,7 +272,16 @@ pub fn find_callers(
         let Ok(source) = std::fs::read_to_string(&full) else {
             continue;
         };
-        for (callee, line, byte) in call_sites(registry, &file.file_path, &source) {
+        // A name that appears nowhere in the file's text cannot be called from
+        // it, so the parse and the macro re-parses below can be skipped
+        // outright. Sound because every call site contains the callee as a
+        // substring, and worth it because most files mention most names never.
+        if !names.iter().any(|n| source.contains(n.as_str())) {
+            continue;
+        }
+        for (callee, line, byte) in
+            call_sites_filtered(registry, &file.file_path, &source, Some(names))
+        {
             if !wanted.contains_key(callee.as_str()) {
                 continue;
             }

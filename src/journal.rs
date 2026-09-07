@@ -340,6 +340,9 @@ pub type AgentReadKey = (String, String);
 #[derive(Debug, Default)]
 pub struct JournalContents {
     pub header: Option<(u32, EnvironmentManifest)>,
+    /// Non-empty lines seen, header included. Reported here so a caller that
+    /// wants the record count does not have to read the file a second time.
+    pub records: usize,
     /// Symbol-level view: what was read, and what it looked like.
     ///
     /// Folded to mirror `ContextLedger`'s own semantics rather than by naive
@@ -403,6 +406,7 @@ pub fn read_journal(path: &Path) -> JournalContents {
         if line.trim().is_empty() {
             continue;
         }
+        out.records += 1;
         let record: Record = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(e) => {
