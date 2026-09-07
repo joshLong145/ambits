@@ -103,6 +103,11 @@ fresh scan rather than stored, so they are accurate even for files edited since
 the read. Use them: read that range directly instead of re-reading the file or
 spending a `find_symbol` call to locate the symbol.
 
+An entry marked `(was src/old.rs)` moved since you read it. Its body is
+byte-identical — you still know it — but the address you remember is stale, so
+use the one given. Renames are not tracked this way and will appear as
+no-longer-present instead.
+
 Use `--max-tokens N` to fit a budget (default 3000), and `--format json` for
 programmatic use.
 

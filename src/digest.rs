@@ -94,11 +94,27 @@ fn grouped(report: &RestoreReport) -> Vec<FileGroup<'_>> {
 /// It earns its ~16% size cost downstream: an agent that knows a symbol sits
 /// at `src/app.rs:227-280` can read 53 lines instead of pulling a 40k-token
 /// file or spending a `find_symbol` round-trip to locate it.
+///
+/// A symbol that moved additionally carries where it moved *from*, because the
+/// agent is holding that stale address. Told only the new location it cannot
+/// connect it to what it remembers; told only the old one it reads the wrong
+/// file. Which half of the old id is shown depends on what actually changed —
+/// naming the old file is useless when the symbol never left it.
 fn symbol_label(sym: &RestoredSymbol) -> String {
-    format!(
+    let base = format!(
         "{}:{}-{}",
         sym.name_path, sym.line_range.start, sym.line_range.end
-    )
+    );
+    let Some(ref old_id) = sym.moved_from else {
+        return base;
+    };
+    match crate::restore::split_symbol_id(old_id) {
+        Some((old_file, _)) if Path::new(old_file) != sym.file_path => {
+            format!("{base} (was {old_file})")
+        }
+        Some((_, old_name)) => format!("{base} (was {old_name})"),
+        None => format!("{base} (was {old_id})"),
+    }
 }
 
 /// Fit as many comma-separated names as `budget` chars allow, returning the
@@ -122,6 +138,7 @@ fn fit_names(names: &[String], budget: usize) -> (String, usize) {
     }
     (out, 0)
 }
+
 
 fn format_tokens(n: u64) -> String {
     if n >= 1_000 {
@@ -317,6 +334,10 @@ struct SymbolDto<'a> {
     lines: [u32; 2],
     depth: String,
     tokens: u32,
+    /// Present only when the symbol was located by content hash under a
+    /// different id — see `RestoredSymbol::moved_from`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved_from: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -365,6 +386,7 @@ impl DigestFormatter for JsonFormatter {
                     lines: [s.line_range.start, s.line_range.end],
                     depth: s.depth.to_string(),
                     tokens: s.estimated_tokens,
+                    moved_from: s.moved_from.as_deref(),
                 })
                 .collect();
             // Approximate the rendered cost the same way the markdown path
@@ -382,7 +404,7 @@ impl DigestFormatter for JsonFormatter {
         }
 
         let dto = ReportDto {
-            schema_version: 1,
+            schema_version: 2,
             source: match report.source {
                 crate::restore::RestoreSource::Journal => "journal",
                 crate::restore::RestoreSource::SessionLogs => "session_logs",
@@ -434,6 +456,7 @@ mod tests {
             depth: ReadDepth::FullBody,
             line_range: 1..10,
             estimated_tokens: tokens,
+            moved_from: None,
         }
     }
 
@@ -465,6 +488,49 @@ mod tests {
         assert!(out.contains("one:1-10, two:1-10"));
         assert!(out.contains("### b.rs — 1 symbol"));
         assert!(out.contains("unchanged since"));
+    }
+
+    /// A moved symbol lists under where it lives now, but must name where it
+    /// came from — that stale address is what the agent is still holding.
+    #[test]
+    fn a_moved_symbol_names_the_file_it_came_from() {
+        let mut sym = restored("src/digest.rs", "format_tokens", 40);
+        sym.line_range = 126..132;
+        sym.moved_from = Some("src/ui/stats.rs::format_tokens".into());
+        let r = report(vec![sym], RestoreSource::Journal);
+
+        let out = MarkdownFormatter.format(&r, DEFAULT_MAX_TOKENS);
+        assert!(out.contains("### src/digest.rs"), "grouped by where it is now");
+        assert!(out.contains("format_tokens:126-132 (was src/ui/stats.rs)"));
+    }
+
+    /// When it never left the file, naming the file says nothing — the old
+    /// name path is the part that moved.
+    #[test]
+    fn a_symbol_reparented_within_a_file_names_the_old_path() {
+        let mut sym = restored("src/app.rs", "Helper/run", 40);
+        sym.line_range = 10..20;
+        sym.moved_from = Some("src/app.rs::App/run".into());
+        let r = report(vec![sym], RestoreSource::Journal);
+
+        let out = MarkdownFormatter.format(&r, DEFAULT_MAX_TOKENS);
+        assert!(out.contains("Helper/run:10-20 (was App/run)"));
+    }
+
+    #[test]
+    fn json_carries_moved_from_only_when_set() {
+        let mut moved = restored("b.rs", "x", 10);
+        moved.moved_from = Some("a.rs::x".into());
+        let r = report(vec![moved, restored("b.rs", "y", 10)], RestoreSource::Journal);
+
+        let out = JsonFormatter.format(&r, DEFAULT_MAX_TOKENS);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let syms = &v["files"][0]["symbols"];
+        assert_eq!(syms[0]["moved_from"], "a.rs::x");
+        assert!(
+            syms[1].get("moved_from").is_none(),
+            "omitted for the ordinary case rather than emitted as null"
+        );
     }
 
     /// Line ranges are what let an agent read a slice instead of a whole file,
@@ -643,7 +709,7 @@ mod tests {
         let r = report(vec![restored("a.rs", "one", 10)], RestoreSource::Journal);
         let out = JsonFormatter.format(&r, DEFAULT_MAX_TOKENS);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["schema_version"], 2);
         assert_eq!(v["source"], "journal");
         assert_eq!(v["drift_verified"], true);
         assert_eq!(v["restored_symbols"], 1);

@@ -12,7 +12,14 @@
 //! |---|---|---|
 //! | read at hash H | symbol exists, hash H | **restored** |
 //! | read at hash H | symbol exists, hash H' | **drifted** — omitted |
+//! | read at hash H | id is gone, hash H found elsewhere | **restored**, `moved_from` set |
 //! | read at hash H | symbol is gone | **removed** — omitted |
+//!
+//! The third row is why the hash is worth more than the id. An id encodes a
+//! location (`<path>::<name-path>`), so hoisting a helper into another module
+//! destroys it; the body is unchanged and the agent's knowledge of it is
+//! entirely intact. See [`classify`] for the uniqueness rules that keep this
+//! from guessing.
 //!
 //! Only the first bucket is handed onward. Dropping the other two is a
 //! feature, not a shortfall: a stale entry is strictly worse than a missing
@@ -48,6 +55,15 @@ pub struct RestoredSymbol {
     pub line_range: Range<u32>,
     /// Cost of re-reading this symbol, if the agent decides to.
     pub estimated_tokens: u32,
+    /// The id this symbol had when it was read, when that differs from where
+    /// it lives now — i.e. it was located by content hash rather than by id.
+    ///
+    /// `None` for the ordinary case. When set, every other field on this
+    /// struct describes the symbol's *current* home; this is the stale address
+    /// the agent is still holding, and consumers must surface it. An agent
+    /// told only the new location has no way to connect it to what it
+    /// remembers; one told only the old location will read the wrong file.
+    pub moved_from: Option<String>,
 }
 
 /// Why a journaled read was withheld.
@@ -85,6 +101,13 @@ impl RestoreOutcome {
     /// Total journaled reads considered.
     pub fn total(&self) -> usize {
         self.restored.len() + self.drifted.len() + self.removed.len()
+    }
+
+    /// Restored symbols that were found somewhere other than where they were
+    /// read. A subset of `restored` — a moved symbol is recovered knowledge,
+    /// not a separate outcome.
+    pub fn moved(&self) -> impl Iterator<Item = &RestoredSymbol> {
+        self.restored.iter().filter(|s| s.moved_from.is_some())
     }
 
     /// Restored symbols grouped by file, preserving the sorted order.
@@ -293,16 +316,58 @@ pub fn index_tree(tree: &ProjectTree) -> HashMap<&str, Vec<&SymbolNode>> {
     out
 }
 
+/// Index every symbol in the tree by content hash.
+///
+/// A `Vec` because bodies collide: identical trivial symbols (`mod helpers;`,
+/// a unit struct, a two-line helper duplicated across modules) hash the same.
+/// Measured on this repo, ~1% of hashes name more than one symbol, which is
+/// exactly why the move rescue demands a unique match.
+pub fn index_tree_by_hash(tree: &ProjectTree) -> HashMap<[u8; 32], Vec<&SymbolNode>> {
+    fn walk<'a>(syms: &'a [SymbolNode], out: &mut HashMap<[u8; 32], Vec<&'a SymbolNode>>) {
+        for sym in syms {
+            out.entry(sym.content_hash).or_default().push(sym);
+            walk(&sym.children, out);
+        }
+    }
+    let mut out = HashMap::new();
+    for file in &tree.files {
+        walk(&file.symbols, &mut out);
+    }
+    out
+}
+
 /// Partition journaled reads against the current tree.
 ///
 /// `reads` is the last-write-wins fold produced by
 /// [`crate::journal::read_journal`].
+///
+/// ## Following moves
+///
+/// A symbol whose id has vanished is not necessarily gone: hoisting a helper
+/// into a shared module changes its id (the id is `<path>::<name-path>`) while
+/// leaving its body byte-identical. A second pass therefore looks the orphans
+/// up by content hash and, on a unique match, restores them at their new
+/// address with `moved_from` set.
+///
+/// Renames are deliberately *not* followed. `content_hash` covers the
+/// symbol's whole source span including its signature, so renaming changes the
+/// hash — and a renamed symbol genuinely is something the agent's memory now
+/// mislabels.
+///
+/// The rescue requires uniqueness on **both** sides: one unclaimed tree node
+/// with that hash, and one journal entry claiming it. That is not
+/// conservatism for its own sake — `index` is a `HashMap` with randomized
+/// iteration order, so a "first claimant wins" rule would rescue different
+/// symbols on different runs over identical data.
 pub fn classify(
     reads: &ReadSet,
     tree: &ProjectTree,
 ) -> RestoreOutcome {
     let index = index_tree(tree);
     let mut outcome = RestoreOutcome::default();
+    // Orphans, held back for the hash pass below rather than being written
+    // off as removed immediately.
+    let mut orphans: Vec<(&String, [u8; 32], ReadDepth)> = Vec::new();
 
     for (id, (hash_at_read, depth)) in reads {
         // Paths come from the symbol id in every branch, not from
@@ -327,6 +392,7 @@ pub fn classify(
                     depth: *depth,
                     line_range: sym.line_range.clone(),
                     estimated_tokens: sym.estimated_tokens,
+                    moved_from: None,
                 });
             }
             (Some(_), None) => outcome.drifted.push(OmittedSymbol {
@@ -335,14 +401,11 @@ pub fn classify(
                 name_path,
                 reason: OmissionReason::Drifted,
             }),
-            (None, _) => outcome.removed.push(OmittedSymbol {
-                symbol_id: id.clone(),
-                file_path,
-                name_path,
-                reason: OmissionReason::Removed,
-            }),
+            (None, _) => orphans.push((id, *hash_at_read, *depth)),
         }
     }
+
+    follow_moves(&mut outcome, orphans, tree);
 
     // Deterministic ordering: reads come from a HashMap, whose iteration order
     // is deliberately randomized between runs.
@@ -363,6 +426,82 @@ pub fn classify(
     }
 
     outcome
+}
+
+/// Second classification pass: rescue orphans that merely moved.
+///
+/// Everything here is decided by uniqueness, never by order. Any orphan that
+/// is not rescued falls through to `removed`, which is where it would have
+/// landed without this pass — so the worst case is the previous behavior.
+fn follow_moves(
+    outcome: &mut RestoreOutcome,
+    orphans: Vec<(&String, [u8; 32], ReadDepth)>,
+    tree: &ProjectTree,
+) {
+    // Nothing to do in the overwhelmingly common case, and building the hash
+    // index over the whole tree is not free.
+    if orphans.is_empty() {
+        return;
+    }
+
+    let by_hash = index_tree_by_hash(tree);
+
+    // Nodes already restored under their own id are spoken for. Collected up
+    // front so the check below is a lookup rather than a scan per orphan.
+    let claimed: std::collections::HashSet<(String, u32)> = outcome
+        .restored
+        .iter()
+        .map(|r| (r.symbol_id.clone(), r.line_range.start))
+        .collect();
+
+    // Count how many orphans want each hash, so a body duplicated across two
+    // files — one copy since deleted — cannot be rescued to the survivor. We
+    // could not tell which of the two the agent read, and they were identical
+    // anyway.
+    let mut claims: HashMap<[u8; 32], usize> = HashMap::new();
+    for (_, hash, depth) in &orphans {
+        if *depth == ReadDepth::FullBody {
+            *claims.entry(*hash).or_insert(0) += 1;
+        }
+    }
+
+    for (old_id, hash, depth) in orphans {
+        // Only full-body reads follow a move. At shallower depths what the
+        // agent retained is essentially the symbol's name and location — and
+        // the location is precisely what changed, so there is nothing to
+        // carry over. A full read means it knows the body, and the body is
+        // provably identical.
+        let rescued = (depth == ReadDepth::FullBody && claims.get(&hash) == Some(&1))
+            .then(|| by_hash.get(&hash))
+            .flatten()
+            .filter(|nodes| nodes.len() == 1)
+            .map(|nodes| nodes[0])
+            // Without this an unrelated orphan sharing a node's body would
+            // surface that same node twice in one digest.
+            .filter(|node| !claimed.contains(&(node.id.clone(), node.line_range.start)));
+
+        let (file_path, name_path) = split_id(old_id);
+        match rescued {
+            Some(node) => {
+                let (new_file, new_name) = split_id(&node.id);
+                outcome.restored.push(RestoredSymbol {
+                    symbol_id: node.id.clone(),
+                    file_path: new_file,
+                    name_path: new_name,
+                    depth,
+                    line_range: node.line_range.clone(),
+                    estimated_tokens: node.estimated_tokens,
+                    moved_from: Some(old_id.clone()),
+                });
+            }
+            None => outcome.removed.push(OmittedSymbol {
+                symbol_id: old_id.clone(),
+                file_path,
+                name_path,
+                reason: OmissionReason::Removed,
+            }),
+        }
+    }
 }
 
 /// Owned `(file_path, name_path)` for a symbol id. A malformed id degrades to
@@ -537,8 +676,10 @@ mod tests {
     #[test]
     fn vanished_symbol_is_withheld_as_removed() {
         let tree = project(vec![file("a.rs", vec![sym_hashed("a.rs::x", "x", "body")])]);
+        // A body that survives nowhere in the tree — otherwise this is a move,
+        // not a deletion, and `follow_moves` would rightly rescue it.
         let out = classify(
-            &reads(&[("a.rs::gone", content_hash("body"), ReadDepth::FullBody)]),
+            &reads(&[("a.rs::gone", content_hash("deleted body"), ReadDepth::FullBody)]),
             &tree,
         );
         assert_eq!(out.removed.len(), 1);
@@ -917,5 +1058,117 @@ mod tests {
 
         assert_eq!(refresh_staleness(&mut ledger, &tree), 1);
         assert!(ledger.is_stale("a.rs::gone"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Following moves
+    // -----------------------------------------------------------------------
+
+    /// The case this exists for: a helper hoisted into another module. Its id
+    /// changes because the id embeds the path, but the body is byte-identical.
+    #[test]
+    fn a_moved_symbol_is_restored_at_its_new_home() {
+        let mut moved = sym_hashed("src/util.rs::format_tokens", "format_tokens", "fn body");
+        moved.line_range = 12..18;
+        let tree = project(vec![
+            file("src/util.rs", vec![moved]),
+            file("src/stats.rs", vec![sym_hashed("src/stats.rs::other", "other", "unrelated")]),
+        ]);
+
+        let out = classify(
+            &reads(&[(
+                "src/stats.rs::format_tokens",
+                content_hash("fn body"),
+                ReadDepth::FullBody,
+            )]),
+            &tree,
+        );
+
+        assert!(out.removed.is_empty(), "it was found, not lost");
+        assert_eq!(out.restored.len(), 1);
+        let r = &out.restored[0];
+        assert_eq!(r.symbol_id, "src/util.rs::format_tokens", "the current address");
+        assert_eq!(r.file_path, PathBuf::from("src/util.rs"));
+        assert_eq!(r.line_range, 12..18, "line numbers describe where it is now");
+        assert_eq!(
+            r.moved_from.as_deref(),
+            Some("src/stats.rs::format_tokens"),
+            "the stale address the agent is still holding"
+        );
+        assert_eq!(out.moved().count(), 1);
+    }
+
+    /// ~1% of hashes name more than one symbol — duplicated trivial bodies
+    /// like `mod helpers;`. Picking one would invent a location.
+    #[test]
+    fn an_ambiguous_target_is_not_followed() {
+        let tree = project(vec![
+            file("a.rs", vec![sym_hashed("a.rs::helpers", "helpers", "same")]),
+            file("b.rs", vec![sym_hashed("b.rs::helpers", "helpers", "same")]),
+        ]);
+
+        let out = classify(
+            &reads(&[("c.rs::helpers", content_hash("same"), ReadDepth::FullBody)]),
+            &tree,
+        );
+
+        assert!(out.restored.is_empty());
+        assert_eq!(out.removed.len(), 1, "ambiguity falls back to removed");
+    }
+
+    /// The mirror case: one body duplicated in two files, one copy deleted.
+    /// We cannot tell which the agent read, so neither is rescued.
+    #[test]
+    fn two_orphans_claiming_one_node_are_both_withheld() {
+        let tree = project(vec![file("c.rs", vec![sym_hashed("c.rs::dup", "dup", "same")])]);
+
+        let out = classify(
+            &reads(&[
+                ("a.rs::dup", content_hash("same"), ReadDepth::FullBody),
+                ("b.rs::dup", content_hash("same"), ReadDepth::FullBody),
+            ]),
+            &tree,
+        );
+
+        assert!(out.restored.is_empty());
+        assert_eq!(out.removed.len(), 2);
+    }
+
+    /// A node restored under its own id is spoken for. Without this guard an
+    /// unrelated orphan sharing its body would list the same node twice.
+    #[test]
+    fn a_node_already_restored_is_not_claimed_again() {
+        let tree = project(vec![file("a.rs", vec![sym_hashed("a.rs::x", "x", "same")])]);
+
+        let out = classify(
+            &reads(&[
+                ("a.rs::x", content_hash("same"), ReadDepth::FullBody),
+                ("gone.rs::x", content_hash("same"), ReadDepth::FullBody),
+            ]),
+            &tree,
+        );
+
+        assert_eq!(out.restored.len(), 1, "the node appears once");
+        assert_eq!(out.restored[0].moved_from, None, "claimed by its own id");
+        assert_eq!(out.removed.len(), 1);
+    }
+
+    /// At shallower depths what the agent retained is the name and location —
+    /// and the location is exactly what changed, so there is nothing to carry.
+    #[test]
+    fn only_full_body_reads_follow_a_move() {
+        let tree = project(vec![file("b.rs", vec![sym_hashed("b.rs::x", "x", "body")])]);
+
+        for depth in [ReadDepth::NameOnly, ReadDepth::Overview, ReadDepth::Signature] {
+            let out = classify(&reads(&[("a.rs::x", content_hash("body"), depth)]), &tree);
+            assert!(out.restored.is_empty(), "{depth:?} must not follow a move");
+            assert_eq!(out.removed.len(), 1);
+        }
+
+        let out = classify(
+            &reads(&[("a.rs::x", content_hash("body"), ReadDepth::FullBody)]),
+            &tree,
+        );
+        assert_eq!(out.restored.len(), 1, "a full read does");
     }
 }
