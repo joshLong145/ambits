@@ -49,8 +49,8 @@ ambits -p . find 'ui::render'         # scoped to a directory
 
 ```
 restore::classify — 2 matches
-  [fn] src/restore.rs::classify  L336-404
-  [fn] src/restore.rs::tests/rehydrate_and_classify_agree_on_where_a_symbol_lives  L1000-1020
+  [fn] src/restore.rs::classify  L408-476
+  [fn] src/restore.rs::tests/rehydrate_and_classify_agree_on_where_a_symbol_lives  L1072-1092
 ```
 
 The pattern is `[path]::[name]`, or a bare name; both halves are optional and
@@ -62,9 +62,10 @@ The path half matches whole **components**, not substrings — so `ui` matches
 
 The name half matches the **leaf** name, unless the pattern contains `/`, in
 which case it matches the whole name path. That distinction matters at scale:
-on this repo `test` matches 42 symbols by leaf but 486 by full path, since
-every `tests/…` child matches through its parent. Writing `::App/` opts into
-path matching deliberately, which is how you ask for a type's members.
+on this repo `test` matches 44 symbols by leaf, while `tests/` — which contains
+a `/`, and so matches the whole name path — matches 518, since every test
+function matches through its parent module. Writing `::App/` opts into path
+matching deliberately, which is how you ask for a type's members.
 
 Results carry **coverage context** when the TUI has been running: a depth
 column showing what this session already read, `—` for unread, and a per-query
@@ -72,12 +73,16 @@ count. That answers the question a search is usually a step toward — do I need
 to read this?
 
 ```
-fmt:: — 6 matches (5 read)
+fmt:: — 6 matches (6 read)
   [fn ] src/fmt.rs::tokens  L10-18  full
+  [fn ] src/fmt.rs::bytes  L23-33  full
   [mod] src/fmt.rs::tests  L36-62  full
+  …
 
-parser/typescript::extract — 5 matches (0 read)
-  [fn] src/parser/typescript.rs::extract_symbols  L157-245  —
+benches/tracking:: — 6 matches (0 read)
+  [fn] benches/tracking.rs::record_n_symbols  L13-24  —
+  [fn] benches/tracking.rs::depth_of_n_symbols  L49-67  —
+  …
 ```
 
 Without a coverage journal the column is omitted entirely rather than shown
@@ -114,26 +119,28 @@ that id goes straight into `show`.
 
 **Matching is by name, not by resolution.** tree-sitter parses; it does not do
 type inference, so a call to `new()` cannot be tied to one of the twelve
-definitions named `new`. On this repo 838 of 916 function names are unique, so
+definitions named `new`. On this repo 895 of 993 function names are unique, so
 most answers are exact — but `callers new` returns every call to anything named
 `new`. `--format json` sets `name_matched_only: true` so a consumer cannot
 mistake this for a resolved call graph.
 
 References are extracted on demand rather than stored, so `find`, `show`, and
-the TUI pay nothing for this. It costs about 0.8s on this repo against 0.1s for
+the TUI pay nothing for this. It costs about 0.3s on this repo against 0.02s for
 `find`.
 
 ## Reading code by symbol
 
 ```bash
-ambits -p . show 'src/digest.rs::format_tokens'
+ambits -p . show 'src/fmt.rs::tokens'
 ```
 
 ```json
-{"schema_version":1,"results":[{"query":"src/digest.rs::format_tokens","selector":"id",
-"matches":[{"id":"src/digest.rs::format_tokens","name":"format_tokens","file":"src/digest.rs",
-"lines":[143,149],"bytes":[5621,5766],"content_hash":"b3:178ab30e…","label":"fn",
-"estimated_tokens":56,"definition":"fn format_tokens(n: u64) -> String {\n …"}]}]}
+{"schema_version":2,"coverage":{"session_id":"30172621-…","symbols_read":1034},
+"results":[{"query":"src/fmt.rs::tokens","selector":"id",
+"matches":[{"id":"src/fmt.rs::tokens","name":"tokens","file":"src/fmt.rs",
+"lines":[10,18],"bytes":[418,641],"content_hash":"b3:46d7bd8b…","label":"fn",
+"estimated_tokens":88,"definition":"pub fn tokens(n: u64) -> String {\n …",
+"read_depth":"full"}]}]}
 ```
 
 A selector is either a **symbol id** — `<path>::<name-path>`, exactly what `restore-context` prints — or a **content hash**, full or an 8-character prefix. Several resolve per invocation, so a batch of lookups costs one process:
@@ -149,7 +156,7 @@ not guaranteed unique — Rust allows a type several inherent impl blocks in one
 file, and nothing in the name distinguishes them. A content hash always names
 exactly one symbol. Empty `matches` means no such symbol; `"selector": "unrecognized"` means the query was neither an id nor a hash. The command exits `0` either way: "nothing matches" is an answer, not a failure.
 
-In practice this is a large saving. Reading the six implementation symbols of a 316-line module costs ~630 tokens against ~3,500 for the file.
+In practice this is a large saving. `src/filter.rs` is 479 lines — roughly 9,300 tokens to read whole. The five `PathFilter` methods a caller actually needs come to about 630.
 
 ## Knowing what it has already read
 
@@ -160,17 +167,17 @@ ambits -p . restore-context
 ```
 
 ```
-### src/app.rs — 85 symbols (~40.4k tok)
-App/process_compaction:340-388, App/rebuild_tree_rows:391-458,
-App/handle_key:460-533, …
+### src/app.rs — 100 symbols (~49.2k tok)
+App/switch_session:342-345, App/process_compaction:364-412,
+App/rebuild_tree_rows:415-482, App/handle_key:484-557, …
 
-### src/digest.rs — 43 symbols (~11.6k tok)
-format_tokens:143-149 (was src/ui/stats.rs), grouped:63-83, …
+### src/digest.rs — 47 symbols (~13.7k tok)
+grouped:64-84, symbol_label:104-119, fit_names:126-141, …
 ```
 
 Entries are `name:first-last`. Line numbers come from a fresh scan at print time rather than from storage, so they stay correct in files edited since the read — the agent can read that range directly instead of pulling the file.
 
-`(was src/ui/stats.rs)` marks a symbol that moved between files. ambits identifies symbols by content as well as by path, so hoisting a helper into a shared module does not lose it.
+A symbol that moved between files is annotated `(was <old path>)`. ambits identifies symbols by content as well as by path, so hoisting a helper into a shared module does not lose it.
 
 `--max-tokens N` fits a budget (default 3000). `--format json` gives the same data structurally, including each symbol's `content_hash` for exact `show` lookups.
 
@@ -222,6 +229,13 @@ ambits -p .
 
 Tails the session log and updates live. Three panels — symbol tree, coverage stats, activity feed — cycled with `Tab`.
 
+It watches your source files too, re-parsing one when it changes so the tree and
+the coverage numbers follow your edits without a restart. The watcher honours
+`.gitignore`, so generated code stays out of the tree — without that, a build
+tool writing into `target/` (rust-analyzer running `cargo check`, say) pushes
+rows in for files you never wrote. Deleted files leave the tree rather than
+lingering until you quit.
+
 - **Depth-aware coloring** — every symbol shaded by how deeply it was read
 - **Per-file counts** — `seen/total` on each file header, so partial coverage shows without expanding
 - **Sortable tree** — alphabetical, or grouped by coverage to surface half-read files first
@@ -239,6 +253,7 @@ Symbols carried over from before a compaction render dimmed — the read happene
 | `h` / `l` | Collapse / expand tree nodes |
 | `Enter` | Expand node, or select agent when Stats is focused |
 | `Tab` | Cycle panel focus (Tree / Stats / Activity) |
+| `Shift+Tab` | Cycle agent filter backward |
 | `/` | Search symbols |
 | `s` | Toggle sort (alphabetical / coverage) |
 | `a` / `A` | Cycle agent filter forward / backward |
@@ -246,6 +261,7 @@ Symbols carried over from before a compaction render dimmed — the read happene
 | `C` | Compaction history (`[` / `]` to page) |
 | `g` / `G` | Jump to first / last |
 | `PgUp` / `PgDn` | Scroll by page |
+| `Esc` | Close the alignment view, or cancel a search |
 | `q` | Quit |
 
 ### Color legend
@@ -276,16 +292,16 @@ ambits -p . --coverage
 ```
 
 ```
-Coverage Report (session: 34e212cf-…)
+Coverage Report (session: 30172621-…)
 ─────────────────────────────────────────────────────────────────────────────
 File                                      Symbols    Seen    Full   Seen%   Full%
 ─────────────────────────────────────────────────────────────────────────────
 src/events.rs                                   3       3       3    100%    100%
-src/parser/mod.rs                               8       8       1    100%     12%
-src/app.rs                                     89      89      85    100%     95%
+src/parser/mod.rs                              15       2       2     13%     13%
+src/app.rs                                    100     100     100    100%    100%
 …
 ─────────────────────────────────────────────────────────────────────────────
-TOTAL                                         214     182     175     85%     82%
+TOTAL                                        1307     309     309     24%     24%
 ```
 
 - **Seen%** — symbols the agent has any awareness of
@@ -404,6 +420,15 @@ arguments arrive as an unparsed token tree — so those are re-parsed as source,
 and since macros nest it runs as a bounded worklist that feeds itself. Without
 it, anything called from inside `println!` or `assert_eq!` is invisible.
 
+The TUI's file watcher enters this pipeline at `SRC`, and so has to agree with
+the walk about what counts as a project file. `ProjectScope` (`src/filter.rs`)
+is that shared answer. It is deliberately the narrower of the two — it reads the
+root `.gitignore` and `.git/info/exclude`, not `.gitignore` files nested in
+subdirectories, which `WalkBuilder` discovers as it descends. The asymmetry
+points that way on purpose: too permissive merely admits a file the scan would
+have skipped, while too strict would silently stop live updates for a file the
+scan included, which is both worse and harder to notice.
+
 # Configuration
 
 ## The read journal
@@ -416,7 +441,7 @@ ambits -p . cache clear --session <id>
 ambits -p . cache clear --all
 ```
 
-Size is bounded by what an agent can read in one session, not by repository size — a full day of heavy work on this repo is around 150 KB. Nothing is pruned automatically, and `cache clear` requires naming a target, because a journal is the only record of what a past session read.
+Size is bounded by what an agent can read in one session, not by repository size — a full day of heavy work on this repo runs to a few hundred KB. Nothing is pruned automatically, and `cache clear` requires naming a target, because a journal is the only record of what a past session read.
 
 Disable with `--no-journal`; tune the write interval with `--flush-interval-ms`.
 
