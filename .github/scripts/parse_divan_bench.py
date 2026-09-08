@@ -46,12 +46,23 @@ def strip_tree_prefix(line: str) -> tuple[int, str]:
     Remove divan's tree-drawing prefix characters and return (indent_level, clean_text).
     Indent level is determined by how many leading whitespace/box chars there are.
     """
-    # Count leading whitespace to estimate nesting depth
-    stripped = line.lstrip()
-    indent = len(line) - len(stripped)
-    # Remove box-drawing characters from the start of the stripped text
-    clean = stripped.lstrip("".join(BRANCH_CHARS) + " ")
-    return indent, clean
+    # Depth must count the box-drawing prefix, not just whitespace. Divan draws
+    # every group but the last with a `│` continuation column:
+    #
+    #     ├─ bench_content_hash
+    #     │  ├─ large            <- starts with `│`, not a space
+    #     ╰─ bench_estimate_tokens
+    #        ├─ large            <- starts with spaces
+    #
+    # Measuring whitespace alone gave those `│`-prefixed children the same
+    # depth as their parent, so the parent was popped off the stack and the
+    # bench name was lost from the path. Every group except the last silently
+    # produced names like `merkle_hash/large`, which matched no threshold and
+    # was skipped — 8 of 12 checks in this file were inert.
+    i = 0
+    while i < len(line) and (line[i].isspace() or line[i] in BRANCH_CHARS):
+        i += 1
+    return i, line[i:]
 
 
 def extract_median(line: str) -> float | None:
