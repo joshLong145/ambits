@@ -325,6 +325,25 @@ impl App {
         self.rebuild_tree_rows();
     }
 
+    /// Adopt a new session identity, discarding everything tied to the old one.
+    ///
+    /// Ordering is the whole point of this method. [`Self::reset_session`]
+    /// rebuilds `agent_tree` from scratch and re-seeds its root from
+    /// `self.session_id`, while [`AgentTree::add_agent`] latches `root_id` on
+    /// the first parentless node it ever sees. Resetting *before* adopting the
+    /// new id therefore seeds the fresh tree with the session that just ended
+    /// and pins `root_id` to it permanently; the live session is then added as
+    /// a second parentless node, and the agent panel renders two rows both
+    /// labelled `main` — one of them a corpse.
+    ///
+    /// Callers switching sessions must use this rather than `reset_session` +
+    /// [`Self::set_session_id`]. A bare `reset_session` remains correct for a
+    /// `/clear` *within* one session, where the identity does not change.
+    pub fn switch_session(&mut self, session_id: Option<String>) {
+        self.session_id = session_id;
+        self.reset_session();
+    }
+
     /// Snapshot the current ledger state, record a compaction event, then
     /// demote every ledger entry to [`Provenance::Restored`].
     ///
