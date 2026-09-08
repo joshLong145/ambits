@@ -387,6 +387,12 @@ pub fn mark_stale_symbols(
     check_staleness(new_symbols, &old_map, ledger);
 }
 
+impl Default for ContextLedger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,11 +602,5 @@ mod tests {
         assert_eq!(ledger.depth_of_for_agent("s1", "a"), ReadDepth::NameOnly);
         assert_eq!(ledger.depth_of_for_agent("s1", "b"), ReadDepth::Signature);
         assert_eq!(ledger.depth_of_for_agent("s1", "c"), ReadDepth::FullBody);
-    }
-}
-
-impl Default for ContextLedger {
-    fn default() -> Self {
-        Self::new()
     }
 }

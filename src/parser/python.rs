@@ -488,6 +488,12 @@ fn extract_from_compound_bodies(
     }
 }
 
+impl Default for PythonParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -930,11 +936,5 @@ mod tests {
         assert!(!is_upper_snake_case("myVar"));
         assert!(!is_upper_snake_case("Max_Size"));
         assert!(!is_upper_snake_case("123"));
-    }
-}
-
-impl Default for PythonParser {
-    fn default() -> Self {
-        Self::new()
     }
 }

@@ -288,6 +288,12 @@ fn child_by_kind<'a>(node: &'a Node<'a>, kind: &str) -> Option<Node<'a>> {
     result
 }
 
+impl Default for RustParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,11 +367,5 @@ impl Display for P {
     fn parse_empty_file() {
         let syms = parse("");
         assert!(syms.is_empty());
-    }
-}
-
-impl Default for RustParser {
-    fn default() -> Self {
-        Self::new()
     }
 }

@@ -638,6 +638,12 @@ fn has_child_kind(node: &Node, kind: &str) -> bool {
     result
 }
 
+impl Default for TypescriptParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1187,11 +1193,5 @@ declare function require(id: string): any;
     fn estimated_tokens_nonzero() {
         let syms = parse("function foo() { return 42; }");
         assert!(syms[0].estimated_tokens > 0);
-    }
-}
-
-impl Default for TypescriptParser {
-    fn default() -> Self {
-        Self::new()
     }
 }
