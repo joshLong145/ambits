@@ -15,9 +15,82 @@
 //! project root is checked by [`PathFilter::validate`] so the CLI can produce
 //! a clear "not accessible from root" error before any scan work begins.
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use color_eyre::eyre::{eyre, Result};
+
+/// Decides whether a path is part of the project at all, independently of any
+/// user-supplied [`PathFilter`].
+///
+/// This exists because the scanner and the file watcher disagreed. The scanner
+/// walks with `ignore`'s gitignore handling, so `target/` never enters the
+/// tree; the watcher filtered only on file extension, so a build tool writing
+/// `target/**/out/*.rs` — rust-analyzer running `cargo check`, say — pushed
+/// generated files into the tree one event at a time, and nothing ever removed
+/// them.
+///
+/// Deliberately *narrower* in fidelity than the scanner's walk: it reads the
+/// root `.gitignore` and `.git/info/exclude`, not `.gitignore` files nested in
+/// subdirectories, which `ignore::WalkBuilder` discovers as it descends. That
+/// asymmetry is the safe direction. Being too permissive means a file the
+/// scanner would have skipped can still reach the tree — the old behaviour,
+/// for an exotic layout. Being too strict would silently stop live updates for
+/// files the scanner *did* include, which is a worse failure and much harder
+/// to notice. `scope_agrees_with_the_scanner` pins the invariant against this
+/// repo.
+#[derive(Debug)]
+pub struct ProjectScope {
+    root: PathBuf,
+    ignore: ignore::gitignore::Gitignore,
+}
+
+impl ProjectScope {
+    /// Build a scope for `root`, reading its `.gitignore` and
+    /// `.git/info/exclude`. Unreadable or absent files simply contribute no
+    /// patterns — a missing `.gitignore` is normal, not an error.
+    pub fn new(root: &Path) -> Self {
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+        // `add` returns Some(err) on failure and None on success; a missing
+        // file is reported the same way, so both are ignored on purpose.
+        builder.add(root.join(".gitignore"));
+        builder.add(root.join(".git/info/exclude"));
+
+        let ignore = builder.build().unwrap_or_else(|_| {
+            ignore::gitignore::Gitignore::empty()
+        });
+
+        Self {
+            root: root.to_path_buf(),
+            ignore,
+        }
+    }
+
+    /// Is `path` inside the project and not excluded?
+    ///
+    /// Rejects anything outside `root`, anything under a dot-prefixed
+    /// component (matching the scanner's `hidden(true)`), and anything the
+    /// gitignore patterns exclude. Parent directories are consulted, so a file
+    /// under an ignored directory is excluded even when only the directory is
+    /// named in `.gitignore` — which is how `/target` excludes
+    /// `target/debug/build/serde/out/private.rs`.
+    pub fn contains(&self, path: &Path) -> bool {
+        let Ok(rel) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+
+        let hidden = rel
+            .components()
+            .any(|c| matches!(c, Component::Normal(s) if s.to_string_lossy().starts_with('.')));
+        if hidden {
+            return false;
+        }
+
+        !self
+            .ignore
+            .matched_path_or_any_parents(rel, false)
+            .is_ignore()
+    }
+}
 
 /// Restricts which files are included in a project scan.
 #[derive(Debug, Clone)]
@@ -312,5 +385,95 @@ mod tests {
     #[test]
     fn display_regex_uses_re_prefix() {
         assert_eq!(re("^foo$").display(), "re:^foo$");
+    }
+
+    // -- ProjectScope ------------------------------------------------------
+
+    /// A project root with a `.gitignore` and one file at each of the paths
+    /// in `files`.
+    fn scoped_project(gitignore: &str, files: &[&str]) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), gitignore).unwrap();
+        for f in files {
+            let path = dir.path().join(f);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "fn x() {}\n").unwrap();
+        }
+        dir
+    }
+
+    /// The case that started this: build output under an ignored directory.
+    #[test]
+    fn scope_excludes_files_under_an_ignored_directory() {
+        let dir = scoped_project(
+            "/target\n",
+            &["src/main.rs", "target/release/build/serde/out/private.rs"],
+        );
+        let scope = ProjectScope::new(dir.path());
+
+        assert!(scope.contains(&dir.path().join("src/main.rs")));
+        assert!(
+            !scope.contains(&dir.path().join("target/release/build/serde/out/private.rs")),
+            "`/target` must exclude everything beneath it, not just the directory entry"
+        );
+    }
+
+    #[test]
+    fn scope_excludes_hidden_components() {
+        let dir = scoped_project("", &["src/main.rs", ".cache/gen.rs"]);
+        let scope = ProjectScope::new(dir.path());
+
+        assert!(scope.contains(&dir.path().join("src/main.rs")));
+        assert!(!scope.contains(&dir.path().join(".cache/gen.rs")));
+    }
+
+    #[test]
+    fn scope_excludes_a_named_file_pattern() {
+        let dir = scoped_project("*.gen.rs\n", &["src/a.rs", "src/b.gen.rs"]);
+        let scope = ProjectScope::new(dir.path());
+
+        assert!(scope.contains(&dir.path().join("src/a.rs")));
+        assert!(!scope.contains(&dir.path().join("src/b.gen.rs")));
+    }
+
+    #[test]
+    fn scope_rejects_paths_outside_the_root() {
+        let dir = scoped_project("", &["src/main.rs"]);
+        let scope = ProjectScope::new(dir.path());
+
+        assert!(!scope.contains(Path::new("/etc/passwd")));
+    }
+
+    #[test]
+    fn scope_without_a_gitignore_admits_everything_visible() {
+        let dir = TempDir::new().unwrap();
+        let scope = ProjectScope::new(dir.path());
+
+        assert!(scope.contains(&dir.path().join("src/main.rs")));
+    }
+
+    /// The invariant the watcher depends on: every file the scanner puts in
+    /// the tree must also be in scope. If these two ever drift, live updates
+    /// silently stop for whatever the scope wrongly rejects.
+    #[test]
+    fn scope_agrees_with_the_scanner() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let scope = ProjectScope::new(root);
+        let tree = crate::parser::ParserRegistry::new()
+            .scan_project(root, None)
+            .expect("scanning this repo must succeed");
+
+        assert!(!tree.files.is_empty(), "the scan found nothing to compare");
+        for file in &tree.files {
+            let abs = root.join(&file.file_path);
+            assert!(
+                scope.contains(&abs),
+                "scanner included {} but the scope rejects it",
+                file.file_path.display()
+            );
+        }
+
+        // And the converse for the path that motivated all this.
+        assert!(!scope.contains(&root.join("target/debug/build/serde/out/private.rs")));
     }
 }

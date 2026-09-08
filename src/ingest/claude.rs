@@ -739,9 +739,14 @@ impl LogTailer {
         let mut positions = std::collections::HashMap::new();
         for f in &files {
             // Start at the current end of file so we only get new events.
-            if let Ok(meta) = fs::metadata(f) {
-                positions.insert(f.clone(), meta.len());
-            }
+            //
+            // Every file gets a key, including one that cannot be stat'd:
+            // `read_new_events` treats a missing key as position 0 and could
+            // not write one back, so a single failed stat here meant that file
+            // was re-read from the top on every poll forever, replaying its
+            // whole history as new events each time.
+            let start = fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+            positions.insert(f.clone(), start);
         }
         Self { files, positions, mapper, pending_metadata: None }
     }
@@ -815,10 +820,9 @@ impl LogTailer {
                 }
             }
 
-            // Update position in-place — key is already present from `new()` or `add_file()`.
-            if let Some(p) = self.positions.get_mut(&self.files[i]) {
-                *p = current_len;
-            }
+            // Insert rather than `get_mut`: an absent key must start tracking
+            // from here, not silently keep re-reading from 0.
+            self.positions.insert(self.files[i].clone(), current_len);
         }
 
         output

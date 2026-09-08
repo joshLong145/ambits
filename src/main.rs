@@ -670,6 +670,9 @@ fn run_tui(
             Ok(AppEvent::FileChanged(path)) => {
                 tui::TuiSession::handle_file_changed(path, project_path, registry, app);
             }
+            Ok(AppEvent::FileRemoved(path)) => {
+                tui::TuiSession::handle_file_removed(path, project_path, app);
+            }
             Ok(AppEvent::Tick) => {
                 session.handle_tick(log_dir, app, serena_mode, project_path);
             }

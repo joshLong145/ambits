@@ -8,6 +8,7 @@ use color_eyre::eyre::Result;
 use notify::{Event as NotifyEvent, EventKind, RecursiveMode, Watcher};
 
 use ambits::app::App;
+use ambits::filter::ProjectScope;
 use ambits::ingest::{EventTailer, SessionIngester};
 
 use crate::events::AppEvent;
@@ -47,18 +48,31 @@ impl TuiSession {
         serena_mode: bool,
         tx: &flume::Sender<AppEvent>,
     ) -> Result<Self> {
-        // Project source watcher — fires FileChanged for recognized extensions.
+        // Project source watcher — fires FileChanged for recognized extensions
+        // that are actually part of the project. Without the scope check the
+        // watcher sees everything under the root, including the build output
+        // the scanner deliberately skips.
         let tx_file = tx.clone();
+        let scope = ProjectScope::new(project_path);
         let mut project_watcher =
             notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
                 if let Ok(event) = res {
-                    if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                    let removed = matches!(event.kind, EventKind::Remove(_));
+                    if removed || matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
+                    {
                         for path in event.paths {
-                            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                                if watched_extensions.contains(ext) {
-                                    let _ = tx_file.try_send(AppEvent::FileChanged(path));
-                                }
+                            let watched = path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .is_some_and(|ext| watched_extensions.contains(ext));
+                            if !watched || !scope.contains(&path) {
+                                continue;
                             }
+                            let _ = tx_file.try_send(if removed {
+                                AppEvent::FileRemoved(path)
+                            } else {
+                                AppEvent::FileChanged(path)
+                            });
                         }
                     }
                 }
@@ -275,6 +289,27 @@ impl TuiSession {
                     }
                 }
             }
+        }
+    }
+
+    /// Drop a deleted file's row from the project tree.
+    ///
+    /// The ledger keeps its entries for the removed symbols on purpose: they
+    /// record what an agent read, which stays true after the file is gone, and
+    /// a rename fires Remove + Create so discarding them would lose coverage
+    /// across an ordinary refactor.
+    pub fn handle_file_removed(path: PathBuf, project_path: &Path, app: &mut App) {
+        let Ok(rel) = path.strip_prefix(project_path) else {
+            return;
+        };
+        let rel_str = rel.to_string_lossy().to_string();
+        let before = app.project_tree.files.len();
+        app.project_tree
+            .files
+            .retain(|f| f.file_path.to_string_lossy() != rel_str);
+
+        if app.project_tree.files.len() != before {
+            app.rebuild_tree_rows();
         }
     }
 }
@@ -534,6 +569,70 @@ mod tests {
             Some("sentinel"),
             "a second reset would have cleared this"
         );
+    }
+
+    /// Build a real two-file project and scan it, so the tree under test is
+    /// shaped exactly as the TUI's is.
+    fn scanned_project() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("alpha.rs"), "pub fn alpha() {}\n").unwrap();
+        fs::write(dir.path().join("beta.rs"), "pub fn beta() {}\n").unwrap();
+
+        let tree = ambits::parser::ParserRegistry::new()
+            .scan_project(dir.path(), None)
+            .unwrap();
+        assert_eq!(tree.files.len(), 2);
+
+        let app = App::new(tree, dir.path().to_path_buf(), None);
+        (dir, app)
+    }
+
+    /// Before this, nothing handled `EventKind::Remove` — a deleted file kept
+    /// its row until the TUI was restarted, so the tree only ever grew.
+    #[test]
+    fn removing_a_file_drops_it_from_the_tree() {
+        let (dir, mut app) = scanned_project();
+
+        TuiSession::handle_file_removed(dir.path().join("beta.rs"), dir.path(), &mut app);
+
+        let remaining: Vec<String> = app
+            .project_tree
+            .files
+            .iter()
+            .map(|f| f.file_path.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(remaining, vec!["alpha.rs".to_string()]);
+    }
+
+    /// The ledger is a record of what was read, which a deletion does not
+    /// falsify — and a rename arrives as Remove + Create, so dropping entries
+    /// here would lose coverage across an ordinary refactor.
+    #[test]
+    fn removing_a_file_leaves_the_ledger_alone() {
+        let (dir, mut app) = scanned_project();
+        let symbol = app.project_tree.files[1].symbols[0].clone();
+        app.ledger.record(
+            symbol.id.clone(),
+            ambits::tracking::ReadDepth::FullBody,
+            symbol.content_hash,
+            "agent-1".to_string(),
+            10,
+        );
+        let before = app.ledger.entries.len();
+        assert!(before > 0);
+
+        TuiSession::handle_file_removed(dir.path().join("beta.rs"), dir.path(), &mut app);
+
+        assert_eq!(app.ledger.entries.len(), before);
+    }
+
+    #[test]
+    fn removing_an_unknown_file_is_a_no_op() {
+        let (dir, mut app) = scanned_project();
+
+        TuiSession::handle_file_removed(dir.path().join("never_existed.rs"), dir.path(), &mut app);
+
+        assert_eq!(app.project_tree.files.len(), 2);
     }
 
     #[test]

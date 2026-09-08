@@ -17,6 +17,9 @@ pub enum AppEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
     FileChanged(PathBuf),
+    /// A watched source file was deleted or renamed away. Without this the
+    /// file tree only ever grew: a removed file kept its row until restart.
+    FileRemoved(PathBuf),
     Tick,
 }
 
