@@ -3,17 +3,20 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyEvent, MouseEvent};
 
-use ambits::ingest::AgentToolCall;
-
-/// Unified application event.
+/// Something the TUI loop must react to.
+///
+/// Only what a producer actually sends. Session activity is deliberately not
+/// here: agent events, clears and compactions reach the app through
+/// `TuiSession::handle_tick`, which polls the log tailer, rather than being
+/// pushed down this channel. Variants existed for all three and were matched
+/// in the loop, but nothing had constructed them since that responsibility
+/// moved — three arms that could never fire, implying a data path that no
+/// longer exists.
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
     FileChanged(PathBuf),
-    AgentEvent(AgentToolCall),
-    SessionCleared,
-    Compacted(ambits::ingest::CompactionEvent),
     Tick,
 }
 

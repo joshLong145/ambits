@@ -670,11 +670,6 @@ fn run_tui(
             Ok(AppEvent::FileChanged(path)) => {
                 tui::TuiSession::handle_file_changed(path, project_path, registry, app);
             }
-            Ok(AppEvent::AgentEvent(event)) => app.process_agent_event(event),
-            Ok(AppEvent::SessionCleared) => app.reset_session(),
-            Ok(AppEvent::Compacted(ev)) => {
-                app.process_compaction(ev.summary, ev.timestamp, ev.agent_id, ev.metadata);
-            }
             Ok(AppEvent::Tick) => {
                 session.handle_tick(log_dir, app, serena_mode, project_path);
             }

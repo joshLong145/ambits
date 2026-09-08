@@ -8,7 +8,19 @@ use std::path::{Path, PathBuf};
 use color_eyre::eyre::Result;
 
 use crate::filter::PathFilter;
-use crate::symbols::{FileSymbols, ProjectTree};
+use crate::symbols::{FileSymbols, ProjectTree, SymbolCategory};
+
+/// What a grammar node maps to in the symbol tree.
+///
+/// Identical in all three parsers before this — each declared its own copy, so
+/// a change to the shape had to be made three times or silently diverge. The
+/// per-language constants built from it stay with their parsers, since those
+/// genuinely differ.
+#[derive(Debug, Clone, Copy)]
+pub struct SymbolMeta {
+    pub category: SymbolCategory,
+    pub label: &'static str,
+}
 
 /// Trait for language-specific parsers.
 /// Implement this trait to add support for a new language.
@@ -175,5 +187,11 @@ impl ParserRegistry {
             root: root.to_path_buf(),
             files,
         })
+    }
+}
+
+impl Default for ParserRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }

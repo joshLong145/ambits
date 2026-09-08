@@ -4,6 +4,7 @@ use std::sync::Arc;
 use color_eyre::eyre::eyre;
 use tree_sitter::{Node, Parser};
 
+use super::SymbolMeta;
 use crate::symbols::merkle::{compute_merkle_hash, content_hash, estimate_tokens};
 use crate::symbols::{FileSymbols, NameInterner, SymbolCategory, SymbolNode};
 
@@ -89,11 +90,6 @@ impl LanguageParser for RustParser {
 }
 
 /// Symbol metadata: category and display label
-struct SymbolMeta {
-    category: SymbolCategory,
-    label: &'static str,
-}
-
 const MOD: SymbolMeta = SymbolMeta { category: SymbolCategory::Module, label: "mod" };
 const STRUCT: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "struct" };
 const ENUM: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "enum" };
@@ -365,5 +361,11 @@ impl Display for P {
     fn parse_empty_file() {
         let syms = parse("");
         assert!(syms.is_empty());
+    }
+}
+
+impl Default for RustParser {
+    fn default() -> Self {
+        Self::new()
     }
 }

@@ -598,3 +598,9 @@ mod tests {
         assert_eq!(ledger.depth_of_for_agent("s1", "c"), ReadDepth::FullBody);
     }
 }
+
+impl Default for ContextLedger {
+    fn default() -> Self {
+        Self::new()
+    }
+}

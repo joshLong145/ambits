@@ -35,6 +35,7 @@ use std::sync::Arc;
 use color_eyre::eyre::eyre;
 use tree_sitter::{Node, Parser};
 
+use super::SymbolMeta;
 use crate::symbols::merkle::{compute_merkle_hash, content_hash, estimate_tokens};
 use crate::symbols::{FileSymbols, NameInterner, SymbolCategory, SymbolNode};
 
@@ -111,11 +112,6 @@ impl LanguageParser for PythonParser {
 // mapping logic at every call site.
 
 /// Pairs a [`SymbolCategory`] with a display label for use in [`SymbolNode`].
-struct SymbolMeta {
-    category: SymbolCategory,
-    label: &'static str,
-}
-
 // -- Definitions ------------------------------------------------------------
 const CLASS: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "class" };
 const DEF: SymbolMeta = SymbolMeta { category: SymbolCategory::Function, label: "def" };
@@ -934,5 +930,11 @@ mod tests {
         assert!(!is_upper_snake_case("myVar"));
         assert!(!is_upper_snake_case("Max_Size"));
         assert!(!is_upper_snake_case("123"));
+    }
+}
+
+impl Default for PythonParser {
+    fn default() -> Self {
+        Self::new()
     }
 }

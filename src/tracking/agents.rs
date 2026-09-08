@@ -39,3 +39,9 @@ impl AgentTree {
             .collect()
     }
 }
+
+impl Default for AgentTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
