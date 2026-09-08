@@ -6,8 +6,8 @@
 
   "merkle_hash/bench_estimate_tokens/tiny":  2000,
   "merkle_hash/bench_estimate_tokens/small": 2000,
-  "merkle_hash/bench_estimate_tokens/medium":5000,
-  "merkle_hash/bench_estimate_tokens/large": 15000,
+  "merkle_hash/bench_estimate_tokens/medium":15000,
+  "merkle_hash/bench_estimate_tokens/large": 40000,
 
   "merkle_hash/bench_compute_merkle_hash/1":    5000,
   "merkle_hash/bench_compute_merkle_hash/10":   50000,
@@ -57,10 +57,10 @@
   "coverage/count_symbols_nested_depth/3": 100000,
   "coverage/count_symbols_nested_depth/5": 2000000,
 
-  "tracking/record_n_symbols/10":    10000,
-  "tracking/record_n_symbols/100":   100000,
-  "tracking/record_n_symbols/1000":  1000000,
-  "tracking/record_n_symbols/10000": 10000000,
+  "tracking/record_n_symbols/10":    20000,
+  "tracking/record_n_symbols/100":   200000,
+  "tracking/record_n_symbols/1000":  2000000,
+  "tracking/record_n_symbols/10000": 20000000,
 
   "tracking/record_upgrade_n_symbols/10":  30000,
   "tracking/record_upgrade_n_symbols/100": 300000,
