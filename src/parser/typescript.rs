@@ -89,7 +89,13 @@ impl LanguageParser for TypescriptParser {
         let file_path_arc = Arc::new(path.to_path_buf());
         let names = NameInterner::new();
 
-        extract_symbols(root, src, &file_path_arc, &names, &path_prefix, "", &mut symbols);
+        let ctx = FileCtx {
+            src,
+            file_path: &file_path_arc,
+            names: &names,
+            path_prefix: &path_prefix,
+        };
+        extract_symbols(root, &ctx, "", &mut symbols);
 
         for sym in symbols.iter_mut() {
             compute_merkle_hash(sym);
@@ -150,12 +156,22 @@ const DECLARE: SymbolMeta = SymbolMeta { category: SymbolCategory::Variable, lab
 ///
 /// The function is called at the top level (with `root_node`) and recursively by
 /// `emit_namespace` to handle nested declarations inside `namespace` blocks.
+/// What stays fixed while walking one file.
+///
+/// Every extractor below needs the same four values and none of them change
+/// during a parse, so threading them individually made each signature four
+/// parameters longer without saying anything — and buried `parent_name_path`,
+/// the one that actually varies, among them.
+struct FileCtx<'a> {
+    src: &'a [u8],
+    file_path: &'a Arc<PathBuf>,
+    names: &'a NameInterner,
+    path_prefix: &'a str,
+}
+
 fn extract_symbols(
     node: Node,
-    src: &[u8],
-    file_path: &Arc<PathBuf>,
-    names: &NameInterner,
-    path_prefix: &str,
+    ctx: &FileCtx,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
 ) {
@@ -181,7 +197,7 @@ fn extract_symbols(
             let mut inner_cursor = child.walk();
             for inner in child.children(&mut inner_cursor) {
                 if inner.kind() == "internal_module" {
-                    emit_namespace(&inner, src, file_path, names, path_prefix, parent_name_path, out);
+                    emit_namespace(&inner, ctx, parent_name_path, out);
                 }
             }
             continue;
@@ -194,45 +210,45 @@ fn extract_symbols(
         match target.kind() {
             // `function foo()` or `function* gen()` - leaf symbol, no children.
             "function_declaration" | "generator_function_declaration" => {
-                if let Some(sym) = build_named_symbol(&target, src, file_path, names, path_prefix, parent_name_path, &FN, byte_range) {
+                if let Some(sym) = build_named_symbol(&target, ctx, parent_name_path, &FN, byte_range) {
                     out.push(sym);
                 }
             }
             // `class Foo { ... }` - container, recurse into class_body for members.
             "class_declaration" => {
-                emit_class(&target, src, file_path, names, path_prefix, parent_name_path, &CLASS, byte_range, out);
+                emit_class(&target, ctx, parent_name_path, &CLASS, byte_range, out);
             }
             // `abstract class Base { ... }` - same as class but different label.
             "abstract_class_declaration" => {
-                emit_class(&target, src, file_path, names, path_prefix, parent_name_path, &ABSTRACT_CLASS, byte_range, out);
+                emit_class(&target, ctx, parent_name_path, &ABSTRACT_CLASS, byte_range, out);
             }
             // `interface Config { ... }` - container, recurse into interface_body.
             "interface_declaration" => {
-                emit_interface(&target, src, file_path, names, path_prefix, parent_name_path, byte_range, out);
+                emit_interface(&target, ctx, parent_name_path, byte_range, out);
             }
             // `type Alias = ...` - leaf symbol.
             "type_alias_declaration" => {
-                if let Some(sym) = build_named_symbol(&target, src, file_path, names, path_prefix, parent_name_path, &TYPE, byte_range) {
+                if let Some(sym) = build_named_symbol(&target, ctx, parent_name_path, &TYPE, byte_range) {
                     out.push(sym);
                 }
             }
             // `enum Status { ... }` - leaf (we don't extract enum members).
             "enum_declaration" => {
-                if let Some(sym) = build_named_symbol(&target, src, file_path, names, path_prefix, parent_name_path, &ENUM, byte_range) {
+                if let Some(sym) = build_named_symbol(&target, ctx, parent_name_path, &ENUM, byte_range) {
                     out.push(sym);
                 }
             }
             // `namespace N { ... }` / `module M { ... }` - container, recurse.
             "internal_module" | "module" => {
-                emit_namespace(&target, src, file_path, names, path_prefix, parent_name_path, out);
+                emit_namespace(&target, ctx, parent_name_path, out);
             }
             // `const foo = () => {}` or `let bar = function() {}` - detect arrow/fn expressions.
             "lexical_declaration" | "variable_declaration" => {
-                extract_arrow_fns(&target, src, file_path, names, path_prefix, parent_name_path, out);
+                extract_arrow_fns(&target, ctx, parent_name_path, out);
             }
             // `declare function ...`, `declare class ...`, `declare const ...`, etc.
             "ambient_declaration" => {
-                extract_ambient(&target, src, file_path, names, path_prefix, parent_name_path, out);
+                extract_ambient(&target, ctx, parent_name_path, out);
             }
             // Imports, comments, expression statements, etc. - ignored.
             _ => {}
@@ -257,10 +273,7 @@ fn extract_symbols(
 /// just the arrow function body, so the coverage span is accurate.
 fn extract_arrow_fns(
     node: &Node,
-    src: &[u8],
-    file_path: &Arc<PathBuf>,
-    names: &NameInterner,
-    path_prefix: &str,
+    ctx: &FileCtx,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
 ) {
@@ -281,7 +294,7 @@ fn extract_arrow_fns(
         }
 
         let name = match child.child_by_field_name("name") {
-            Some(n) => match n.utf8_text(src) {
+            Some(n) => match n.utf8_text(ctx.src) {
                 Ok(s) => s.to_string(),
                 Err(_) => continue,
             },
@@ -290,7 +303,7 @@ fn extract_arrow_fns(
 
         // Use the full declaration range (includes const/let keyword).
         let byte_range = node.byte_range();
-        out.push(make_symbol(name, &FN, node, byte_range, src, file_path, names, path_prefix, parent_name_path, Vec::new()));
+        out.push(make_symbol(name, &FN, node, byte_range, ctx, parent_name_path, Vec::new()));
     }
 }
 
@@ -305,10 +318,7 @@ fn extract_arrow_fns(
 /// a single declaration can bind multiple names.
 fn extract_ambient(
     node: &Node,
-    src: &[u8],
-    file_path: &Arc<PathBuf>,
-    names: &NameInterner,
-    path_prefix: &str,
+    ctx: &FileCtx,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
 ) {
@@ -319,17 +329,17 @@ fn extract_ambient(
         let name = match child.kind() {
             "function_signature" | "class_declaration" | "abstract_class_declaration"
             | "interface_declaration" | "enum_declaration" | "type_alias_declaration"
-            | "internal_module" | "module" => child_name(&child, src),
+            | "internal_module" | "module" => child_name(&child, ctx.src),
             "lexical_declaration" | "variable_declaration" => {
                 // Extract variable names from declare const/let/var.
-                extract_ambient_vars(&child, src, file_path, names, path_prefix, parent_name_path, &ambient_range, out);
+                extract_ambient_vars(&child, ctx, parent_name_path, &ambient_range, out);
                 None
             }
             _ => None,
         };
 
         if let Some(name) = name {
-            out.push(make_symbol(name, &DECLARE, node, ambient_range, src, file_path, names, path_prefix, parent_name_path, Vec::new()));
+            out.push(make_symbol(name, &DECLARE, node, ambient_range, ctx, parent_name_path, Vec::new()));
             return; // One symbol per ambient_declaration.
         }
     }
@@ -338,10 +348,7 @@ fn extract_ambient(
 /// Extract variable names from `declare const x: T` / `declare let x: T`.
 fn extract_ambient_vars(
     node: &Node,
-    src: &[u8],
-    file_path: &Arc<PathBuf>,
-    names: &NameInterner,
-    path_prefix: &str,
+    ctx: &FileCtx,
     parent_name_path: &str,
     ambient_range: &std::ops::Range<usize>,
     out: &mut Vec<SymbolNode>,
@@ -353,14 +360,14 @@ fn extract_ambient_vars(
         }
 
         let name = match child.child_by_field_name("name") {
-            Some(n) => match n.utf8_text(src) {
+            Some(n) => match n.utf8_text(ctx.src) {
                 Ok(s) => s.to_string(),
                 Err(_) => continue,
             },
             None => continue,
         };
 
-        out.push(make_symbol(name, &DECLARE, &child, ambient_range.clone(), src, file_path, names, path_prefix, parent_name_path, Vec::new()));
+        out.push(make_symbol(name, &DECLARE, &child, ambient_range.clone(), ctx, parent_name_path, Vec::new()));
     }
 }
 
@@ -374,16 +381,13 @@ fn extract_ambient_vars(
 /// properties, getters, and setters found inside the class body.
 fn emit_class(
     node: &Node,
-    src: &[u8],
-    file_path: &Arc<PathBuf>,
-    names: &NameInterner,
-    path_prefix: &str,
+    ctx: &FileCtx,
     parent_name_path: &str,
     meta: &SymbolMeta,
     byte_range: std::ops::Range<usize>,
     out: &mut Vec<SymbolNode>,
 ) {
-    let name = match child_name(node, src) {
+    let name = match child_name(node, ctx.src) {
         Some(n) => n,
         None => return,
     };
@@ -396,10 +400,10 @@ fn emit_class(
 
     let mut children = Vec::new();
     if let Some(body) = child_by_kind(node, "class_body") {
-        extract_members(body, src, file_path, names, path_prefix, &name_path, &mut children);
+        extract_members(body, ctx, &name_path, &mut children);
     }
 
-    out.push(make_symbol(name, meta, node, byte_range, src, file_path, names, path_prefix, parent_name_path, children));
+    out.push(make_symbol(name, meta, node, byte_range, ctx, parent_name_path, children));
 }
 
 /// Extract members from a `class_body` or `interface_body` node.
@@ -413,10 +417,7 @@ fn emit_class(
 ///   interface method declarations without bodies.
 fn extract_members(
     body: Node,
-    src: &[u8],
-    file_path: &Arc<PathBuf>,
-    names: &NameInterner,
-    path_prefix: &str,
+    ctx: &FileCtx,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
 ) {
@@ -424,7 +425,7 @@ fn extract_members(
     for child in body.children(&mut cursor) {
         let (name, meta) = match child.kind() {
             "method_definition" => {
-                let name = match child_name(&child, src) {
+                let name = match child_name(&child, ctx.src) {
                     Some(n) => n,
                     None => continue,
                 };
@@ -438,13 +439,13 @@ fn extract_members(
                 (name, meta)
             }
             "public_field_definition" | "property_signature" => {
-                match child_name(&child, src) {
+                match child_name(&child, ctx.src) {
                     Some(n) => (n, &PROP),
                     None => continue,
                 }
             }
             "abstract_method_signature" | "method_signature" => {
-                match child_name(&child, src) {
+                match child_name(&child, ctx.src) {
                     Some(n) => (n, &METHOD),
                     None => continue,
                 }
@@ -453,7 +454,7 @@ fn extract_members(
         };
 
         let byte_range = child.byte_range();
-        out.push(make_symbol(name, meta, &child, byte_range, src, file_path, names, path_prefix, parent_name_path, Vec::new()));
+        out.push(make_symbol(name, meta, &child, byte_range, ctx, parent_name_path, Vec::new()));
     }
 }
 
@@ -463,15 +464,12 @@ fn extract_members(
 /// of `class_body`, and always uses the [`IFACE`] metadata.
 fn emit_interface(
     node: &Node,
-    src: &[u8],
-    file_path: &Arc<PathBuf>,
-    names: &NameInterner,
-    path_prefix: &str,
+    ctx: &FileCtx,
     parent_name_path: &str,
     byte_range: std::ops::Range<usize>,
     out: &mut Vec<SymbolNode>,
 ) {
-    let name = match child_name(node, src) {
+    let name = match child_name(node, ctx.src) {
         Some(n) => n,
         None => return,
     };
@@ -484,10 +482,10 @@ fn emit_interface(
 
     let mut children = Vec::new();
     if let Some(body) = child_by_kind(node, "interface_body") {
-        extract_members(body, src, file_path, names, path_prefix, &name_path, &mut children);
+        extract_members(body, ctx, &name_path, &mut children);
     }
 
-    out.push(make_symbol(name, &IFACE, node, byte_range, src, file_path, names, path_prefix, parent_name_path, children));
+    out.push(make_symbol(name, &IFACE, node, byte_range, ctx, parent_name_path, children));
 }
 
 /// Emit a `namespace`/`module` symbol and recurse into `statement_block` for nested declarations.
@@ -497,14 +495,11 @@ fn emit_interface(
 /// into [`extract_symbols`] rather than [`extract_members`].
 fn emit_namespace(
     node: &Node,
-    src: &[u8],
-    file_path: &Arc<PathBuf>,
-    names: &NameInterner,
-    path_prefix: &str,
+    ctx: &FileCtx,
     parent_name_path: &str,
     out: &mut Vec<SymbolNode>,
 ) {
-    let name = match child_name(node, src) {
+    let name = match child_name(node, ctx.src) {
         Some(n) => n,
         None => return,
     };
@@ -517,11 +512,11 @@ fn emit_namespace(
 
     let mut children = Vec::new();
     if let Some(body) = child_by_kind(node, "statement_block") {
-        extract_symbols(body, src, file_path, names, path_prefix, &name_path, &mut children);
+        extract_symbols(body, ctx, &name_path, &mut children);
     }
 
     let byte_range = node.byte_range();
-    out.push(make_symbol(name, &NS, node, byte_range, src, file_path, names, path_prefix, parent_name_path, children));
+    out.push(make_symbol(name, &NS, node, byte_range, ctx, parent_name_path, children));
 }
 
 // ---------------------------------------------------------------------------
@@ -544,10 +539,7 @@ fn make_symbol(
     meta: &SymbolMeta,
     line_node: &Node,
     byte_range: std::ops::Range<usize>,
-    src: &[u8],
-    file_path: &Arc<PathBuf>,
-    names: &NameInterner,
-    path_prefix: &str,
+    ctx: &FileCtx,
     parent_name_path: &str,
     children: Vec<SymbolNode>,
 ) -> SymbolNode {
@@ -556,17 +548,17 @@ fn make_symbol(
     } else {
         format!("{parent_name_path}/{name}")
     };
-    let id = format!("{path_prefix}::{name_path}");
+    let id = format!("{}::{name_path}", ctx.path_prefix);
     let start_line = line_node.start_position().row + 1;
     let end_line = line_node.end_position().row + 1;
-    let text = std::str::from_utf8(&src[byte_range.clone()]).unwrap_or("");
+    let text = std::str::from_utf8(&ctx.src[byte_range.clone()]).unwrap_or("");
 
     SymbolNode {
         id,
-        name: names.intern(&name),
+        name: ctx.names.intern(&name),
         category: meta.category,
         label: meta.label,
-        file_path: Arc::clone(file_path),
+        file_path: Arc::clone(ctx.file_path),
         byte_range: byte_range.start as u32..byte_range.end as u32,
         line_range: start_line as u32..end_line as u32,
         content_hash: content_hash(text),
@@ -581,16 +573,13 @@ fn make_symbol(
 /// Returns `None` if the node has no extractable name (see [`child_name`]).
 fn build_named_symbol(
     node: &Node,
-    src: &[u8],
-    file_path: &Arc<PathBuf>,
-    names: &NameInterner,
-    path_prefix: &str,
+    ctx: &FileCtx,
     parent_name_path: &str,
     meta: &SymbolMeta,
     byte_range: std::ops::Range<usize>,
 ) -> Option<SymbolNode> {
-    let name = child_name(node, src)?;
-    Some(make_symbol(name, meta, node, byte_range, src, file_path, names, path_prefix, parent_name_path, Vec::new()))
+    let name = child_name(node, ctx.src)?;
+    Some(make_symbol(name, meta, node, byte_range, ctx, parent_name_path, Vec::new()))
 }
 
 // ---------------------------------------------------------------------------

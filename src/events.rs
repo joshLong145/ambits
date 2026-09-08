@@ -23,20 +23,20 @@ pub enum AppEvent {
 /// Spawn a thread that polls crossterm key events and sends them to the channel.
 pub fn spawn_key_reader(tx: flume::Sender<AppEvent>) {
     std::thread::spawn(move || loop {
-        if event::poll(Duration::from_millis(50)).unwrap_or(false) {
-            match event::read() {
-                Ok(Event::Key(key)) => {
-                    if tx.send(AppEvent::Key(key)).is_err() {
-                        break;
-                    }
-                }
-                Ok(Event::Mouse(mouse)) => {
-                    if tx.send(AppEvent::Mouse(mouse)).is_err() {
-                        break;
-                    }
-                }
-                _ => {}
-            }
+        if !event::poll(Duration::from_millis(50)).unwrap_or(false) {
+            continue;
+        }
+        // Translate first, send once. A failed send means the receiver is gone
+        // and the thread should stop; that is one fact about the channel, not
+        // one per event kind, and duplicating the check per arm is what made
+        // this read as two unrelated branches.
+        let event = match event::read() {
+            Ok(Event::Key(key)) => AppEvent::Key(key),
+            Ok(Event::Mouse(mouse)) => AppEvent::Mouse(mouse),
+            _ => continue,
+        };
+        if tx.send(event).is_err() {
+            break;
         }
     });
 }
