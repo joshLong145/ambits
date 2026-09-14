@@ -169,27 +169,17 @@ enum Commands {
         max_bytes: Option<usize>,
     },
 
-    /// Search the symbol index by `[path]::[name]` pattern.
+    /// Search file contents, ripgrep-style, reporting the symbol each match
+    /// lands in and how deeply it has already been read.
     ///
-    /// Answers the questions `show` cannot: what is in this file, where is
-    /// this name defined, what hangs off this type. Both halves are optional
-    /// and case-insensitive — `src/app.rs::` enumerates a file, `::new` finds
-    /// one name everywhere, `ui::render` scopes to a directory.
+    /// The flag set is ripgrep's, because Claude Code's `Grep` tool is
+    /// ripgrep-backed and that is the dialect agents already speak. Four
+    /// defaults deviate on purpose: results are always sorted by
+    /// `(path, line, column)`; `--head-limit` and `--max-columns` are capped,
+    /// because this output lands in a context window; and `--column` is on.
     ///
-    /// Searches definitions, not usages: a method call is not a symbol here.
-    Find {
-        /// `[path]::[name]`, or a bare name. Repeatable.
-        #[arg(required = true)]
-        pattern: Vec<String>,
-
-        /// Maximum matches reported per pattern.
-        #[arg(long, default_value_t = ambits::find::DEFAULT_LIMIT)]
-        limit: usize,
-
-        /// Output format.
-        #[arg(long, value_enum, default_value = "text")]
-        format: FindFormat,
-    },
+    /// Exits 0 when something matched, 1 when nothing did, 2 on error.
+    Find(FindArgs),
 
     /// List the call sites of a function, and which symbol each sits in.
     ///
@@ -215,6 +205,136 @@ enum Commands {
     },
 }
 
+/// `ambits find` — ripgrep's flag set, plus the symbol column.
+#[derive(clap::Args, Debug)]
+struct FindArgs {
+        /// PATTERN, then optional PATHs. Every argument is a PATH when `-e` is
+        /// given, exactly as in ripgrep.
+        #[arg(value_name = "PATTERN|PATH")]
+        args: Vec<String>,
+
+        /// Additional pattern. Repeatable; combined as an alternation.
+        #[arg(short = 'e', long = "regexp", value_name = "PATTERN")]
+        regexp: Vec<String>,
+
+        /// Treat patterns as literal strings.
+        #[arg(short = 'F', long)]
+        fixed_strings: bool,
+
+        /// Case-insensitive matching.
+        #[arg(short, long)]
+        ignore_case: bool,
+
+        /// Match only whole words.
+        #[arg(short, long)]
+        word_regexp: bool,
+
+        /// Match only whole lines. Takes precedence over --word-regexp.
+        #[arg(short = 'x', long)]
+        line_regexp: bool,
+
+        /// Allow patterns to match across line boundaries.
+        #[arg(short = 'U', long)]
+        multiline: bool,
+
+        /// Report non-matching lines instead.
+        #[arg(short = 'v', long)]
+        invert_match: bool,
+
+        /// Include files matching this glob; prefix with ! to exclude.
+        #[arg(short, long, value_name = "GLOB")]
+        glob: Vec<String>,
+
+        /// Restrict to a file type, e.g. rust, py, ts, md.
+        #[arg(short = 't', long = "type", value_name = "TYPE")]
+        file_type: Vec<String>,
+
+        /// Lines of context after each match.
+        #[arg(short = 'A', long, default_value_t = 0, value_name = "N")]
+        after_context: usize,
+
+        /// Lines of context before each match.
+        #[arg(short = 'B', long, default_value_t = 0, value_name = "N")]
+        before_context: usize,
+
+        /// Lines of context around each match.
+        #[arg(short = 'C', long, value_name = "N")]
+        context: Option<usize>,
+
+        /// Show line numbers (default).
+        #[arg(short = 'n', long, overrides_with = "no_line_number")]
+        line_number: bool,
+
+        /// Hide line numbers.
+        #[arg(short = 'N', long)]
+        no_line_number: bool,
+
+        /// Hide the column of each match.
+        #[arg(long)]
+        no_column: bool,
+
+        /// Print only the matched part of each line.
+        #[arg(short, long)]
+        only_matching: bool,
+
+        /// Print only the paths of files with a match.
+        #[arg(short = 'l', long, conflicts_with_all = ["count", "count_matches", "quiet"])]
+        files_with_matches: bool,
+
+        /// Print only a count of matching lines per file.
+        #[arg(short, long, conflicts_with_all = ["count_matches", "quiet"])]
+        count: bool,
+
+        /// Print only a count of individual matches per file.
+        #[arg(long, conflicts_with = "quiet")]
+        count_matches: bool,
+
+        /// Print nothing; the exit code is the answer.
+        #[arg(short, long)]
+        quiet: bool,
+
+        /// Stop after this many matches per file.
+        #[arg(short = 'm', long, value_name = "NUM")]
+        max_count: Option<usize>,
+
+        /// Truncate lines longer than this, marking the cut. 0 for unlimited.
+        #[arg(short = 'M', long, default_value_t = ambits::find::DEFAULT_MAX_COLUMNS, value_name = "NUM")]
+        max_columns: usize,
+
+        /// Cap total matches across all files. 0 for unlimited. Not a ripgrep
+        /// flag: unbounded output is a hazard in a context window.
+        #[arg(long, default_value_t = ambits::find::DEFAULT_HEAD_LIMIT, value_name = "NUM")]
+        head_limit: usize,
+
+        /// Search hidden files and directories.
+        #[arg(long)]
+        hidden: bool,
+
+        /// Ignore .gitignore and friends.
+        #[arg(long)]
+        no_ignore: bool,
+
+        /// Group matches under a file heading (default on a terminal).
+        #[arg(long, overrides_with = "no_heading")]
+        heading: bool,
+
+        /// Print one flat `file:line:col:` line per match.
+        #[arg(long)]
+        no_heading: bool,
+
+        /// Omit the symbol column, for byte-identical ripgrep output.
+        #[arg(long)]
+        no_symbol: bool,
+
+        /// When to colorize output.
+        #[arg(long, value_enum, default_value = "auto", value_name = "WHEN")]
+        color: ColorWhen,
+
+        /// Emit ripgrep's JSON Lines events, with an added `symbol` field.
+        #[arg(long)]
+        json: bool,
+}
+
 #[derive(Subcommand, Debug)]
 enum CacheCommands {
     /// List the coverage journals on disk with their size and age.
@@ -235,6 +355,14 @@ enum CacheCommands {
         #[arg(long)]
         all: bool,
     },
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ColorWhen {
+    /// Colorize when stdout is a terminal.
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -288,6 +416,179 @@ enum SkillCommands {
     },
 }
 
+/// Record the symbols a search showed, in this session's coverage journal.
+///
+/// Failure is never fatal: a search that answered correctly has done its job,
+/// and a journal that cannot be written costs coverage rather than an answer.
+fn journal_find_reads(
+    outcome: &ambits::find::Outcome,
+    session_id: &str,
+    project_path: &Path,
+    serena_backend: bool,
+    registry: &ParserRegistry,
+    filter: Option<&PathFilter>,
+) {
+    let backend = if serena_backend { "serena" } else { "tree-sitter" };
+    ambits::find::journal_reads(project_path, session_id, &outcome.shown, || {
+        // Only called when a header has to be written — once per session — so
+        // the whole-tree scan a fingerprint needs is not on the search path.
+        let tree = scan_tree(serena_backend, registry, project_path, filter)
+            .unwrap_or_else(|e| {
+                eprintln!("[ambit warning] journal header: {e}");
+                ambits::symbols::ProjectTree {
+                    root: project_path.to_path_buf(),
+                    files: Vec::new(),
+                }
+            });
+        ambits::journal::EnvironmentManifest::capture(
+            &tree,
+            backend,
+            filter.map(|f| f.display()),
+        )
+    });
+}
+
+/// Map `find`'s CLI arguments onto a walk and a search.
+///
+/// Splitting positionals the way ripgrep does — the first is the pattern unless
+/// `-e` was given, in which case every one of them is a path — is the only part
+/// of this that is not a direct field-for-field mapping.
+fn run_find(
+    args: &FindArgs,
+    registry: &ParserRegistry,
+    project_path: &Path,
+    filter: Option<&PathFilter>,
+    coverage: Option<&ambits::restore::CoverageIndex>,
+) -> Result<ambits::find::Outcome> {
+    use ambits::find::{ColorChoice, Options, OutputMode};
+    use ambits::parser::{walk_files, WalkOptions};
+    use color_eyre::eyre::eyre;
+
+    let (patterns, paths): (Vec<String>, &[String]) = if args.regexp.is_empty() {
+        match args.args.split_first() {
+            Some((pattern, rest)) => (vec![pattern.clone()], rest),
+            None => (Vec::new(), &[]),
+        }
+    } else {
+        (args.regexp.clone(), args.args.as_slice())
+    };
+    if patterns.is_empty() {
+        return Err(eyre!("no pattern given"));
+    }
+
+    // PATH arguments resolve against the working directory, as grep's do, and
+    // are then walked directly — walking only what was asked for beats walking
+    // the project and discarding most of it.
+    let mut roots = Vec::with_capacity(paths.len());
+    for raw in paths {
+        let resolved = std::fs::canonicalize(raw)
+            .map_err(|e| eyre!("{raw}: {e}"))?;
+        if !resolved.starts_with(project_path) {
+            return Err(eyre!(
+                "{raw} is outside the project root {}",
+                project_path.display()
+            ));
+        }
+        roots.push(resolved);
+    }
+
+    let overrides = if args.glob.is_empty() {
+        None
+    } else {
+        let mut builder = ignore::overrides::OverrideBuilder::new(project_path);
+        for glob in &args.glob {
+            builder.add(glob).map_err(|e| eyre!("invalid glob {glob:?}: {e}"))?;
+        }
+        Some(builder.build()?)
+    };
+
+    let types = if args.file_type.is_empty() {
+        None
+    } else {
+        let mut builder = ignore::types::TypesBuilder::new();
+        builder.add_defaults();
+        for name in &args.file_type {
+            builder.select(name);
+        }
+        Some(builder.build().map_err(|e| eyre!("invalid --type: {e}"))?)
+    };
+
+    let mode = if args.quiet {
+        OutputMode::Quiet
+    } else if args.files_with_matches {
+        OutputMode::FilesWithMatches
+    } else if args.count {
+        OutputMode::Count
+    } else if args.count_matches {
+        OutputMode::CountMatches
+    } else {
+        OutputMode::Content
+    };
+
+    let options = Options {
+        patterns,
+        fixed_strings: args.fixed_strings,
+        ignore_case: args.ignore_case,
+        word_regexp: args.word_regexp,
+        line_regexp: args.line_regexp,
+        multiline: args.multiline,
+        invert_match: args.invert_match,
+        mode,
+        json: args.json,
+        heading: match (args.heading, args.no_heading) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            // Neither, or both via `overrides_with`: follow the terminal.
+            _ => None,
+        },
+        line_number: !args.no_line_number,
+        column: !args.no_column,
+        only_matching: args.only_matching,
+        before_context: args.context.unwrap_or(args.before_context),
+        after_context: args.context.unwrap_or(args.after_context),
+        max_columns: args.max_columns,
+        max_count: args.max_count,
+        head_limit: args.head_limit,
+        no_symbol: args.no_symbol,
+        color: match args.color {
+            ColorWhen::Auto => ColorChoice::Auto,
+            ColorWhen::Always => ColorChoice::Always,
+            ColorWhen::Never => ColorChoice::Never,
+        },
+    };
+
+    let targets = walk_files(
+        project_path,
+        &WalkOptions {
+            filter,
+            overrides,
+            types,
+            hidden: args.hidden,
+            no_ignore: args.no_ignore,
+            roots,
+        },
+    );
+
+    ambits::find::run(registry, &targets, &options, coverage)
+}
+
+/// Build the project symbol tree with whichever backend was selected.
+///
+/// Named because two call sites need it and they must not drift: `find`
+/// scans on its own, ahead of the project-wide scan every other command shares.
+fn scan_tree(
+    serena_backend: bool,
+    registry: &ParserRegistry,
+    project_path: &Path,
+    filter: Option<&PathFilter>,
+) -> Result<ambits::symbols::ProjectTree> {
+    if serena_backend {
+        serena::scan_project_serena(project_path, filter)
+    } else {
+        registry.scan_project(project_path, filter)
+    }
+}
+
 fn main() -> Result<()> {
     color_eyre::install()?;
     let mut cli = Cli::parse();
@@ -321,6 +622,11 @@ fn main() -> Result<()> {
     // Capture the `[cache]` stanza before `tool_config` is coerced into the
     // mapper trait object below and its concrete type is no longer reachable.
     let cache_cfg = tool_config.cache.clone();
+
+    // Both the TUI and `find` write to the journal, and `find` dispatches long
+    // before the TUI is built, so the decision is made once here. CLI flags win
+    // over the `[cache]` stanza in tools.toml.
+    let journal_enabled = !cli.no_journal && cache_cfg.enabled.unwrap_or(true);
 
     // Build the session ingester — coerce ToolMappingConfig to Arc<dyn ToolCallMapper>.
     let mapper: Arc<dyn ToolCallMapper> = tool_config;
@@ -357,11 +663,72 @@ fn main() -> Result<()> {
     }
 
     let registry = ParserRegistry::new();
-    let project_tree = if cli.serena {
-        serena::scan_project_serena(&project_path, filter.as_ref())?
-    } else {
-        registry.scan_project(&project_path, filter.as_ref())?
-    };
+
+    // Resolve log directory and session. Hoisted above the scan because `find`
+    // dispatches before it: neither depends on the symbol tree, and both read
+    // the CLI values rather than consuming them so `--coverage` below still
+    // resolves its own.
+    let log_dir = cli
+        .log_dir
+        .clone()
+        .or_else(|| ingester.log_dir_for_project(&project_path));
+
+    let session_id = cli.session.clone().or_else(|| {
+        log_dir
+            .as_ref()
+            .and_then(|d| ingester.find_latest_session(d))
+    });
+
+    // Coverage context for `find` and `show`. Loaded once, from the journal
+    // the TUI maintains, so both can report whether a symbol has already been
+    // read. `None` when there is no session or no journal — which callers must
+    // not confuse with "nothing has been read".
+    let coverage_index = ambits::restore::CoverageIndex::load(&project_path, session_id.as_deref());
+
+    // `find` runs before the project-wide scan, the way `cache` does. A content
+    // search reads the files it walks and parses only the ones that match, so
+    // paying for a full parse first would be paying for work it discards. The
+    // tree it still asks for here is temporary scaffolding.
+    if let Some(Commands::Find(args)) = &command {
+        for w in &config_warnings {
+            eprintln!("[ambit warning] {w}");
+        }
+        // grep's exit codes, which agents chain on: 0 matched, 1 did not,
+        // 2 something went wrong. `color_eyre` would exit 1 for an error,
+        // which is indistinguishable from an honest "no match".
+        match run_find(
+            args,
+            &registry,
+            &project_path,
+            filter.as_ref(),
+            coverage_index.as_ref(),
+        ) {
+            Ok(outcome) => {
+                if journal_enabled {
+                    if let Some(session) = session_id.as_deref() {
+                        journal_find_reads(
+                            &outcome,
+                            session,
+                            &project_path,
+                            cli.serena,
+                            &registry,
+                            filter.as_ref(),
+                        );
+                    }
+                }
+                if outcome.matched {
+                    return Ok(());
+                }
+                std::process::exit(1)
+            }
+            Err(e) => {
+                eprintln!("ambits find: {e:#}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let project_tree = scan_tree(cli.serena, &registry, &project_path, filter.as_ref())?;
 
     if cli.dump {
         for w in &config_warnings {
@@ -391,23 +758,6 @@ fn main() -> Result<()> {
         );
     }
 
-    // Resolve log directory and session.
-    let log_dir = cli
-        .log_dir
-        .or_else(|| ingester.log_dir_for_project(&project_path));
-
-    let session_id = cli.session.or_else(|| {
-        log_dir
-            .as_ref()
-            .and_then(|d| ingester.find_latest_session(d))
-    });
-
-    // Coverage context for `find` and `show`. Loaded once, from the journal
-    // the TUI maintains, so both can report whether a symbol has already been
-    // read. `None` when there is no session or no journal — which callers must
-    // not confuse with "nothing has been read".
-    let coverage_index = ambits::restore::CoverageIndex::load(&project_path, session_id.as_deref());
-
     if let Some(Commands::Show {
         selector,
         no_body,
@@ -423,24 +773,6 @@ fn main() -> Result<()> {
             selector,
             !no_body,
             *max_bytes,
-            coverage_index.as_ref(),
-        );
-    }
-
-    if let Some(Commands::Find {
-        pattern,
-        limit,
-        format,
-    }) = &command
-    {
-        for w in &config_warnings {
-            eprintln!("[ambit warning] {w}");
-        }
-        return ambits::find::run(
-            &project_tree,
-            pattern,
-            *limit,
-            matches!(format, FindFormat::Json),
             coverage_index.as_ref(),
         );
     }
@@ -473,12 +805,11 @@ fn main() -> Result<()> {
         );
     }
 
-    // Launch TUI.
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    // Everything below happens before the terminal is touched. None of it
+    // needs a terminal, and all of it can fail: a session log with a line we
+    // cannot parse used to panic *after* raw mode was on, which left the
+    // terminal swallowing input with the panic message painted on an alternate
+    // screen nobody would ever see again.
 
     // Set up event log writer if --log-output is specified.
     let event_log = if let Some(ref log_output_dir) = cli.log_output {
@@ -523,7 +854,6 @@ fn main() -> Result<()> {
     // now, so nothing looks drifted; only the journal knows what they looked
     // like at the time. Skipped entirely when journaling is off, since then
     // there is no journal to trust.
-    let journal_enabled = !cli.no_journal && cache_cfg.enabled.unwrap_or(true);
     if journal_enabled {
         if let Some(stats) = app.rehydrate_from_journal() {
             if stats.drifted > 0 || stats.inserted > 0 || stats.moved > 0 {
@@ -553,6 +883,17 @@ fn main() -> Result<()> {
         app.sync_journal();
     }
 
+    // Terminal setup, as late as possible. The guard restores it on every
+    // path out of here — `?`, panic, or a clean return — and the panic hook
+    // gets there first so the report lands on the normal screen.
+    install_panic_restore();
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let _guard = TerminalGuard;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
     let result = run_tui(&mut terminal, &mut app, &project_path, &log_dir, session_id, &registry, serena_mode, &ingester);
 
     // Capture the tail of the session. Records are written unbuffered, so this
@@ -565,12 +906,51 @@ fn main() -> Result<()> {
         let _ = writer.flush();
     }
 
-    // Restore terminal.
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    // `_guard` restores the rest as it drops.
     terminal.show_cursor()?;
 
     result
+}
+
+/// Put the terminal back the way it was found.
+///
+/// Deliberately ignores its errors: it runs on paths where something has
+/// already gone wrong, and a failure to restore must not mask what that was.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+}
+
+/// Restores the terminal however this scope is left — a clean return, a `?`, or
+/// an unwind.
+///
+/// The teardown used to be three statements at the end of `main`, which is the
+/// one place an early exit never reaches.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+/// Restore the terminal *before* the panic report is printed.
+///
+/// The `Drop` guard alone is not enough: a hook runs before unwinding begins,
+/// so `color_eyre` would paint its report onto the alternate screen and the
+/// guard would then tear that screen down, taking the message with it. Chaining
+/// in front of the existing hook puts the report on the normal screen, where it
+/// can be read.
+///
+/// Not hypothetical for a long-running TUI: the log tailer parses new lines as
+/// they arrive, so a session log can start failing to parse at any point during
+/// a session, not only at startup.
+fn install_panic_restore() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        previous(info);
+    }));
 }
 
 /// Print the still-valid prior reads for a session.

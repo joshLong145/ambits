@@ -31,6 +31,16 @@ pub fn sym_with_children(id: &str, name: &str, children: Vec<SymbolNode>) -> Sym
     s
 }
 
+/// Create a SymbolNode with a custom byte range.
+///
+/// Byte ranges are what attribution searches: `FileSymbols::enclosing` maps a
+/// match or call-site offset back to the symbol holding it.
+pub fn sym_with_bytes(id: &str, name: &str, start: u32, end: u32) -> SymbolNode {
+    let mut s = sym(id, name);
+    s.byte_range = start..end;
+    s
+}
+
 /// Create a SymbolNode with a custom line range.
 pub fn sym_with_lines(id: &str, name: &str, start: usize, end: usize) -> SymbolNode {
     let mut s = sym(id, name);

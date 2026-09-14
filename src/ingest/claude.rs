@@ -577,12 +577,20 @@ fn render_description(
                     out.push_str(value);
                 } else {
                     // Truncate at a char boundary within the limit.
-                    let truncated = value.char_indices()
+                    //
+                    // The end offset is computed before any slicing: the
+                    // fallback used to be `unwrap_or(&value[..CMD_MAX])`, which
+                    // `unwrap_or` evaluates whether or not it is needed, so
+                    // every truncation sliced at a fixed 200 bytes. A command
+                    // holding a multi-byte character across that offset — a box
+                    // drawing `─` in a heredoc, say — panicked the whole
+                    // program, from the TUI and `--coverage` alike.
+                    let end = value
+                        .char_indices()
                         .take_while(|(i, _)| *i < CMD_MAX)
                         .last()
-                        .map(|(i, c)| &value[..i + c.len_utf8()])
-                        .unwrap_or(&value[..CMD_MAX]);
-                    out.push_str(truncated);
+                        .map_or(0, |(i, c)| i + c.len_utf8());
+                    out.push_str(&value[..end]);
                     out.push('…');
                 }
             }

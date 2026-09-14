@@ -1,0 +1,350 @@
+//! Process-level tests for `ambits find`.
+//!
+//! These run the built binary rather than the library, because the things worth
+//! pinning here only exist at that boundary: exit codes, which stream output
+//! lands on, how positional arguments are split, and whether a journal file
+//! appears on disk. `tests/e2e.rs` covers the library-level pipeline.
+
+use std::path::Path;
+use std::process::Command;
+
+/// A small project: two Rust files, a Markdown file, and a gitignored one.
+fn fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // `ignore` honours `.gitignore` only inside a git repository, so the
+    // fixture needs one for the walk to behave the way it does in the field.
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::create_dir_all(root.join("target")).unwrap();
+
+    std::fs::write(root.join(".gitignore"), "/target\n").unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn needle() -> u32 {\n    42\n}\n\npub fn haystack() -> u32 {\n    needle()\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/util.rs"),
+        "pub fn unrelated() -> u32 {\n    7\n}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("docs/notes.md"), "the needle is documented here\n").unwrap();
+    std::fs::write(root.join("target/generated.rs"), "fn needle() {}\n").unwrap();
+
+    dir
+}
+
+struct Output {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+fn run(root: &Path, args: &[&str]) -> Output {
+    let out = Command::new(env!("CARGO_BIN_EXE_ambits"))
+        // PATH arguments resolve against the working directory, as grep's do,
+        // so the tests run from inside the project the way a caller would.
+        .current_dir(root)
+        .arg("-p")
+        .arg(root)
+        .args(args)
+        .output()
+        .expect("the binary must run");
+    Output {
+        code: out.status.code().expect("no signal"),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// `find` with a session, so journal writes have somewhere to go.
+fn find(root: &Path, args: &[&str]) -> Output {
+    let mut all = vec!["-s", "sess", "find"];
+    all.extend_from_slice(args);
+    run(root, &all)
+}
+
+fn journal(root: &Path) -> String {
+    // `find` writes its own shard, distinct from the primary file a running
+    // TUI would write — see `journal::Journal::open_shard`.
+    std::fs::read_to_string(root.join(".ambit/coverage/sess.find.ndjson")).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Exit codes
+// ---------------------------------------------------------------------------
+
+/// grep's convention, and the reason it matters: agents chain with `&&`, so
+/// "no match" and "the command failed" must not be the same answer.
+#[test]
+fn exit_codes_follow_grep() {
+    let dir = fixture();
+
+    assert_eq!(find(dir.path(), &["needle"]).code, 0, "matched");
+    assert_eq!(find(dir.path(), &["nosuchtext"]).code, 1, "no match");
+
+    let broken = find(dir.path(), &["fn ("]);
+    assert_eq!(broken.code, 2, "a pattern that cannot compile is an error");
+    assert!(
+        broken.stderr.contains("invalid pattern"),
+        "the error names the pattern: {:?}",
+        broken.stderr
+    );
+    assert!(broken.stdout.is_empty(), "errors never go to stdout");
+}
+
+#[test]
+fn a_path_outside_the_project_root_is_an_error() {
+    let dir = fixture();
+    let outside = find(dir.path(), &["needle", "/etc"]);
+
+    assert_eq!(outside.code, 2);
+    assert!(
+        outside.stderr.contains("outside the project root"),
+        "got {:?}",
+        outside.stderr
+    );
+}
+
+#[test]
+fn a_path_that_does_not_exist_is_an_error() {
+    let dir = fixture();
+    let missing = find(dir.path(), &["needle", "src/nope"]);
+    assert_eq!(missing.code, 2);
+    assert!(missing.stderr.contains("src/nope"), "{:?}", missing.stderr);
+}
+
+// ---------------------------------------------------------------------------
+// Narrowing the walk
+// ---------------------------------------------------------------------------
+
+#[test]
+fn path_arguments_narrow_the_search() {
+    let dir = fixture();
+
+    let everywhere = find(dir.path(), &["needle", "-l"]);
+    assert!(everywhere.stdout.contains("src/lib.rs"));
+    assert!(
+        everywhere.stdout.contains("docs/notes.md"),
+        "every text file is searched, not only parseable ones"
+    );
+
+    let scoped = find(dir.path(), &["needle", "-l", "src"]);
+    assert!(scoped.stdout.contains("src/lib.rs"));
+    assert!(!scoped.stdout.contains("docs/notes.md"), "PATH narrows it");
+}
+
+#[test]
+fn glob_and_type_filters_narrow_the_walk() {
+    let dir = fixture();
+
+    let typed = find(dir.path(), &["needle", "-l", "-t", "rust"]);
+    assert!(typed.stdout.contains("src/lib.rs"));
+    assert!(!typed.stdout.contains("notes.md"), "-t rust excludes md");
+
+    let globbed = find(dir.path(), &["needle", "-l", "-g", "*.md"]);
+    assert!(globbed.stdout.contains("notes.md"));
+    assert!(!globbed.stdout.contains("lib.rs"), "-g selects");
+
+    let negated = find(dir.path(), &["needle", "-l", "-g", "!*.md"]);
+    assert!(!negated.stdout.contains("notes.md"), "!glob excludes");
+}
+
+/// The walk is the scanner's: gitignored files stay out unless asked for.
+#[test]
+fn gitignored_files_are_skipped_unless_no_ignore() {
+    let dir = fixture();
+
+    let default = find(dir.path(), &["needle", "-l"]);
+    assert!(!default.stdout.contains("target/"), "/target is ignored");
+
+    let forced = find(dir.path(), &["needle", "-l", "--no-ignore"]);
+    assert!(forced.stdout.contains("target/generated.rs"));
+}
+
+// ---------------------------------------------------------------------------
+// Output contract
+// ---------------------------------------------------------------------------
+
+/// Piped output is what a grep consumer parses, so nothing else may appear on
+/// stdout — the withheld notice included.
+#[test]
+fn the_withheld_trailer_goes_to_stderr_not_stdout() {
+    let dir = fixture();
+    let capped = find(dir.path(), &["needle", "--head-limit", "1"]);
+
+    assert_eq!(capped.stdout.lines().count(), 1, "one match printed");
+    assert!(!capped.stdout.contains("withheld"));
+    assert!(
+        capped.stderr.contains("withheld"),
+        "the notice belongs on stderr: {:?}",
+        capped.stderr
+    );
+}
+
+#[test]
+fn piped_output_is_one_flat_line_per_match() {
+    let dir = fixture();
+    let out = find(dir.path(), &["needle", "-t", "rust"]);
+
+    for line in out.stdout.lines() {
+        let mut fields = line.splitn(4, ':');
+        let path = fields.next().unwrap();
+        assert!(path.ends_with(".rs"), "field 1 is the path: {line:?}");
+        assert!(
+            fields.next().unwrap().parse::<u32>().is_ok(),
+            "field 2 is the line number: {line:?}"
+        );
+        assert!(
+            fields.next().unwrap().parse::<u32>().is_ok(),
+            "field 3 is the column: {line:?}"
+        );
+    }
+}
+
+#[test]
+fn json_is_one_event_per_line() {
+    let dir = fixture();
+    let out = find(dir.path(), &["needle", "-t", "rust", "--json"]);
+
+    let events: Vec<serde_json::Value> = out
+        .stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("every line parses as one event"))
+        .collect();
+
+    assert_eq!(events.first().unwrap()["type"], "begin");
+    assert_eq!(events.last().unwrap()["type"], "summary");
+    let matched = events.iter().find(|e| e["type"] == "match").unwrap();
+    assert_eq!(
+        matched["data"]["symbol"]["id"], "src/lib.rs::needle",
+        "the symbol id rides along with the match"
+    );
+}
+
+/// The composition the whole pair exists for: search, then fetch.
+#[test]
+fn find_then_show_composes_on_the_emitted_id() {
+    let dir = fixture();
+    let out = find(dir.path(), &["fn needle", "-t", "rust", "--json"]);
+    let id = out
+        .stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["type"] == "match")
+        .and_then(|e| e["data"]["symbol"]["id"].as_str().map(str::to_owned))
+        .expect("a match carries an id");
+
+    let shown = run(dir.path(), &["show", &id]);
+    assert_eq!(shown.code, 0);
+    let parsed: serde_json::Value = serde_json::from_str(shown.stdout.trim()).unwrap();
+    assert_eq!(parsed["results"][0]["matches"][0]["id"], id.as_str());
+    assert!(
+        parsed["results"][0]["matches"][0]["definition"]
+            .as_str()
+            .unwrap()
+            .contains("fn needle"),
+        "the id round-trips to the definition"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Journaling
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_search_journals_the_symbols_it_showed() {
+    let dir = fixture();
+    assert!(journal(dir.path()).is_empty(), "no journal to start with");
+
+    find(dir.path(), &["fn needle", "-t", "rust"]);
+
+    let written = journal(dir.path());
+    assert!(written.contains("\"kind\":\"header\""), "header first");
+    assert!(
+        written.contains("\"sym\":\"src/lib.rs::needle\"") && written.contains("full_body"),
+        "the symbol it showed is recorded at full depth: {written}"
+    );
+    assert!(
+        !written.contains("src/util.rs"),
+        "a file that never matched is not recorded"
+    );
+}
+
+/// The credit rule at the process boundary: `-l` prints no source, so it can
+/// credit no read.
+#[test]
+fn modes_that_print_no_source_journal_nothing() {
+    let dir = fixture();
+    find(dir.path(), &["needle", "-l"]);
+    assert!(
+        journal(dir.path()).is_empty(),
+        "a file listing is not a read"
+    );
+
+    find(dir.path(), &["needle", "-c"]);
+    assert!(journal(dir.path()).is_empty(), "nor is a count");
+
+    find(dir.path(), &["needle", "-q"]);
+    assert!(journal(dir.path()).is_empty(), "nor is an exit code");
+}
+
+#[test]
+fn no_journal_suppresses_the_write() {
+    let dir = fixture();
+    let out = run(
+        dir.path(),
+        &["-s", "sess", "--no-journal", "find", "fn needle"],
+    );
+
+    assert_eq!(out.code, 0, "the search still answers");
+    assert!(journal(dir.path()).is_empty(), "but records nothing");
+}
+
+#[test]
+fn cache_disabled_in_tools_toml_suppresses_the_write() {
+    let dir = fixture();
+    let config = dir.path().join("tools.toml");
+    std::fs::write(&config, "version = 1\n\n[cache]\nenabled = false\n").unwrap();
+
+    let out = run(
+        dir.path(),
+        &[
+            "-s",
+            "sess",
+            "--tools-config",
+            config.to_str().unwrap(),
+            "find",
+            "fn needle",
+        ],
+    );
+
+    assert_eq!(out.code, 0);
+    assert!(
+        journal(dir.path()).is_empty(),
+        "the [cache] stanza disables find's writes too"
+    );
+}
+
+/// The loop closes: what one search records, the next one reports.
+#[test]
+fn a_second_search_reports_what_the_first_recorded() {
+    let dir = fixture();
+
+    let first = find(dir.path(), &["fn needle", "-t", "rust"]);
+    assert!(
+        first.stdout.contains("[needle]"),
+        "no journal existed yet, so depth is unknown rather than unread: {:?}",
+        first.stdout
+    );
+
+    let second = find(dir.path(), &["fn needle", "-t", "rust"]);
+    assert!(
+        second.stdout.contains("[full needle]"),
+        "the journal the first search wrote is read back: {:?}",
+        second.stdout
+    );
+}

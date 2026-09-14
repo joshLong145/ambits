@@ -38,67 +38,78 @@ ambits -p .
 
 # For the agent
 
-## Finding symbols
+## Searching code
+
+`find` is a grep whose every hit knows which symbol it landed in.
 
 ```bash
-ambits -p . find 'parse_selector'     # where is this defined?
-ambits -p . find 'src/app.rs::'       # everything in a file
-ambits -p . find '::App/'             # every member of a type
-ambits -p . find 'ui::render'         # scoped to a directory
+ambits -p . find 'is_binary'                 # every use and definition
+ambits -p . find 'fn enclosing' -t rust      # one file type
+ambits -p . find 'TODO' -g '!tests/**'       # globs; ! excludes
+ambits -p . find 'Journal::open' -A 3        # with trailing context
+ambits -p . find 'unwrap\(\)' -c             # matching lines per file
 ```
 
 ```
-restore::classify — 2 matches
-  [fn] src/restore.rs::classify  L408-476
-  [fn] src/restore.rs::tests/rehydrate_and_classify_agree_on_where_a_symbol_lives  L1072-1092
+src/find.rs:67:7:[full BINARY_SNIFF_BYTES] const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+src/find.rs:337:4:[full is_binary] fn is_binary(buf: &[u8]) -> bool {
+src/find.rs:338:21:[full is_binary]     buf.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0)
+src/find.rs:442:8:[full search_file]     if is_binary(&buf) || !matcher.worth_searching(&buf) {
 ```
 
-The pattern is `[path]::[name]`, or a bare name; both halves are optional and
-case-insensitive.
+`file:line:column:` — the prefix every grep consumer already parses — then the
+symbol the match sits in and how deeply this session has read it, then the line.
+`--no-symbol` drops that field for output byte-identical to ripgrep's.
 
-The path half matches whole **components**, not substrings — so `ui` matches
-`src/ui/` but not `src/tui.rs`, while `app` still matches `app.rs` and
-`ui/stats` matches `src/ui/stats.rs`.
+The flags **are** ripgrep's, down to the regex engine: `-i -w -x -F -v -U -e -g
+-t -A -B -C -n -N -o -l -c -m -M -q --hidden --no-ignore --heading --color
+--json`. That is not imitation for its own sake — Claude Code's `Grep` tool is
+ripgrep-backed, so an agent reaching for this already knows the dialect, and the
+same `regex` crate means patterns behave identically, including the shared
+absence of backreferences and lookaround.
 
-The name half matches the **leaf** name, unless the pattern contains `/`, in
-which case it matches the whole name path. That distinction matters at scale:
-on this repo `test` matches 44 symbols by leaf, while `tests/` — which contains
-a `/`, and so matches the whole name path — matches 518, since every test
-function matches through its parent module. Writing `::App/` opts into path
-matching deliberately, which is how you ask for a type's members.
+### What the symbol column is for
 
-Results carry **coverage context** when the TUI has been running: a depth
-column showing what this session already read, `—` for unread, and a per-query
-count. That answers the question a search is usually a step toward — do I need
-to read this?
+| Form | Meaning |
+|---|---|
+| `[full name]`, `[signature name]`, … | This session has read the symbol, at that depth |
+| `[— name]` | It has not |
+| `[name]` | No coverage journal: *unknown*, which is not the same as unread |
+| `[-]` | The match is not inside any symbol — a `use` line, or a file no parser handles |
 
-```
-fmt:: — 6 matches (6 read)
-  [fn ] src/fmt.rs::tokens  L10-18  full
-  [fn ] src/fmt.rs::bytes  L23-33  full
-  [mod] src/fmt.rs::tests  L36-62  full
-  …
+The third row is the one that matters. An empty column would read as "unread"
+when the honest answer is "nobody was watching", and only one of those means go
+read it. In `--json`, a `coverage` object on the summary event is what
+distinguishes them.
 
-benches/tracking:: — 6 matches (0 read)
-  [fn] benches/tracking.rs::record_n_symbols  L13-24  —
-  [fn] benches/tracking.rs::depth_of_n_symbols  L49-67  —
-  …
-```
+Every text file is searched, not only the parseable ones — a hit in a TOML file
+is a real hit, it simply has no symbol.
 
-Without a coverage journal the column is omitted entirely rather than shown
-empty — "unknown" and "unread" are different answers, and only one of them
-means go read it. In JSON, a `coverage` object on the envelope is what
-distinguishes them; `show` carries the same annotation per match.
+### Searching is reading
 
-Results are capped at 100 per pattern (`--limit`), and a truncated result says
-how many it withheld. `--format json` emits the same fields as `show --no-body`, so `find` feeds
-straight into `show` — except that `children` comes back as a `children_count`,
-since listing them made a broad search 72% child ids by byte.
+A search prints source into an agent's context, so it records what it showed:
+every symbol whose matching line was printed is journaled as read, at the hash
+it was searched at. Modes that print no source — `-q`, `-l`, `-c` — record
+nothing, and neither do matches cut past `--head-limit`. The journal is a record
+of what was *seen*, not of what the process computed.
 
-Unlike grep, results carry their kind — `struct`, `impl`, `fn` — so a name that
-appears as a type, its impl block, and a method inside it comes back as three
-labelled, distinguishable entries. But this searches **definitions, not
-usages**: a method call is not a symbol, so `find is_none_or` returns nothing.
+### Deviations from ripgrep, all four deliberate
+
+Output is always sorted by path, line and column, because determinism is worth
+more to an agent than the microseconds. `--head-limit` caps at 200 matches and
+`-M` clips lines at 300 columns, because this output lands in a context window
+rather than a terminal; `0` lifts either. `--column` is on by default, because
+it is what disambiguates two matches on one line. Exit codes are grep's: `0`
+matched, `1` nothing matched, `2` error.
+
+### The pipeline runs backwards
+
+Every other command scans the project first: walk, parse every file, then
+answer. A search inverts that — walk, read, reject on the raw bytes, and parse
+only the survivors. Searching this repo for `classify` reads 61 files and parses
+the 5 that matched, in about 0.01s; a pattern that matches nothing parses
+nothing and costs 0.00s, where the old symbol-index `find` paid for a full parse
+every time.
 
 ## Finding callers
 
@@ -125,8 +136,9 @@ most answers are exact — but `callers new` returns every call to anything name
 mistake this for a resolved call graph.
 
 References are extracted on demand rather than stored, so `find`, `show`, and
-the TUI pay nothing for this. It costs about 0.3s on this repo against 0.02s for
-`find`.
+the TUI pay nothing for this. It costs about 0.06s on this repo against under
+0.01s for `find` — and unlike a search, it reports call nodes only, so the
+definition and the doc comments mentioning it do not come back with them.
 
 ## Reading code by symbol
 
@@ -433,7 +445,7 @@ scan included, which is both worse and harder to notice.
 
 ## The read journal
 
-While the TUI runs it maintains an append-only NDJSON record at `.ambit/coverage/<session>.ndjson` — one entry per `(symbol, agent)` read. This is what lets `restore-context` answer after the fact, and it survives restarts.
+While the TUI runs it maintains an append-only NDJSON record at `.ambit/coverage/<session>.ndjson` — one entry per `(symbol, agent)` read. `ambits find` keeps its own record of what it showed alongside it, in `<session>.find.ndjson`, rather than appending to the TUI's file — the two are folded together as one session wherever it matters (`restore-context`, `cache status`, `cache clear`). This is what lets `restore-context` answer after the fact, and it survives restarts.
 
 ```bash
 ambits -p . cache status              # sessions, symbols, size on disk
@@ -496,7 +508,7 @@ Installs a [skill](https://code.claude.com/docs/en/skills) that teaches the agen
 | Command | Description |
 |---|---|
 | `ambits -p <path>` | Launch the TUI |
-| `ambits … find <pattern>…` | Search symbols by `[path]::[name]` |
+| `ambits … find <pattern> [path…]` | Grep file contents; every hit names its symbol |
 | `ambits … callers <name>…` | List call sites and their enclosing symbol |
 | `ambits … show <selector>…` | Print symbol definitions as JSON |
 | `ambits … restore-context` | Print this session's read history |

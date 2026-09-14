@@ -194,8 +194,8 @@ pub struct TargetSymbolSpec {
 /// — an agent that reads efficiently would look less informed than one that
 /// pulls whole files.
 ///
-/// Only the `requires` marker and the selector grammar decide what is picked
-/// up. Flags need no special handling: `--no-body` and a numeric `--max-bytes`
+/// The `requires` marker, the optional `subcommand`, and the selector grammar
+/// decide what is picked up. Flags need no special handling: `--no-body` and a numeric `--max-bytes`
 /// argument simply fail to parse as a selector and are ignored, so the spec
 /// does not have to track the command's option list.
 #[derive(Debug, Clone, Deserialize)]
@@ -206,6 +206,23 @@ pub struct TargetSelectorSpec {
     /// Keeps an unrelated command that merely mentions a symbol id from
     /// registering a read.
     pub requires: String,
+    /// Subcommand that must appear in an invocation before its selectors count,
+    /// and after which they are read.
+    ///
+    /// `requires` alone cannot express this: global flags sit between the
+    /// binary and its subcommand (`ambits -p . show <id>`), so no fixed
+    /// substring spans the two. Matching a whole token instead is exact, and
+    /// taking selectors only from what follows it mirrors the grammar —
+    /// everything before the subcommand is a global flag and cannot be a
+    /// selector anyway.
+    ///
+    /// Without it, `ambits find 'src/app.rs::App'` credited a full read of that
+    /// symbol. A search pattern is a regex over file content, not a request for
+    /// a definition, and `find` already journals precisely what it displayed.
+    /// Optional, so a tool whose every invocation returns definitions needs no
+    /// such marker.
+    #[serde(default)]
+    pub subcommand: Option<String>,
     /// Depth credited when the command returns definitions.
     pub depth: ReadDepthDe,
     /// Flag that makes the command return metadata only.
@@ -246,7 +263,17 @@ impl TargetSelectorSpec {
                 (Some(flag), Some(d)) if segment.contains(flag) => d,
                 _ => full,
             };
-            for token in segment.split_whitespace() {
+            // `any` consumes through the match, so what remains is exactly
+            // the subcommand's own arguments — which is where selectors live,
+            // and the only place they can mean "return this definition".
+            let mut tokens = segment.split_whitespace();
+            if let Some(subcommand) = &self.subcommand {
+                if !tokens.any(|t| t == subcommand) {
+                    continue;
+                }
+            }
+
+            for token in tokens {
                 let token = token.trim_matches(|c| c == '\'' || c == '"');
                 if matches!(
                     crate::lookup::parse_selector(token),
@@ -465,6 +492,13 @@ impl ToolMappingConfig {
                     if stanza.target_lines.is_none() {
                         stanza.target_lines = base_stanza.target_lines.clone();
                     }
+                    // Inherited like every other optional field. It was left
+                    // out, so a user stanza extending `Bash` to add one command
+                    // prefix silently lost `ambits show` crediting — the exact
+                    // coverage hole the spec exists to close.
+                    if stanza.target_selectors.is_none() {
+                        stanza.target_selectors = base_stanza.target_selectors.clone();
+                    }
                 }
                 // base_name not found: skip silently
             }
@@ -672,6 +706,50 @@ mod tests {
             .is_none());
     }
 
+    /// The regression this `subcommand` field exists for. `find`'s pattern is a
+    /// regex over file *content*, so a search for text that happens to look
+    /// like a symbol id is not a request for that symbol — and crediting it
+    /// would claim a read of something the search may never have displayed.
+    /// `find` journals exactly what it showed; it needs no help from here.
+    #[test]
+    fn a_search_pattern_that_looks_like_an_id_is_not_credited() {
+        let cfg = ToolMappingConfig::builtin().unwrap();
+        assert!(selector_spec(&cfg)
+            .resolve(&bash_input("ambits -p . find 'src/app.rs::App'"))
+            .is_none());
+    }
+
+    /// …and the same command run for real: a search and a lookup chained
+    /// together credit only the lookup.
+    #[test]
+    fn a_search_beside_a_lookup_credits_only_the_lookup() {
+        let cfg = ToolMappingConfig::builtin().unwrap();
+        let got = selector_spec(&cfg)
+            .resolve(&bash_input(
+                "ambits -p . find 'a.rs::pattern' && ambits -p . show b.rs::real",
+            ))
+            .unwrap();
+        assert_eq!(got, vec![("b.rs::real".to_string(), ReadDepth::FullBody)]);
+    }
+
+    /// Every other subcommand is excluded by the same rule, without listing
+    /// them: `callers` takes a bare name, but nothing stops one being written
+    /// as a path-qualified string.
+    #[test]
+    fn other_subcommands_credit_nothing() {
+        let cfg = ToolMappingConfig::builtin().unwrap();
+        for cmd in [
+            "ambits -p . callers 'src/app.rs::App'",
+            "ambits -p . cache clear --session src/app.rs::App",
+            "ambits -p . --dump src/app.rs::App",
+        ] {
+            assert!(
+                selector_spec(&cfg).resolve(&bash_input(cmd)).is_none(),
+                "{cmd} does not print a definition, so it credits nothing"
+            );
+        }
+    }
+
     #[test]
     fn a_marker_with_no_selectors_yields_nothing() {
         let cfg = ToolMappingConfig::builtin().unwrap();
@@ -859,6 +937,35 @@ description  = "new"
         assert_eq!(merged.tools[idx].path_keys, vec!["new_key"]);
         // Expect one DuplicateName warning.
         assert!(warnings.iter().any(|w| matches!(w, ConfigWarning::DuplicateName { name, .. } if name == "NewTool")));
+    }
+
+    /// Extending `Bash` to add one command prefix must not cost the selector
+    /// spec: without inheritance, a user config that customises Bash silently
+    /// stopped crediting `ambits show`.
+    #[test]
+    fn merge_extends_inherits_target_selectors() {
+        let user = r#"
+version = 1
+[[tool]]
+names   = ["Bash"]
+extends = "Bash"
+path_keys = []
+description = "custom bash"
+"#;
+        let mut warnings = Vec::new();
+        let user_cfg: ToolMappingConfig = toml::from_str(user).unwrap();
+        let merged = ToolMappingConfig::merge(
+            ToolMappingConfig::builtin().unwrap(),
+            user_cfg,
+            &mut warnings,
+        );
+
+        let mapping = &merged.tools[merged.index["Bash"]];
+        let spec = mapping
+            .target_selectors
+            .as_ref()
+            .expect("the selector spec survives an extends");
+        assert_eq!(spec.subcommand.as_deref(), Some("show"));
     }
 
     // -----------------------------------------------------------------------

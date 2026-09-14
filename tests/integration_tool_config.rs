@@ -373,6 +373,28 @@ fn tool_bash_long_command_truncated() {
     assert!(body.len() <= 204, "truncated body too long: {}", body);
 }
 
+/// The panic this guards: a multi-byte character straddling the truncation
+/// offset. `unwrap_or` evaluated its fallback slice unconditionally, so every
+/// long command was cut at a fixed 200 bytes regardless of where characters
+/// began — and a box-drawing `─` in a heredoc took down the TUI and
+/// `--coverage` alike, from nothing worse than reading the session log back.
+#[test]
+fn tool_bash_truncates_a_multibyte_command_on_a_char_boundary() {
+    let cfg = builtin();
+    // `─` occupies bytes 198..201, so a naive cut at 200 lands inside it.
+    let cmd = format!("{}─ and more text after the cut", "x".repeat(198));
+    assert!(cmd.len() > 200);
+
+    let input = serde_json::json!({ "command": cmd });
+    let call = map_tool_call(&cfg, "Bash", &input, "a", "ts").unwrap();
+
+    assert!(call.description.contains('…'), "still truncated");
+    assert!(
+        call.description.is_char_boundary(call.description.len()),
+        "the result is valid UTF-8 by construction"
+    );
+}
+
 #[test]
 fn tool_bash_description_key_fallback() {
     let cfg = builtin();
@@ -380,6 +402,50 @@ fn tool_bash_description_key_fallback() {
     let input = serde_json::json!({ "description": "List files" });
     let call = map_tool_call(&cfg, "Bash", &input, "a", "ts").unwrap();
     assert!(call.description.contains("List files"), "description was: {}", call.description);
+}
+
+// ---------------------------------------------------------------------------
+// 14b. Bash — selectors, which only `ambits show` earns
+// ---------------------------------------------------------------------------
+
+/// `ambits show` reads code without naming a file, so this is the only route
+/// by which it earns coverage at all.
+#[test]
+fn tool_bash_show_command_credits_its_selectors() {
+    let cfg = builtin();
+    let input = serde_json::json!({ "command": "ambits -p . show src/app.rs::App/render" });
+    let call = map_tool_call(&cfg, "Bash", &input, "a", "ts").unwrap();
+
+    assert_eq!(
+        call.target_selectors,
+        vec![("src/app.rs::App/render".to_string(), ReadDepth::FullBody)]
+    );
+    assert_eq!(
+        call.read_depth,
+        ReadDepth::FullBody,
+        "the selector's depth overrides the generic Bash default"
+    );
+}
+
+/// …and `find` does not. Its pattern is a regex over file content, so a search
+/// for text shaped like an id is not a request for that symbol — and `find`
+/// journals what it actually displayed on its own.
+#[test]
+fn tool_bash_find_pattern_credits_nothing() {
+    let cfg = builtin();
+    let input = serde_json::json!({ "command": "ambits -p . find 'src/app.rs::App/render'" });
+    let call = map_tool_call(&cfg, "Bash", &input, "a", "ts").unwrap();
+
+    assert!(
+        call.target_selectors.is_empty(),
+        "a search pattern is not a selector, got {:?}",
+        call.target_selectors
+    );
+    assert_eq!(
+        call.read_depth,
+        ReadDepth::NameOnly,
+        "and the command falls back to the generic Bash depth"
+    );
 }
 
 // ---------------------------------------------------------------------------

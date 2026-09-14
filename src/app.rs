@@ -194,18 +194,20 @@ impl App {
                 "no session id resolved; coverage journaling disabled".to_string()
             ];
         };
-        let manifest = crate::journal::EnvironmentManifest::capture(
-            &self.project_tree,
-            backend,
-            // Same display form the coverage report records (`CoverageReport.filter`),
-            // so the two agree on what "this run was filtered" means.
-            self.filter.as_ref().map(|f| f.display()),
-        );
         let journal = crate::journal::Journal::open(
             &self.project_root,
             &session_id,
-            manifest,
             interval,
+            || {
+                crate::journal::EnvironmentManifest::capture(
+                    &self.project_tree,
+                    backend,
+                    // Same display form the coverage report records
+                    // (`CoverageReport.filter`), so the two agree on what
+                    // "this run was filtered" means.
+                    self.filter.as_ref().map(|f| f.display()),
+                )
+            },
         );
         let warnings = journal.warnings().to_vec();
         self.journal = Some(journal);
@@ -223,11 +225,8 @@ impl App {
     /// scoring a cold-started session as if no agent had read anything.
     pub fn rehydrate_from_journal(&mut self) -> Option<crate::restore::RehydrateStats> {
         let session_id = self.session_id.clone()?;
-        let path = self
-            .project_root
-            .join(crate::journal::JOURNAL_SUBDIR)
-            .join(format!("{session_id}.ndjson"));
-        let contents = crate::journal::read_journal(&path);
+        let dir = self.project_root.join(crate::journal::JOURNAL_SUBDIR);
+        let contents = crate::journal::read_journal_session(&dir, &session_id);
         if contents.reads.is_empty() {
             return None;
         }

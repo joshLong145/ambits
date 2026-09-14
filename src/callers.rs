@@ -45,7 +45,7 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
 
 use crate::parser::ParserRegistry;
-use crate::symbols::{ProjectTree, SymbolNode};
+use crate::symbols::ProjectTree;
 
 /// Bumped on any breaking change to the emitted shape.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -241,19 +241,6 @@ fn collect(
     }
 }
 
-/// The innermost symbol whose byte range contains `byte`.
-///
-/// Innermost rather than outermost: a call inside a method should be
-/// attributed to the method, not to the `impl` block wrapping it.
-fn enclosing(symbols: &[SymbolNode], byte: u32) -> Option<&SymbolNode> {
-    for sym in symbols {
-        if sym.byte_range.start <= byte && byte < sym.byte_range.end {
-            return enclosing(&sym.children, byte).or(Some(sym));
-        }
-    }
-    None
-}
-
 /// Find every call site whose callee matches one of `names`, case-sensitively.
 ///
 /// Matching is exact on the callee as written, not a substring: `new` should
@@ -289,7 +276,7 @@ pub fn find_callers(
                 callee,
                 file: file.file_path.clone(),
                 line,
-                caller: enclosing(&file.symbols, byte).map(|s| s.id.clone()),
+                caller: file.enclosing(byte).map(|s| s.id.clone()),
             });
         }
     }
@@ -414,7 +401,6 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::helpers::*;
 
     fn registry() -> ParserRegistry {
         ParserRegistry::new()
@@ -486,19 +472,6 @@ fn e() { target(); }
         assert_eq!(found, 5, "four path or generic forms, plus the bare call");
     }
 
-    /// A call is attributed to the function containing it, not to the `impl`
-    /// block wrapping that function.
-    #[test]
-    fn attribution_picks_the_innermost_enclosing_symbol() {
-        let outer = sym_with_range("a.rs::Thing", "Thing", 0, 100);
-        let inner = sym_with_range("a.rs::Thing/method", "method", 40, 60);
-        let tree = vec![sym_with_children_ranged(outer, vec![inner])];
-
-        assert_eq!(enclosing(&tree, 50).unwrap().id, "a.rs::Thing/method");
-        assert_eq!(enclosing(&tree, 10).unwrap().id, "a.rs::Thing");
-        assert!(enclosing(&tree, 200).is_none(), "outside every symbol");
-    }
-
     /// Rust puts an enormous amount of real code inside macros — `println!`,
     /// `format!`, `assert_eq!` — and tree-sitter does not parse macro bodies:
     /// the arguments arrive as an unparsed `token_tree`. Without descending
@@ -543,16 +516,5 @@ fn caller() {
     #[test]
     fn an_unparseable_language_yields_no_sites_rather_than_failing() {
         assert!(call_sites(&registry(), Path::new("a.txt"), "helper()").is_empty());
-    }
-
-    fn sym_with_range(id: &str, name: &str, start: u32, end: u32) -> SymbolNode {
-        let mut s = sym(id, name);
-        s.byte_range = start..end;
-        s
-    }
-
-    fn sym_with_children_ranged(mut parent: SymbolNode, children: Vec<SymbolNode>) -> SymbolNode {
-        parent.children = children;
-        parent
     }
 }

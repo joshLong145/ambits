@@ -59,8 +59,28 @@
 //! only ever *under*-reports coverage. Under-reporting is the safe direction —
 //! the agent re-reads something it already knew.
 //!
-//! Only the TUI writes. Readers (`restore-context`) never open the file for
-//! writing, which removes concurrent-writer concerns rather than managing them.
+//! The TUI is no longer the only writer: `ambits find` shows source, so it
+//! records what it showed too. Rather than have two processes append to one
+//! file and lean on `O_APPEND` to keep their writes from interleaving badly,
+//! each writer gets its own file: the long-running TUI writes
+//! `<session>.ndjson`, and every `ambits find` invocation folds its hits into
+//! `<session>.find.ndjson` ([`Journal::open_shard`]). No writer ever opens a
+//! file another *kind* of writer might also have open, so there is nothing
+//! shared for a lock to protect between them. [`session_shard_paths`]
+//! enumerates a session's shards and [`read_journal_session`] folds them into
+//! one view with the same [`fold`] rule used within a file: a new hash
+//! supersedes, an equal hash keeps the deeper read. Readers (`restore-context`)
+//! still never open a file for writing.
+//!
+//! This narrows the race rather than closing it: two `ambits find`
+//! invocations racing in the *same* session still share `<session>.find.ndjson`,
+//! so the single-`write_all`-under-`O_APPEND` guarantee above remains the
+//! safety net for that case (`concurrent_appends_all_parse` below exercises it
+//! directly, now against a shard rather than the primary file). A real mutex
+//! around a shard's open-diff-write sequence would close that gap too; this is
+//! the file-layout half of that fix, landed first because it is what makes the
+//! remaining race small enough to be worth locking deliberately rather than
+//! papering over.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -462,6 +482,71 @@ pub fn read_journal(path: &Path) -> JournalContents {
     out
 }
 
+/// Every on-disk shard of `session_id`'s journal under `dir` (the
+/// `.ambit/coverage` directory) — the primary `<session>.ndjson` first, if it
+/// exists, then any named shards such as `<session>.find.ndjson`, sorted for
+/// a deterministic merge order.
+///
+/// A session's journal is not necessarily one file (see the module doc's
+/// "Durability" section), so anything that needs the *whole* session —
+/// reading, listing, deleting — goes through this rather than assuming one
+/// path.
+///
+/// Matches by filename prefix `"<session_id>."`, which is safe because
+/// session ids are Claude Code UUIDs and never contain a `.` themselves; a
+/// shard name is everything between that prefix and the trailing `.ndjson`.
+pub fn session_shard_paths(dir: &Path, session_id: &str) -> Vec<PathBuf> {
+    let primary = dir.join(format!("{session_id}.ndjson"));
+    let prefix = format!("{session_id}.");
+    let mut shards: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            *p != primary
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".ndjson"))
+        })
+        .collect();
+    shards.sort();
+
+    let mut paths = Vec::with_capacity(shards.len() + 1);
+    if primary.exists() {
+        paths.push(primary);
+    }
+    paths.extend(shards);
+    paths
+}
+
+/// Read and fold every shard of `session_id`'s journal into one merged view.
+///
+/// Shards fold together with the same rule [`fold`] uses for lines within a
+/// single file: a record carrying a *new* hash supersedes what came before
+/// (the content moved on since an earlier shard's read), and one carrying the
+/// *same* hash contributes its depth to the maximum. Which shard's header
+/// survives depends on iteration order, not correctness — any valid header
+/// describes the same session's environment.
+pub fn read_journal_session(dir: &Path, session_id: &str) -> JournalContents {
+    let mut out = JournalContents::default();
+    for path in session_shard_paths(dir, session_id) {
+        let shard = read_journal(&path);
+        out.records += shard.records;
+        out.warnings.extend(shard.warnings);
+        if shard.header.is_some() {
+            out.header = shard.header;
+        }
+        for (id, (hash, depth)) in shard.reads {
+            fold(out.reads.entry(id), hash, depth);
+        }
+        for (key, (hash, depth)) in shard.agent_reads {
+            fold(out.agent_reads.entry(key), hash, depth);
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Writing
 // ---------------------------------------------------------------------------
@@ -496,14 +581,51 @@ impl Journal {
     /// makes relaunching ambit idempotent: startup replays the whole session
     /// log through the ledger, and without this every launch would re-append
     /// the entire history.
+    /// `manifest` is a closure because building one costs a full project scan
+    /// (`EnvironmentManifest::capture` fingerprints the whole tree) and is
+    /// needed only when a header actually gets written — which is once per
+    /// session. `find` parses only the files that matched its pattern, so
+    /// paying for a whole-tree scan on every search to produce a manifest
+    /// nobody reads would undo the reason it is fast.
     pub fn open(
         project_root: &Path,
         session_id: &str,
-        manifest: EnvironmentManifest,
         interval: Duration,
+        manifest: impl FnOnce() -> EnvironmentManifest,
+    ) -> Self {
+        Self::open_at(project_root, session_id, None, interval, manifest)
+    }
+
+    /// Open a named shard of `session_id`'s journal: a file distinct from the
+    /// primary `<session>.ndjson`, so this writer never appends to a file
+    /// another *kind* of writer might have open. `ambits find` opens the
+    /// `"find"` shard.
+    ///
+    /// Two callers opening the *same* shard concurrently (two `find`
+    /// invocations racing in one session) still share a file — see the
+    /// module doc's "Durability" section for why that remains safe.
+    pub fn open_shard(
+        project_root: &Path,
+        session_id: &str,
+        shard: &str,
+        interval: Duration,
+        manifest: impl FnOnce() -> EnvironmentManifest,
+    ) -> Self {
+        Self::open_at(project_root, session_id, Some(shard), interval, manifest)
+    }
+
+    fn open_at(
+        project_root: &Path,
+        session_id: &str,
+        shard: Option<&str>,
+        interval: Duration,
+        manifest: impl FnOnce() -> EnvironmentManifest,
     ) -> Self {
         let dir = project_root.join(JOURNAL_SUBDIR);
-        let path = dir.join(format!("{session_id}.ndjson"));
+        let path = match shard {
+            Some(s) => dir.join(format!("{session_id}.{s}.ndjson")),
+            None => dir.join(format!("{session_id}.ndjson")),
+        };
 
         let mut journal = Self {
             path: path.clone(),
@@ -556,7 +678,7 @@ impl Journal {
                 schema_version: SUPPORTED_SCHEMA_VERSION,
                 created_at: timestamp(),
                 session_id: session_id.to_string(),
-                environment: manifest,
+                environment: manifest(),
             }));
             journal.write(&header);
         }
@@ -709,7 +831,152 @@ mod tests {
     }
 
     fn journal_in(dir: &Path) -> Journal {
-        Journal::open(dir, "sess", manifest(), Duration::from_millis(0))
+        Journal::open(dir, "sess", Duration::from_millis(0), manifest)
+    }
+
+    /// The manifest is a closure because building one fingerprints the whole
+    /// project. A journal that already has a current header needs none, and
+    /// `find` — which parses only what matched — must not be made to scan
+    /// everything for a value nobody will write.
+    #[test]
+    fn open_does_not_build_a_manifest_when_a_header_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(journal_in(dir.path()));
+
+        let mut second = Journal::open(dir.path(), "sess", Duration::from_millis(0), || {
+            panic!("the manifest must not be built when the header is current")
+        });
+        let mut ledger = ContextLedger::new();
+        ledger.record("a.rs::x".into(), ReadDepth::FullBody, content_hash("b"), "ag".into(), 5);
+        assert_eq!(second.sync(&ledger), 1, "and it still appends reads");
+    }
+
+    /// Different writer *kinds* (the TUI, `find`) no longer share a file — see
+    /// [`open_shard`] — but two `find` invocations racing in the same session
+    /// still share `<session>.find.ndjson`. That remaining case is what this
+    /// exercises: records are single `write_all`s under `O_APPEND`, so
+    /// concurrent writers to the *same* shard still interleave whole lines
+    /// rather than splitting one.
+    #[test]
+    fn concurrent_appends_to_the_same_shard_all_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        // `&Path` is Copy, so each `move` closure takes its own copy of the
+        // reference and the `TempDir` itself outlives the scope.
+        let root = dir.path();
+        drop(Journal::open_shard(root, "sess", "find", Duration::from_millis(0), manifest));
+
+        std::thread::scope(|scope| {
+            for writer in 0..4 {
+                scope.spawn(move || {
+                    let mut journal =
+                        Journal::open_shard(root, "sess", "find", Duration::from_millis(0), manifest);
+                    let mut ledger = ContextLedger::new();
+                    for i in 0..25 {
+                        ledger.record(
+                            format!("a.rs::sym{writer}_{i}"),
+                            ReadDepth::FullBody,
+                            content_hash(&format!("{writer}-{i}")),
+                            format!("agent-{writer}"),
+                            5,
+                        );
+                    }
+                    journal.sync(&ledger);
+                });
+            }
+        });
+
+        let contents = read_journal(&crate::cache::journal_dir(root).join("sess.find.ndjson"));
+        assert!(
+            contents.warnings.is_empty(),
+            "every line must be whole JSON: {:?}",
+            contents.warnings
+        );
+        assert_eq!(contents.reads.len(), 100, "no writer clobbered another");
+    }
+
+    /// The file-layout half of the fix: the TUI's primary shard and `find`'s
+    /// named shard never touch the same file, yet `read_journal_session` still
+    /// reports one merged view — same symbol/agent pairs fold exactly as they
+    /// would within a single file.
+    #[test]
+    fn two_shards_fold_into_one_session_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // The TUI's primary shard reads one symbol at Overview.
+        let mut tui_ledger = ContextLedger::new();
+        tui_ledger.record(
+            "a.rs::x".into(),
+            ReadDepth::Overview,
+            content_hash("body"),
+            "agent-tui".into(),
+            5,
+        );
+        journal_in(root).sync(&tui_ledger);
+
+        // `find`'s shard shows the *same* symbol, unchanged, but read deeper —
+        // plus a symbol the TUI never touched.
+        let mut find_ledger = ContextLedger::new();
+        find_ledger.record(
+            "a.rs::x".into(),
+            ReadDepth::FullBody,
+            content_hash("body"),
+            "agent-tui".into(),
+            5,
+        );
+        find_ledger.record(
+            "b.rs::y".into(),
+            ReadDepth::FullBody,
+            content_hash("other"),
+            "agent-cli".into(),
+            5,
+        );
+        Journal::open_shard(root, "sess", "find", Duration::from_millis(0), manifest).sync(&find_ledger);
+
+        let dir_path = crate::cache::journal_dir(root);
+        assert_eq!(
+            crate::journal::session_shard_paths(&dir_path, "sess").len(),
+            2,
+            "primary and find shard both exist"
+        );
+
+        let merged = read_journal_session(&dir_path, "sess");
+        assert!(merged.warnings.is_empty());
+        assert_eq!(merged.reads.len(), 2, "both symbols are visible");
+        assert_eq!(
+            merged.reads["a.rs::x"].1,
+            ReadDepth::FullBody,
+            "the deeper of the two shards' reads wins at an equal hash"
+        );
+        assert_eq!(merged.reads["b.rs::y"].1, ReadDepth::FullBody);
+    }
+
+    /// The property that makes two writers safe. A TUI syncing `Overview` for a
+    /// symbol `find` already recorded at `FullBody` must not demote it — the
+    /// journal is last-wins on *hash*, but greatest-wins on depth.
+    #[test]
+    fn fold_upgrades_depth_at_an_equal_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::cache::journal_dir(dir.path()).join("sess.ndjson");
+        drop(journal_in(dir.path()));
+
+        let hash = content_hash("body");
+        let mut deep = ContextLedger::new();
+        deep.record("a.rs::x".into(), ReadDepth::FullBody, hash, "ag".into(), 5);
+        journal_in(dir.path()).sync(&deep);
+
+        // A second writer with a shallower view of the same, unchanged symbol.
+        let mut shallow = ContextLedger::new();
+        shallow.record("a.rs::x".into(), ReadDepth::Overview, hash, "ag".into(), 5);
+        let mut other = journal_in(dir.path());
+        other.sync(&shallow);
+
+        let contents = read_journal(&path);
+        assert_eq!(
+            contents.reads["a.rs::x"].1,
+            ReadDepth::FullBody,
+            "the shallower record must not demote the deeper one"
+        );
     }
 
     #[test]
@@ -1011,7 +1278,7 @@ mod tests {
         let mut ledger = ContextLedger::new();
         ledger.record("a.rs::x".into(), ReadDepth::FullBody, content_hash("b"), "ag".into(), 5);
 
-        let mut j = Journal::open(dir.path(), "sess", manifest(), Duration::from_secs(3600));
+        let mut j = Journal::open(dir.path(), "sess", Duration::from_secs(3600), manifest);
         assert_eq!(j.maybe_sync(&ledger), 0, "interval has not elapsed");
         assert_eq!(j.sync(&ledger), 1, "explicit sync ignores the interval");
     }
