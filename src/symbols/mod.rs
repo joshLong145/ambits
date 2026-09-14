@@ -145,6 +145,32 @@ impl FileSymbols {
     pub fn total_symbols(&self) -> usize {
         self.symbols.iter().map(|s| s.total_symbols()).sum()
     }
+
+    /// The innermost symbol whose byte range contains `byte`.
+    ///
+    /// Innermost rather than outermost: a call inside a method should be
+    /// attributed to the method, not to the `impl` block wrapping it.
+    ///
+    /// One containment search for every consumer that has an offset and wants
+    /// the symbol around it — `callers` asks it of a call site, `find` asks it
+    /// of a match. It lived privately in `callers` first, which is fine until
+    /// a second caller has to either re-implement the descent or forget it.
+    pub fn enclosing(&self, byte: u32) -> Option<&SymbolNode> {
+        enclosing(&self.symbols, byte)
+    }
+}
+
+/// Recursive half of [`FileSymbols::enclosing`].
+///
+/// Descends before returning, so the deepest containing symbol wins; a symbol
+/// whose children do not contain `byte` is itself the answer.
+fn enclosing(symbols: &[SymbolNode], byte: u32) -> Option<&SymbolNode> {
+    for sym in symbols {
+        if sym.byte_range.start <= byte && byte < sym.byte_range.end {
+            return enclosing(&sym.children, byte).or(Some(sym));
+        }
+    }
+    None
 }
 
 /// The full project symbol tree, organized by directory structure.
@@ -189,5 +215,47 @@ impl ProjectTree {
 
     pub fn total_files(&self) -> usize {
         self.files.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::helpers::{file, sym_with_bytes, sym_with_children};
+    use crate::symbols::FileSymbols;
+
+    /// `sym_with_children` leaves the parent spanning 0..100, so the child's
+    /// 40..60 is genuinely nested inside it.
+    fn thing() -> FileSymbols {
+        file(
+            "a.rs",
+            vec![sym_with_children(
+                "a.rs::Thing",
+                "Thing",
+                vec![sym_with_bytes("a.rs::Thing/method", "method", 40, 60)],
+            )],
+        )
+    }
+
+    /// The reason this is innermost-first: a call inside a method belongs to
+    /// the method, not to the `impl` block wrapping it.
+    #[test]
+    fn enclosing_picks_the_innermost_symbol() {
+        assert_eq!(
+            thing().enclosing(50).unwrap().id,
+            "a.rs::Thing/method",
+            "an offset inside the child must not be attributed to the parent"
+        );
+        assert_eq!(
+            thing().enclosing(10).unwrap().id,
+            "a.rs::Thing",
+            "an offset inside the parent alone belongs to the parent"
+        );
+    }
+
+    /// File-scope offsets — a `use` line, a top-level comment — have no
+    /// enclosing symbol, and must report that rather than the nearest one.
+    #[test]
+    fn enclosing_is_none_outside_every_range() {
+        assert!(thing().enclosing(200).is_none());
     }
 }

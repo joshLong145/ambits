@@ -288,6 +288,23 @@ enum SkillCommands {
     },
 }
 
+/// Build the project symbol tree with whichever backend was selected.
+///
+/// Named because two call sites need it and they must not drift: `find`
+/// scans on its own, ahead of the project-wide scan every other command shares.
+fn scan_tree(
+    serena_backend: bool,
+    registry: &ParserRegistry,
+    project_path: &Path,
+    filter: Option<&PathFilter>,
+) -> Result<ambits::symbols::ProjectTree> {
+    if serena_backend {
+        serena::scan_project_serena(project_path, filter)
+    } else {
+        registry.scan_project(project_path, filter)
+    }
+}
+
 fn main() -> Result<()> {
     color_eyre::install()?;
     let mut cli = Cli::parse();
@@ -357,11 +374,52 @@ fn main() -> Result<()> {
     }
 
     let registry = ParserRegistry::new();
-    let project_tree = if cli.serena {
-        serena::scan_project_serena(&project_path, filter.as_ref())?
-    } else {
-        registry.scan_project(&project_path, filter.as_ref())?
-    };
+
+    // Resolve log directory and session. Hoisted above the scan because `find`
+    // dispatches before it: neither depends on the symbol tree, and both read
+    // the CLI values rather than consuming them so `--coverage` below still
+    // resolves its own.
+    let log_dir = cli
+        .log_dir
+        .clone()
+        .or_else(|| ingester.log_dir_for_project(&project_path));
+
+    let session_id = cli.session.clone().or_else(|| {
+        log_dir
+            .as_ref()
+            .and_then(|d| ingester.find_latest_session(d))
+    });
+
+    // Coverage context for `find` and `show`. Loaded once, from the journal
+    // the TUI maintains, so both can report whether a symbol has already been
+    // read. `None` when there is no session or no journal — which callers must
+    // not confuse with "nothing has been read".
+    let coverage_index = ambits::restore::CoverageIndex::load(&project_path, session_id.as_deref());
+
+    // `find` runs before the project-wide scan, the way `cache` does. A content
+    // search reads the files it walks and parses only the ones that match, so
+    // paying for a full parse first would be paying for work it discards. The
+    // tree it still asks for here is temporary scaffolding.
+    if let Some(Commands::Find {
+        pattern,
+        limit,
+        format,
+    }) = &command
+    {
+        for w in &config_warnings {
+            eprintln!("[ambit warning] {w}");
+        }
+        let project_tree = scan_tree(cli.serena, &registry, &project_path, filter.as_ref())?;
+        return ambits::find::run(
+            &project_tree,
+            pattern,
+            *limit,
+            matches!(format, FindFormat::Json),
+            coverage_index.as_ref(),
+        );
+    }
+
+    let project_tree = scan_tree(cli.serena, &registry, &project_path, filter.as_ref())?;
 
     if cli.dump {
         for w in &config_warnings {
@@ -391,23 +449,6 @@ fn main() -> Result<()> {
         );
     }
 
-    // Resolve log directory and session.
-    let log_dir = cli
-        .log_dir
-        .or_else(|| ingester.log_dir_for_project(&project_path));
-
-    let session_id = cli.session.or_else(|| {
-        log_dir
-            .as_ref()
-            .and_then(|d| ingester.find_latest_session(d))
-    });
-
-    // Coverage context for `find` and `show`. Loaded once, from the journal
-    // the TUI maintains, so both can report whether a symbol has already been
-    // read. `None` when there is no session or no journal — which callers must
-    // not confuse with "nothing has been read".
-    let coverage_index = ambits::restore::CoverageIndex::load(&project_path, session_id.as_deref());
-
     if let Some(Commands::Show {
         selector,
         no_body,
@@ -423,24 +464,6 @@ fn main() -> Result<()> {
             selector,
             !no_body,
             *max_bytes,
-            coverage_index.as_ref(),
-        );
-    }
-
-    if let Some(Commands::Find {
-        pattern,
-        limit,
-        format,
-    }) = &command
-    {
-        for w in &config_warnings {
-            eprintln!("[ambit warning] {w}");
-        }
-        return ambits::find::run(
-            &project_tree,
-            pattern,
-            *limit,
-            matches!(format, FindFormat::Json),
             coverage_index.as_ref(),
         );
     }

@@ -53,6 +53,70 @@ pub trait LanguageParser: Send + Sync {
     }
 }
 
+/// Where a walk may go, beyond the defaults every command shares.
+///
+/// The defaults reproduce the scanner's historical behaviour exactly — hidden
+/// files skipped, ignore files honoured, no glob or type narrowing — so a
+/// caller that wants that says `WalkOptions::default()` and nothing else.
+/// `find` populates the rest from its ripgrep-compatible flags.
+#[derive(Debug, Default)]
+pub struct WalkOptions<'a> {
+    /// Project-relative path filter: `--filter` / `--filter-regex`, and
+    /// `find`'s positional PATH arguments.
+    pub filter: Option<&'a PathFilter>,
+    /// Glob overrides (`-g`), from `ignore::overrides::OverrideBuilder`.
+    pub overrides: Option<ignore::overrides::Override>,
+    /// File-type narrowing (`-t`), from `ignore::types::TypesBuilder`.
+    pub types: Option<ignore::types::Types>,
+    /// Include hidden files (`--hidden`). Inverted relative to
+    /// `WalkBuilder::hidden`, which takes "skip hidden".
+    pub hidden: bool,
+    /// Ignore `.gitignore`, `.ignore`, and their global and parent variants
+    /// (`--no-ignore`).
+    pub no_ignore: bool,
+}
+
+/// Every file under `root` the options admit, as `(absolute, project-relative)`.
+///
+/// Split out of [`ParserRegistry::scan_project`] because `find` needs the same
+/// traversal without the parse that used to follow it, and because glob and
+/// type narrowing belong to the walk rather than to any one command. Walk
+/// errors are skipped rather than propagated: one unreadable directory should
+/// narrow the answer, not fail the command.
+pub fn walk_files(root: &Path, opts: &WalkOptions<'_>) -> Vec<(PathBuf, PathBuf)> {
+    use ignore::WalkBuilder;
+
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(!opts.hidden)
+        .ignore(!opts.no_ignore)
+        .git_ignore(!opts.no_ignore)
+        .git_global(!opts.no_ignore)
+        .git_exclude(!opts.no_ignore);
+    if let Some(o) = &opts.overrides {
+        builder.overrides(o.clone());
+    }
+    if let Some(t) = &opts.types {
+        builder.types(t.clone());
+    }
+
+    let mut out = Vec::new();
+    for entry in builder.build().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let rel_path = path.strip_prefix(root).unwrap_or(path);
+        if let Some(f) = opts.filter {
+            if !f.matches(rel_path) {
+                continue;
+            }
+        }
+        out.push((path.to_path_buf(), rel_path.to_path_buf()));
+    }
+    out
+}
+
 /// Registry of all available language parsers.
 pub struct ParserRegistry {
     parsers: Vec<Box<dyn LanguageParser>>,
@@ -101,36 +165,26 @@ impl ParserRegistry {
         root: &Path,
         filter: Option<&PathFilter>,
     ) -> Result<ProjectTree> {
-        use ignore::WalkBuilder;
-
         // Walk first, parse second. Measured on this repo, walking the tree is
         // effectively free — restricting the parse to a single file costs the
         // same as parsing none — while parsing every file is ~95ms of the
         // ~112ms a command spends before it can answer anything. Since files
         // parse independently, that is the one part worth spreading across
         // cores.
-        let mut targets: Vec<(PathBuf, PathBuf)> = Vec::new();
-        for result in WalkBuilder::new(root).hidden(true).git_ignore(true).build() {
-            let entry = match result {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let path = entry.path();
-            if path.is_dir() {
-                continue;
-            }
-
-            let rel_path = path.strip_prefix(root).unwrap_or(path);
-            if let Some(f) = filter {
-                if !f.matches(rel_path) {
-                    continue;
-                }
-            }
-            if self.parser_for(path).is_some() {
-                targets.push((path.to_path_buf(), rel_path.to_path_buf()));
-            }
-        }
+        //
+        // The extension test stays here rather than in the walk: a scan wants
+        // only files it can parse, but a content search wants every text file
+        // in scope and attributes symbols to the subset that parses.
+        let targets: Vec<(PathBuf, PathBuf)> = walk_files(
+            root,
+            &WalkOptions {
+                filter,
+                ..Default::default()
+            },
+        )
+        .into_iter()
+        .filter(|(abs, _)| self.parser_for(abs).is_some())
+        .collect();
 
         let mut files: Vec<FileSymbols> = Vec::with_capacity(targets.len());
         if !targets.is_empty() {
