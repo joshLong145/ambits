@@ -1,471 +1,1368 @@
-//! Pattern search over the symbol index, for `ambits find`.
+//! Content search with symbol attribution, for `ambits find`.
 //!
-//! ## Why this is not `show`
+//! ## Why this is shaped like ripgrep
 //!
-//! [`crate::lookup`] is addressable-only: you must already know an exact id or
-//! content hash. That covers acting on a digest, and nothing else. Every other
-//! question — *what is in this file*, *where is this name defined*, *what
-//! methods hang off this type* — is a query, and there was no way to ask one.
+//! The interface is not ours to invent. Claude Code's `Grep` tool is
+//! ripgrep-backed, so every agent that reaches for this already knows `-g`,
+//! `-t`, `-i`, `-A/-B/-C`, `-l`, `-c`. A bespoke grammar — this command had one
+//! — is a second dialect to learn for no gain. Where `grep(1)` and `rg`
+//! disagree, `rg` wins; where `rg` and ambit's own conventions disagree, `rg`
+//! still wins.
 //!
-//! Kept a separate command deliberately. `show` reports
-//! `"selector": "unrecognized"` for anything that is neither an id nor a hash,
-//! and that signal is load-bearing: it is how a caller distinguishes a
-//! malformed query from a symbol that does not exist. Making bare names mean
-//! "search" would quietly destroy it.
+//! We deviate in four places, each on purpose: output is always sorted by
+//! `(path, line, column)`, because determinism is worth more to an agent than
+//! the microseconds; `--head-limit` and `--max-columns` carry non-zero defaults,
+//! because this output lands in a context window rather than a terminal; and
+//! `--column` is on, because it is what disambiguates two matches on one line.
 //!
-//! ## The pattern grammar
+//! ## What the symbol column buys
 //!
-//! `[path]::[name]`, or a bare `name` when there is no `::`. Both halves are
-//! case-insensitive, and an empty half matches everything — which is what
-//! makes `src/app.rs::` an enumeration of that file.
+//! A grep hit is a coordinate. `src/app.rs:1847` tells an agent where to look
+//! but not what it is looking at, and nothing about whether it has been there
+//! before. Every symbol carries a `byte_range`, so the innermost symbol
+//! containing a match is a containment search over that file's symbols
+//! ([`FileSymbols::enclosing`]), and the coverage journal turns the resulting id
+//! into a read depth. `src/app.rs:1847` becomes
+//! `src/app.rs::App/process_agent_event`, already read in full — an id `show`
+//! accepts and a reason not to spend a `Read` on it.
 //!
-//! **The path half matches whole components, not raw substrings.** A substring
-//! rule looks right until you try it: `ui::` then matches `src/tui.rs`,
-//! because "ui" sits inside "tui". Requiring consecutive path components to
-//! prefix-match drops exactly that and keeps everything else, including
-//! `app` → `app.rs` and multi-segment `ui/stats`.
+//! Files no parser handles are still searched. A hit in `Cargo.toml` is a real
+//! hit; it simply has no symbol, and says so rather than being hidden.
 //!
-//! **The name half matches the leaf, unless the pattern contains `/`.** Leaf
-//! matching is what keeps results honest: against this repo, `test` matches 41
-//! symbols by leaf but 486 by full path, because every `tests/foo` matches
-//! through its parent. A `/` in the pattern means the caller is addressing
-//! nesting on purpose, so the whole name path is matched instead — which is
-//! what makes `::App/` return every member of `App` rather than nothing.
+//! ## Prefilter first, parse second
 //!
-//! ## What it does not do
-//!
-//! This searches *definitions*. It has no notion of usages: a method call like
-//! `is_none_or` returns nothing, because no symbol in the tree is named that.
-//! For call sites, grep remains the right tool.
+//! Every other command scans the project up front: walk, then parse every file,
+//! then answer. For a search that is backwards. Most files do not match, and a
+//! file that does not match need never be parsed — so the pipeline is walk,
+//! read, reject on the raw bytes, and only then parse the survivors for
+//! attribution. Against this repo a typical query parses 7 files instead of 40.
+//! The regex crate's own literal prefilters do the rejecting, which is the same
+//! machinery ripgrep relies on.
 
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Result, WrapErr};
-use serde::Serialize;
+use regex::bytes::{Regex, RegexBuilder};
 
-use crate::symbols::{ProjectTree, SymbolNode};
+use crate::parser::ParserRegistry;
+use crate::restore::CoverageIndex;
+use crate::symbols::FileSymbols;
+use crate::tracking::ReadDepth;
 
-/// Bumped on any breaking change to the emitted shape.
-pub const SCHEMA_VERSION: u32 = 2;
-
-/// Results reported per query before truncating.
+/// Matches reported before truncating, across all files.
 ///
-/// Chosen against real volume rather than taste: on this repo a single letter
-/// matches over a thousand symbols, so an uncapped search is a wall of text.
-/// Every realistic query lands far below this.
-pub const DEFAULT_LIMIT: usize = 100;
+/// ripgrep has no such cap, and for a terminal it should not. This output goes
+/// into an agent's context window, where an unbounded grep is a hazard rather
+/// than a scroll. `0` lifts it.
+pub const DEFAULT_HEAD_LIMIT: usize = 200;
 
-/// A parsed `[path]::[name]` query.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Pattern {
-    /// `/`-separated path segments, lowercased. Empty matches every file.
-    pub path: Vec<String>,
-    /// Lowercased name fragment. Empty matches every symbol.
-    pub name: String,
-    /// Set when `name` contained a `/`, which switches matching from the leaf
-    /// to the full name path.
-    pub nested: bool,
+/// Columns of a matching line shown before truncating.
+///
+/// Also not an rg default. A minified bundle or an embedded blob is one line of
+/// tens of thousands of bytes, and printing it teaches the reader nothing.
+pub const DEFAULT_MAX_COLUMNS: usize = 300;
+
+/// How much of a file to sniff for NUL before calling it binary.
+const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+
+/// What to print for a symbol that has never been read. An empty column would
+/// read as "unread" when the truth may be "unknown"; see [`Options::no_symbol`]
+/// and the journal-absent case in [`render_symbol`].
+const UNREAD: &str = "—";
+
+/// What to print where a symbol should be but none exists — a match at file
+/// scope, or in a file no parser handles.
+const NO_SYMBOL: &str = "-";
+
+// ---------------------------------------------------------------------------
+// Options
+// ---------------------------------------------------------------------------
+
+/// How results are reported, mirroring ripgrep's mutually exclusive modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputMode {
+    /// Matching lines. The default, and the only mode that shows source.
+    #[default]
+    Content,
+    /// `-l`: one path per file with a match.
+    FilesWithMatches,
+    /// `-c`: matching lines per file.
+    Count,
+    /// `--count-matches`: total matches per file.
+    CountMatches,
+    /// `-q`: nothing at all; the exit code is the answer.
+    Quiet,
 }
 
-impl Pattern {
-    pub fn parse(query: &str) -> Self {
-        let q = query.trim();
-        let (path, name) = match q.split_once("::") {
-            Some((p, n)) => (p, n),
-            None => ("", q),
-        };
-        Pattern {
-            path: path
-                .to_ascii_lowercase()
-                .split('/')
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect(),
-            name: name.to_ascii_lowercase(),
-            nested: name.contains('/'),
+impl OutputMode {
+    /// Whether this mode puts source text in front of the caller.
+    ///
+    /// Load-bearing beyond formatting: only a mode that shows source can
+    /// justify recording a read, so this is what the journal keys off.
+    pub fn shows_source(&self) -> bool {
+        matches!(self, OutputMode::Content)
+    }
+}
+
+/// When to colorize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorChoice {
+    /// Color when stdout is a terminal.
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+/// Everything `find` needs, mapped from the CLI in `main`.
+///
+/// A bag rather than a dozen parameters: the flag set is ripgrep's, so it is
+/// large by definition, and threading it as arguments would put this function
+/// well past any reasonable arity.
+#[derive(Debug, Default)]
+pub struct Options {
+    /// Patterns, combined as an alternation. The positional `PATTERN` plus
+    /// every `-e`.
+    pub patterns: Vec<String>,
+    /// `-F`: treat patterns as literal text.
+    pub fixed_strings: bool,
+    /// `-i`
+    pub ignore_case: bool,
+    /// `-w`
+    pub word_regexp: bool,
+    /// `-x`. Takes precedence over `-w`, as in rg.
+    pub line_regexp: bool,
+    /// `-U`: patterns may match across line boundaries.
+    pub multiline: bool,
+    /// `-v`
+    pub invert_match: bool,
+
+    pub mode: OutputMode,
+    /// `--json`: ripgrep's JSON Lines event stream, plus `symbol` and
+    /// `coverage`.
+    pub json: bool,
+    /// `--heading` / `--no-heading`. `None` follows the terminal.
+    pub heading: Option<bool>,
+    /// `-n` / `-N`
+    pub line_number: bool,
+    /// `--column` / `--no-column`
+    pub column: bool,
+    /// `-o`
+    pub only_matching: bool,
+    /// `-B`
+    pub before_context: usize,
+    /// `-A`
+    pub after_context: usize,
+    /// `-M`, `0` for unlimited.
+    pub max_columns: usize,
+    /// `-m`, per file.
+    pub max_count: Option<usize>,
+    /// `--head-limit`, `0` for unlimited.
+    pub head_limit: usize,
+    /// Drop the attribution field entirely, for byte-identical rg output.
+    pub no_symbol: bool,
+    pub color: ColorChoice,
+}
+
+impl Options {
+    /// Options for `patterns`, with every default in place.
+    ///
+    /// The defaults are the CLI's defaults, so tests exercise the same
+    /// configuration users get rather than an all-false strawman.
+    pub fn new(patterns: Vec<String>) -> Self {
+        Self {
+            patterns,
+            line_number: true,
+            column: true,
+            max_columns: DEFAULT_MAX_COLUMNS,
+            head_limit: DEFAULT_HEAD_LIMIT,
+            ..Default::default()
         }
     }
+}
 
-    /// Whether any run of consecutive path components prefix-matches the
-    /// pattern's segments.
-    pub fn matches_path(&self, path: &Path) -> bool {
-        if self.path.is_empty() {
-            return true;
+// ---------------------------------------------------------------------------
+// Matcher
+// ---------------------------------------------------------------------------
+
+/// A compiled pattern set.
+///
+/// `regex::bytes` rather than `regex`: a source tree contains files that are not
+/// valid UTF-8, and refusing to search them — or lossily rewriting them before
+/// the match, which moves every byte offset after the first bad byte — are both
+/// worse than matching the bytes as they are.
+#[derive(Debug)]
+pub struct Matcher {
+    re: Regex,
+    invert: bool,
+    multiline: bool,
+}
+
+impl Matcher {
+    /// Compile `opts.patterns` into one alternation.
+    ///
+    /// Alternation rather than a `RegexSet` because the match *positions* are
+    /// the whole point; `RegexSet` reports which patterns matched but not where.
+    pub fn new(opts: &Options) -> Result<Self> {
+        if opts.patterns.is_empty() {
+            return Err(color_eyre::eyre::eyre!("no pattern given"));
         }
-        let comps: Vec<String> = path
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
-            .collect();
-        if comps.len() < self.path.len() {
-            return false;
-        }
-        (0..=comps.len() - self.path.len()).any(|i| {
-            self.path
-                .iter()
-                .enumerate()
-                .all(|(j, seg)| comps[i + j].starts_with(seg.as_str()))
+        let alternation = opts
+            .patterns
+            .iter()
+            .map(|p| {
+                let atom = if opts.fixed_strings {
+                    regex::escape(p)
+                } else {
+                    p.clone()
+                };
+                // `-x` subsumes `-w`: a pattern anchored to the whole line is
+                // already at word boundaries, and applying both nests the
+                // anchors wrongly.
+                if opts.line_regexp {
+                    format!("^(?:{atom})$")
+                } else if opts.word_regexp {
+                    format!(r"\b(?:{atom})\b")
+                } else {
+                    format!("(?:{atom})")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+
+        let re = RegexBuilder::new(&alternation)
+            .case_insensitive(opts.ignore_case)
+            // Only meaningful in multiline mode: the per-line path matches
+            // against one line at a time, where `^`/`$` already mean what the
+            // caller expects.
+            .multi_line(opts.multiline)
+            .build()
+            .wrap_err_with(|| format!("invalid pattern: {alternation}"))?;
+
+        Ok(Self {
+            re,
+            invert: opts.invert_match,
+            multiline: opts.multiline,
         })
     }
 
-    /// Whether the symbol's name matches, against the leaf or the whole name
-    /// path depending on how the pattern was written.
-    pub fn matches_name(&self, name_path: &str) -> bool {
-        if self.name.is_empty() {
-            return true;
-        }
-        let hay = if self.nested {
-            name_path
-        } else {
-            name_path.rsplit('/').next().unwrap_or(name_path)
-        };
-        hay.to_ascii_lowercase().contains(&self.name)
+    /// Whether the file is worth opening further.
+    ///
+    /// Under `-v` every file qualifies — a file with no match is nothing but
+    /// inverted matches — so the prefilter is skipped rather than inverted.
+    fn worth_searching(&self, buf: &[u8]) -> bool {
+        self.invert || self.re.is_match(buf)
     }
 }
 
-/// Everything matching `pattern`, and how many there were in total.
+// ---------------------------------------------------------------------------
+// Results
+// ---------------------------------------------------------------------------
+
+/// The symbol a match landed in.
 ///
-/// The total is reported separately from the returned slice so a truncated
-/// result can say how much it withheld rather than implying it found only
-/// what it shows.
-pub fn search<'a>(
-    tree: &'a ProjectTree,
-    pattern: &Pattern,
-    limit: usize,
-) -> (Vec<(&'a Path, &'a SymbolNode)>, usize) {
-    let mut hits: Vec<(&Path, &SymbolNode)> = tree
-        .walk()
-        .into_iter()
-        .filter(|(file, sym)| pattern.matches_path(file) && pattern.matches_name(sym.name_path()))
-        .collect();
+/// Owned rather than borrowed from a `FileSymbols`: files are parsed one at a
+/// time and dropped, so there is no tree outliving the search to borrow from.
+/// At `--head-limit` scale the allocations are noise.
+#[derive(Debug, Clone)]
+pub struct SymbolHit {
+    /// `<path>::<name-path>`, accepted as-is by `show`.
+    pub id: String,
+    /// The nesting path alone, which is what the text output shows.
+    pub name_path: String,
+    pub label: &'static str,
+    /// 1-based inclusive line range of the whole symbol.
+    pub lines: [u32; 2],
+    /// Depth this symbol was read at, when a journal says so.
+    pub depth: Option<ReadDepth>,
+    /// Current content hash, for the journal to record against.
+    pub content_hash: [u8; 32],
+    pub estimated_tokens: u32,
+}
 
-    // Deterministic: the walk is ordered, but stating it makes the contract
-    // explicit rather than incidental.
-    hits.sort_by(|a, b| {
-        a.0.cmp(b.0)
-            .then_with(|| a.1.line_range.start.cmp(&b.1.line_range.start))
-            .then_with(|| a.1.id.cmp(&b.1.id))
-    });
+/// One matching line.
+#[derive(Debug, Clone)]
+pub struct Hit {
+    /// 1-based.
+    pub line: u32,
+    /// 1-based **byte** column of the match start, as rg reports it.
+    pub column: u32,
+    /// Absolute byte offset of the match start, which is what attribution
+    /// searches.
+    pub byte: u32,
+    /// The whole line, or every line the match spans under `-U`.
+    pub text: Vec<u8>,
+    /// The match, relative to `text`.
+    pub span: (usize, usize),
+    pub symbol: Option<SymbolHit>,
+}
 
-    let total = hits.len();
-    hits.truncate(limit);
+/// One file's matches.
+#[derive(Debug)]
+pub struct FileHits {
+    /// Project-relative.
+    pub path: PathBuf,
+    pub hits: Vec<Hit>,
+    /// Matches before `-m` truncated them.
+    pub total: usize,
+    /// `-A`/`-B`/`-C` lines, by 1-based line number, never overlapping `hits`.
+    /// Captured during the search because that is the only point at which the
+    /// file's bytes are in hand.
+    pub context: Vec<(u32, Vec<u8>)>,
+}
+
+// ---------------------------------------------------------------------------
+// Searching
+// ---------------------------------------------------------------------------
+
+/// Whether `buf` looks like something a reader would want printed.
+///
+/// rg's heuristic: a NUL byte near the start. Cheap, and wrong only for text
+/// files that open with a NUL, which are not text files.
+fn is_binary(buf: &[u8]) -> bool {
+    buf.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0)
+}
+
+/// Every match in one already-read buffer, before attribution.
+fn hits_in(matcher: &Matcher, buf: &[u8], max_count: Option<usize>) -> (Vec<Hit>, usize) {
+    let mut hits = Vec::new();
+    let mut total = 0usize;
+
+    if matcher.multiline {
+        // One pass over the whole buffer: the match may cross line boundaries,
+        // so lines are derived from the match rather than the other way around.
+        for m in matcher.re.find_iter(buf) {
+            total += 1;
+            if max_count.is_some_and(|c| hits.len() >= c) {
+                continue;
+            }
+            let line_start = buf[..m.start()]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |i| i + 1);
+            let line_end = buf[m.end()..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(buf.len(), |i| m.end() + i);
+            hits.push(Hit {
+                line: buf[..m.start()].iter().filter(|&&b| b == b'\n').count() as u32 + 1,
+                column: (m.start() - line_start) as u32 + 1,
+                byte: m.start() as u32,
+                text: buf[line_start..line_end].to_vec(),
+                span: (m.start() - line_start, m.end() - line_start),
+                symbol: None,
+            });
+        }
+        return (hits, total);
+    }
+
+    let mut offset = 0usize;
+    for (i, raw) in buf.split_inclusive(|&b| b == b'\n').enumerate() {
+        let line_no = i as u32 + 1;
+        let line = strip_newline(raw);
+
+        if matcher.invert {
+            if !matcher.re.is_match(line) {
+                total += 1;
+                if !max_count.is_some_and(|c| hits.len() >= c) {
+                    hits.push(Hit {
+                        line: line_no,
+                        column: 1,
+                        byte: offset as u32,
+                        text: line.to_vec(),
+                        span: (0, 0),
+                        symbol: None,
+                    });
+                }
+            }
+        } else {
+            for m in matcher.re.find_iter(line) {
+                total += 1;
+                if max_count.is_some_and(|c| hits.len() >= c) {
+                    continue;
+                }
+                hits.push(Hit {
+                    line: line_no,
+                    column: m.start() as u32 + 1,
+                    byte: (offset + m.start()) as u32,
+                    text: line.to_vec(),
+                    span: (m.start(), m.end()),
+                    symbol: None,
+                });
+            }
+        }
+        offset += raw.len();
+    }
+
     (hits, total)
 }
 
-#[derive(Serialize)]
-struct ResultDto<'a> {
-    query: &'a str,
-    /// Total matches, which exceeds `matches.len()` when truncated.
-    matched: usize,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    truncated: bool,
-    matches: Vec<crate::lookup::MatchDto<'a>>,
-    /// How many of the reported matches have a recorded read. Absent without a
-    /// coverage journal, which is not the same as zero.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    read: Option<usize>,
+/// A line without its terminator, CRLF included.
+fn strip_newline(raw: &[u8]) -> &[u8] {
+    let mut line = raw;
+    if line.last() == Some(&b'\n') {
+        line = &line[..line.len() - 1];
+        if line.last() == Some(&b'\r') {
+            line = &line[..line.len() - 1];
+        }
+    }
+    line
 }
 
-#[derive(Serialize)]
-struct FindDto<'a> {
-    schema_version: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    coverage: Option<crate::lookup::CoverageDto<'a>>,
-    results: Vec<ResultDto<'a>>,
-}
-
-/// Resolve `queries` and print them, as JSON or as an aligned listing.
+/// Search one file, parsing it only if it matched and only if attribution is
+/// wanted.
 ///
-/// Exits successfully when nothing matches, for the same reason `show` does:
-/// "no symbol is named that" is an answer, not a failure.
-pub fn run(
-    tree: &ProjectTree,
-    queries: &[String],
-    limit: usize,
-    json: bool,
-    coverage: Option<&crate::restore::CoverageIndex>,
-) -> Result<()> {
-    if json {
-        let results: Vec<ResultDto> = queries
-            .iter()
-            .map(|q| {
-                let (hits, total) = search(tree, &Pattern::parse(q), limit);
-                let read = coverage.map(|c| {
-                    hits.iter()
-                        .filter(|(_, n)| c.depth_of(&n.id).is_some())
-                        .count()
-                });
-                ResultDto {
-                    query: q,
-                    matched: total,
-                    truncated: total > hits.len(),
-                    matches: hits
-                        .into_iter()
-                        .map(|(file, node)| {
-                            crate::lookup::describe_summary(file, node, coverage)
-                        })
-                        .collect(),
-                    read,
-                }
-            })
-            .collect();
-        println!(
-            "{}",
-            serde_json::to_string(&FindDto {
-                schema_version: SCHEMA_VERSION,
-                coverage: crate::lookup::CoverageDto::of(coverage),
-                results,
-            })
-            .wrap_err("serializing find results")?
-        );
-        return Ok(());
+/// Returns `None` for a file that is unreadable, binary, or has no match —
+/// three outcomes a caller treats identically, and none of which is an error:
+/// one unreadable file should narrow the answer, not fail the command.
+pub fn search_file(
+    matcher: &Matcher,
+    registry: &ParserRegistry,
+    abs: &Path,
+    rel: &Path,
+    opts: &Options,
+    coverage: Option<&CoverageIndex>,
+) -> Option<FileHits> {
+    let buf = std::fs::read(abs).ok()?;
+    if is_binary(&buf) || !matcher.worth_searching(&buf) {
+        return None;
     }
 
-    for (i, query) in queries.iter().enumerate() {
-        if i > 0 {
-            println!();
+    let (mut hits, total) = hits_in(matcher, &buf, opts.max_count);
+    if hits.is_empty() {
+        return None;
+    }
+
+    // Attribution is the only reason to parse, so the modes that show no source
+    // skip it outright — as does a file whose bytes are not valid UTF-8, since
+    // the parsers take `&str` and a lossy rewrite would move every offset after
+    // the first bad byte.
+    if opts.mode.shows_source() && !opts.no_symbol {
+        if let (Some(parser), Ok(source)) = (registry.parser_for(abs), std::str::from_utf8(&buf)) {
+            if let Ok(symbols) = parser.parse_file(rel, source) {
+                attribute(&mut hits, &symbols, coverage);
+            }
         }
-        let (hits, total) = search(tree, &Pattern::parse(query), limit);
-        if total == 0 {
-            println!("{query} — no matches");
+    }
+
+    let context = context_lines(&buf, &hits, opts);
+
+    Some(FileHits {
+        path: rel.to_path_buf(),
+        hits,
+        total,
+        context,
+    })
+}
+
+/// The `-A`/`-B` lines around `hits`, excluding the matching lines themselves.
+///
+/// One pass over the buffer rather than a ring buffer during matching: context
+/// is off by default, and keeping the match loop free of it is worth more than
+/// the second pass costs on the few files that matched.
+fn context_lines(buf: &[u8], hits: &[Hit], opts: &Options) -> Vec<(u32, Vec<u8>)> {
+    if opts.before_context == 0 && opts.after_context == 0 || hits.is_empty() {
+        return Vec::new();
+    }
+    let matched: std::collections::HashSet<u32> = hits.iter().map(|h| h.line).collect();
+
+    let mut out = Vec::new();
+    for (i, raw) in buf.split_inclusive(|&b| b == b'\n').enumerate() {
+        let line_no = i as u32 + 1;
+        if matched.contains(&line_no) {
             continue;
         }
-        let read = coverage.map(|c| {
-            hits.iter()
-                .filter(|(_, n)| c.depth_of(&n.id).is_some())
-                .count()
+        let wanted = hits.iter().any(|h| {
+            let lo = h.line.saturating_sub(opts.before_context as u32);
+            let hi = h.line + opts.after_context as u32;
+            line_no >= lo && line_no <= hi
         });
-        match read {
-            Some(r) => println!(
-                "{query} — {total} match{} ({r} read)",
-                if total == 1 { "" } else { "es" }
+        if wanted {
+            out.push((line_no, strip_newline(raw).to_vec()));
+        }
+    }
+    out
+}
+
+/// Fill in each hit's enclosing symbol and read depth.
+fn attribute(hits: &mut [Hit], symbols: &FileSymbols, coverage: Option<&CoverageIndex>) {
+    for hit in hits {
+        let Some(node) = symbols.enclosing(hit.byte) else {
+            continue;
+        };
+        hit.symbol = Some(SymbolHit {
+            id: node.id.clone(),
+            name_path: node.name_path().to_string(),
+            label: node.label,
+            lines: [node.line_range.start, node.line_range.end],
+            depth: coverage.and_then(|c| c.depth_of(&node.id)),
+            content_hash: node.content_hash,
+            estimated_tokens: node.estimated_tokens,
+        });
+    }
+}
+
+/// Search every file the walk yields.
+///
+/// Files are searched in parallel and the results sorted afterwards: threads
+/// finish out of order, and ripgrep's own nondeterminism under `-j` is a thing
+/// callers work around rather than want.
+pub fn search(
+    matcher: &Matcher,
+    registry: &ParserRegistry,
+    targets: &[(PathBuf, PathBuf)],
+    opts: &Options,
+    coverage: Option<&CoverageIndex>,
+) -> Vec<FileHits> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(targets.len());
+    let chunk = targets.len().div_ceil(threads);
+
+    let mut out: Vec<FileHits> = std::thread::scope(|scope| {
+        let handles: Vec<_> = targets
+            .chunks(chunk)
+            .map(|batch| {
+                scope.spawn(move || {
+                    batch
+                        .iter()
+                        .filter_map(|(abs, rel)| {
+                            search_file(matcher, registry, abs, rel, opts, coverage)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().ok())
+            .flatten()
+            .collect()
+    });
+
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+/// Drop everything past `head_limit` matches, reporting how many were dropped.
+///
+/// Applied after sorting so the kept prefix is stable across runs, and counted
+/// in matches rather than files so the cap means what it says.
+pub fn apply_head_limit(files: &mut Vec<FileHits>, head_limit: usize) -> usize {
+    if head_limit == 0 {
+        return 0;
+    }
+    let mut kept = 0usize;
+    let mut withheld = 0usize;
+    for file in files.iter_mut() {
+        let room = head_limit.saturating_sub(kept);
+        if file.hits.len() > room {
+            withheld += file.hits.len() - room;
+            file.hits.truncate(room);
+        }
+        kept += file.hits.len();
+    }
+    files.retain(|f| !f.hits.is_empty());
+    withheld
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+/// Whether to group by file with a heading, as rg does on a terminal.
+fn use_heading(opts: &Options) -> bool {
+    opts.heading
+        .unwrap_or_else(|| std::io::IsTerminal::is_terminal(&std::io::stdout()))
+}
+
+fn use_color(opts: &Options) -> bool {
+    match opts.color {
+        ColorChoice::Always => true,
+        ColorChoice::Never => false,
+        ColorChoice::Auto => std::io::IsTerminal::is_terminal(&std::io::stdout()),
+    }
+}
+
+/// The attribution field.
+///
+/// Three cases, and the difference between the last two is load-bearing: with
+/// no journal loaded, an unread symbol and an unknown one are indistinguishable,
+/// so the depth is omitted entirely rather than shown as unread. A caller told a
+/// symbol is unread will go read it; one told nothing should not.
+fn render_symbol(symbol: Option<&SymbolHit>, have_journal: bool) -> String {
+    let Some(sym) = symbol else {
+        return format!("[{NO_SYMBOL}]");
+    };
+    if !have_journal {
+        return format!("[{}]", sym.name_path);
+    }
+    match sym.depth {
+        Some(d) => format!("[{d} {}]", sym.name_path),
+        None => format!("[{UNREAD} {}]", sym.name_path),
+    }
+}
+
+/// Clip to `max` bytes on a character boundary, reporting whether it cut.
+fn clip(text: &str, max: usize) -> (String, bool) {
+    if max == 0 || text.len() <= max {
+        return (text.to_string(), false);
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (format!("{}…", &text[..end]), true)
+}
+
+/// The text of one hit: the whole line, or just the match under `-o`.
+fn body(hit: &Hit, opts: &Options, color: bool) -> (String, bool) {
+    let bytes = if opts.only_matching {
+        &hit.text[hit.span.0.min(hit.text.len())..hit.span.1.min(hit.text.len())]
+    } else {
+        &hit.text[..]
+    };
+    let raw = String::from_utf8_lossy(bytes).into_owned();
+    let (shown, truncated) = clip(&raw, opts.max_columns);
+
+    let (start, end) = hit.span;
+    let highlightable = color
+        && !opts.only_matching
+        && end > start
+        && end <= shown.len()
+        && shown.is_char_boundary(start)
+        && shown.is_char_boundary(end);
+    if highlightable {
+        return (
+            format!(
+                "{}\x1b[1;31m{}\x1b[0m{}",
+                &shown[..start],
+                &shown[start..end],
+                &shown[end..]
             ),
-            None => println!("{query} — {total} match{}", if total == 1 { "" } else { "es" }),
+            truncated,
+        );
+    }
+    (shown, truncated)
+}
+
+/// `path:line:col:` — or the `-` separated form context lines use.
+fn locate(path: &Path, line: u32, column: Option<u32>, opts: &Options, sep: char) -> String {
+    let mut out = format!("{}{sep}", path.display());
+    if opts.line_number {
+        out.push_str(&format!("{line}{sep}"));
+        if let Some(c) = column {
+            out.push_str(&format!("{c}{sep}"));
+        }
+    }
+    out
+}
+
+/// One printable line: a match, or a context line around one.
+///
+/// The two arrive as separate sequences and print interleaved by line number,
+/// which is the whole reason they need a common type.
+enum Row<'a> {
+    Match(&'a Hit),
+    Context(u32, &'a [u8]),
+}
+
+impl Row<'_> {
+    /// Sort key. Context lines sort before any match on the same line, which
+    /// cannot happen — a line is one or the other — but keeps the order total.
+    fn order(&self) -> (u32, u32) {
+        match self {
+            Row::Match(hit) => (hit.line, hit.column),
+            Row::Context(line, _) => (*line, 0),
+        }
+    }
+}
+
+/// Print matching lines, either flat or grouped under file headings.
+fn print_content(
+    w: &mut impl Write,
+    files: &[FileHits],
+    opts: &Options,
+    have_journal: bool,
+) -> std::io::Result<()> {
+    let heading = use_heading(opts);
+    let color = use_color(opts);
+
+    for (i, file) in files.iter().enumerate() {
+        if heading {
+            if i > 0 {
+                writeln!(w)?;
+            }
+            writeln!(w, "{}", file.path.display())?;
         }
 
-        let width = hits
+        // Context lines interleave by line number, so the two sequences are
+        // merged rather than printed in turn.
+        let mut rows: Vec<Row> = file
+            .hits
             .iter()
-            .map(|(_, s)| s.label.len())
-            .max()
-            .unwrap_or(0);
-        for (file, sym) in &hits {
-            // The depth column is omitted entirely without a journal: an empty
-            // column would read as "unread" when the truth is "unknown".
-            let depth = match coverage {
-                Some(c) => match c.depth_of(&sym.id) {
-                    Some(d) => format!("  {d}"),
-                    None => "  —".to_string(),
-                },
-                None => String::new(),
-            };
-            println!(
-                "  [{:width$}] {}::{}  L{}-{}{}",
-                sym.label,
-                file.display(),
-                sym.name_path(),
-                sym.line_range.start,
-                sym.line_range.end,
-                depth,
-            );
-        }
-        if total > hits.len() {
-            println!("  … {} more (use --limit)", total - hits.len());
+            .map(Row::Match)
+            .chain(
+                file.context
+                    .iter()
+                    .map(|(line, text)| Row::Context(*line, text.as_slice())),
+            )
+            .collect();
+        rows.sort_by_key(Row::order);
+
+        for row in rows {
+            match row {
+                Row::Match(hit) => {
+                    let (text, _) = body(hit, opts, color);
+                    let symbol = if opts.no_symbol {
+                        String::new()
+                    } else {
+                        format!("{} ", render_symbol(hit.symbol.as_ref(), have_journal))
+                    };
+                    if heading {
+                        let col = if opts.column {
+                            format!(":{}", hit.column)
+                        } else {
+                            String::new()
+                        };
+                        writeln!(w, "  {}{col}  {symbol}{text}", hit.line)?;
+                    } else {
+                        let prefix = locate(
+                            &file.path,
+                            hit.line,
+                            opts.column.then_some(hit.column),
+                            opts,
+                            ':',
+                        );
+                        writeln!(w, "{prefix}{symbol}{text}")?;
+                    }
+                }
+                Row::Context(line, text) => {
+                    let (shown, _) = clip(&String::from_utf8_lossy(text), opts.max_columns);
+                    if heading {
+                        writeln!(w, "  {line}-  {shown}")?;
+                    } else {
+                        writeln!(w, "{}{shown}", locate(&file.path, line, None, opts, '-'))?;
+                    }
+                }
+            }
         }
     }
     Ok(())
 }
 
+/// ripgrep's JSON Lines stream, plus `symbol` on each match and `coverage` on
+/// the summary.
+///
+/// The event shape is rg's so existing consumers keep working; `stats` carries
+/// the subset we can answer honestly rather than inventing timings.
+fn print_json(
+    w: &mut impl Write,
+    files: &[FileHits],
+    opts: &Options,
+    coverage: Option<&CoverageIndex>,
+    withheld: usize,
+) -> std::io::Result<()> {
+    use serde_json::json;
+
+    let mut matched_lines = 0usize;
+    for file in files {
+        let path = file.path.display().to_string();
+        writeln!(w, "{}", json!({"type": "begin", "data": {"path": {"text": path}}}))?;
+
+        if opts.mode.shows_source() {
+            for hit in &file.hits {
+                let (mut text, truncated) = body(hit, opts, false);
+                // rg's `lines.text` carries the line terminator. A truncated
+                // line has had its tail removed, so it gets none — the marker
+                // already says the line did not end there.
+                if !truncated && !opts.only_matching {
+                    text.push('\n');
+                }
+                let matched = String::from_utf8_lossy(
+                    &hit.text[hit.span.0.min(hit.text.len())..hit.span.1.min(hit.text.len())],
+                )
+                .into_owned();
+                let symbol = hit.symbol.as_ref().map(|s| {
+                    json!({
+                        "id": s.id,
+                        "label": s.label,
+                        "lines": s.lines,
+                        "read_depth": s.depth.map(|d| d.to_string()),
+                    })
+                });
+                writeln!(
+                    w,
+                    "{}",
+                    json!({
+                        "type": "match",
+                        "data": {
+                            "path": {"text": path},
+                            "lines": {"text": text},
+                            "line_number": hit.line,
+                            "absolute_offset": hit.byte,
+                            "submatches": [{
+                                "match": {"text": matched},
+                                "start": hit.span.0,
+                                "end": hit.span.1,
+                            }],
+                            "symbol": symbol,
+                            "truncated": truncated,
+                        }
+                    })
+                )?;
+            }
+        }
+
+        matched_lines += file.hits.len();
+        writeln!(
+            w,
+            "{}",
+            json!({
+                "type": "end",
+                "data": {
+                    "path": {"text": path},
+                    "binary_offset": serde_json::Value::Null,
+                    "stats": {"matched_lines": file.hits.len(), "matches": file.total},
+                }
+            })
+        )?;
+    }
+
+    let coverage = coverage.map(|c| json!({"session_id": c.session_id(), "symbols_read": c.len()}));
+    writeln!(
+        w,
+        "{}",
+        json!({
+            "type": "summary",
+            "data": {
+                "stats": {"matched_lines": matched_lines, "searched_files": files.len()},
+                "coverage": coverage,
+                "withheld": withheld,
+            }
+        })
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+/// What a search produced, beyond what it printed.
+#[derive(Debug, Default)]
+pub struct Outcome {
+    /// Whether anything matched, which is the exit code.
+    pub matched: bool,
+    /// The symbols whose matches were actually **shown**, deduplicated.
+    ///
+    /// This is what may be journaled as read, and why it is "shown" rather than
+    /// "found": `-l`, `-c` and `-q` put no source in front of the caller, and
+    /// neither do matches cut off by `--head-limit`. The journal has to record
+    /// what the agent saw, not what the process computed.
+    pub shown: Vec<SymbolHit>,
+}
+
+/// Search `targets`, print the results, and report what was shown.
+///
+/// Walking is the caller's job: `main` builds the [`crate::parser::WalkOptions`]
+/// from the CLI, which keeps this function testable against a synthetic file
+/// list and keeps glob/type handling in one place.
+pub fn run(
+    registry: &ParserRegistry,
+    targets: &[(PathBuf, PathBuf)],
+    opts: &Options,
+    coverage: Option<&CoverageIndex>,
+) -> Result<Outcome> {
+    let matcher = Matcher::new(opts)?;
+    let mut files = search(&matcher, registry, targets, opts, coverage);
+    let withheld = apply_head_limit(&mut files, opts.head_limit);
+
+    let matched = !files.is_empty();
+    let mut shown: Vec<SymbolHit> = Vec::new();
+    if opts.mode.shows_source() {
+        let mut seen = std::collections::HashSet::new();
+        for file in &files {
+            for hit in &file.hits {
+                if let Some(sym) = &hit.symbol {
+                    if seen.insert(sym.id.clone()) {
+                        shown.push(sym.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    if opts.mode == OutputMode::Quiet {
+        return Ok(Outcome { matched, shown });
+    }
+
+    let stdout = std::io::stdout();
+    let mut w = std::io::BufWriter::new(stdout.lock());
+
+    if opts.json {
+        print_json(&mut w, &files, opts, coverage, withheld)?;
+        w.flush()?;
+        return Ok(Outcome { matched, shown });
+    }
+
+    match opts.mode {
+        OutputMode::Content => print_content(&mut w, &files, opts, coverage.is_some())?,
+        OutputMode::FilesWithMatches => {
+            for file in &files {
+                writeln!(w, "{}", file.path.display())?;
+            }
+        }
+        OutputMode::Count => {
+            for file in &files {
+                writeln!(w, "{}:{}", file.path.display(), file.hits.len())?;
+            }
+        }
+        OutputMode::CountMatches => {
+            for file in &files {
+                writeln!(w, "{}:{}", file.path.display(), file.total)?;
+            }
+        }
+        OutputMode::Quiet => unreachable!("returned above"),
+    }
+    w.flush()?;
+
+    // stderr, so stdout stays exactly what a grep consumer expects to parse.
+    if withheld > 0 {
+        eprintln!("… {withheld} more matches withheld (--head-limit 0 for all)");
+    }
+
+    Ok(Outcome { matched, shown })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::helpers::*;
+    use crate::helpers::{file, sym_with_bytes, sym_with_children};
     use crate::tracking::ReadDepth;
 
-    fn tree() -> ProjectTree {
-        project(vec![
-            file(
-                "src/ui/stats.rs",
-                vec![sym_with_children(
-                    "src/ui/stats.rs::App",
-                    "App",
-                    vec![sym("src/ui/stats.rs::App/render", "render")],
-                )],
-            ),
-            file("src/tui.rs", vec![sym("src/tui.rs::render", "render")]),
-            file("src/app.rs", vec![sym("src/app.rs::render", "render")]),
-        ])
+    // ─── matching ────────────────────────────────────────────────────────────
+
+    const SRC: &str = "fn alpha() {}\nfn beta() {}\nlet alphabet = 1;\n";
+
+    fn hits(src: &str, opts: &Options) -> Vec<Hit> {
+        let matcher = Matcher::new(opts).expect("pattern must compile");
+        hits_in(&matcher, src.as_bytes(), opts.max_count).0
     }
 
-    fn ids(tree: &ProjectTree, q: &str) -> Vec<String> {
-        search(tree, &Pattern::parse(q), DEFAULT_LIMIT)
-            .0
-            .into_iter()
-            .map(|(_, s)| s.id.clone())
-            .collect()
+    fn lines_of(hits: &[Hit]) -> Vec<u32> {
+        hits.iter().map(|h| h.line).collect()
     }
 
-    /// The false positive that motivated component matching: a raw substring
-    /// rule makes `ui` match `tui.rs`, because "ui" sits inside "tui".
+    /// The headline change: the pattern searches file *content*, not symbol
+    /// names, so a use of a name matches as readily as its definition.
     #[test]
-    fn the_path_half_matches_components_not_substrings() {
-        let t = tree();
-        let hits = ids(&t, "ui::render");
-        assert_eq!(hits, vec!["src/ui/stats.rs::App/render"]);
+    fn a_bare_pattern_is_a_regex_over_content() {
+        let found = hits(SRC, &Options::new(vec!["fn \\w+".into()]));
+        assert_eq!(lines_of(&found), vec![1, 2]);
+        assert_eq!(found[0].column, 1, "columns are 1-based, as in ripgrep");
+    }
+
+    #[test]
+    fn fixed_strings_disables_metacharacters() {
+        let mut opts = Options::new(vec!["alpha()".into()]);
+        assert_eq!(
+            lines_of(&hits(SRC, &opts)),
+            vec![1, 3],
+            "as a regex `()` is an empty group, so this is really just `alpha` \
+             and drags in `alphabet`"
+        );
+
+        opts.fixed_strings = true;
+        assert_eq!(
+            lines_of(&hits(SRC, &opts)),
+            vec![1],
+            "taken literally, `alpha()` appears only where it is called"
+        );
+    }
+
+    /// `-w` must hold the boundary that `-i` would otherwise widen: `alpha`
+    /// matches `alphabet` without it, and must not with it.
+    #[test]
+    fn ignore_case_and_word_boundaries_compose() {
+        let mut opts = Options::new(vec!["ALPHA".into()]);
+        opts.ignore_case = true;
+        assert_eq!(lines_of(&hits(SRC, &opts)), vec![1, 3]);
+
+        opts.word_regexp = true;
+        assert_eq!(
+            lines_of(&hits(SRC, &opts)),
+            vec![1],
+            "`alphabet` is not the word `alpha`"
+        );
+    }
+
+    #[test]
+    fn line_regexp_anchors_the_whole_line() {
+        let mut opts = Options::new(vec!["fn beta\\(\\) \\{\\}".into()]);
+        opts.line_regexp = true;
+        assert_eq!(lines_of(&hits(SRC, &opts)), vec![2]);
+
+        let mut partial = Options::new(vec!["fn beta".into()]);
+        partial.line_regexp = true;
         assert!(
-            !hits.iter().any(|i| i.contains("tui.rs")),
-            "`ui` must not match `tui.rs`"
+            hits(SRC, &partial).is_empty(),
+            "a partial line must not match under -x"
         );
     }
 
     #[test]
-    fn a_path_segment_may_match_a_file_stem() {
-        assert_eq!(ids(&tree(), "app::render"), vec!["src/app.rs::render"]);
+    fn invert_match_reports_non_matching_lines() {
+        let mut opts = Options::new(vec!["fn ".into()]);
+        opts.invert_match = true;
+        assert_eq!(lines_of(&hits(SRC, &opts)), vec![3]);
     }
 
+    /// Under `-U` a match owns several lines; the one reported is where it
+    /// starts, and the text carries every line it touched.
     #[test]
-    fn multi_segment_paths_match_consecutively() {
-        assert_eq!(
-            ids(&tree(), "ui/stats::render"),
-            vec!["src/ui/stats.rs::App/render"]
+    fn multiline_reports_the_line_of_the_match_start() {
+        let mut opts = Options::new(vec!["alpha[\\s\\S]*beta".into()]);
+        opts.multiline = true;
+        let found = hits(SRC, &opts);
+        assert_eq!(lines_of(&found), vec![1]);
+        assert!(
+            String::from_utf8_lossy(&found[0].text).contains("fn beta"),
+            "the text spans to the end of the matched region"
         );
     }
 
-    /// A bare name matches the leaf everywhere, which is the "where is this
-    /// defined" question.
     #[test]
-    fn a_bare_name_matches_every_file() {
-        assert_eq!(ids(&tree(), "render").len(), 3);
+    fn max_count_caps_per_file_and_head_limit_caps_globally() {
+        let mut opts = Options::new(vec!["fn".into()]);
+        opts.max_count = Some(1);
+        let matcher = Matcher::new(&opts).unwrap();
+        let (kept, total) = hits_in(&matcher, SRC.as_bytes(), opts.max_count);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(total, 2, "the total still counts what -m withheld");
+
+        let mut files = vec![
+            FileHits {
+                path: PathBuf::from("a.rs"),
+                hits: hits(SRC, &Options::new(vec!["fn".into()])),
+                total: 2,
+                context: Vec::new(),
+            },
+            FileHits {
+                path: PathBuf::from("b.rs"),
+                hits: hits(SRC, &Options::new(vec!["fn".into()])),
+                total: 2,
+                context: Vec::new(),
+            },
+        ];
+        assert_eq!(apply_head_limit(&mut files, 3), 1);
+        assert_eq!(files.iter().map(|f| f.hits.len()).sum::<usize>(), 3);
     }
 
-    /// An empty name half enumerates a file — the case that replaces
-    /// `--dump --filter` plus hand-built selectors.
     #[test]
-    fn an_empty_name_half_enumerates_the_file() {
-        assert_eq!(
-            ids(&tree(), "src/ui/stats.rs::"),
+    fn max_columns_truncates_and_marks() {
+        let long = format!("let x = \"{}\";\n", "a".repeat(500));
+        let mut opts = Options::new(vec!["let x".into()]);
+        opts.max_columns = 20;
+        let found = hits(&long, &opts);
+        let (text, truncated) = body(&found[0], &opts, false);
+        assert!(truncated);
+        assert!(text.ends_with('…'));
+        assert!(text.chars().count() <= 21, "20 columns plus the marker");
+    }
+
+    /// A pattern that cannot compile is a usage error. Reporting it as "no
+    /// matches" would tell the caller their search succeeded and found nothing.
+    #[test]
+    fn an_invalid_regex_is_an_error_not_an_empty_result() {
+        let err = Matcher::new(&Options::new(vec!["fn (".into()])).unwrap_err();
+        assert!(
+            format!("{err}").contains("invalid pattern"),
+            "the message must name the pattern as the problem"
+        );
+    }
+
+    // ─── attribution ─────────────────────────────────────────────────────────
+
+    fn hit_at(byte: u32) -> Hit {
+        Hit {
+            line: 1,
+            column: 1,
+            byte,
+            text: b"x".to_vec(),
+            span: (0, 1),
+            symbol: None,
+        }
+    }
+
+    fn thing() -> crate::symbols::FileSymbols {
+        file(
+            "a.rs",
+            vec![sym_with_children(
+                "a.rs::Thing",
+                "Thing",
+                vec![sym_with_bytes("a.rs::Thing/method", "method", 40, 60)],
+            )],
+        )
+    }
+
+    #[test]
+    fn a_hit_is_attributed_to_the_innermost_symbol() {
+        let mut found = vec![hit_at(50)];
+        attribute(&mut found, &thing(), None);
+        assert_eq!(found[0].symbol.as_ref().unwrap().id, "a.rs::Thing/method");
+    }
+
+    /// A match in a `use` line or a file-level comment belongs to no symbol,
+    /// and must say so rather than be attributed to whatever is nearest.
+    #[test]
+    fn a_hit_between_symbols_has_no_symbol() {
+        let mut found = vec![hit_at(500)];
+        attribute(&mut found, &thing(), None);
+        assert!(found[0].symbol.is_none());
+    }
+
+    /// Symbol ids are not unique — `struct Foo` and `impl Foo` in one file both
+    /// yield `a.rs::Foo` — so hits are keyed by position, never by id. Two hits
+    /// in two different symbols that share an id stay two hits.
+    #[test]
+    fn colliding_ids_do_not_merge_hits() {
+        let symbols = file(
+            "a.rs",
             vec![
-                "src/ui/stats.rs::App",
-                "src/ui/stats.rs::App/render"
-            ]
+                sym_with_bytes("a.rs::Foo", "Foo", 0, 10),
+                sym_with_bytes("a.rs::Foo", "Foo", 20, 30),
+            ],
         );
+        let mut found = vec![hit_at(5), hit_at(25)];
+        attribute(&mut found, &symbols, None);
+        assert_eq!(found.len(), 2, "position, not id, is the key");
+        assert_eq!(found[0].symbol.as_ref().unwrap().lines, [1, 10]);
+        assert_eq!(found[1].symbol.as_ref().unwrap().lines, [1, 10]);
     }
 
-    /// Leaf matching is what keeps a common word from dragging in every
-    /// symbol nested under a container of that name.
-    #[test]
-    fn the_name_half_matches_the_leaf_by_default() {
-        let t = tree();
-        assert!(
-            ids(&t, "App").iter().all(|i| i.ends_with("::App")),
-            "matching the leaf must not pull in App's children"
-        );
+    // ─── coverage column ─────────────────────────────────────────────────────
+
+    fn symbol_hit(depth: Option<ReadDepth>) -> SymbolHit {
+        SymbolHit {
+            id: "a.rs::render".into(),
+            name_path: "render".into(),
+            label: "fn",
+            lines: [1, 10],
+            depth,
+            content_hash: [0u8; 32],
+            estimated_tokens: 30,
+        }
     }
 
-    /// …but a `/` says the caller means the nesting, so the whole path is
-    /// matched and container members come back.
-    #[test]
-    fn a_slash_switches_to_matching_the_whole_name_path() {
-        assert_eq!(
-            ids(&tree(), "::App/"),
-            vec!["src/ui/stats.rs::App/render"]
-        );
-    }
-
-    #[test]
-    fn matching_ignores_case_on_both_halves() {
-        assert_eq!(ids(&tree(), "UI::RENDER").len(), 1);
-    }
-
-    #[test]
-    fn a_query_matching_nothing_is_empty_rather_than_an_error() {
-        assert!(ids(&tree(), "nosuchsymbol").is_empty());
-    }
-
-    /// A truncated result must say how much it withheld, or a caller reads it
-    /// as the complete answer.
-    #[test]
-    fn truncation_reports_the_full_total() {
-        let t = tree();
-        let (hits, total) = search(&t, &Pattern::parse("render"), 2);
-        assert_eq!(hits.len(), 2);
-        assert_eq!(total, 3, "the total counts what was withheld");
-    }
-
-    /// A search returning many symbols must not spend most of its bytes on
-    /// child ids — and for a search over test modules those ids are largely
-    /// results in their own right, listed twice.
-    #[test]
-    fn children_are_summarized_rather_than_listed() {
-        let t = tree();
-        let (hits, _) = search(&t, &Pattern::parse("App"), DEFAULT_LIMIT);
-        let (file, node) = hits[0];
-        let dto = crate::lookup::describe_summary(file, node, None);
-        let v = serde_json::to_value(&dto).unwrap();
-
-        assert_eq!(v["children_count"], 1, "the count survives");
-        assert!(
-            v.get("children").is_none(),
-            "the list itself does not, or find output balloons"
-        );
-        assert_eq!(
-            v["id"], "src/ui/stats.rs::App",
-            "the id is unchanged, so it still composes into `show`"
-        );
-    }
-
-    fn coverage_for(ids: &[(&str, ReadDepth)]) -> crate::restore::CoverageIndex {
-        let reads = ids
-            .iter()
-            .map(|(id, d)| (id.to_string(), ([0u8; 32], *d)))
-            .collect();
-        crate::restore::CoverageIndex::from_read_set(reads, "test-session")
-    }
-
-    fn dto_of(cov: Option<&crate::restore::CoverageIndex>) -> serde_json::Value {
-        let t = tree();
-        let (hits, _) = search(&t, &Pattern::parse("render"), DEFAULT_LIMIT);
-        let (file, node) = hits
-            .iter()
-            .find(|(_, n)| n.id == "src/app.rs::render")
-            .copied()
-            .unwrap();
-        serde_json::to_value(crate::lookup::describe_summary(file, node, cov)).unwrap()
-    }
-
-    /// The point of the annotation: a caller can tell, from a search alone,
-    /// whether it needs to read the result.
     #[test]
     fn a_read_symbol_reports_the_depth_it_was_read_at() {
-        let cov = coverage_for(&[("src/app.rs::render", ReadDepth::FullBody)]);
-        assert_eq!(dto_of(Some(&cov))["read_depth"], "full");
+        let sym = symbol_hit(Some(ReadDepth::FullBody));
+        assert_eq!(render_symbol(Some(&sym), true), "[full render]");
     }
 
     #[test]
-    fn an_unread_symbol_carries_no_depth() {
-        let cov = coverage_for(&[("src/other.rs::thing", ReadDepth::FullBody)]);
-        assert!(dto_of(Some(&cov)).get("read_depth").is_none());
+    fn an_unread_symbol_renders_an_em_dash() {
+        let sym = symbol_hit(None);
+        assert_eq!(render_symbol(Some(&sym), true), "[— render]");
     }
 
-    /// Without a journal there is no coverage context at all, and that must
-    /// not be reported the same way as "read nothing" — an agent told a symbol
-    /// is unread will go read it; one told nothing is known should not.
+    /// Without a journal there is no coverage context at all, and that must not
+    /// be rendered the same way as "read nothing" — an agent told a symbol is
+    /// unread will go read it; one told nothing is known should not.
     #[test]
-    fn no_journal_is_distinguishable_from_nothing_read() {
-        let unread = coverage_for(&[("src/other.rs::thing", ReadDepth::FullBody)]);
+    fn no_journal_omits_the_depth_entirely() {
+        let sym = symbol_hit(None);
+        assert_eq!(render_symbol(Some(&sym), false), "[render]");
+        assert_eq!(render_symbol(None, true), "[-]", "no symbol is its own case");
+    }
 
-        // Both omit `read_depth` on the match itself…
-        assert!(dto_of(Some(&unread)).get("read_depth").is_none());
-        assert!(dto_of(None).get("read_depth").is_none());
+    // ─── output ──────────────────────────────────────────────────────────────
 
-        // …so the envelope is what distinguishes them.
-        assert!(crate::lookup::CoverageDto::of(Some(&unread)).is_some());
-        assert!(crate::lookup::CoverageDto::of(None).is_none());
+    fn one_file(path: &str, opts: &Options) -> Vec<FileHits> {
+        let mut found = hits(SRC, opts);
+        attribute(&mut found, &thing(), None);
+        vec![FileHits {
+            path: PathBuf::from(path),
+            hits: found,
+            total: 2,
+            context: Vec::new(),
+        }]
+    }
+
+    fn rendered(files: &[FileHits], opts: &Options, journal: bool) -> String {
+        let mut buf = Vec::new();
+        print_content(&mut buf, files, opts, journal).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// Piped output is what agents parse, and the `file:line:col:` prefix is
+    /// what every existing grep consumer expects. Ambit's field goes after it.
+    #[test]
+    fn piped_output_keeps_the_file_line_col_prefix() {
+        let mut opts = Options::new(vec!["fn alpha".into()]);
+        opts.heading = Some(false);
+        let out = rendered(&one_file("src/a.rs", &opts), &opts, true);
+        assert!(
+            out.starts_with("src/a.rs:1:1:"),
+            "expected a file:line:col prefix, got {out:?}"
+        );
     }
 
     #[test]
-    fn parse_splits_on_the_first_separator() {
-        let p = Pattern::parse("src/ui::App/render");
-        assert_eq!(p.path, vec!["src", "ui"]);
-        assert_eq!(p.name, "app/render");
-        assert!(p.nested);
+    fn no_symbol_produces_rg_identical_output() {
+        let mut opts = Options::new(vec!["fn alpha".into()]);
+        opts.heading = Some(false);
+        opts.no_symbol = true;
+        let out = rendered(&one_file("src/a.rs", &opts), &opts, true);
+        assert_eq!(out, "src/a.rs:1:1:fn alpha() {}\n");
+    }
+
+    #[test]
+    fn json_match_events_carry_the_symbol() {
+        let mut opts = Options::new(vec!["fn alpha".into()]);
+        opts.json = true;
+        let mut buf = Vec::new();
+        print_json(&mut buf, &one_file("src/a.rs", &opts), &opts, None, 0).unwrap();
+        let events: Vec<serde_json::Value> = String::from_utf8(buf)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("every line is one JSON event"))
+            .collect();
+
+        assert_eq!(events[0]["type"], "begin");
+        assert_eq!(events[1]["type"], "match");
+        assert_eq!(events[1]["data"]["line_number"], 1);
+        assert_eq!(events[1]["data"]["submatches"][0]["match"]["text"], "fn alpha");
+        assert!(
+            events[1]["data"]["symbol"].is_null() || events[1]["data"]["symbol"]["id"].is_string(),
+            "symbol is an object or null, never absent"
+        );
+        assert_eq!(events.last().unwrap()["type"], "summary");
+    }
+
+    /// The envelope's `coverage` is what distinguishes "no journal" from
+    /// "nothing read", exactly as the old `find` envelope did.
+    #[test]
+    fn json_summary_carries_coverage_and_withheld() {
+        let opts = Options::new(vec!["fn alpha".into()]);
+        let reads = [("a.rs::render".to_string(), ([0u8; 32], ReadDepth::FullBody))]
+            .into_iter()
+            .collect();
+        let index = crate::restore::CoverageIndex::from_read_set(reads, "sess-1");
+
+        let mut buf = Vec::new();
+        print_json(&mut buf, &one_file("src/a.rs", &opts), &opts, Some(&index), 7).unwrap();
+        let summary: serde_json::Value = serde_json::from_str(
+            String::from_utf8(buf).unwrap().lines().last().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(summary["data"]["coverage"]["session_id"], "sess-1");
+        assert_eq!(summary["data"]["withheld"], 7);
+
+        let mut without = Vec::new();
+        print_json(&mut without, &one_file("src/a.rs", &opts), &opts, None, 0).unwrap();
+        let summary: serde_json::Value = serde_json::from_str(
+            String::from_utf8(without).unwrap().lines().last().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            summary["data"]["coverage"].is_null(),
+            "no journal must be null, not an empty object"
+        );
+    }
+
+    // ─── searching real files ────────────────────────────────────────────────
+
+    fn write(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> (PathBuf, PathBuf) {
+        let abs = dir.path().join(name);
+        std::fs::write(&abs, bytes).unwrap();
+        (abs, PathBuf::from(name))
+    }
+
+    #[test]
+    fn results_are_sorted_by_path_line_col() {
+        let dir = tempfile::tempdir().unwrap();
+        let targets = vec![
+            write(&dir, "z.rs", b"fn zeta() {}\n"),
+            write(&dir, "a.rs", b"fn alpha() {}\nfn alpha2() {}\n"),
+        ];
+        let opts = Options::new(vec!["fn".into()]);
+        let matcher = Matcher::new(&opts).unwrap();
+        let files = search(&matcher, &ParserRegistry::new(), &targets, &opts, None);
+
+        let paths: Vec<String> = files.iter().map(|f| f.path.display().to_string()).collect();
+        assert_eq!(paths, vec!["a.rs", "z.rs"], "threads finish out of order");
+        assert_eq!(lines_of(&files[0].hits), vec![1, 2]);
+    }
+
+    /// grep searches every text file; only attribution is limited to what a
+    /// parser understands. A hit in a config file is still a hit.
+    #[test]
+    fn a_hit_in_an_unparseable_file_has_no_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        let (abs, rel) = write(&dir, "Cargo.toml", b"name = \"ambits\"\n");
+        let opts = Options::new(vec!["ambits".into()]);
+        let matcher = Matcher::new(&opts).unwrap();
+
+        let found =
+            search_file(&matcher, &ParserRegistry::new(), &abs, &rel, &opts, None).unwrap();
+        assert_eq!(found.hits.len(), 1);
+        assert!(found.hits[0].symbol.is_none());
+    }
+
+    #[test]
+    fn binary_files_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (abs, rel) = write(&dir, "blob.bin", b"fn alpha\x00\x00 more");
+        let opts = Options::new(vec!["fn alpha".into()]);
+        let matcher = Matcher::new(&opts).unwrap();
+        assert!(
+            search_file(&matcher, &ParserRegistry::new(), &abs, &rel, &opts, None).is_none(),
+            "a NUL byte near the start means it is not text"
+        );
+    }
+
+    /// Context lines are a property of the file, not of a match, so they carry
+    /// no attribution — the symbol around a context line may not be the symbol
+    /// the match landed in.
+    #[test]
+    fn context_lines_carry_no_attribution() {
+        let dir = tempfile::tempdir().unwrap();
+        let (abs, rel) = write(&dir, "a.rs", b"fn alpha() {}\nfn beta() {}\nfn gamma() {}\n");
+        let mut opts = Options::new(vec!["beta".into()]);
+        opts.before_context = 1;
+        opts.after_context = 1;
+        let matcher = Matcher::new(&opts).unwrap();
+
+        let found =
+            search_file(&matcher, &ParserRegistry::new(), &abs, &rel, &opts, None).unwrap();
+        assert_eq!(found.context.len(), 2, "one line either side");
+        assert_eq!(found.context[0].0, 1);
+        assert_eq!(found.context[1].0, 3);
+
+        opts.heading = Some(false);
+        let out = rendered(&[found], &opts, true);
+        assert!(
+            out.contains("a.rs-1-fn alpha"),
+            "context uses grep's `-` separator and no symbol field, got {out:?}"
+        );
+    }
+
+    /// The withheld count is reported to the caller so it can go to stderr;
+    /// stdout stays exactly what a grep consumer expects to parse.
+    #[test]
+    fn the_withheld_count_never_reaches_stdout() {
+        let mut opts = Options::new(vec!["fn".into()]);
+        opts.heading = Some(false);
+        let mut files = one_file("src/a.rs", &opts);
+        let withheld = apply_head_limit(&mut files, 1);
+        assert_eq!(withheld, 1);
+        assert!(!rendered(&files, &opts, true).contains("withheld"));
     }
 }

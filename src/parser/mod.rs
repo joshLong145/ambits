@@ -74,6 +74,13 @@ pub struct WalkOptions<'a> {
     /// Ignore `.gitignore`, `.ignore`, and their global and parent variants
     /// (`--no-ignore`).
     pub no_ignore: bool,
+    /// Subtrees to walk instead of the whole project — grep's `PATH...`.
+    ///
+    /// Absolute, and inside the project root (the CLI checks that, so a bad
+    /// path fails with a message rather than silently yielding nothing).
+    /// Walking only what was asked for beats walking everything and discarding
+    /// most of it, which is why these are roots rather than another filter.
+    pub roots: Vec<PathBuf>,
 }
 
 /// Every file under `root` the options admit, as `(absolute, project-relative)`.
@@ -86,7 +93,10 @@ pub struct WalkOptions<'a> {
 pub fn walk_files(root: &Path, opts: &WalkOptions<'_>) -> Vec<(PathBuf, PathBuf)> {
     use ignore::WalkBuilder;
 
-    let mut builder = WalkBuilder::new(root);
+    let mut builder = WalkBuilder::new(opts.roots.first().map_or(root, |p| p.as_path()));
+    for extra in opts.roots.iter().skip(1) {
+        builder.add(extra);
+    }
     builder
         .hidden(!opts.hidden)
         .ignore(!opts.no_ignore)

@@ -169,27 +169,17 @@ enum Commands {
         max_bytes: Option<usize>,
     },
 
-    /// Search the symbol index by `[path]::[name]` pattern.
+    /// Search file contents, ripgrep-style, reporting the symbol each match
+    /// lands in and how deeply it has already been read.
     ///
-    /// Answers the questions `show` cannot: what is in this file, where is
-    /// this name defined, what hangs off this type. Both halves are optional
-    /// and case-insensitive — `src/app.rs::` enumerates a file, `::new` finds
-    /// one name everywhere, `ui::render` scopes to a directory.
+    /// The flag set is ripgrep's, because Claude Code's `Grep` tool is
+    /// ripgrep-backed and that is the dialect agents already speak. Four
+    /// defaults deviate on purpose: results are always sorted by
+    /// `(path, line, column)`; `--head-limit` and `--max-columns` are capped,
+    /// because this output lands in a context window; and `--column` is on.
     ///
-    /// Searches definitions, not usages: a method call is not a symbol here.
-    Find {
-        /// `[path]::[name]`, or a bare name. Repeatable.
-        #[arg(required = true)]
-        pattern: Vec<String>,
-
-        /// Maximum matches reported per pattern.
-        #[arg(long, default_value_t = ambits::find::DEFAULT_LIMIT)]
-        limit: usize,
-
-        /// Output format.
-        #[arg(long, value_enum, default_value = "text")]
-        format: FindFormat,
-    },
+    /// Exits 0 when something matched, 1 when nothing did, 2 on error.
+    Find(FindArgs),
 
     /// List the call sites of a function, and which symbol each sits in.
     ///
@@ -215,6 +205,136 @@ enum Commands {
     },
 }
 
+/// `ambits find` — ripgrep's flag set, plus the symbol column.
+#[derive(clap::Args, Debug)]
+struct FindArgs {
+        /// PATTERN, then optional PATHs. Every argument is a PATH when `-e` is
+        /// given, exactly as in ripgrep.
+        #[arg(value_name = "PATTERN|PATH")]
+        args: Vec<String>,
+
+        /// Additional pattern. Repeatable; combined as an alternation.
+        #[arg(short = 'e', long = "regexp", value_name = "PATTERN")]
+        regexp: Vec<String>,
+
+        /// Treat patterns as literal strings.
+        #[arg(short = 'F', long)]
+        fixed_strings: bool,
+
+        /// Case-insensitive matching.
+        #[arg(short, long)]
+        ignore_case: bool,
+
+        /// Match only whole words.
+        #[arg(short, long)]
+        word_regexp: bool,
+
+        /// Match only whole lines. Takes precedence over --word-regexp.
+        #[arg(short = 'x', long)]
+        line_regexp: bool,
+
+        /// Allow patterns to match across line boundaries.
+        #[arg(short = 'U', long)]
+        multiline: bool,
+
+        /// Report non-matching lines instead.
+        #[arg(short = 'v', long)]
+        invert_match: bool,
+
+        /// Include files matching this glob; prefix with ! to exclude.
+        #[arg(short, long, value_name = "GLOB")]
+        glob: Vec<String>,
+
+        /// Restrict to a file type, e.g. rust, py, ts, md.
+        #[arg(short = 't', long = "type", value_name = "TYPE")]
+        file_type: Vec<String>,
+
+        /// Lines of context after each match.
+        #[arg(short = 'A', long, default_value_t = 0, value_name = "N")]
+        after_context: usize,
+
+        /// Lines of context before each match.
+        #[arg(short = 'B', long, default_value_t = 0, value_name = "N")]
+        before_context: usize,
+
+        /// Lines of context around each match.
+        #[arg(short = 'C', long, value_name = "N")]
+        context: Option<usize>,
+
+        /// Show line numbers (default).
+        #[arg(short = 'n', long, overrides_with = "no_line_number")]
+        line_number: bool,
+
+        /// Hide line numbers.
+        #[arg(short = 'N', long)]
+        no_line_number: bool,
+
+        /// Hide the column of each match.
+        #[arg(long)]
+        no_column: bool,
+
+        /// Print only the matched part of each line.
+        #[arg(short, long)]
+        only_matching: bool,
+
+        /// Print only the paths of files with a match.
+        #[arg(short = 'l', long, conflicts_with_all = ["count", "count_matches", "quiet"])]
+        files_with_matches: bool,
+
+        /// Print only a count of matching lines per file.
+        #[arg(short, long, conflicts_with_all = ["count_matches", "quiet"])]
+        count: bool,
+
+        /// Print only a count of individual matches per file.
+        #[arg(long, conflicts_with = "quiet")]
+        count_matches: bool,
+
+        /// Print nothing; the exit code is the answer.
+        #[arg(short, long)]
+        quiet: bool,
+
+        /// Stop after this many matches per file.
+        #[arg(short = 'm', long, value_name = "NUM")]
+        max_count: Option<usize>,
+
+        /// Truncate lines longer than this, marking the cut. 0 for unlimited.
+        #[arg(short = 'M', long, default_value_t = ambits::find::DEFAULT_MAX_COLUMNS, value_name = "NUM")]
+        max_columns: usize,
+
+        /// Cap total matches across all files. 0 for unlimited. Not a ripgrep
+        /// flag: unbounded output is a hazard in a context window.
+        #[arg(long, default_value_t = ambits::find::DEFAULT_HEAD_LIMIT, value_name = "NUM")]
+        head_limit: usize,
+
+        /// Search hidden files and directories.
+        #[arg(long)]
+        hidden: bool,
+
+        /// Ignore .gitignore and friends.
+        #[arg(long)]
+        no_ignore: bool,
+
+        /// Group matches under a file heading (default on a terminal).
+        #[arg(long, overrides_with = "no_heading")]
+        heading: bool,
+
+        /// Print one flat `file:line:col:` line per match.
+        #[arg(long)]
+        no_heading: bool,
+
+        /// Omit the symbol column, for byte-identical ripgrep output.
+        #[arg(long)]
+        no_symbol: bool,
+
+        /// When to colorize output.
+        #[arg(long, value_enum, default_value = "auto", value_name = "WHEN")]
+        color: ColorWhen,
+
+        /// Emit ripgrep's JSON Lines events, with an added `symbol` field.
+        #[arg(long)]
+        json: bool,
+}
+
 #[derive(Subcommand, Debug)]
 enum CacheCommands {
     /// List the coverage journals on disk with their size and age.
@@ -235,6 +355,14 @@ enum CacheCommands {
         #[arg(long)]
         all: bool,
     },
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ColorWhen {
+    /// Colorize when stdout is a terminal.
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -286,6 +414,130 @@ enum SkillCommands {
         #[arg(long, short)]
         project: Option<PathBuf>,
     },
+}
+
+/// Map `find`'s CLI arguments onto a walk and a search.
+///
+/// Splitting positionals the way ripgrep does — the first is the pattern unless
+/// `-e` was given, in which case every one of them is a path — is the only part
+/// of this that is not a direct field-for-field mapping.
+fn run_find(
+    args: &FindArgs,
+    registry: &ParserRegistry,
+    project_path: &Path,
+    filter: Option<&PathFilter>,
+    coverage: Option<&ambits::restore::CoverageIndex>,
+) -> Result<ambits::find::Outcome> {
+    use ambits::find::{ColorChoice, Options, OutputMode};
+    use ambits::parser::{walk_files, WalkOptions};
+    use color_eyre::eyre::eyre;
+
+    let (patterns, paths): (Vec<String>, &[String]) = if args.regexp.is_empty() {
+        match args.args.split_first() {
+            Some((pattern, rest)) => (vec![pattern.clone()], rest),
+            None => (Vec::new(), &[]),
+        }
+    } else {
+        (args.regexp.clone(), args.args.as_slice())
+    };
+    if patterns.is_empty() {
+        return Err(eyre!("no pattern given"));
+    }
+
+    // PATH arguments resolve against the working directory, as grep's do, and
+    // are then walked directly — walking only what was asked for beats walking
+    // the project and discarding most of it.
+    let mut roots = Vec::with_capacity(paths.len());
+    for raw in paths {
+        let resolved = std::fs::canonicalize(raw)
+            .map_err(|e| eyre!("{raw}: {e}"))?;
+        if !resolved.starts_with(project_path) {
+            return Err(eyre!(
+                "{raw} is outside the project root {}",
+                project_path.display()
+            ));
+        }
+        roots.push(resolved);
+    }
+
+    let overrides = if args.glob.is_empty() {
+        None
+    } else {
+        let mut builder = ignore::overrides::OverrideBuilder::new(project_path);
+        for glob in &args.glob {
+            builder.add(glob).map_err(|e| eyre!("invalid glob {glob:?}: {e}"))?;
+        }
+        Some(builder.build()?)
+    };
+
+    let types = if args.file_type.is_empty() {
+        None
+    } else {
+        let mut builder = ignore::types::TypesBuilder::new();
+        builder.add_defaults();
+        for name in &args.file_type {
+            builder.select(name);
+        }
+        Some(builder.build().map_err(|e| eyre!("invalid --type: {e}"))?)
+    };
+
+    let mode = if args.quiet {
+        OutputMode::Quiet
+    } else if args.files_with_matches {
+        OutputMode::FilesWithMatches
+    } else if args.count {
+        OutputMode::Count
+    } else if args.count_matches {
+        OutputMode::CountMatches
+    } else {
+        OutputMode::Content
+    };
+
+    let options = Options {
+        patterns,
+        fixed_strings: args.fixed_strings,
+        ignore_case: args.ignore_case,
+        word_regexp: args.word_regexp,
+        line_regexp: args.line_regexp,
+        multiline: args.multiline,
+        invert_match: args.invert_match,
+        mode,
+        json: args.json,
+        heading: match (args.heading, args.no_heading) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            // Neither, or both via `overrides_with`: follow the terminal.
+            _ => None,
+        },
+        line_number: !args.no_line_number,
+        column: !args.no_column,
+        only_matching: args.only_matching,
+        before_context: args.context.unwrap_or(args.before_context),
+        after_context: args.context.unwrap_or(args.after_context),
+        max_columns: args.max_columns,
+        max_count: args.max_count,
+        head_limit: args.head_limit,
+        no_symbol: args.no_symbol,
+        color: match args.color {
+            ColorWhen::Auto => ColorChoice::Auto,
+            ColorWhen::Always => ColorChoice::Always,
+            ColorWhen::Never => ColorChoice::Never,
+        },
+    };
+
+    let targets = walk_files(
+        project_path,
+        &WalkOptions {
+            filter,
+            overrides,
+            types,
+            hidden: args.hidden,
+            no_ignore: args.no_ignore,
+            roots,
+        },
+    );
+
+    ambits::find::run(registry, &targets, &options, coverage)
 }
 
 /// Build the project symbol tree with whichever backend was selected.
@@ -400,23 +652,27 @@ fn main() -> Result<()> {
     // search reads the files it walks and parses only the ones that match, so
     // paying for a full parse first would be paying for work it discards. The
     // tree it still asks for here is temporary scaffolding.
-    if let Some(Commands::Find {
-        pattern,
-        limit,
-        format,
-    }) = &command
-    {
+    if let Some(Commands::Find(args)) = &command {
         for w in &config_warnings {
             eprintln!("[ambit warning] {w}");
         }
-        let project_tree = scan_tree(cli.serena, &registry, &project_path, filter.as_ref())?;
-        return ambits::find::run(
-            &project_tree,
-            pattern,
-            *limit,
-            matches!(format, FindFormat::Json),
+        // grep's exit codes, which agents chain on: 0 matched, 1 did not,
+        // 2 something went wrong. `color_eyre` would exit 1 for an error,
+        // which is indistinguishable from an honest "no match".
+        match run_find(
+            args,
+            &registry,
+            &project_path,
+            filter.as_ref(),
             coverage_index.as_ref(),
-        );
+        ) {
+            Ok(outcome) if outcome.matched => return Ok(()),
+            Ok(_) => std::process::exit(1),
+            Err(e) => {
+                eprintln!("ambits find: {e:#}");
+                std::process::exit(2);
+            }
+        }
     }
 
     let project_tree = scan_tree(cli.serena, &registry, &project_path, filter.as_ref())?;
