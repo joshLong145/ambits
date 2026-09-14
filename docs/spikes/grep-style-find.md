@@ -645,9 +645,32 @@ and a no-match query.
     a count reported the cap), and `-c` counted matches where grep counts matching
     *lines*. `--count-matches` now carries the match count.
 
-**P4 — guardrails**
+**P4 — guardrails — DONE**
 
-20. Remaining e2e tests 38–40, 42.
-21. Benchmarks 43–44.
-22. `cargo test --all` green; manual smoke against a real Claude Code session,
-    verifying the depth column and that the journal grows by exactly the symbols shown.
+20. ✅ `tests/find_cli.rs`, a new process-level suite (15 tests): exit codes, path
+    arguments, glob/type/gitignore narrowing, the stderr trailer, the flat
+    `file:line:col:` contract, JSON Lines, `find → show` composition, and four
+    journaling cases including `--no-journal` and a `[cache] enabled = false`
+    `tools.toml`. Kept separate from `tests/e2e.rs`, which is library-level.
+
+    Two fixture facts worth remembering: `ignore` honours `.gitignore` only inside a
+    git repository, so the fixture creates a `.git` directory; and PATH arguments
+    resolve against the working directory, so the harness sets `current_dir` to the
+    project the way a caller would.
+
+21. ✅ Test 43 became three unit tests rather than a benchmark. Timing cannot
+    distinguish "fast" from "skipped", so a parser that panics when asked to parse
+    does it exactly: a non-matching file must not panic, a matching one must, and a
+    counting mode must not. `benches/find.rs` covers throughput instead, with the
+    contrast that makes the design visible — at 64 large files, 543 µs with no match
+    against 5.9 ms when every file matches, the difference being the parse a search
+    avoids. Seven thresholds added to `.github/bench-thresholds.json` and verified
+    live against the checker rather than assumed.
+
+    The first draft of that benchmark measured nothing: its "with matches" pattern did
+    not occur in the `large` fixture, so both arms ran the same search. The 10×
+    contrast is what proves the arms differ.
+
+22. ✅ 569 tests green (`cargo test`), clippy clean apart from two pre-existing
+    `too many arguments` warnings, and the search verified by hand against this repo's
+    own live journal.

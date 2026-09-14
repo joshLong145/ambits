@@ -1703,3 +1703,81 @@ mod head_limit_tests {
         assert_eq!(files[0].hits.len(), 200);
     }
 }
+
+/// The invariant the whole pipeline rests on: a file that cannot match is never
+/// parsed. Pinned with a parser that panics rather than by timing, which would
+/// be both flaky and unable to tell "fast" from "skipped".
+#[cfg(test)]
+mod prefilter_tests {
+    use super::*;
+    use crate::parser::LanguageParser;
+    use crate::symbols::FileSymbols;
+
+    /// Claims `.probe` files and explodes if anything asks it to parse one.
+    struct ExplodingParser;
+
+    impl LanguageParser for ExplodingParser {
+        fn extensions(&self) -> &[&str] {
+            &["probe"]
+        }
+
+        fn parse_file(&self, _path: &Path, _source: &str) -> color_eyre::Result<FileSymbols> {
+            panic!("parsed a file it did not need to parse");
+        }
+
+        fn language(&self) -> tree_sitter::Language {
+            tree_sitter_rust::LANGUAGE.into()
+        }
+
+        fn tags_query(&self) -> &'static str {
+            ""
+        }
+    }
+
+    fn registry() -> ParserRegistry {
+        let mut registry = ParserRegistry::new();
+        registry.register(Box::new(ExplodingParser));
+        registry
+    }
+
+    fn probe(body: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let abs = dir.path().join("a.probe");
+        std::fs::write(&abs, body).unwrap();
+        (dir, abs, PathBuf::from("a.probe"))
+    }
+
+    #[test]
+    fn a_file_with_no_match_is_never_parsed() {
+        let (_dir, abs, rel) = probe("nothing of interest here\n");
+        let opts = Options::new(vec!["needle".into()]);
+        let matcher = Matcher::new(&opts).unwrap();
+
+        assert!(search_file(&matcher, &registry(), &abs, &rel, &opts, None).is_none());
+    }
+
+    /// The other half, without which the first proves nothing: a file that
+    /// *does* match is parsed, so the parser really was reachable.
+    #[test]
+    #[should_panic(expected = "parsed a file it did not need to parse")]
+    fn a_file_with_a_match_is_parsed_for_attribution() {
+        let (_dir, abs, rel) = probe("here is a needle\n");
+        let opts = Options::new(vec!["needle".into()]);
+        let matcher = Matcher::new(&opts).unwrap();
+
+        search_file(&matcher, &registry(), &abs, &rel, &opts, None);
+    }
+
+    /// …and modes that show no source skip the parse even when it matched,
+    /// because attribution is the only thing the parse was for.
+    #[test]
+    fn counting_modes_do_not_parse_at_all() {
+        let (_dir, abs, rel) = probe("here is a needle\n");
+        let mut opts = Options::new(vec!["needle".into()]);
+        opts.mode = OutputMode::FilesWithMatches;
+        let matcher = Matcher::new(&opts).unwrap();
+
+        let found = search_file(&matcher, &registry(), &abs, &rel, &opts, None).unwrap();
+        assert_eq!(found.hits.len(), 1, "it matched, it just was not parsed");
+    }
+}

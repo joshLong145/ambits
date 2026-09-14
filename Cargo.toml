@@ -67,6 +67,10 @@ harness = false
 name = "symbol_pipeline"
 harness = false
 
+[[bench]]
+name = "find"
+harness = false
+
 [[bin]]
 name = "heap_probe"
 path = "src/bin/heap_probe.rs"
