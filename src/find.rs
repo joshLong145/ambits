@@ -678,12 +678,19 @@ fn locate(path: &Path, line: u32, column: Option<u32>, opts: &Options, sep: char
     out
 }
 
-/// One printable line: a match, or a context line around one.
+/// One printable line: a group of same-line matches, or a context line.
 ///
-/// The two arrive as separate sequences and print interleaved by line number,
-/// which is the whole reason they need a common type.
+/// `Match` holds every [`Hit`] on that line, not just one — ripgrep prints a
+/// line once regardless of how many matches it holds, and `--json` folds them
+/// into one event's `submatches`. Printing one row per `Hit` (the bug this
+/// grouping fixes) double-counted a two-match line as two hits, in both plain
+/// text and `--json`. `-o` is the deliberate exception: each match *is* its
+/// own line there, so [`match_groups`] leaves it ungrouped.
+///
+/// The two variants arrive as separate sequences and print interleaved by
+/// line number, which is the whole reason they need a common type.
 enum Row<'a> {
-    Match(&'a Hit),
+    Match(&'a [Hit]),
     Context(u32, &'a [u8]),
 }
 
@@ -692,9 +699,24 @@ impl Row<'_> {
     /// cannot happen — a line is one or the other — but keeps the order total.
     fn order(&self) -> (u32, u32) {
         match self {
-            Row::Match(hit) => (hit.line, hit.column),
+            Row::Match(group) => (group[0].line, group[0].column),
             Row::Context(line, _) => (*line, 0),
         }
+    }
+}
+
+/// Group `hits` into same-line runs for printing, except under `-o` where
+/// each match prints as its own line and must stay ungrouped.
+///
+/// `hits` is already sorted by `(line, column)` — the search walks each
+/// file's bytes once, left to right, so two matches on one line are always
+/// adjacent — which is what makes a simple [`slice::chunk_by`] correct here
+/// without a re-sort.
+fn match_groups<'a>(hits: &'a [Hit], opts: &Options) -> Vec<&'a [Hit]> {
+    if opts.only_matching {
+        hits.iter().map(std::slice::from_ref).collect()
+    } else {
+        hits.chunk_by(|a, b| a.line == b.line).collect()
     }
 }
 
@@ -718,9 +740,8 @@ fn print_content(
 
         // Context lines interleave by line number, so the two sequences are
         // merged rather than printed in turn.
-        let mut rows: Vec<Row> = file
-            .hits
-            .iter()
+        let mut rows: Vec<Row> = match_groups(&file.hits, opts)
+            .into_iter()
             .map(Row::Match)
             .chain(
                 file.context
@@ -732,7 +753,11 @@ fn print_content(
 
         for row in rows {
             match row {
-                Row::Match(hit) => {
+                Row::Match(group) => {
+                    // Every hit in the group shares a line, so the text and
+                    // (per rg's own convention) the reported column both come
+                    // from the first — the leftmost match on that line.
+                    let hit = &group[0];
                     let (text, _) = body(hit, opts, color);
                     let symbol = if opts.no_symbol {
                         String::new()
@@ -791,7 +816,10 @@ fn print_json(
         writeln!(w, "{}", json!({"type": "begin", "data": {"path": {"text": path}}}))?;
 
         if opts.mode.shows_source() {
-            for hit in &file.hits {
+            // One event per line, not per match — real rg folds same-line
+            // matches into one event's `submatches`; see `match_groups`.
+            for group in match_groups(&file.hits, opts) {
+                let hit = &group[0];
                 let (mut text, truncated) = body(hit, opts, false);
                 // rg's `lines.text` carries the line terminator. A truncated
                 // line has had its tail removed, so it gets none — the marker
@@ -799,10 +827,20 @@ fn print_json(
                 if !truncated && !opts.only_matching {
                     text.push('\n');
                 }
-                let matched = String::from_utf8_lossy(
-                    &hit.text[hit.span.0.min(hit.text.len())..hit.span.1.min(hit.text.len())],
-                )
-                .into_owned();
+                let submatches: Vec<_> = group
+                    .iter()
+                    .map(|h| {
+                        let matched = String::from_utf8_lossy(
+                            &h.text[h.span.0.min(h.text.len())..h.span.1.min(h.text.len())],
+                        )
+                        .into_owned();
+                        json!({
+                            "match": {"text": matched},
+                            "start": h.span.0,
+                            "end": h.span.1,
+                        })
+                    })
+                    .collect();
                 let symbol = hit.symbol.as_ref().map(|s| {
                     json!({
                         "id": s.id,
@@ -821,11 +859,7 @@ fn print_json(
                             "lines": {"text": text},
                             "line_number": hit.line,
                             "absolute_offset": hit.byte,
-                            "submatches": [{
-                                "match": {"text": matched},
-                                "start": hit.span.0,
-                                "end": hit.span.1,
-                            }],
+                            "submatches": submatches,
                             "symbol": symbol,
                             "truncated": truncated,
                         }
@@ -1333,6 +1367,74 @@ mod tests {
         assert_eq!(out, "src/a.rs:1:1:fn alpha() {}\n");
     }
 
+    /// Two matches sharing a line print as one row, not two — printing one
+    /// row per `Hit` used to double the line, both here and in `rg`'s own
+    /// default text mode, which never repeats a line for extra matches on it.
+    #[test]
+    fn two_matches_on_one_line_print_as_one_row() {
+        let two_on_one_line = "fn alpha() { fn nested() {} }\nfn beta() {}\n";
+        let mut opts = Options::new(vec!["fn".into()]);
+        opts.heading = Some(false);
+        let found = hits(two_on_one_line, &opts);
+        assert_eq!(lines_of(&found), vec![1, 1, 2], "fixture: two matches on line 1");
+
+        let files = vec![FileHits {
+            path: PathBuf::from("a.rs"),
+            hits: found,
+            total: 3,
+            context: Vec::new(),
+        }];
+        let out = rendered(&files, &opts, false);
+        let rows: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            rows.len(),
+            2,
+            "one row per line, not per match: {rows:?}"
+        );
+        assert!(
+            rows[0].starts_with("a.rs:1:1:"),
+            "reports the leftmost match's column: {:?}",
+            rows[0]
+        );
+    }
+
+    /// Same grouping, under `--heading`'s separate rendering branch.
+    #[test]
+    fn two_matches_on_one_line_print_as_one_row_under_heading() {
+        let two_on_one_line = "fn alpha() { fn nested() {} }\nfn beta() {}\n";
+        let mut opts = Options::new(vec!["fn".into()]);
+        opts.heading = Some(true);
+        let files = vec![FileHits {
+            path: PathBuf::from("a.rs"),
+            hits: hits(two_on_one_line, &opts),
+            total: 3,
+            context: Vec::new(),
+        }];
+        let out = rendered(&files, &opts, false);
+        let match_rows = out
+            .lines()
+            .filter(|l| l.trim_start().starts_with("1:") || l.trim_start().starts_with("2:"))
+            .count();
+        assert_eq!(match_rows, 2, "grouped under heading mode too: {out:?}");
+    }
+
+    /// `-o` is the deliberate exception: each match is its own line even when
+    /// several share a source line, so it must stay ungrouped.
+    #[test]
+    fn only_matching_keeps_each_match_as_its_own_group() {
+        let two_on_one_line = "fn alpha() { fn nested() {} }\nfn beta() {}\n";
+        let mut opts = Options::new(vec!["fn".into()]);
+        opts.only_matching = true;
+        let found = hits(two_on_one_line, &opts);
+        let groups = match_groups(&found, &opts);
+        assert_eq!(
+            groups.len(),
+            3,
+            "-o prints one line per match, even sharing a source line"
+        );
+        assert!(groups.iter().all(|g| g.len() == 1));
+    }
+
     #[test]
     fn json_match_events_carry_the_symbol() {
         let mut opts = Options::new(vec!["fn alpha".into()]);
@@ -1354,6 +1456,41 @@ mod tests {
             "symbol is an object or null, never absent"
         );
         assert_eq!(events.last().unwrap()["type"], "summary");
+    }
+
+    /// Real `rg --json` folds same-line matches into one `match` event with a
+    /// multi-entry `submatches` array, rather than one event per match. This
+    /// pins that shape down — it is the whole point of speaking rg's dialect.
+    #[test]
+    fn two_matches_on_one_line_are_one_json_event_with_two_submatches() {
+        let two_on_one_line = "fn alpha() { fn nested() {} }\nfn beta() {}\n";
+        let mut opts = Options::new(vec!["fn".into()]);
+        opts.json = true;
+        let files = vec![FileHits {
+            path: PathBuf::from("a.rs"),
+            hits: hits(two_on_one_line, &opts),
+            total: 3,
+            context: Vec::new(),
+        }];
+        let mut buf = Vec::new();
+        print_json(&mut buf, &files, &opts, None, 0).unwrap();
+        let events: Vec<serde_json::Value> = String::from_utf8(buf)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("every line is one JSON event"))
+            .collect();
+        let matches: Vec<&serde_json::Value> =
+            events.iter().filter(|e| e["type"] == "match").collect();
+
+        assert_eq!(matches.len(), 2, "one event per line, not per match: {matches:?}");
+        assert_eq!(matches[0]["data"]["line_number"], 1);
+        assert_eq!(
+            matches[0]["data"]["submatches"].as_array().unwrap().len(),
+            2,
+            "both of line 1's matches ride in one event"
+        );
+        assert_eq!(matches[1]["data"]["line_number"], 2);
+        assert_eq!(matches[1]["data"]["submatches"].as_array().unwrap().len(), 1);
     }
 
     /// The envelope's `coverage` is what distinguishes "no journal" from
