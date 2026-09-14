@@ -561,6 +561,10 @@ pub fn run_report(
     // not record. The coverage journal (see the cache work) is exactly that
     // missing record, so the fix is to have this path consult the journal when
     // one exists rather than to bolt a staleness check on here.
+    //
+    // That gap is about *depth* being overstated. It is not why this report
+    // once disagreed with the journal on how much had been read at all — that
+    // was a compaction wiping the replayed ledger, fixed below.
     let mut ledger = ContextLedger::new();
     // `run_report` is the CLI (non-TUI) report path; it has no alignment
     // popup to serve, so this cache is populated (to satisfy the shared
@@ -618,11 +622,18 @@ pub fn run_report(
                                 duration_ms: m.duration_ms,
                             }),
                         });
-                        // Mirror `App::process_compaction`: wipe live depth state
-                        // so the final coverage report reflects post-compaction
-                        // context only. `compactions` is preserved.
-                        ledger = ContextLedger::new();
-                        files_accessed.clear();
+                        // Mirror `App::process_compaction`: demote rather than
+                        // wipe. The reads are still facts — they just no longer
+                        // live in the model's context — and `App` stopped
+                        // wiping here long ago. Replaying a wipe discarded
+                        // every read before the last compaction, which is why
+                        // this report could disagree wildly with the journal on
+                        // a session that had compacted even once.
+                        //
+                        // `files_accessed` is likewise left standing, because
+                        // `App` derives its equivalent from the whole ledger at
+                        // compaction time, restored entries included.
+                        ledger.mark_all_restored();
                         tool_call_count = 0;
                     }
                     SessionEvent::SessionCleared => {
@@ -1116,4 +1127,133 @@ mod tests {
             "filter field should be omitted when None, got: {value}",
         );
     }
+
+    // -- run_report: compaction must demote, not discard -------------------
+
+    /// Feeds `run_report` a fixed event script, standing in for session JSONL.
+    struct ScriptedIngester {
+        events: Vec<crate::ingest::SessionEvent>,
+    }
+
+    impl crate::ingest::SessionIngester for ScriptedIngester {
+        fn log_dir_for_project(&self, _project_path: &Path) -> Option<PathBuf> {
+            Some(PathBuf::from("/logs"))
+        }
+        fn find_latest_session(&self, _log_dir: &Path) -> Option<String> {
+            Some("sess".to_string())
+        }
+        fn session_log_files(&self, _log_dir: &Path, _session_id: &str) -> Vec<PathBuf> {
+            vec![PathBuf::from("/logs/sess.jsonl")]
+        }
+        fn parse_log_file(&self, _path: &Path) -> Vec<crate::ingest::SessionEvent> {
+            self.events.clone()
+        }
+        fn new_tailer(&self, _files: Vec<PathBuf>) -> Box<dyn crate::ingest::EventTailer> {
+            unreachable!("run_report never tails")
+        }
+    }
+
+    /// Captures the totals the formatter would have rendered.
+    #[derive(Default)]
+    struct Capture {
+        totals: std::cell::RefCell<(usize, usize, usize)>,
+    }
+
+    impl CoverageFormatter for Capture {
+        fn format(&self, report: &CoverageReport) -> String {
+            *self.totals.borrow_mut() = report.files.iter().fold((0, 0, 0), |acc, f| {
+                (acc.0 + f.total_symbols, acc.1 + f.seen_count, acc.2 + f.full_count)
+            });
+            String::new()
+        }
+    }
+
+    fn read_of(project_path: &str, rel: &str) -> crate::ingest::SessionEvent {
+        crate::ingest::SessionEvent::ToolCall(crate::ingest::AgentToolCall {
+            agent_id: "ag".into(),
+            tool_name: "Read".into(),
+            file_path: Some(PathBuf::from(project_path).join(rel)),
+            read_depth: ReadDepth::FullBody,
+            description: format!("Read {rel}"),
+            timestamp_str: "2026-01-01T00:00:00Z".to_string(),
+            target_symbol: None,
+            target_lines: None,
+            target_selectors: Vec::new(),
+            label: "ag".into(),
+        })
+    }
+
+    fn compaction() -> crate::ingest::SessionEvent {
+        crate::ingest::SessionEvent::Compacted {
+            summary: "summary".to_string(),
+            timestamp: "2026-01-01T00:01:00Z".to_string(),
+            agent_id: "ag".into(),
+            metadata: None,
+        }
+    }
+
+    fn totals_for(events: Vec<crate::ingest::SessionEvent>) -> (usize, usize, usize) {
+        let tree = project(vec![
+            file("a.rs", vec![sym("a.rs::one", "one")]),
+            file("b.rs", vec![sym("b.rs::two", "two")]),
+        ]);
+        let ingester = ScriptedIngester { events };
+        let capture = Capture::default();
+        run_report(
+            Path::new("/proj"),
+            &tree,
+            &None,
+            &None,
+            &None,
+            None,
+            &ingester,
+            &capture,
+        )
+        .unwrap();
+        let totals = *capture.totals.borrow();
+        totals
+    }
+
+    /// A read before a compaction is still a read. `App::process_compaction`
+    /// demotes the ledger to `Restored`; this path used to wipe it, so a
+    /// session that had compacted even once under-reported everything read
+    /// before the last boundary — disagreeing sharply with the journal.
+    #[test]
+    fn a_compaction_demotes_earlier_reads_instead_of_discarding_them() {
+        let (total, seen, _full) = totals_for(vec![
+            read_of("/proj", "a.rs"),
+            compaction(),
+            read_of("/proj", "b.rs"),
+        ]);
+
+        assert_eq!(total, 2);
+        assert_eq!(seen, 2, "the pre-compaction read of a.rs must still count");
+    }
+
+    /// Two compactions must not compound the loss either.
+    #[test]
+    fn reads_survive_repeated_compactions() {
+        let (_total, seen, _full) = totals_for(vec![
+            read_of("/proj", "a.rs"),
+            compaction(),
+            compaction(),
+            read_of("/proj", "b.rs"),
+        ]);
+
+        assert_eq!(seen, 2);
+    }
+
+    /// A `/clear` is different in kind: the session really did throw its
+    /// context away, so the wipe there is correct and must stay.
+    #[test]
+    fn session_cleared_still_discards_earlier_reads() {
+        let (_total, seen, _full) = totals_for(vec![
+            read_of("/proj", "a.rs"),
+            crate::ingest::SessionEvent::SessionCleared,
+            read_of("/proj", "b.rs"),
+        ]);
+
+        assert_eq!(seen, 1, "only the post-clear read survives");
+    }
+
 }
