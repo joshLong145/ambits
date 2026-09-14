@@ -543,32 +543,27 @@ Output:
    maintenance below ~1M files.
 4. **Journal shards per process** (`<session>.<pid>.ndjson`) if the concurrency stress
    test ever tears. Ship single-file first.
-5. **`target_selectors` must not credit `find`'s pattern.** Ready to file; `bd` could
-   not reach its Dolt server during this work, so it is parked here.
+5. ✅ **`target_selectors` no longer credits `find`'s pattern.** Fixed, not filed.
 
-   > **Title:** Bash `target_selectors` credits find's search pattern as a symbol read
-   > **Type:** bug · **Priority:** 1
-   >
-   > The `Bash` stanza in `src/ingest/default_tools.toml` carries
-   > `target_selectors = { key = "command", requires = "ambits", depth = "FullBody", … }`.
-   > It scans the command string for tokens that parse as a symbol id and credits each
-   > at `FullBody`. That was correct when `::` in an `ambits` command meant the old
-   > `find`'s query syntax — the caller really was asking for that symbol.
-   >
-   > `find`'s pattern is now a regex over content, so `ambits find 'src/app.rs::App'`,
-   > or any search for text containing `::` such as `std::fs::read`, credits a symbol
-   > the search may never have displayed. `find` already journals precisely what it
-   > showed (`find::journal_reads`), so this heuristic can only over-credit now.
-   >
-   > Fix: an `excludes` counterpart to `requires` in `TargetSelectorSpec`, set so the
-   > rule skips `ambits find` while still covering `ambits show`. Config-schema change,
-   > so it needs a `tools.toml` version bump and a merge-semantics test.
+   `TargetSelectorSpec` gained an optional `subcommand`, and the built-in `Bash`
+   stanza sets it to `show`. Within each invocation, selectors are read only from the
+   tokens *after* that subcommand token — which matches the grammar, since everything
+   before it is a global flag and cannot be a selector.
 
-   File with:
-   ```bash
-   bd create "Bash target_selectors credits find's search pattern as a symbol read" \
-     --description="..." -t bug -p 1 --json
-   ```
+   A plain `requires = "ambits show"` cannot work: global flags sit between the binary
+   and the subcommand (`ambits -p . show <id>`), so no fixed substring spans the two.
+   Matching a whole token does, and `Iterator::any` consuming through the match leaves
+   exactly the subcommand's own arguments to scan.
+
+   **No version bump.** The spike assumed one was needed; `load` rejects only
+   `version > SUPPORTED_VERSION`, and the field is optional, so every existing
+   `tools.toml` keeps parsing and keeps its behaviour. Bumping would have invalidated
+   user configs to no purpose.
+
+   One adjacent bug fixed with it: `extends` inherited `path_keys`, `pattern_keys`,
+   `depth`, `target_symbol` and `target_lines` but not `target_selectors`, so a user
+   stanza extending `Bash` to add one command prefix silently stopped crediting
+   `ambits show` — the exact coverage hole the spec exists to close.
 
 ---
 

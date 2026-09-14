@@ -383,6 +383,50 @@ fn tool_bash_description_key_fallback() {
 }
 
 // ---------------------------------------------------------------------------
+// 14b. Bash — selectors, which only `ambits show` earns
+// ---------------------------------------------------------------------------
+
+/// `ambits show` reads code without naming a file, so this is the only route
+/// by which it earns coverage at all.
+#[test]
+fn tool_bash_show_command_credits_its_selectors() {
+    let cfg = builtin();
+    let input = serde_json::json!({ "command": "ambits -p . show src/app.rs::App/render" });
+    let call = map_tool_call(&cfg, "Bash", &input, "a", "ts").unwrap();
+
+    assert_eq!(
+        call.target_selectors,
+        vec![("src/app.rs::App/render".to_string(), ReadDepth::FullBody)]
+    );
+    assert_eq!(
+        call.read_depth,
+        ReadDepth::FullBody,
+        "the selector's depth overrides the generic Bash default"
+    );
+}
+
+/// …and `find` does not. Its pattern is a regex over file content, so a search
+/// for text shaped like an id is not a request for that symbol — and `find`
+/// journals what it actually displayed on its own.
+#[test]
+fn tool_bash_find_pattern_credits_nothing() {
+    let cfg = builtin();
+    let input = serde_json::json!({ "command": "ambits -p . find 'src/app.rs::App/render'" });
+    let call = map_tool_call(&cfg, "Bash", &input, "a", "ts").unwrap();
+
+    assert!(
+        call.target_selectors.is_empty(),
+        "a search pattern is not a selector, got {:?}",
+        call.target_selectors
+    );
+    assert_eq!(
+        call.read_depth,
+        ReadDepth::NameOnly,
+        "and the command falls back to the generic Bash depth"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 15. TodoWrite — first todo's content shown truncated
 // ---------------------------------------------------------------------------
 #[test]
