@@ -543,9 +543,32 @@ Output:
    maintenance below ~1M files.
 4. **Journal shards per process** (`<session>.<pid>.ndjson`) if the concurrency stress
    test ever tears. Ship single-file first.
-5. **`target_selectors` must not credit `find`'s pattern.** See §6.7: a search for text
-   containing `::` is credited as a read of that symbol id. Needs an `excludes` field
-   beside `requires` in the tool-config schema.
+5. **`target_selectors` must not credit `find`'s pattern.** Ready to file; `bd` could
+   not reach its Dolt server during this work, so it is parked here.
+
+   > **Title:** Bash `target_selectors` credits find's search pattern as a symbol read
+   > **Type:** bug · **Priority:** 1
+   >
+   > The `Bash` stanza in `src/ingest/default_tools.toml` carries
+   > `target_selectors = { key = "command", requires = "ambits", depth = "FullBody", … }`.
+   > It scans the command string for tokens that parse as a symbol id and credits each
+   > at `FullBody`. That was correct when `::` in an `ambits` command meant the old
+   > `find`'s query syntax — the caller really was asking for that symbol.
+   >
+   > `find`'s pattern is now a regex over content, so `ambits find 'src/app.rs::App'`,
+   > or any search for text containing `::` such as `std::fs::read`, credits a symbol
+   > the search may never have displayed. `find` already journals precisely what it
+   > showed (`find::journal_reads`), so this heuristic can only over-credit now.
+   >
+   > Fix: an `excludes` counterpart to `requires` in `TargetSelectorSpec`, set so the
+   > rule skips `ambits find` while still covering `ambits show`. Config-schema change,
+   > so it needs a `tools.toml` version bump and a merge-semantics test.
+
+   File with:
+   ```bash
+   bd create "Bash target_selectors credits find's search pattern as a symbol read" \
+     --description="..." -t bug -p 1 --json
+   ```
 
 ---
 
@@ -606,10 +629,21 @@ and a no-match query.
     rather than claiming only the TUI writes. `cache.rs` status text updated.
 18. ❌ Dropped — see §6.7.
 
-**P3 — surface**
+**P3 — surface — DONE**
 
-19. `SKILL.md`, `examples.md`, `README.md`. The false "use grep for call sites"
-    paragraph must go.
+19. ✅ `SKILL.md` §"Finding symbols" replaced by §"Searching code": the rg dialect, the
+    four forms of the symbol column, the fact that searching records reads, exit codes,
+    the two caps, and what is unsupported. The "use grep for call sites" paragraph is
+    gone; `callers` now explains when to prefer it over a search instead.
+    `README.md` §"Finding symbols" replaced by §"Searching code", with real output and
+    re-measured numbers (61 files read, 5 parsed, ~0.01s; 0.00s for a pattern matching
+    nothing; `callers` 0.06s against find's <0.01s, replacing a stale 0.3s/0.02s pair).
+    CLI table updated. `examples.md` needed no change — it is entirely `--coverage`.
+
+    Two bugs surfaced while writing the examples, both fixed with tests:
+    `--head-limit` was truncating `-l` and `-c` (so a listing silently dropped files and
+    a count reported the cap), and `-c` counted matches where grep counts matching
+    *lines*. `--count-matches` now carries the match count.
 
 **P4 — guardrails**
 

@@ -123,34 +123,61 @@ That adds a `SessionStart` hook with `matcher: "compact"` to
 result the moment a compaction completes. It merges into existing settings and
 is safe to re-run. When there is nothing to restore it emits nothing.
 
-### Finding symbols
+### Searching code
 
-To locate something without knowing its exact id:
+`find` is a grep. The pattern is a regular expression over file **content**, and
+the flags are ripgrep's — which is what your own `Grep` tool is built on, so the
+dialect you already know applies here:
 
 ```bash
-ambits -p . find 'parse_selector'          # where is this defined?
-ambits -p . find 'src/app.rs::'            # everything in a file
-ambits -p . find '::App/'                  # every member of a type
-ambits -p . find 'ui::render'              # scoped to a directory
+ambits -p . find 'depth_of'                  # every use and definition
+ambits -p . find 'fn enclosing' -t rust      # one file type
+ambits -p . find 'TODO' -g '!tests/**'       # globs; ! excludes
+ambits -p . find 'Journal::open' -A 3        # with trailing context
+ambits -p . find 'unwrap\(\)' -c             # matching lines per file
+ambits -p . find 'Matcher' src/find.rs       # scoped to paths
 ```
 
-The pattern is `[path]::[name]`, or a bare name. Both halves are optional and
-case-insensitive. The path half matches whole path components, so `ui` matches
-`src/ui/` but not `src/tui.rs`. The name half matches the **leaf** name unless
-your pattern contains `/`, in which case it matches the whole name path — which
-is what makes `::App/` return App's members.
+What makes it worth using over `Grep`: every match says which symbol it landed
+in, and how deeply you have already read that symbol.
 
-`--format json` emits the same fields as `show --no-body`, so `find` output
-feeds straight into `show`; `children` is summarized as `children_count`. Capped at 100 per pattern; a
-truncated result says how many it withheld.
+```
+src/symbols/mod.rs:158:9:[— FileSymbols/enclosing]     pub fn enclosing(&self, byte: u32) -> …
+```
 
-Results show what you have already read — a depth column (`full`, `signature`,
-…) with `—` for unread, plus a per-query count. Use it before reading: a match
-marked `full` needs no `show`. The column is absent entirely when no coverage
-journal exists, which means *unknown*, not unread.
+That is `file:line:column:` — the prefix any grep consumer expects — then
+`[depth symbol]`, then the line. The bracket has four forms:
 
-**This searches definitions, not usages.** A method call is not a symbol, so
-`find is_none_or` returns nothing. Use grep for call sites.
+| Form | Meaning |
+|---|---|
+| `[full name]`, `[signature name]`, … | You have read this symbol, at that depth |
+| `[— name]` | You have **not** read it |
+| `[name]` | No coverage journal loaded: *unknown*, not unread |
+| `[-]` | The match is not inside any symbol — a `use` line, or a file no parser handles |
+
+Use it before reading: a match inside a symbol marked `full` needs no `show`.
+For one marked `—`, the id `show` wants is the file and the name path the line
+already gives you — `src/symbols/mod.rs::FileSymbols/enclosing` — or take it
+verbatim from `--json`.
+
+**Searching records what it showed you.** Any symbol whose matching line was
+printed is journaled as read, so your coverage reflects it and a later
+`restore-context` will hand it back. Modes that print no source — `-q`, `-l`,
+`-c` — record nothing, and neither do matches cut off by `--head-limit`.
+
+Non-obvious bits:
+
+- **Exit codes are grep's**: `0` matched, `1` nothing matched, `2` error. Safe to
+  chain with `&&`.
+- Output is capped at **200 matches** (`--head-limit 0` for all) and lines at 300
+  columns (`-M 0`). Both are deliberate: this lands in your context window.
+- Results are always sorted by path, line, column.
+- Every text file is searched, not only parseable ones. A hit in a TOML file is a
+  real hit; it just has no symbol.
+- `--json` emits ripgrep's JSON Lines events with a `symbol` field added to each
+  match and a `coverage` object on the summary.
+- Not supported: `-P/--pcre2`, `-r/--replace`, `-f/--file`. No backreferences or
+  lookaround — same regex engine as ripgrep, same limits.
 
 ### Finding callers
 
@@ -165,6 +192,10 @@ comes from parsed call nodes rather than text.
 Matching is by callee **name** — tree-sitter does not resolve which definition
 a call binds to. Most names are unique, but `callers new` returns calls to
 every `new`. `--format json` marks this with `name_matched_only: true`.
+
+Prefer this over `find` when you want calls specifically: `find 'centered_rect'`
+returns the definition, the doc comments mentioning it, and the call sites all
+mixed together, while `callers` returns call nodes only.
 
 ### Fetching a definition
 

@@ -298,6 +298,20 @@ pub struct Hit {
     pub symbol: Option<SymbolHit>,
 }
 
+impl FileHits {
+    /// Distinct lines with at least one match, which is what `-c` reports.
+    ///
+    /// Hits are per match, not per line, so this is not `hits.len()`: a line
+    /// holding two matches is one matching line.
+    pub fn matched_lines(&self) -> usize {
+        self.hits
+            .iter()
+            .map(|h| h.line)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+}
+
 /// One file's matches.
 #[derive(Debug)]
 pub struct FileHits {
@@ -820,7 +834,7 @@ fn print_json(
             }
         }
 
-        matched_lines += file.hits.len();
+        matched_lines += file.matched_lines();
         writeln!(
             w,
             "{}",
@@ -829,7 +843,7 @@ fn print_json(
                 "data": {
                     "path": {"text": path},
                     "binary_offset": serde_json::Value::Null,
-                    "stats": {"matched_lines": file.hits.len(), "matches": file.total},
+                    "stats": {"matched_lines": file.matched_lines(), "matches": file.hits.len()},
                 }
             })
         )?;
@@ -902,9 +916,18 @@ pub fn run(
 ) -> Result<Outcome> {
     let matcher = Matcher::new(opts)?;
     let mut files = search(&matcher, registry, targets, opts, coverage);
-    let withheld = apply_head_limit(&mut files, opts.head_limit);
-
     let matched = !files.is_empty();
+
+    // `--head-limit` caps what is *printed*, so it applies only where matches
+    // are printed. Letting it truncate `-l` or `-c` would silently drop files
+    // from a listing and cap a count at the limit — answers that look complete
+    // and are not.
+    let withheld = if opts.mode.shows_source() {
+        apply_head_limit(&mut files, opts.head_limit)
+    } else {
+        0
+    };
+
     let shown = shown_symbols(&files, opts.mode);
 
     if opts.mode == OutputMode::Quiet {
@@ -927,14 +950,17 @@ pub fn run(
                 writeln!(w, "{}", file.path.display())?;
             }
         }
+        // grep and rg both count matching *lines* for `-c`; only
+        // `--count-matches` counts the matches themselves. A line with two
+        // matches is one line and two matches.
         OutputMode::Count => {
             for file in &files {
-                writeln!(w, "{}:{}", file.path.display(), file.hits.len())?;
+                writeln!(w, "{}:{}", file.path.display(), file.matched_lines())?;
             }
         }
         OutputMode::CountMatches => {
             for file in &files {
-                writeln!(w, "{}:{}", file.path.display(), file.total)?;
+                writeln!(w, "{}:{}", file.path.display(), file.hits.len())?;
             }
         }
         OutputMode::Quiet => unreachable!("returned above"),
@@ -1431,6 +1457,21 @@ mod tests {
         );
     }
 
+    /// `-c` counts lines and `--count-matches` counts matches, which differ the
+    /// moment a line holds two of them.
+    #[test]
+    fn counting_distinguishes_lines_from_matches() {
+        let opts = Options::new(vec!["fn".into()]);
+        let file = FileHits {
+            path: PathBuf::from("a.rs"),
+            hits: hits("fn alpha() { fn nested() {} }\nfn beta() {}\n", &opts),
+            total: 3,
+            context: Vec::new(),
+        };
+        assert_eq!(file.hits.len(), 3, "three matches");
+        assert_eq!(file.matched_lines(), 2, "on two lines");
+    }
+
     /// The withheld count is reported to the caller so it can go to stderr;
     /// stdout stays exactly what a grep consumer expects to parse.
     #[test]
@@ -1613,5 +1654,52 @@ mod journaling_tests {
             ],
         )];
         assert_eq!(shown_symbols(&files, OutputMode::Content).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod head_limit_tests {
+    use super::*;
+
+    fn file_of(path: &str, hits: usize) -> FileHits {
+        FileHits {
+            path: PathBuf::from(path),
+            hits: (0..hits)
+                .map(|i| Hit {
+                    line: i as u32 + 1,
+                    column: 1,
+                    byte: i as u32,
+                    text: b"x".to_vec(),
+                    span: (0, 1),
+                    symbol: None,
+                })
+                .collect(),
+            total: hits,
+            context: Vec::new(),
+        }
+    }
+
+    /// `--head-limit` caps what is printed. Applying it to `-l` would drop
+    /// files from a listing that claims to be every file with a match, and
+    /// applying it to `-c` would report a count that is really the limit.
+    #[test]
+    fn counting_modes_are_not_subject_to_head_limit() {
+        for mode in [
+            OutputMode::FilesWithMatches,
+            OutputMode::Count,
+            OutputMode::CountMatches,
+            OutputMode::Quiet,
+        ] {
+            assert!(
+                !mode.shows_source(),
+                "{mode:?} prints no matches, so the cap must not reach it"
+            );
+        }
+
+        // The cap itself still works where matches are printed.
+        let mut files = vec![file_of("a.rs", 300), file_of("b.rs", 5)];
+        assert_eq!(apply_head_limit(&mut files, 200), 105);
+        assert_eq!(files.len(), 1, "b.rs had no room left");
+        assert_eq!(files[0].hits.len(), 200);
     }
 }
