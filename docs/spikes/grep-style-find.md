@@ -377,12 +377,14 @@ pub fn open(root: &Path, session: &str, interval: Duration,
 scan is paid on the first find of a session and never again. The TUI passes
 `|| EnvironmentManifest::capture(&tree, backend, filter)` and is otherwise untouched.
 
-**Two documented invariants change and must be updated in the same commit:**
+**Two documented invariants change and must be updated in the same commit.** Both
+quotes below are of the *superseded* text — they no longer appear in the code, and an
+evaluator reading this spike mistook them for current claims:
 
-- `journal.rs:62` — *"Only the TUI writes. Readers (`restore-context`) never open the
-  file for writing, which removes concurrent-writer concerns rather than managing
-  them."* Now managed; document `fold` and `O_APPEND` as the mechanism.
-- `cache.rs:109` — *"Journals are written by the TUI."*
+- `journal.rs:62` used to read *"Only the TUI writes. Readers (`restore-context`) never
+  open the file for writing, which removes concurrent-writer concerns rather than
+  managing them."* Now managed; `fold` and `O_APPEND` are documented as the mechanism.
+- `cache.rs:109` used to read *"Journals are written by the TUI."*
 
 **Honest caveat, recorded deliberately:** a symbol credited `FullBody` because one line
 matched will be reported to a future agent as known in full. The hash is verified, so
