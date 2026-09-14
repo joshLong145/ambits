@@ -191,10 +191,8 @@ pub fn load_from_journal(
     project_root: &Path,
     session_id: &str,
 ) -> Option<(ReadSet, Vec<String>)> {
-    let path = project_root
-        .join(crate::journal::JOURNAL_SUBDIR)
-        .join(format!("{session_id}.ndjson"));
-    let contents = crate::journal::read_journal(&path);
+    let dir = project_root.join(crate::journal::JOURNAL_SUBDIR);
+    let contents = crate::journal::read_journal_session(&dir, session_id);
     if contents.reads.is_empty() {
         return None;
     }

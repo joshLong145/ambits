@@ -29,19 +29,24 @@ use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Result, WrapErr};
 
-use crate::journal::{read_journal, JOURNAL_SUBDIR};
+use crate::journal::{read_journal_session, session_shard_paths, JOURNAL_SUBDIR};
 
-/// One journal file on disk.
+/// One session's journal, possibly folded from several on-disk shards — see
+/// the journal module's "Durability" section. There is deliberately no
+/// `path` field: a session's journal is not one file, so nothing downstream
+/// should assume it is. [`crate::journal::session_shard_paths`] is the way
+/// to get the actual files for one session.
 #[derive(Debug, Clone)]
 pub struct JournalStat {
     pub session_id: String,
-    pub path: PathBuf,
+    /// Sum of every shard's size.
     pub bytes: u64,
-    /// Total records, including the header.
+    /// Total records across all shards, including headers.
     pub records: usize,
-    /// Distinct symbols recoverable from the file.
+    /// Distinct symbols recoverable once shards are folded together.
     pub symbols: usize,
-    /// Whole days since last modified, or `None` if unavailable.
+    /// Whole days since the most recently modified shard, or `None` if
+    /// unavailable.
     pub age_days: Option<u64>,
     pub schema_version: Option<u32>,
 }
@@ -51,9 +56,12 @@ pub fn journal_dir(project_root: &Path) -> PathBuf {
     project_root.join(JOURNAL_SUBDIR)
 }
 
-/// Gather stats for every journal, newest first.
+/// Gather stats for every session, newest first.
 ///
-/// A file that cannot be read is skipped rather than failing the listing —
+/// A session's journal may be split across shards (`<id>.ndjson` from the
+/// TUI, `<id>.find.ndjson` from `ambits find`); this groups them by session
+/// id first, so `status`/`clear` reason about sessions rather than files. A
+/// shard that cannot be read is skipped rather than failing the listing —
 /// the point of `status` is to show what is there, and one unreadable file
 /// should not hide the rest.
 pub fn collect(project_root: &Path) -> Vec<JournalStat> {
@@ -62,29 +70,45 @@ pub fn collect(project_root: &Path) -> Vec<JournalStat> {
         return Vec::new();
     };
 
-    let mut out = Vec::new();
+    // `<id>.ndjson` and `<id>.<shard>.ndjson` both end in `.ndjson`, which
+    // `file_stem` strips; the session id is what remains up to the first
+    // `.`, since session ids (Claude Code UUIDs) never contain one.
+    let mut session_ids = std::collections::BTreeSet::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("ndjson") {
             continue;
         }
-        let Some(session_id) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let Ok(meta) = entry.metadata() else { continue };
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            session_ids.insert(stem.split('.').next().unwrap_or(stem).to_string());
+        }
+    }
 
-        let age_days = meta
-            .modified()
-            .ok()
+    let mut out = Vec::new();
+    for session_id in session_ids {
+        let shards = session_shard_paths(&dir, &session_id);
+        if shards.is_empty() {
+            continue;
+        }
+
+        let mut bytes = 0u64;
+        let mut newest: Option<std::time::SystemTime> = None;
+        for path in &shards {
+            let Ok(meta) = std::fs::metadata(path) else { continue };
+            bytes += meta.len();
+            if let Ok(m) = meta.modified() {
+                newest = Some(newest.map_or(m, |n| n.max(m)));
+            }
+        }
+        let age_days = newest
             .and_then(|m| m.elapsed().ok())
             .map(|d| d.as_secs() / 86_400);
 
-        let contents = read_journal(&path);
+        let contents = read_journal_session(&dir, &session_id);
 
         out.push(JournalStat {
-            session_id: session_id.to_string(),
-            path,
-            bytes: meta.len(),
+            session_id,
+            bytes,
             records: contents.records,
             symbols: contents.reads.len(),
             age_days,
@@ -151,14 +175,23 @@ pub fn clear(project_root: &Path, session: Option<&str>, all: bool) -> Result<()
 
     let targets: Vec<PathBuf> = match (session, all) {
         (Some(id), _) => {
-            let path = dir.join(format!("{id}.ndjson"));
-            if !path.exists() {
+            let shards = session_shard_paths(&dir, id);
+            if shards.is_empty() {
                 println!("No journal for session {id} in {}", dir.display());
                 return Ok(());
             }
-            vec![path]
+            shards
         }
-        (None, true) => collect(project_root).into_iter().map(|s| s.path).collect(),
+        // Every shard of every session — not `collect()`'s one-row-per-session
+        // view, which no longer carries individual paths.
+        (None, true) => match std::fs::read_dir(&dir) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("ndjson"))
+                .collect(),
+            Err(_) => Vec::new(),
+        },
         // Refuse to guess. Deleting every journal is not a reasonable default
         // for a bare `cache clear`.
         (None, false) => {
@@ -230,6 +263,27 @@ mod tests {
         std::fs::write(dir.join(format!("{session}.ndjson")), out).unwrap();
     }
 
+    /// Same shape as `write_journal`, but for a named shard (`find`'s, in
+    /// practice) rather than the primary file.
+    fn write_shard(root: &Path, session: &str, shard: &str, reads: usize) {
+        let dir = journal_dir(root);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut out = String::new();
+        for i in 0..reads {
+            out.push_str(
+                &serde_json::to_string(&Record::Read {
+                    symbol_id: format!("b.rs::t{i}"),
+                    hash: encode_hash(&[(100 + i) as u8; 32]),
+                    depth: DepthDto::FullBody,
+                    agent: Some("cli".into()),
+                })
+                .unwrap(),
+            );
+            out.push('\n');
+        }
+        std::fs::write(dir.join(format!("{session}.{shard}.ndjson")), out).unwrap();
+    }
+
     #[test]
     fn collect_reports_symbols_and_records_separately() {
         let dir = tempfile::tempdir().unwrap();
@@ -271,6 +325,35 @@ mod tests {
             .map(|s| s.session_id)
             .collect();
         assert_eq!(remaining, vec!["keep".to_string()]);
+    }
+
+    /// The TUI's primary file and `find`'s shard are one session, not two: one
+    /// combined row in `status`, and `clear --session` must take both with it.
+    #[test]
+    fn shards_of_one_session_collect_and_clear_together() {
+        let dir = tempfile::tempdir().unwrap();
+        write_journal(dir.path(), "sess-a", 2); // TUI shard: 2 symbols
+        write_shard(dir.path(), "sess-a", "find", 3); // find shard: 3 more symbols
+        write_journal(dir.path(), "sess-b", 1);
+
+        let stats = collect(dir.path());
+        assert_eq!(stats.len(), 2, "two sessions, not three files");
+        let a = stats.iter().find(|s| s.session_id == "sess-a").unwrap();
+        assert_eq!(a.symbols, 5, "folded across both shards");
+
+        clear(dir.path(), Some("sess-a"), false).unwrap();
+        let remaining: Vec<String> = collect(dir.path())
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
+        assert_eq!(
+            remaining,
+            vec!["sess-b".to_string()],
+            "clearing a session removes every one of its shards"
+        );
+        assert!(
+            crate::journal::session_shard_paths(&journal_dir(dir.path()), "sess-a").is_empty()
+        );
     }
 
     #[test]

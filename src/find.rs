@@ -1006,6 +1006,12 @@ pub fn run(
 /// records use for a session's main agent (`agentId` falls back to `sessionId`
 /// in `ingest::claude`). The `--agent` flag deliberately does not steer this: it
 /// is a *filter*, matched by prefix, and a prefix is not an id to write down.
+///
+/// Writes to this session's `find` shard (`<session>.find.ndjson`), not the
+/// primary file a running TUI writes — see `journal::Journal::open_shard` —
+/// so this invocation never appends to a file the TUI might have open, and a
+/// long-running TUI never has to account for a CLI process appending to the
+/// file it holds open.
 pub fn journal_reads(
     project_root: &Path,
     session_id: &str,
@@ -1032,9 +1038,10 @@ pub fn journal_reads(
         );
     }
 
-    let mut journal = crate::journal::Journal::open(
+    let mut journal = crate::journal::Journal::open_shard(
         project_root,
         session_id,
+        "find",
         // No interval: a CLI process syncs once and exits, where the TUI
         // spreads its writes over a long-lived run.
         std::time::Duration::ZERO,
@@ -1551,7 +1558,7 @@ mod journaling_tests {
         );
         assert_eq!(written, 1);
 
-        let contents = read_journal(&crate::cache::journal_dir(dir.path()).join("sess.ndjson"));
+        let contents = read_journal(&crate::cache::journal_dir(dir.path()).join("sess.find.ndjson"));
         let (_, depth) = contents.reads.get("a.rs::alpha").expect("recorded");
         assert_eq!(*depth, ReadDepth::FullBody);
     }
@@ -1561,7 +1568,7 @@ mod journaling_tests {
         let dir = tempfile::tempdir().unwrap();
         journal_reads(dir.path(), "sess", &[symbol("a.rs::alpha", 1)], manifest);
 
-        let contents = read_journal(&crate::cache::journal_dir(dir.path()).join("sess.ndjson"));
+        let contents = read_journal(&crate::cache::journal_dir(dir.path()).join("sess.find.ndjson"));
         assert!(
             !contents.reads.contains_key("a.rs::beta"),
             "a symbol the search never showed must not appear"
@@ -1574,7 +1581,7 @@ mod journaling_tests {
     #[test]
     fn a_matched_symbol_that_drifted_gets_a_fresh_hash() {
         let dir = tempfile::tempdir().unwrap();
-        let path = crate::cache::journal_dir(dir.path()).join("sess.ndjson");
+        let path = crate::cache::journal_dir(dir.path()).join("sess.find.ndjson");
 
         journal_reads(dir.path(), "sess", &[symbol("a.rs::alpha", 1)], manifest);
         let before = read_journal(&path).reads["a.rs::alpha"].0;
@@ -1592,7 +1599,7 @@ mod journaling_tests {
     #[test]
     fn an_unmatched_drifted_symbol_stays_stale() {
         let dir = tempfile::tempdir().unwrap();
-        let path = crate::cache::journal_dir(dir.path()).join("sess.ndjson");
+        let path = crate::cache::journal_dir(dir.path()).join("sess.find.ndjson");
 
         journal_reads(
             dir.path(),

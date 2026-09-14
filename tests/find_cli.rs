@@ -68,7 +68,9 @@ fn find(root: &Path, args: &[&str]) -> Output {
 }
 
 fn journal(root: &Path) -> String {
-    std::fs::read_to_string(root.join(".ambit/coverage/sess.ndjson")).unwrap_or_default()
+    // `find` writes its own shard, distinct from the primary file a running
+    // TUI would write — see `journal::Journal::open_shard`.
+    std::fs::read_to_string(root.join(".ambit/coverage/sess.find.ndjson")).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
