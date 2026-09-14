@@ -868,6 +868,27 @@ pub struct Outcome {
     pub shown: Vec<SymbolHit>,
 }
 
+/// The symbols whose matches are about to be printed, deduplicated.
+///
+/// Called after `--head-limit` has already truncated, so a symbol cut from the
+/// output is absent here too. Modes that print no source contribute nothing at
+/// all: the caller cannot have read what it was never shown.
+fn shown_symbols(files: &[FileHits], mode: OutputMode) -> Vec<SymbolHit> {
+    if !mode.shows_source() {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut shown = Vec::new();
+    for hit in files.iter().flat_map(|f| f.hits.iter()) {
+        if let Some(sym) = &hit.symbol {
+            if seen.insert(sym.id.clone()) {
+                shown.push(sym.clone());
+            }
+        }
+    }
+    shown
+}
+
 /// Search `targets`, print the results, and report what was shown.
 ///
 /// Walking is the caller's job: `main` builds the [`crate::parser::WalkOptions`]
@@ -884,19 +905,7 @@ pub fn run(
     let withheld = apply_head_limit(&mut files, opts.head_limit);
 
     let matched = !files.is_empty();
-    let mut shown: Vec<SymbolHit> = Vec::new();
-    if opts.mode.shows_source() {
-        let mut seen = std::collections::HashSet::new();
-        for file in &files {
-            for hit in &file.hits {
-                if let Some(sym) = &hit.symbol {
-                    if seen.insert(sym.id.clone()) {
-                        shown.push(sym.clone());
-                    }
-                }
-            }
-        }
-    }
+    let shown = shown_symbols(&files, opts.mode);
 
     if opts.mode == OutputMode::Quiet {
         return Ok(Outcome { matched, shown });
@@ -938,6 +947,74 @@ pub fn run(
     }
 
     Ok(Outcome { matched, shown })
+}
+
+// ---------------------------------------------------------------------------
+// Journaling
+// ---------------------------------------------------------------------------
+
+/// Record the symbols this search showed as read, in the session's journal.
+///
+/// ## Why a search records reads at all
+///
+/// Because it puts source in front of an agent. A `Grep` tool call is credited
+/// at `Overview` against a path; this can do better, because it knows exactly
+/// which symbols it printed and what their contents hash to right now.
+///
+/// ## Why `FullBody`
+///
+/// `find` searched the symbol's entire body, and the hash recorded alongside is
+/// the body it searched. The agent saw the matching lines rather than all of
+/// them, so this is generous — a deliberate product decision, made knowing the
+/// exposure is over-crediting at restore time rather than unsound drift
+/// detection.
+///
+/// ## What is *not* recorded
+///
+/// Anything the caller did not see: `shown` excludes `-q`, `-l` and `-c`, which
+/// print no source, and excludes matches cut off by `--head-limit`. A journal
+/// that records what the process computed rather than what the agent read is
+/// worse than no journal, because it claims knowledge nobody has.
+///
+/// Attribution goes to the session id, which is the agent id Claude Code's own
+/// records use for a session's main agent (`agentId` falls back to `sessionId`
+/// in `ingest::claude`). The `--agent` flag deliberately does not steer this: it
+/// is a *filter*, matched by prefix, and a prefix is not an id to write down.
+pub fn journal_reads(
+    project_root: &Path,
+    session_id: &str,
+    shown: &[SymbolHit],
+    manifest: impl FnOnce() -> crate::journal::EnvironmentManifest,
+) -> usize {
+    if shown.is_empty() {
+        return 0;
+    }
+
+    // The ledger starts empty rather than rehydrated: `Journal::open` seeds its
+    // dedup map from the file, so a symbol already recorded at this hash and
+    // depth is skipped without needing the whole history in memory. `record`
+    // refreshes `content_hash_at_read` and clears `stale`, which is exactly the
+    // "a symbol that matched is current again" rule, for free.
+    let mut ledger = crate::tracking::ContextLedger::new();
+    for sym in shown {
+        ledger.record(
+            sym.id.clone(),
+            ReadDepth::FullBody,
+            sym.content_hash,
+            session_id.to_string(),
+            sym.estimated_tokens as usize,
+        );
+    }
+
+    let mut journal = crate::journal::Journal::open(
+        project_root,
+        session_id,
+        // No interval: a CLI process syncs once and exits, where the TUI
+        // spreads its writes over a long-lived run.
+        std::time::Duration::ZERO,
+        manifest,
+    );
+    journal.sync(&ledger)
 }
 
 #[cfg(test)]
@@ -1364,5 +1441,177 @@ mod tests {
         let withheld = apply_head_limit(&mut files, 1);
         assert_eq!(withheld, 1);
         assert!(!rendered(&files, &opts, true).contains("withheld"));
+    }
+}
+
+#[cfg(test)]
+mod journaling_tests {
+    use super::*;
+    use crate::journal::{read_journal, EnvironmentManifest};
+    use crate::tracking::ReadDepth;
+
+    fn manifest() -> EnvironmentManifest {
+        EnvironmentManifest {
+            project_root: "/p".into(),
+            tree_fingerprint: crate::journal::encode_hash(&[7u8; 32]),
+            ambit_version: "test".into(),
+            backend: "tree-sitter".into(),
+            parsers: vec![],
+            tool_config_version: Some(1),
+            filter: None,
+            os: "testos".into(),
+            arch: "testarch".into(),
+            host: "testhost".into(),
+        }
+    }
+
+    fn symbol(id: &str, hash: u8) -> SymbolHit {
+        SymbolHit {
+            id: id.into(),
+            name_path: id.rsplit("::").next().unwrap().into(),
+            label: "fn",
+            lines: [1, 10],
+            depth: None,
+            content_hash: [hash; 32],
+            estimated_tokens: 30,
+        }
+    }
+
+    fn hit_with(symbol: Option<SymbolHit>) -> Hit {
+        Hit {
+            line: 1,
+            column: 1,
+            byte: 0,
+            text: b"x".to_vec(),
+            span: (0, 1),
+            symbol,
+        }
+    }
+
+    fn file_with(path: &str, symbols: Vec<Option<SymbolHit>>) -> FileHits {
+        FileHits {
+            path: PathBuf::from(path),
+            hits: symbols.into_iter().map(hit_with).collect(),
+            total: 1,
+            context: Vec::new(),
+        }
+    }
+
+    /// A search shows source, so it records what it showed — at `FullBody`,
+    /// because it searched the whole body and recorded the hash it searched.
+    #[test]
+    fn a_printed_hit_records_full_body_for_its_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = journal_reads(
+            dir.path(),
+            "sess",
+            &[symbol("a.rs::alpha", 1)],
+            manifest,
+        );
+        assert_eq!(written, 1);
+
+        let contents = read_journal(&crate::cache::journal_dir(dir.path()).join("sess.ndjson"));
+        let (_, depth) = contents.reads.get("a.rs::alpha").expect("recorded");
+        assert_eq!(*depth, ReadDepth::FullBody);
+    }
+
+    #[test]
+    fn a_symbol_with_no_hit_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        journal_reads(dir.path(), "sess", &[symbol("a.rs::alpha", 1)], manifest);
+
+        let contents = read_journal(&crate::cache::journal_dir(dir.path()).join("sess.ndjson"));
+        assert!(
+            !contents.reads.contains_key("a.rs::beta"),
+            "a symbol the search never showed must not appear"
+        );
+    }
+
+    /// The staleness rule, and the reason it needs no machinery of its own:
+    /// `ContextLedger::record` refreshes `content_hash_at_read` on every read,
+    /// so a symbol that matched again is current again.
+    #[test]
+    fn a_matched_symbol_that_drifted_gets_a_fresh_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::cache::journal_dir(dir.path()).join("sess.ndjson");
+
+        journal_reads(dir.path(), "sess", &[symbol("a.rs::alpha", 1)], manifest);
+        let before = read_journal(&path).reads["a.rs::alpha"].0;
+
+        // Same symbol, different content: the file changed and it matched again.
+        journal_reads(dir.path(), "sess", &[symbol("a.rs::alpha", 2)], manifest);
+        let after = read_journal(&path).reads["a.rs::alpha"].0;
+
+        assert_ne!(before, after, "the newer hash supersedes the older");
+        assert_eq!(after, [2u8; 32]);
+    }
+
+    /// …and the converse. A symbol that did not match keeps the hash it was
+    /// read at, so a later restore still sees it as drifted.
+    #[test]
+    fn an_unmatched_drifted_symbol_stays_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::cache::journal_dir(dir.path()).join("sess.ndjson");
+
+        journal_reads(
+            dir.path(),
+            "sess",
+            &[symbol("a.rs::alpha", 1), symbol("a.rs::beta", 1)],
+            manifest,
+        );
+        // Only alpha matches the second search.
+        journal_reads(dir.path(), "sess", &[symbol("a.rs::alpha", 2)], manifest);
+
+        let reads = read_journal(&path).reads;
+        assert_eq!(reads["a.rs::alpha"].0, [2u8; 32], "refreshed");
+        assert_eq!(reads["a.rs::beta"].0, [1u8; 32], "untouched, so still stale");
+    }
+
+    /// The credit rule: modes that print no source put nothing in front of the
+    /// caller, so they credit nothing.
+    #[test]
+    fn modes_that_print_no_source_record_nothing() {
+        let files = vec![file_with("a.rs", vec![Some(symbol("a.rs::alpha", 1))])];
+        assert_eq!(shown_symbols(&files, OutputMode::Content).len(), 1);
+        for silent in [
+            OutputMode::Quiet,
+            OutputMode::FilesWithMatches,
+            OutputMode::Count,
+            OutputMode::CountMatches,
+        ] {
+            assert!(
+                shown_symbols(&files, silent).is_empty(),
+                "{silent:?} shows no source, so it can credit no read"
+            );
+        }
+    }
+
+    /// A match cut off by `--head-limit` was never shown, so it is never
+    /// credited — the journal records what the agent saw.
+    #[test]
+    fn symbols_past_head_limit_record_nothing() {
+        let mut files = vec![
+            file_with("a.rs", vec![Some(symbol("a.rs::alpha", 1))]),
+            file_with("b.rs", vec![Some(symbol("b.rs::beta", 1))]),
+        ];
+        assert_eq!(apply_head_limit(&mut files, 1), 1);
+
+        let shown = shown_symbols(&files, OutputMode::Content);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].id, "a.rs::alpha", "only the printed one");
+    }
+
+    /// One symbol matched five times is one read, not five records.
+    #[test]
+    fn repeated_hits_in_one_symbol_are_one_read() {
+        let files = vec![file_with(
+            "a.rs",
+            vec![
+                Some(symbol("a.rs::alpha", 1)),
+                Some(symbol("a.rs::alpha", 1)),
+                None,
+            ],
+        )];
+        assert_eq!(shown_symbols(&files, OutputMode::Content).len(), 1);
     }
 }

@@ -416,6 +416,38 @@ enum SkillCommands {
     },
 }
 
+/// Record the symbols a search showed, in this session's coverage journal.
+///
+/// Failure is never fatal: a search that answered correctly has done its job,
+/// and a journal that cannot be written costs coverage rather than an answer.
+fn journal_find_reads(
+    outcome: &ambits::find::Outcome,
+    session_id: &str,
+    project_path: &Path,
+    serena_backend: bool,
+    registry: &ParserRegistry,
+    filter: Option<&PathFilter>,
+) {
+    let backend = if serena_backend { "serena" } else { "tree-sitter" };
+    ambits::find::journal_reads(project_path, session_id, &outcome.shown, || {
+        // Only called when a header has to be written — once per session — so
+        // the whole-tree scan a fingerprint needs is not on the search path.
+        let tree = scan_tree(serena_backend, registry, project_path, filter)
+            .unwrap_or_else(|e| {
+                eprintln!("[ambit warning] journal header: {e}");
+                ambits::symbols::ProjectTree {
+                    root: project_path.to_path_buf(),
+                    files: Vec::new(),
+                }
+            });
+        ambits::journal::EnvironmentManifest::capture(
+            &tree,
+            backend,
+            filter.map(|f| f.display()),
+        )
+    });
+}
+
 /// Map `find`'s CLI arguments onto a walk and a search.
 ///
 /// Splitting positionals the way ripgrep does — the first is the pattern unless
@@ -591,6 +623,11 @@ fn main() -> Result<()> {
     // mapper trait object below and its concrete type is no longer reachable.
     let cache_cfg = tool_config.cache.clone();
 
+    // Both the TUI and `find` write to the journal, and `find` dispatches long
+    // before the TUI is built, so the decision is made once here. CLI flags win
+    // over the `[cache]` stanza in tools.toml.
+    let journal_enabled = !cli.no_journal && cache_cfg.enabled.unwrap_or(true);
+
     // Build the session ingester — coerce ToolMappingConfig to Arc<dyn ToolCallMapper>.
     let mapper: Arc<dyn ToolCallMapper> = tool_config;
     let ingester: Arc<dyn SessionIngester> =
@@ -666,8 +703,24 @@ fn main() -> Result<()> {
             filter.as_ref(),
             coverage_index.as_ref(),
         ) {
-            Ok(outcome) if outcome.matched => return Ok(()),
-            Ok(_) => std::process::exit(1),
+            Ok(outcome) => {
+                if journal_enabled {
+                    if let Some(session) = session_id.as_deref() {
+                        journal_find_reads(
+                            &outcome,
+                            session,
+                            &project_path,
+                            cli.serena,
+                            &registry,
+                            filter.as_ref(),
+                        );
+                    }
+                }
+                if outcome.matched {
+                    return Ok(());
+                }
+                std::process::exit(1)
+            }
             Err(e) => {
                 eprintln!("ambits find: {e:#}");
                 std::process::exit(2);
@@ -802,7 +855,6 @@ fn main() -> Result<()> {
     // now, so nothing looks drifted; only the journal knows what they looked
     // like at the time. Skipped entirely when journaling is off, since then
     // there is no journal to trust.
-    let journal_enabled = !cli.no_journal && cache_cfg.enabled.unwrap_or(true);
     if journal_enabled {
         if let Some(stats) = app.rehydrate_from_journal() {
             if stats.drifted > 0 || stats.inserted > 0 || stats.moved > 0 {

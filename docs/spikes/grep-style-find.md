@@ -398,16 +398,24 @@ unchanged requires reading and hashing them, which is the parse we are skipping.
 real use is as the invalidation key for a future parse cache (§10), where those
 already-computed hashes are currently dead weight.
 
-### 6.7 Tool-config parity
+### 6.7 Tool-config parity — **dropped, with reasons**
 
-`default_tools.toml:123` maps bash `grep `/`rg ` to `Overview`. `ambits find` now does
-the same job, so it gets the same treatment — a `{ prefix = "ambits find", depth =
-"Overview" }` pattern in the `Bash` stanza, for the case where find's own journaling is
-disabled or unavailable.
+The plan was to mirror `default_tools.toml:123`'s bash `grep `/`rg ` → `Overview`
+mapping with an `ambits find` prefix. Investigating it showed the line would be
+cosmetic: a `Bash` tool call carries no `file_path` (`path_keys = []`, and
+`empty_path_keys_produces_none_file_path` pins it), so the stanza's depth never reaches
+a symbol. It tints the activity feed and nothing else. With find journaling itself
+authoritatively (§6.6), an inert config line is noise that reads like a mechanism.
 
-This is belt-and-braces: the `target_selectors` rule can only inspect the *command*
-string, never our output, so find's self-journaling (§6.6) remains the authoritative
-path.
+**A real interaction turned up instead.** The `Bash` stanza's `target_selectors` rule
+scans the *command string* for anything that parses as a symbol id and credits it
+`FullBody`. That was right when a `::` in an `ambits` command was the old find's query
+syntax. Now the pattern is a regex over content, so `ambits find 'src/app.rs::App'` —
+or any search for text containing `::` — credits a symbol the search may never have
+shown, which is exactly the over-crediting §6.6 is careful to avoid. Expressing
+"except for `find`" needs an `excludes` counterpart to `requires` in the config schema,
+which is an ingest-side change. Filed as a follow-up rather than smuggled into this
+work.
 
 ---
 
@@ -535,6 +543,9 @@ Output:
    maintenance below ~1M files.
 4. **Journal shards per process** (`<session>.<pid>.ndjson`) if the concurrency stress
    test ever tears. Ship single-file first.
+5. **`target_selectors` must not credit `find`'s pattern.** See §6.7: a search for text
+   containing `::` is credited as a read of that symbol id. Needs an `excludes` field
+   beside `requires` in the tool-config schema.
 
 ---
 
@@ -576,14 +587,24 @@ and a no-match query.
 12. Delete `Pattern`, `search`, `SCHEMA_VERSION`, `DEFAULT_LIMIT`. Rewrite the module
     doc.
 
-**P2 — journaling**
+**P2 — journaling — DONE**
 
-13. Lazy manifest in `Journal::open`; update the TUI call site; test 32.
-14. Ledger construction and `sync` in `find`; tests 24–29.
-15. `--no-journal` and `[cache] enabled` suppression; tests 30–31.
-16. Concurrency tests 33–34.
-17. Update the invariant docs in `journal.rs` and `cache.rs`.
-18. `ambits find` stanza in `default_tools.toml`.
+13. ✅ `Journal::open` takes `manifest: impl FnOnce() -> EnvironmentManifest`, with
+    `interval` moved ahead of it so the closure sits last. `App::enable_journal` passes
+    a closure; test 32 pins it with one that panics.
+14. ✅ `find::journal_reads` builds a `ContextLedger`, records each shown symbol at
+    `FullBody`, and `sync`s once. `shown_symbols` extracted from `run` so the credit
+    rule is testable without capturing stdout. Tests 24–27 plus two more: modes that
+    print no source credit nothing, and repeated hits in one symbol are one read.
+15. ✅ `journal_enabled` hoisted so `find` shares the TUI's `--no-journal` /
+    `[cache] enabled` decision. Verified end-to-end against a temp project; CLI-level
+    tests 30–31 move to P4 with the other binary-level tests.
+16. ✅ Tests 33–34: four concurrent writers produce 100 intact records with no
+    warnings, and a later `Overview` at an equal hash folds **up** to `FullBody`.
+17. ✅ `journal.rs` module doc now states how concurrent writers are held safe
+    (`O_APPEND` whole-line appends, `open`'s dedup seed, `fold`'s greatest-depth rule)
+    rather than claiming only the TUI writes. `cache.rs` status text updated.
+18. ❌ Dropped — see §6.7.
 
 **P3 — surface**
 

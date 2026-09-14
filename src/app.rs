@@ -194,18 +194,20 @@ impl App {
                 "no session id resolved; coverage journaling disabled".to_string()
             ];
         };
-        let manifest = crate::journal::EnvironmentManifest::capture(
-            &self.project_tree,
-            backend,
-            // Same display form the coverage report records (`CoverageReport.filter`),
-            // so the two agree on what "this run was filtered" means.
-            self.filter.as_ref().map(|f| f.display()),
-        );
         let journal = crate::journal::Journal::open(
             &self.project_root,
             &session_id,
-            manifest,
             interval,
+            || {
+                crate::journal::EnvironmentManifest::capture(
+                    &self.project_tree,
+                    backend,
+                    // Same display form the coverage report records
+                    // (`CoverageReport.filter`), so the two agree on what
+                    // "this run was filtered" means.
+                    self.filter.as_ref().map(|f| f.display()),
+                )
+            },
         );
         let warnings = journal.warnings().to_vec();
         self.journal = Some(journal);

@@ -106,8 +106,8 @@ pub fn status(project_root: &Path) -> Result<()> {
     if stats.is_empty() {
         println!("No coverage journals in {}", dir.display());
         println!();
-        println!("Journals are written by the TUI. Without one, `restore-context`");
-        println!("reconstructs the read history from session logs instead.");
+        println!("Journals are written by the TUI and by `find`. Without one,");
+        println!("`restore-context` rebuilds the history from session logs instead.");
         return Ok(());
     }
 

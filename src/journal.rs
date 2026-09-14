@@ -59,8 +59,16 @@
 //! only ever *under*-reports coverage. Under-reporting is the safe direction —
 //! the agent re-reads something it already knew.
 //!
-//! Only the TUI writes. Readers (`restore-context`) never open the file for
-//! writing, which removes concurrent-writer concerns rather than managing them.
+//! The TUI is no longer the only writer: `ambits find` shows source, so it
+//! records what it showed. Concurrent appends are therefore managed rather than
+//! avoided, by three properties that were already true. Each record is one
+//! `write_all` under `O_APPEND`, so two processes interleave whole lines rather
+//! than splitting one. [`Journal::open`] seeds its dedup map from what is
+//! already on disk, so a second writer appends only what the first has not.
+//! And [`fold`] resolves duplicates by taking the greater depth at an equal
+//! hash — so a TUI that later writes `Overview` for a symbol `find` recorded as
+//! `FullBody` cannot demote it. Readers (`restore-context`) still never open
+//! the file for writing.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -496,11 +504,17 @@ impl Journal {
     /// makes relaunching ambit idempotent: startup replays the whole session
     /// log through the ledger, and without this every launch would re-append
     /// the entire history.
+    /// `manifest` is a closure because building one costs a full project scan
+    /// (`EnvironmentManifest::capture` fingerprints the whole tree) and is
+    /// needed only when a header actually gets written — which is once per
+    /// session. `find` parses only the files that matched its pattern, so
+    /// paying for a whole-tree scan on every search to produce a manifest
+    /// nobody reads would undo the reason it is fast.
     pub fn open(
         project_root: &Path,
         session_id: &str,
-        manifest: EnvironmentManifest,
         interval: Duration,
+        manifest: impl FnOnce() -> EnvironmentManifest,
     ) -> Self {
         let dir = project_root.join(JOURNAL_SUBDIR);
         let path = dir.join(format!("{session_id}.ndjson"));
@@ -556,7 +570,7 @@ impl Journal {
                 schema_version: SUPPORTED_SCHEMA_VERSION,
                 created_at: timestamp(),
                 session_id: session_id.to_string(),
-                environment: manifest,
+                environment: manifest(),
             }));
             journal.write(&header);
         }
@@ -709,7 +723,91 @@ mod tests {
     }
 
     fn journal_in(dir: &Path) -> Journal {
-        Journal::open(dir, "sess", manifest(), Duration::from_millis(0))
+        Journal::open(dir, "sess", Duration::from_millis(0), manifest)
+    }
+
+    /// The manifest is a closure because building one fingerprints the whole
+    /// project. A journal that already has a current header needs none, and
+    /// `find` — which parses only what matched — must not be made to scan
+    /// everything for a value nobody will write.
+    #[test]
+    fn open_does_not_build_a_manifest_when_a_header_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(journal_in(dir.path()));
+
+        let mut second = Journal::open(dir.path(), "sess", Duration::from_millis(0), || {
+            panic!("the manifest must not be built when the header is current")
+        });
+        let mut ledger = ContextLedger::new();
+        ledger.record("a.rs::x".into(), ReadDepth::FullBody, content_hash("b"), "ag".into(), 5);
+        assert_eq!(second.sync(&ledger), 1, "and it still appends reads");
+    }
+
+    /// Two writers, because `find` writes from the CLI while a TUI may be
+    /// running. Records are single `write_all`s under `O_APPEND`, so they
+    /// interleave whole lines rather than splitting one.
+    #[test]
+    fn concurrent_appends_all_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        // `&Path` is Copy, so each `move` closure takes its own copy of the
+        // reference and the `TempDir` itself outlives the scope.
+        let root = dir.path();
+        drop(journal_in(root));
+
+        std::thread::scope(|scope| {
+            for writer in 0..4 {
+                scope.spawn(move || {
+                    let mut journal = journal_in(root);
+                    let mut ledger = ContextLedger::new();
+                    for i in 0..25 {
+                        ledger.record(
+                            format!("a.rs::sym{writer}_{i}"),
+                            ReadDepth::FullBody,
+                            content_hash(&format!("{writer}-{i}")),
+                            format!("agent-{writer}"),
+                            5,
+                        );
+                    }
+                    journal.sync(&ledger);
+                });
+            }
+        });
+
+        let contents = read_journal(&crate::cache::journal_dir(root).join("sess.ndjson"));
+        assert!(
+            contents.warnings.is_empty(),
+            "every line must be whole JSON: {:?}",
+            contents.warnings
+        );
+        assert_eq!(contents.reads.len(), 100, "no writer clobbered another");
+    }
+
+    /// The property that makes two writers safe. A TUI syncing `Overview` for a
+    /// symbol `find` already recorded at `FullBody` must not demote it — the
+    /// journal is last-wins on *hash*, but greatest-wins on depth.
+    #[test]
+    fn fold_upgrades_depth_at_an_equal_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::cache::journal_dir(dir.path()).join("sess.ndjson");
+        drop(journal_in(dir.path()));
+
+        let hash = content_hash("body");
+        let mut deep = ContextLedger::new();
+        deep.record("a.rs::x".into(), ReadDepth::FullBody, hash, "ag".into(), 5);
+        journal_in(dir.path()).sync(&deep);
+
+        // A second writer with a shallower view of the same, unchanged symbol.
+        let mut shallow = ContextLedger::new();
+        shallow.record("a.rs::x".into(), ReadDepth::Overview, hash, "ag".into(), 5);
+        let mut other = journal_in(dir.path());
+        other.sync(&shallow);
+
+        let contents = read_journal(&path);
+        assert_eq!(
+            contents.reads["a.rs::x"].1,
+            ReadDepth::FullBody,
+            "the shallower record must not demote the deeper one"
+        );
     }
 
     #[test]
@@ -1011,7 +1109,7 @@ mod tests {
         let mut ledger = ContextLedger::new();
         ledger.record("a.rs::x".into(), ReadDepth::FullBody, content_hash("b"), "ag".into(), 5);
 
-        let mut j = Journal::open(dir.path(), "sess", manifest(), Duration::from_secs(3600));
+        let mut j = Journal::open(dir.path(), "sess", Duration::from_secs(3600), manifest);
         assert_eq!(j.maybe_sync(&ledger), 0, "interval has not elapsed");
         assert_eq!(j.sync(&ledger), 1, "explicit sync ignores the interval");
     }
