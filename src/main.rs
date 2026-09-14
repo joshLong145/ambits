@@ -805,12 +805,11 @@ fn main() -> Result<()> {
         );
     }
 
-    // Launch TUI.
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    // Everything below happens before the terminal is touched. None of it
+    // needs a terminal, and all of it can fail: a session log with a line we
+    // cannot parse used to panic *after* raw mode was on, which left the
+    // terminal swallowing input with the panic message painted on an alternate
+    // screen nobody would ever see again.
 
     // Set up event log writer if --log-output is specified.
     let event_log = if let Some(ref log_output_dir) = cli.log_output {
@@ -884,6 +883,17 @@ fn main() -> Result<()> {
         app.sync_journal();
     }
 
+    // Terminal setup, as late as possible. The guard restores it on every
+    // path out of here — `?`, panic, or a clean return — and the panic hook
+    // gets there first so the report lands on the normal screen.
+    install_panic_restore();
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let _guard = TerminalGuard;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
     let result = run_tui(&mut terminal, &mut app, &project_path, &log_dir, session_id, &registry, serena_mode, &ingester);
 
     // Capture the tail of the session. Records are written unbuffered, so this
@@ -896,12 +906,51 @@ fn main() -> Result<()> {
         let _ = writer.flush();
     }
 
-    // Restore terminal.
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    // `_guard` restores the rest as it drops.
     terminal.show_cursor()?;
 
     result
+}
+
+/// Put the terminal back the way it was found.
+///
+/// Deliberately ignores its errors: it runs on paths where something has
+/// already gone wrong, and a failure to restore must not mask what that was.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+}
+
+/// Restores the terminal however this scope is left — a clean return, a `?`, or
+/// an unwind.
+///
+/// The teardown used to be three statements at the end of `main`, which is the
+/// one place an early exit never reaches.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+/// Restore the terminal *before* the panic report is printed.
+///
+/// The `Drop` guard alone is not enough: a hook runs before unwinding begins,
+/// so `color_eyre` would paint its report onto the alternate screen and the
+/// guard would then tear that screen down, taking the message with it. Chaining
+/// in front of the existing hook puts the report on the normal screen, where it
+/// can be read.
+///
+/// Not hypothetical for a long-running TUI: the log tailer parses new lines as
+/// they arrive, so a session log can start failing to parse at any point during
+/// a session, not only at startup.
+fn install_panic_restore() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        previous(info);
+    }));
 }
 
 /// Print the still-valid prior reads for a session.

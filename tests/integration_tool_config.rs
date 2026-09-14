@@ -373,6 +373,28 @@ fn tool_bash_long_command_truncated() {
     assert!(body.len() <= 204, "truncated body too long: {}", body);
 }
 
+/// The panic this guards: a multi-byte character straddling the truncation
+/// offset. `unwrap_or` evaluated its fallback slice unconditionally, so every
+/// long command was cut at a fixed 200 bytes regardless of where characters
+/// began — and a box-drawing `─` in a heredoc took down the TUI and
+/// `--coverage` alike, from nothing worse than reading the session log back.
+#[test]
+fn tool_bash_truncates_a_multibyte_command_on_a_char_boundary() {
+    let cfg = builtin();
+    // `─` occupies bytes 198..201, so a naive cut at 200 lands inside it.
+    let cmd = format!("{}─ and more text after the cut", "x".repeat(198));
+    assert!(cmd.len() > 200);
+
+    let input = serde_json::json!({ "command": cmd });
+    let call = map_tool_call(&cfg, "Bash", &input, "a", "ts").unwrap();
+
+    assert!(call.description.contains('…'), "still truncated");
+    assert!(
+        call.description.is_char_boundary(call.description.len()),
+        "the result is valid UTF-8 by construction"
+    );
+}
+
 #[test]
 fn tool_bash_description_key_fallback() {
     let cfg = builtin();
