@@ -4,6 +4,7 @@
 //! that show how much of a project's symbols have been seen by an LLM agent.
 
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::Result;
@@ -682,32 +683,77 @@ pub fn run_report(
 }
 
 /// Print a project's symbol tree to stdout.
+///
+/// `depth` bounds how many levels of children are descended into: `Some(0)`
+/// (the CLI default) prints top-level symbols only, `Some(n)` descends `n`
+/// levels, and `None` recurses without limit — today's behavior, from before
+/// a default this cheap existed, still reachable via `--full`.
 pub fn dump_tree(
     root: &Path,
     project_tree: &ProjectTree,
     filter: Option<&crate::filter::PathFilter>,
+    depth: Option<usize>,
 ) {
-    println!(
+    let stdout = std::io::stdout();
+    let _ = write_tree(&mut stdout.lock(), root, project_tree, filter, depth);
+}
+
+/// The writer-generic core of [`dump_tree`], split out so the depth/`+N`
+/// behavior can be asserted on a buffer instead of by eye on real stdout.
+fn write_tree(
+    w: &mut impl Write,
+    root: &Path,
+    project_tree: &ProjectTree,
+    filter: Option<&crate::filter::PathFilter>,
+    depth: Option<usize>,
+) -> std::io::Result<()> {
+    writeln!(
+        w,
         "Project: {} ({} files, {} symbols)",
         root.display(),
         project_tree.total_files(),
         project_tree.total_symbols(),
-    );
+    )?;
     if let Some(f) = filter {
-        println!("Filter: {}", f.display());
+        writeln!(w, "Filter: {}", f.display())?;
     }
-    println!();
+    if depth.is_some() {
+        writeln!(
+            w,
+            "Depth: {} — a symbol marked `+N` has N more children below this \
+             level; --depth or --full to expand",
+            depth.map_or("unlimited".to_string(), |d| d.to_string())
+        )?;
+    }
+    writeln!(w)?;
 
     for file in &project_tree.files {
-        println!("  {} ({} lines)", file.file_path.display(), file.total_lines);
+        writeln!(w, "  {} ({} lines)", file.file_path.display(), file.total_lines)?;
         for sym in &file.symbols {
-            print_symbol(sym, 4);
+            write_symbol(w, sym, 4, depth)?;
         }
     }
+    Ok(())
 }
 
-/// Print a single symbol and its children recursively with indentation.
-pub fn print_symbol(sym: &SymbolNode, indent: usize) {
+/// Print a single symbol and, while `depth` allows, its children —
+/// recursively, with indentation. See [`dump_tree`] for what `depth` means.
+///
+/// A symbol whose children are cut off by the depth bound is marked `+N`
+/// (direct children only, not a deep count) rather than silently hidden —
+/// hiding a method count instead of showing zero methods would misreport
+/// what is actually there, not just omit detail about it.
+pub fn print_symbol(sym: &SymbolNode, indent: usize, depth: Option<usize>) {
+    let stdout = std::io::stdout();
+    let _ = write_symbol(&mut stdout.lock(), sym, indent, depth);
+}
+
+fn write_symbol(
+    w: &mut impl Write,
+    sym: &SymbolNode,
+    indent: usize,
+    depth: Option<usize>,
+) -> std::io::Result<()> {
     let pad = " ".repeat(indent);
     // An inherent impl is named `impl Foo` so its id stays distinct from the
     // type's, which would otherwise render as "impl impl Foo" here.
@@ -716,8 +762,14 @@ pub fn print_symbol(sym: &SymbolNode, indent: usize) {
         .strip_prefix(sym.label)
         .and_then(|rest| rest.starts_with(' ').then_some(""))
         .unwrap_or(sym.label);
-    println!(
-        "{}{}{}{} [L{}-{}] (~{} tokens)",
+    let hidden = if depth == Some(0) && !sym.children.is_empty() {
+        format!(" +{}", sym.children.len())
+    } else {
+        String::new()
+    };
+    writeln!(
+        w,
+        "{}{}{}{} [L{}-{}] (~{} tokens){}",
         pad,
         kind,
         if kind.is_empty() { "" } else { " " },
@@ -725,10 +777,15 @@ pub fn print_symbol(sym: &SymbolNode, indent: usize) {
         sym.line_range.start,
         sym.line_range.end,
         sym.estimated_tokens,
-    );
-    for child in &sym.children {
-        print_symbol(child, indent + 2);
+        hidden,
+    )?;
+    if depth != Some(0) {
+        let next_depth = depth.map(|d| d - 1);
+        for child in &sym.children {
+            write_symbol(w, child, indent + 2, next_depth)?;
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -736,6 +793,70 @@ mod tests {
     use super::*;
     use crate::helpers::*;
     use crate::tracking::ContextLedger;
+
+    // -- write_tree / write_symbol: --dump's depth bound ---------------------
+
+    fn rendered(tree: &ProjectTree, depth: Option<usize>) -> String {
+        let mut buf = Vec::new();
+        write_tree(&mut buf, Path::new("/proj"), tree, None, depth).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// The default (`Some(0)`): top-level symbols only, and a symbol with
+    /// hidden children is marked `+N` rather than looking childless.
+    #[test]
+    fn depth_zero_hides_children_but_marks_the_count() {
+        let leaf = sym("a.rs::Foo/method", "method");
+        let container = sym_with_children("a.rs::Foo", "Foo", vec![leaf]);
+        let tree = project(vec![file("a.rs", vec![container])]);
+
+        let out = rendered(&tree, Some(0));
+        assert!(out.contains("Foo"), "{out}");
+        assert!(out.contains("+1"), "one hidden child noted: {out}");
+        assert!(!out.contains("method"), "the child itself is not printed: {out}");
+    }
+
+    /// `Some(1)`: children print, grandchildren do not — and a fully-shown
+    /// symbol carries no `+N`, since nothing about it was hidden.
+    #[test]
+    fn depth_one_shows_children_not_grandchildren() {
+        let grandchild = sym("a.rs::Foo/method/inner", "inner");
+        let child = sym_with_children("a.rs::Foo/method", "method", vec![grandchild]);
+        let container = sym_with_children("a.rs::Foo", "Foo", vec![child]);
+        let tree = project(vec![file("a.rs", vec![container])]);
+
+        let out = rendered(&tree, Some(1));
+        assert!(out.contains("method"), "the immediate child prints: {out}");
+        assert!(!out.contains("inner"), "the grandchild does not: {out}");
+        // `method` has one hidden grandchild.
+        assert!(out.contains("method [") && out.contains("+1"), "{out}");
+    }
+
+    /// `None`: every level prints, exactly as `--dump` always behaved before
+    /// a cheaper default existed — no symbol is ever marked `+N`.
+    #[test]
+    fn unlimited_depth_shows_everything_and_marks_nothing() {
+        let grandchild = sym("a.rs::Foo/method/inner", "inner");
+        let child = sym_with_children("a.rs::Foo/method", "method", vec![grandchild]);
+        let container = sym_with_children("a.rs::Foo", "Foo", vec![child]);
+        let tree = project(vec![file("a.rs", vec![container])]);
+
+        let out = rendered(&tree, None);
+        assert!(out.contains("inner"), "{out}");
+        assert!(!out.contains('+'), "nothing is hidden, so nothing is marked: {out}");
+    }
+
+    /// A childless symbol never gets a `+N`, even at depth 0 — there is
+    /// nothing hidden to report. (The legend line itself contains the
+    /// literal text `+N`, so this checks the symbol's own line, not the
+    /// whole buffer.)
+    #[test]
+    fn a_leaf_symbol_is_never_marked() {
+        let tree = project(vec![file("a.rs", vec![sym("a.rs::solo", "solo")])]);
+        let out = rendered(&tree, Some(0));
+        let symbol_line = out.lines().find(|l| l.contains("solo")).unwrap();
+        assert!(!symbol_line.contains('+'), "{symbol_line:?}");
+    }
 
     #[test]
     fn seen_percent_basic() {

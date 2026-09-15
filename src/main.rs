@@ -54,6 +54,17 @@ struct Cli {
     #[arg(long)]
     dump: bool,
 
+    /// With `--dump`, how many levels of children to descend into. 0 (the
+    /// default) prints top-level symbols only; a symbol with hidden children
+    /// is marked `+N`. Ignored unless `--dump` is set.
+    #[arg(long, default_value_t = 0)]
+    depth: usize,
+
+    /// With `--dump`, descend to every level regardless of `--depth` — the
+    /// full tree, as `--dump` always printed before a cheaper default existed.
+    #[arg(long)]
+    full: bool,
+
     /// Print coverage report to stdout instead of launching TUI.
     #[arg(long)]
     coverage: bool,
@@ -695,7 +706,8 @@ fn main() -> Result<()> {
         for w in &config_warnings {
             println!("[ambit warning] {w}");
         }
-        coverage::dump_tree(&project_path, &project_tree, filter.as_ref());
+        let depth = if cli.full { None } else { Some(cli.depth) };
+        coverage::dump_tree(&project_path, &project_tree, filter.as_ref(), depth);
         return Ok(());
     }
 
