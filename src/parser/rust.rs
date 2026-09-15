@@ -101,6 +101,22 @@ const STATIC: SymbolMeta = SymbolMeta { category: SymbolCategory::Variable, labe
 const TYPE_ALIAS: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "type" };
 const MACRO: SymbolMeta = SymbolMeta { category: SymbolCategory::Macro, label: "macro" };
 
+/// Rust's two comment node kinds. `///`, `//!`, and plain `//` are all
+/// `line_comment`; `/* */` and `/** */` are `block_comment`.
+const COMMENT_KINDS: &[&str] = &["line_comment", "block_comment"];
+
+/// `(start_byte, start_line)` for `node`, widened to include an unbroken run
+/// of comments immediately above it — see `parser::leading_comment_start`.
+/// Applied at every symbol construction site, so a method's own leading
+/// comment attaches to the method (a sibling inside its `impl` block's
+/// body), never to the `impl` block itself.
+fn symbol_start(node: Node) -> (usize, usize) {
+    match super::leading_comment_start(node, COMMENT_KINDS) {
+        Some(leading) => (leading.start_byte(), leading.start_position().row + 1),
+        None => (node.start_byte(), node.start_position().row + 1),
+    }
+}
+
 fn extract_symbols(
     node: Node,
     src: &[u8],
@@ -134,10 +150,10 @@ fn extract_symbols(
             };
 
             let id = format!("{path_prefix}::{name_path}");
-            let byte_range = child.byte_range();
-            let start_line = child.start_position().row + 1;
+            let (start_byte, start_line) = symbol_start(child);
+            let end_byte = child.end_byte();
             let end_line = child.end_position().row + 1;
-            let text = std::str::from_utf8(&src[byte_range.clone()]).unwrap_or("");
+            let text = std::str::from_utf8(&src[start_byte..end_byte]).unwrap_or("");
 
             let mut sym = SymbolNode {
                 id,
@@ -145,7 +161,7 @@ fn extract_symbols(
                 category: meta.category,
                 label: meta.label,
                 file_path: Arc::clone(file_path),
-                byte_range: byte_range.start as u32..byte_range.end as u32,
+                byte_range: start_byte as u32..end_byte as u32,
                 line_range: start_line as u32..end_line as u32,
                 content_hash: content_hash(text),
                 merkle_hash: [0u8; 32],
@@ -197,10 +213,10 @@ fn extract_body_children(
         if let Some((name, meta)) = symbol_info {
             let name_path = format!("{parent_name_path}/{name}");
             let id = format!("{path_prefix}::{name_path}");
-            let byte_range = child.byte_range();
-            let start_line = child.start_position().row + 1;
+            let (start_byte, start_line) = symbol_start(child);
+            let end_byte = child.end_byte();
             let end_line = child.end_position().row + 1;
-            let text = std::str::from_utf8(&src[byte_range.clone()]).unwrap_or("");
+            let text = std::str::from_utf8(&src[start_byte..end_byte]).unwrap_or("");
 
             out.push(SymbolNode {
                 id,
@@ -208,7 +224,7 @@ fn extract_body_children(
                 category: meta.category,
                 label: meta.label,
                 file_path: Arc::clone(file_path),
-                byte_range: byte_range.start as u32..byte_range.end as u32,
+                byte_range: start_byte as u32..end_byte as u32,
                 line_range: start_line as u32..end_line as u32,
                 content_hash: content_hash(text),
                 merkle_hash: [0u8; 32],
@@ -367,5 +383,62 @@ impl Display for P {
     fn parse_empty_file() {
         let syms = parse("");
         assert!(syms.is_empty());
+    }
+
+    // -- leading comments as symbol content ---------------------------------
+
+    /// A doc comment glued to the item below it is part of what the item
+    /// says, so a match purely inside it should attribute — and the content
+    /// hash should cover it too, so editing only the comment marks the
+    /// symbol stale.
+    #[test]
+    fn a_glued_doc_comment_widens_the_symbol() {
+        let syms = parse("/// Adds one.\npub fn inc(x: i32) -> i32 { x + 1 }");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].byte_range.start, 0, "the comment's own start, not the fn's");
+        assert_eq!(syms[0].line_range.start, 1);
+    }
+
+    /// A comment separated from the next item by a blank line is not "about"
+    /// it — matching `find`'s `a_hit_between_symbols_has_no_symbol` — so the
+    /// symbol's range must start at its own definition, unmoved.
+    #[test]
+    fn a_comment_separated_by_a_blank_line_does_not_widen() {
+        let src = "// unrelated note\n\npub fn inc(x: i32) -> i32 { x + 1 }";
+        let syms = parse(src);
+        assert_eq!(syms.len(), 1);
+        let fn_start = src.find("pub fn").unwrap();
+        assert_eq!(syms[0].byte_range.start as usize, fn_start);
+    }
+
+    /// A comment directly above a method inside an `impl` block attaches to
+    /// the method, not to the `impl` block itself — two different symbols,
+    /// two different preceding-sibling contexts.
+    #[test]
+    fn a_method_doc_comment_attaches_to_the_method_not_the_impl_block() {
+        let src = "struct Point;\nimpl Point {\n    /// Make one.\n    fn new() -> Self { Self }\n}";
+        let syms = parse(src);
+        let imp = syms.iter().find(|s| s.category == SymbolCategory::Implementation).unwrap();
+        assert_eq!(
+            imp.byte_range.start as usize,
+            src.find("impl Point").unwrap(),
+            "the impl block itself has no leading comment to absorb"
+        );
+        let method = &imp.children[0];
+        assert_eq!(
+            method.byte_range.start as usize,
+            src.find("/// Make one.").unwrap(),
+            "the method's own doc comment widens only the method"
+        );
+    }
+
+    /// A run of plain `//` lines glued above an item is included exactly
+    /// like a `///` doc comment — the rule is contiguity, not syntax.
+    #[test]
+    fn a_multi_line_plain_comment_run_widens_the_symbol() {
+        let src = "// first line\n// second line\nfn f() {}";
+        let syms = parse(src);
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].byte_range.start, 0);
     }
 }

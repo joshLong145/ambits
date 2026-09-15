@@ -120,6 +120,32 @@ const DEF: SymbolMeta = SymbolMeta { category: SymbolCategory::Function, label: 
 const VAR: SymbolMeta = SymbolMeta { category: SymbolCategory::Variable, label: "var" };
 const TYPE_ALIAS: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "type" };
 
+/// tree-sitter-python's one comment node kind (`#...`), covering both a
+/// standalone note and a docstring-style comment alike.
+const COMMENT_KINDS: &[&str] = &["comment"];
+
+/// `(start_byte, start_line)` for `node`, widened to include an unbroken run
+/// of comments immediately above it — see `parser::leading_comment_start`.
+/// Called on the `decorated_definition` node itself when one wraps `node`
+/// (see `extract_decorated`), so a comment above `@decorator` attaches
+/// correctly rather than being swallowed by the decorator line sitting
+/// between it and the inner `def`/`class`.
+///
+/// Known gap, specific to this grammar: a comment immediately after a block
+/// opener (`class Foo:`, `def foo():`, ...) — before the block's *first*
+/// statement — is not that statement's sibling in tree-sitter-python's CST.
+/// It parses as a child of the *enclosing* definition, positioned before the
+/// `body` field, so this widening never sees it (`leading_comment_start`
+/// only walks `prev_sibling`). A comment before any later statement in the
+/// same block is a genuine sibling and widens correctly — see
+/// `tests::a_leading_comment_on_the_first_block_statement_is_a_known_gap`.
+fn symbol_start(node: Node) -> (usize, usize) {
+    match super::leading_comment_start(node, COMMENT_KINDS) {
+        Some(leading) => (leading.start_byte(), leading.start_position().row + 1),
+        None => (node.start_byte(), node.start_position().row + 1),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Core symbol extraction
 // ---------------------------------------------------------------------------
@@ -184,10 +210,10 @@ fn extract_symbols(
             };
 
             let id = format!("{path_prefix}::{name_path}");
-            let byte_range = child.byte_range();
-            let start_line = child.start_position().row + 1;
+            let (start_byte, start_line) = symbol_start(child);
+            let end_byte = child.end_byte();
             let end_line = child.end_position().row + 1;
-            let text = std::str::from_utf8(&src[byte_range.clone()]).unwrap_or("");
+            let text = std::str::from_utf8(&src[start_byte..end_byte]).unwrap_or("");
 
             let mut sym = SymbolNode {
                 id,
@@ -195,7 +221,7 @@ fn extract_symbols(
                 category: meta.category,
                 label: meta.label,
                 file_path: Arc::clone(file_path),
-                byte_range: byte_range.start as u32..byte_range.end as u32,
+                byte_range: start_byte as u32..end_byte as u32,
                 line_range: start_line as u32..end_line as u32,
                 content_hash: content_hash(text),
                 merkle_hash: [0u8; 32],
@@ -259,11 +285,13 @@ fn extract_decorated(
                 };
 
                 let id = format!("{path_prefix}::{name_path}");
-                // Use the outer decorated_definition range to include decorators.
-                let byte_range = node.byte_range();
-                let start_line = node.start_position().row + 1;
+                // Widen from the outer decorated_definition, not the inner
+                // def/class, so both the `@decorator` lines and any comment
+                // glued above *those* are included.
+                let (start_byte, start_line) = symbol_start(*node);
+                let end_byte = node.end_byte();
                 let end_line = node.end_position().row + 1;
-                let text = std::str::from_utf8(&src[byte_range.clone()]).unwrap_or("");
+                let text = std::str::from_utf8(&src[start_byte..end_byte]).unwrap_or("");
 
                 let mut sym = SymbolNode {
                     id,
@@ -271,7 +299,7 @@ fn extract_decorated(
                     category: meta.category,
                     label: meta.label,
                     file_path: Arc::clone(file_path),
-                    byte_range: byte_range.start as u32..byte_range.end as u32,
+                    byte_range: start_byte as u32..end_byte as u32,
                     line_range: start_line as u32..end_line as u32,
                     content_hash: content_hash(text),
                     merkle_hash: [0u8; 32],
@@ -936,5 +964,80 @@ mod tests {
         assert!(!is_upper_snake_case("myVar"));
         assert!(!is_upper_snake_case("Max_Size"));
         assert!(!is_upper_snake_case("123"));
+    }
+
+    // --- leading comments as symbol content ---------------------------------
+
+    /// A `#` comment glued to the `def` below it widens the symbol to
+    /// include it, mirroring Rust's `///` handling.
+    #[test]
+    fn a_glued_comment_widens_the_symbol() {
+        let src = "# Adds one.\ndef inc(x):\n    return x + 1\n";
+        let syms = parse(src);
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].byte_range.start, 0);
+    }
+
+    /// A comment separated by a blank line stays unattributed to what
+    /// follows — the symbol's range is unmoved.
+    #[test]
+    fn a_comment_separated_by_a_blank_line_does_not_widen() {
+        let src = "# unrelated note\n\ndef inc(x):\n    return x + 1\n";
+        let syms = parse(src);
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].byte_range.start as usize, src.find("def").unwrap());
+    }
+
+    /// A comment above a method inside a class attaches to the method, not
+    /// the class.
+    #[test]
+    fn a_method_comment_attaches_to_the_method_not_the_class() {
+        // The comment precedes the *second* method, not the first — see
+        // `a_leading_comment_on_the_first_block_statement_is_a_known_gap`
+        // for why that distinction matters in Python specifically.
+        let src = "class Point:\n    def first():\n        pass\n    # Make another.\n    def second():\n        pass\n";
+        let syms = parse(src);
+        assert_eq!(syms[0].byte_range.start as usize, src.find("class").unwrap());
+        assert_eq!(syms[0].children.len(), 2);
+        let second = &syms[0].children[1];
+        assert_eq!(second.byte_range.start as usize, src.find("# Make another.").unwrap());
+    }
+
+    /// A known, narrow gap rather than a silent one: in tree-sitter-python's
+    /// grammar, a comment immediately after `class Foo:` — before the block's
+    /// *first* statement — parses as a child of `class_definition` itself,
+    /// positioned before the `body` field, not as a sibling of that first
+    /// statement inside `body`. `leading_comment_start` only walks siblings,
+    /// so it never sees it. Confirmed via `tree.root_node().to_sexp()`:
+    /// `(class_definition name: (identifier) (comment) body: (block ...))` —
+    /// the comment sits beside `body`, not inside it.
+    ///
+    /// A comment before any *later* statement in the same block (see the
+    /// test above) is a genuine block sibling and widens correctly; only the
+    /// very first statement in a block is affected. Neither Rust's nor
+    /// TypeScript's grammars have this quirk — both attach a leading comment
+    /// as a real sibling even when it precedes a block's first member.
+    #[test]
+    fn a_leading_comment_on_the_first_block_statement_is_a_known_gap() {
+        let src = "class Point:\n    # Make one.\n    def new():\n        pass\n";
+        let syms = parse(src);
+        let method = &syms[0].children[0];
+        assert_eq!(
+            method.byte_range.start as usize,
+            src.find("def new").unwrap(),
+            "documents the gap rather than asserting the (better) behavior \
+             this cannot currently deliver"
+        );
+    }
+
+    /// A comment above `@decorator` widens the whole decorated definition —
+    /// the decorator sits *inside* `decorated_definition`, so the comment
+    /// above must be looked up from the outer node, not the inner `def`.
+    #[test]
+    fn a_comment_above_a_decorator_widens_the_decorated_definition() {
+        let src = "# Registers the route.\n@app.route(\"/\")\ndef handler():\n    pass\n";
+        let syms = parse(src);
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].byte_range.start, 0);
     }
 }

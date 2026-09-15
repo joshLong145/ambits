@@ -22,6 +22,53 @@ pub struct SymbolMeta {
     pub label: &'static str,
 }
 
+/// The earliest node in an unbroken run of comments immediately above
+/// `node` — no blank line, no other node between one and the next — or
+/// `None` if `node` has no such comment directly above it.
+///
+/// A `///`/`//!` doc comment is the common case this exists for, but the
+/// rule is contiguity, not comment syntax: a plain `//` note glued to what
+/// follows reads as being about it too, so it is swept in exactly like a doc
+/// comment would be. `comment_kinds` names the grammar's comment node kinds
+/// (Rust distinguishes `line_comment`/`block_comment`; Python and
+/// TypeScript each use a single `comment` kind), since that differs per
+/// language and nothing else in this walk does.
+///
+/// A comment separated from `node` by a blank line is left alone — this
+/// never even looks past it — and so is a comment with nothing recognized
+/// following it at all, since callers only invoke this once a node has
+/// already been classified as a symbol. That is what keeps a standalone
+/// file-level comment attributed to nothing, matching `find`'s
+/// `a_hit_between_symbols_has_no_symbol`: widening symbols is all this
+/// does, never inventing one.
+///
+/// Called once per symbol at parse time, not per search, so walking
+/// `prev_sibling()` a few times costs nothing worth avoiding.
+pub fn leading_comment_start<'a>(
+    node: tree_sitter::Node<'a>,
+    comment_kinds: &[&str],
+) -> Option<tree_sitter::Node<'a>> {
+    let mut result = None;
+    let mut boundary_row = node.start_position().row;
+    let mut sibling = node.prev_sibling();
+
+    while let Some(sib) = sibling {
+        if !comment_kinds.contains(&sib.kind()) {
+            break;
+        }
+        // More than one row of gap between this comment and whatever sits
+        // just below it means a blank line separates them.
+        if boundary_row.saturating_sub(sib.end_position().row) > 1 {
+            break;
+        }
+        boundary_row = sib.start_position().row;
+        result = Some(sib);
+        sibling = sib.prev_sibling();
+    }
+
+    result
+}
+
 /// Trait for language-specific parsers.
 /// Implement this trait to add support for a new language.
 pub trait LanguageParser: Send + Sync {

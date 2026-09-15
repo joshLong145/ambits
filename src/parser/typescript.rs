@@ -139,6 +139,10 @@ const SET: SymbolMeta = SymbolMeta { category: SymbolCategory::Function, label: 
 // -- Ambient (declare) ------------------------------------------------------
 const DECLARE: SymbolMeta = SymbolMeta { category: SymbolCategory::Variable, label: "declare" };
 
+/// tree-sitter-typescript's one comment node kind, covering both `//` and
+/// `/* */`/`/** */` forms.
+const COMMENT_KINDS: &[&str] = &["comment"];
+
 // ---------------------------------------------------------------------------
 // Core symbol extraction
 // ---------------------------------------------------------------------------
@@ -194,10 +198,11 @@ fn extract_symbols(
             }
         } else if child.kind() == "expression_statement" {
             // tree-sitter-typescript wraps bare `namespace X {}` in expression_statement.
+            let leading = super::leading_comment_start(child, COMMENT_KINDS);
             let mut inner_cursor = child.walk();
             for inner in child.children(&mut inner_cursor) {
                 if inner.kind() == "internal_module" {
-                    emit_namespace(&inner, ctx, parent_name_path, out);
+                    emit_namespace(&inner, ctx, parent_name_path, leading, out);
                 }
             }
             continue;
@@ -206,49 +211,54 @@ fn extract_symbols(
         };
 
         let byte_range = range_override.unwrap_or_else(|| target.byte_range());
+        // Computed from `child` — the genuine top-level sibling — not
+        // `target`, which after export-unwrapping is a node *inside*
+        // `export_statement` and so has the wrong prev_sibling context.
+        // See `make_symbol`'s doc for why this cannot be derived downstream.
+        let leading = super::leading_comment_start(child, COMMENT_KINDS);
 
         match target.kind() {
             // `function foo()` or `function* gen()` - leaf symbol, no children.
             "function_declaration" | "generator_function_declaration" => {
-                if let Some(sym) = build_named_symbol(&target, ctx, parent_name_path, &FN, byte_range) {
+                if let Some(sym) = build_named_symbol(&target, ctx, parent_name_path, &FN, byte_range, leading) {
                     out.push(sym);
                 }
             }
             // `class Foo { ... }` - container, recurse into class_body for members.
             "class_declaration" => {
-                emit_class(&target, ctx, parent_name_path, &CLASS, byte_range, out);
+                emit_class(&target, ctx, parent_name_path, &CLASS, byte_range, leading, out);
             }
             // `abstract class Base { ... }` - same as class but different label.
             "abstract_class_declaration" => {
-                emit_class(&target, ctx, parent_name_path, &ABSTRACT_CLASS, byte_range, out);
+                emit_class(&target, ctx, parent_name_path, &ABSTRACT_CLASS, byte_range, leading, out);
             }
             // `interface Config { ... }` - container, recurse into interface_body.
             "interface_declaration" => {
-                emit_interface(&target, ctx, parent_name_path, byte_range, out);
+                emit_interface(&target, ctx, parent_name_path, byte_range, leading, out);
             }
             // `type Alias = ...` - leaf symbol.
             "type_alias_declaration" => {
-                if let Some(sym) = build_named_symbol(&target, ctx, parent_name_path, &TYPE, byte_range) {
+                if let Some(sym) = build_named_symbol(&target, ctx, parent_name_path, &TYPE, byte_range, leading) {
                     out.push(sym);
                 }
             }
             // `enum Status { ... }` - leaf (we don't extract enum members).
             "enum_declaration" => {
-                if let Some(sym) = build_named_symbol(&target, ctx, parent_name_path, &ENUM, byte_range) {
+                if let Some(sym) = build_named_symbol(&target, ctx, parent_name_path, &ENUM, byte_range, leading) {
                     out.push(sym);
                 }
             }
             // `namespace N { ... }` / `module M { ... }` - container, recurse.
             "internal_module" | "module" => {
-                emit_namespace(&target, ctx, parent_name_path, out);
+                emit_namespace(&target, ctx, parent_name_path, leading, out);
             }
             // `const foo = () => {}` or `let bar = function() {}` - detect arrow/fn expressions.
             "lexical_declaration" | "variable_declaration" => {
-                extract_arrow_fns(&target, ctx, parent_name_path, out);
+                extract_arrow_fns(&target, ctx, parent_name_path, leading, out);
             }
             // `declare function ...`, `declare class ...`, `declare const ...`, etc.
             "ambient_declaration" => {
-                extract_ambient(&target, ctx, parent_name_path, out);
+                extract_ambient(&target, ctx, parent_name_path, leading, out);
             }
             // Imports, comments, expression statements, etc. - ignored.
             _ => {}
@@ -275,6 +285,7 @@ fn extract_arrow_fns(
     node: &Node,
     ctx: &FileCtx,
     parent_name_path: &str,
+    leading: Option<Node>,
     out: &mut Vec<SymbolNode>,
 ) {
     let mut cursor = node.walk();
@@ -303,7 +314,14 @@ fn extract_arrow_fns(
 
         // Use the full declaration range (includes const/let keyword).
         let byte_range = node.byte_range();
-        out.push(make_symbol(name, &FN, node, byte_range, ctx, parent_name_path, Vec::new()));
+        out.push(make_symbol(
+            name,
+            &FN,
+            SymbolSpan { line_node: *node, byte_range, leading },
+            ctx,
+            parent_name_path,
+            Vec::new(),
+        ));
     }
 }
 
@@ -320,6 +338,7 @@ fn extract_ambient(
     node: &Node,
     ctx: &FileCtx,
     parent_name_path: &str,
+    leading: Option<Node>,
     out: &mut Vec<SymbolNode>,
 ) {
     let ambient_range = node.byte_range();
@@ -332,14 +351,21 @@ fn extract_ambient(
             | "internal_module" | "module" => child_name(&child, ctx.src),
             "lexical_declaration" | "variable_declaration" => {
                 // Extract variable names from declare const/let/var.
-                extract_ambient_vars(&child, ctx, parent_name_path, &ambient_range, out);
+                extract_ambient_vars(&child, ctx, parent_name_path, &ambient_range, leading, out);
                 None
             }
             _ => None,
         };
 
         if let Some(name) = name {
-            out.push(make_symbol(name, &DECLARE, node, ambient_range, ctx, parent_name_path, Vec::new()));
+            out.push(make_symbol(
+                name,
+                &DECLARE,
+                SymbolSpan { line_node: *node, byte_range: ambient_range, leading },
+                ctx,
+                parent_name_path,
+                Vec::new(),
+            ));
             return; // One symbol per ambient_declaration.
         }
     }
@@ -351,6 +377,7 @@ fn extract_ambient_vars(
     ctx: &FileCtx,
     parent_name_path: &str,
     ambient_range: &std::ops::Range<usize>,
+    leading: Option<Node>,
     out: &mut Vec<SymbolNode>,
 ) {
     let mut cursor = node.walk();
@@ -367,7 +394,14 @@ fn extract_ambient_vars(
             None => continue,
         };
 
-        out.push(make_symbol(name, &DECLARE, &child, ambient_range.clone(), ctx, parent_name_path, Vec::new()));
+        out.push(make_symbol(
+            name,
+            &DECLARE,
+            SymbolSpan { line_node: child, byte_range: ambient_range.clone(), leading },
+            ctx,
+            parent_name_path,
+            Vec::new(),
+        ));
     }
 }
 
@@ -385,6 +419,7 @@ fn emit_class(
     parent_name_path: &str,
     meta: &SymbolMeta,
     byte_range: std::ops::Range<usize>,
+    leading: Option<Node>,
     out: &mut Vec<SymbolNode>,
 ) {
     let name = match child_name(node, ctx.src) {
@@ -403,7 +438,14 @@ fn emit_class(
         extract_members(body, ctx, &name_path, &mut children);
     }
 
-    out.push(make_symbol(name, meta, node, byte_range, ctx, parent_name_path, children));
+    out.push(make_symbol(
+        name,
+        meta,
+        SymbolSpan { line_node: *node, byte_range, leading },
+        ctx,
+        parent_name_path,
+        children,
+    ));
 }
 
 /// Extract members from a `class_body` or `interface_body` node.
@@ -454,7 +496,18 @@ fn extract_members(
         };
 
         let byte_range = child.byte_range();
-        out.push(make_symbol(name, meta, &child, byte_range, ctx, parent_name_path, Vec::new()));
+        // A member's own leading comment is a real sibling within this body
+        // — unlike the top-level dispatch, nothing wraps it — so this looks
+        // it up directly rather than needing anything threaded in.
+        let leading = super::leading_comment_start(child, COMMENT_KINDS);
+        out.push(make_symbol(
+            name,
+            meta,
+            SymbolSpan { line_node: child, byte_range, leading },
+            ctx,
+            parent_name_path,
+            Vec::new(),
+        ));
     }
 }
 
@@ -467,6 +520,7 @@ fn emit_interface(
     ctx: &FileCtx,
     parent_name_path: &str,
     byte_range: std::ops::Range<usize>,
+    leading: Option<Node>,
     out: &mut Vec<SymbolNode>,
 ) {
     let name = match child_name(node, ctx.src) {
@@ -485,7 +539,14 @@ fn emit_interface(
         extract_members(body, ctx, &name_path, &mut children);
     }
 
-    out.push(make_symbol(name, &IFACE, node, byte_range, ctx, parent_name_path, children));
+    out.push(make_symbol(
+        name,
+        &IFACE,
+        SymbolSpan { line_node: *node, byte_range, leading },
+        ctx,
+        parent_name_path,
+        children,
+    ));
 }
 
 /// Emit a `namespace`/`module` symbol and recurse into `statement_block` for nested declarations.
@@ -493,10 +554,18 @@ fn emit_interface(
 /// Unlike classes and interfaces, namespaces can contain arbitrary top-level
 /// declarations (functions, classes, other namespaces, etc.), so we call back
 /// into [`extract_symbols`] rather than [`extract_members`].
+///
+/// `leading` is threaded in from the caller rather than looked up here, for
+/// the same reason `extract_symbols`'s dispatch loop computes it from `child`
+/// — the two call sites, a bare `namespace X {}` (unwrapped from
+/// `expression_statement`) and an `export namespace X {}`, both give this
+/// function a `node` whose `prev_sibling` sits inside a wrapper, not at the
+/// file-level position a leading comment would actually occupy.
 fn emit_namespace(
     node: &Node,
     ctx: &FileCtx,
     parent_name_path: &str,
+    leading: Option<Node>,
     out: &mut Vec<SymbolNode>,
 ) {
     let name = match child_name(node, ctx.src) {
@@ -516,7 +585,14 @@ fn emit_namespace(
     }
 
     let byte_range = node.byte_range();
-    out.push(make_symbol(name, &NS, node, byte_range, ctx, parent_name_path, children));
+    out.push(make_symbol(
+        name,
+        &NS,
+        SymbolSpan { line_node: *node, byte_range, leading },
+        ctx,
+        parent_name_path,
+        children,
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -534,11 +610,30 @@ fn emit_namespace(
 /// - `merkle_hash` - initialized to zeroes here; filled in by [`compute_merkle_hash`]
 ///   after the full tree is assembled.
 /// - `estimated_tokens` - rough LLM token count for the source text.
+///
+/// `leading`, when `Some`, is the earliest node of an unbroken comment run
+/// immediately above this symbol (see `parser::leading_comment_start`); it
+/// overrides where `byte_range`/`line_range` actually start, so `end_line`
+/// alone still comes from `line_node`. Callers compute `leading` themselves
+/// rather than this function deriving it from `line_node`, because the
+/// correct node to look *above* is not always `line_node` — an exported
+/// declaration's real file-level position is the `export_statement`
+/// wrapping it, not the inner declaration `line_node` names.
+/// A symbol's extent: the node line numbers are read from, the byte range
+/// its content hash covers, and any leading comment run that widens both.
+/// Bundled because every call site threads the same three values together —
+/// see `FileCtx` above for the same reasoning applied to what stays fixed
+/// across a whole file, rather than per symbol.
+struct SymbolSpan<'a> {
+    line_node: Node<'a>,
+    byte_range: std::ops::Range<usize>,
+    leading: Option<Node<'a>>,
+}
+
 fn make_symbol(
     name: String,
     meta: &SymbolMeta,
-    line_node: &Node,
-    byte_range: std::ops::Range<usize>,
+    span: SymbolSpan,
     ctx: &FileCtx,
     parent_name_path: &str,
     children: Vec<SymbolNode>,
@@ -549,9 +644,13 @@ fn make_symbol(
         format!("{parent_name_path}/{name}")
     };
     let id = format!("{}::{name_path}", ctx.path_prefix);
-    let start_line = line_node.start_position().row + 1;
-    let end_line = line_node.end_position().row + 1;
-    let text = std::str::from_utf8(&ctx.src[byte_range.clone()]).unwrap_or("");
+    let (start_byte, start_line) = match span.leading {
+        Some(l) => (l.start_byte(), l.start_position().row + 1),
+        None => (span.byte_range.start, span.line_node.start_position().row + 1),
+    };
+    let end_line = span.line_node.end_position().row + 1;
+    let byte_range = span.byte_range;
+    let text = std::str::from_utf8(&ctx.src[start_byte..byte_range.end]).unwrap_or("");
 
     SymbolNode {
         id,
@@ -559,7 +658,7 @@ fn make_symbol(
         category: meta.category,
         label: meta.label,
         file_path: Arc::clone(ctx.file_path),
-        byte_range: byte_range.start as u32..byte_range.end as u32,
+        byte_range: start_byte as u32..byte_range.end as u32,
         line_range: start_line as u32..end_line as u32,
         content_hash: content_hash(text),
         merkle_hash: [0u8; 32],
@@ -577,9 +676,17 @@ fn build_named_symbol(
     parent_name_path: &str,
     meta: &SymbolMeta,
     byte_range: std::ops::Range<usize>,
+    leading: Option<Node>,
 ) -> Option<SymbolNode> {
     let name = child_name(node, ctx.src)?;
-    Some(make_symbol(name, meta, node, byte_range, ctx, parent_name_path, Vec::new()))
+    Some(make_symbol(
+        name,
+        meta,
+        SymbolSpan { line_node: *node, byte_range, leading },
+        ctx,
+        parent_name_path,
+        Vec::new(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1182,5 +1289,74 @@ declare function require(id: string): any;
     fn estimated_tokens_nonzero() {
         let syms = parse("function foo() { return 42; }");
         assert!(syms[0].estimated_tokens > 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Leading comments as symbol content
+    // ---------------------------------------------------------------
+
+    /// A comment glued to the declaration below it widens the symbol to
+    /// include it, mirroring Rust's `///` and Python's `#` handling.
+    #[test]
+    fn a_glued_comment_widens_the_symbol() {
+        let src = "// Adds one.\nfunction inc(x: number): number { return x + 1; }";
+        let syms = parse(src);
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].byte_range.start, 0);
+    }
+
+    /// A comment separated by a blank line stays unattributed — the
+    /// symbol's range is unmoved.
+    #[test]
+    fn a_comment_separated_by_a_blank_line_does_not_widen() {
+        let src = "// unrelated note\n\nfunction inc(x: number): number { return x + 1; }";
+        let syms = parse(src);
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].byte_range.start as usize, src.find("function").unwrap());
+    }
+
+    /// A comment above a method inside a class attaches to the method, not
+    /// the class — the two have different preceding-sibling contexts.
+    #[test]
+    fn a_method_comment_attaches_to_the_method_not_the_class() {
+        let src = "class Point {\n  // Make one.\n  static make(): Point { return new Point(); }\n}";
+        let syms = parse(src);
+        assert_eq!(syms[0].byte_range.start as usize, src.find("class").unwrap());
+        let method = &syms[0].children[0];
+        assert_eq!(method.byte_range.start as usize, src.find("// Make one.").unwrap());
+    }
+
+    /// The case this whole design has to get right for TypeScript
+    /// specifically: `export` wraps the declaration in `export_statement`,
+    /// so the inner node's own `prev_sibling` is the `export` keyword, not
+    /// the comment above the statement. Widening has to be computed from the
+    /// real top-level sibling (`child` in `extract_symbols`), not from the
+    /// node each emitter otherwise treats as "the symbol's own node".
+    #[test]
+    fn a_comment_above_an_exported_declaration_still_widens() {
+        let src = "// A service.\nexport class Service {}";
+        let syms = parse(src);
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].byte_range.start, 0);
+    }
+
+    /// Same wrinkle, for the arrow-function path (`extract_arrow_fns`),
+    /// which is reached through the same export-unwrapping dispatch.
+    #[test]
+    fn a_comment_above_an_exported_arrow_function_still_widens() {
+        let src = "// The handler.\nexport const handler = () => {};";
+        let syms = parse(src);
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].byte_range.start, 0);
+    }
+
+    /// And for `namespace`, which has two call sites into `emit_namespace`
+    /// (bare and exported) that both need the caller-computed `leading`.
+    #[test]
+    fn a_comment_above_a_namespace_still_widens() {
+        let src = "// Validation helpers.\nnamespace Validation {\n  export function ok(): boolean { return true; }\n}";
+        let syms = parse(src);
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].byte_range.start, 0);
     }
 }
