@@ -84,7 +84,10 @@ pub fn parse_selector(query: &str) -> Selector {
 pub(crate) struct MatchDto<'a> {
     id: &'a str,
     name: &'a str,
-    file: String,
+    // No separate `file` field: `id` is always `<file>::<name-path>`, so a
+    // caller that wants just the path already has it — `id.split("::").next()`
+    // — and storing it twice cost 15-30 bytes of pure repetition per match for
+    // zero new information.
     /// 1-based inclusive, matching the digest's `name:first-last`.
     lines: [u32; 2],
     /// Byte offsets into the file, for callers that want to slice it
@@ -158,14 +161,12 @@ struct ShowDto<'a> {
 /// Describe a symbol without its source. The body-bearing fields stay `None`,
 /// which is exactly what `--no-body` and `find` both want.
 pub(crate) fn describe<'a>(
-    file: &'a Path,
     node: &'a SymbolNode,
     coverage: Option<&crate::restore::CoverageIndex>,
 ) -> MatchDto<'a> {
     MatchDto {
         id: &node.id,
         name: &node.name,
-        file: file.display().to_string(),
         lines: [node.line_range.start, node.line_range.end],
         bytes: [node.byte_range.start, node.byte_range.end],
         content_hash: encode_hash(&node.content_hash),
@@ -303,7 +304,7 @@ fn resolve<'a>(
                 MatchDto {
                     definition,
                     truncated,
-                    ..describe(file, node, coverage)
+                    ..describe(node, coverage)
                 }
             })
             .collect();
