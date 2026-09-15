@@ -260,6 +260,23 @@ struct FindArgs {
         #[arg(short = 't', long = "type", value_name = "TYPE")]
         file_type: Vec<String>,
 
+        /// List every type name --type accepts, with the globs it expands
+        /// to, and exit. Takes no PATTERN.
+        #[arg(long)]
+        type_list: bool,
+
+        /// Additional pattern(s), one per line, read from a file.
+        /// Repeatable; combined with -e and PATTERN as one alternation.
+        #[arg(short = 'f', long = "file", value_name = "PATTERNFILE")]
+        pattern_file: Vec<PathBuf>,
+
+        /// Print one line per match rather than grouping matches that share
+        /// a line — vim/emacs quickfix format. Also splits --json's
+        /// per-line events back into one per match, matching -o's existing
+        /// behavior there.
+        #[arg(long)]
+        vimgrep: bool,
+
         /// Lines of context after each match.
         #[arg(short = 'A', long, default_value_t = 0, value_name = "N")]
         after_context: usize,
@@ -291,6 +308,11 @@ struct FindArgs {
         /// Print only the paths of files with a match.
         #[arg(short = 'l', long, conflicts_with_all = ["count", "count_matches", "quiet"])]
         files_with_matches: bool,
+
+        /// Print only the paths of files with *no* match — the complement of
+        /// `-l`, not of `-v`.
+        #[arg(long, conflicts_with_all = ["files_with_matches", "count", "count_matches", "quiet"])]
+        files_without_match: bool,
 
         /// Print only a count of matching lines per file.
         #[arg(short, long, conflicts_with_all = ["count_matches", "quiet"])]
@@ -443,7 +465,7 @@ fn run_find(
     use ambits::parser::{walk_files, WalkOptions};
     use color_eyre::eyre::eyre;
 
-    let (patterns, paths): (Vec<String>, &[String]) = if args.regexp.is_empty() {
+    let (mut patterns, paths): (Vec<String>, &[String]) = if args.regexp.is_empty() {
         match args.args.split_first() {
             Some((pattern, rest)) => (vec![pattern.clone()], rest),
             None => (Vec::new(), &[]),
@@ -451,6 +473,18 @@ fn run_find(
     } else {
         (args.regexp.clone(), args.args.as_slice())
     };
+
+    // `-f`: one pattern per non-empty line, combined into the same
+    // alternation as -e/PATTERN — the contract already documented for -e.
+    // A missing or unreadable file is an expected, actionable failure (not a
+    // bug), so it propagates through `?` to the tool's own "2 on error" exit
+    // code rather than panicking or being silently skipped.
+    for path in &args.pattern_file {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| eyre!("{}: {e}", path.display()))?;
+        patterns.extend(text.lines().filter(|l| !l.is_empty()).map(str::to_string));
+    }
+
     if patterns.is_empty() {
         return Err(eyre!("no pattern given"));
     }
@@ -496,6 +530,8 @@ fn run_find(
         OutputMode::Quiet
     } else if args.files_with_matches {
         OutputMode::FilesWithMatches
+    } else if args.files_without_match {
+        OutputMode::FilesWithoutMatch
     } else if args.count {
         OutputMode::Count
     } else if args.count_matches {
@@ -523,6 +559,7 @@ fn run_find(
         line_number: !args.no_line_number,
         column: !args.no_column,
         only_matching: args.only_matching,
+        vimgrep: args.vimgrep,
         before_context: args.context.unwrap_or(args.before_context),
         after_context: args.context.unwrap_or(args.after_context),
         max_columns: args.max_columns,
@@ -672,6 +709,21 @@ fn main() -> Result<()> {
         for w in &config_warnings {
             eprintln!("[ambit warning] {w}");
         }
+
+        // Takes no PATTERN, so it is handled before the pattern-required
+        // path below ever runs — reuses the same TypesBuilder that `-t`
+        // itself builds, just calling `.definitions()` on it before `.build()`.
+        if args.type_list {
+            let mut builder = ignore::types::TypesBuilder::new();
+            builder.add_defaults();
+            let mut defs = builder.definitions();
+            defs.sort_by(|a, b| a.name().cmp(b.name()));
+            for def in defs {
+                println!("{}: {}", def.name(), def.globs().join(", "));
+            }
+            return Ok(());
+        }
+
         // grep's exit codes, which agents chain on: 0 matched, 1 did not,
         // 2 something went wrong. `color_eyre` would exit 1 for an error,
         // which is indistinguishable from an honest "no match".

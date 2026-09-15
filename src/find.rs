@@ -87,6 +87,11 @@ pub enum OutputMode {
     Content,
     /// `-l`: one path per file with a match.
     FilesWithMatches,
+    /// `--files-without-match`: one path per file with *no* match — the
+    /// complement of `-l`, not of `-v`. `-v` reports non-matching *lines*
+    /// within files that were searched; this reports files that had zero
+    /// matching lines at all.
+    FilesWithoutMatch,
     /// `-c`: matching lines per file.
     Count,
     /// `--count-matches`: total matches per file.
@@ -150,6 +155,13 @@ pub struct Options {
     pub column: bool,
     /// `-o`
     pub only_matching: bool,
+    /// `--vimgrep`: one row per match, even where several share a line —
+    /// the exception to the default line-grouped output, same as `-o`. See
+    /// `match_groups`, which both text and JSON printing call, so this
+    /// affects `--json` too, splitting a shared-line event's `submatches`
+    /// back into one event per match — exactly `-o`'s existing precedent
+    /// there, not a special case invented for this flag.
+    pub vimgrep: bool,
     /// `-B`
     pub before_context: usize,
     /// `-A`
@@ -732,15 +744,17 @@ impl Row<'_> {
     }
 }
 
-/// Group `hits` into same-line runs for printing, except under `-o` where
-/// each match prints as its own line and must stay ungrouped.
+/// Group `hits` into same-line runs for printing, except under `-o` or
+/// `--vimgrep`, where each match prints as its own line and must stay
+/// ungrouped — `-o` because there is no shared line text left to group by,
+/// `--vimgrep` because quickfix format is one entry per match by definition.
 ///
 /// `hits` is already sorted by `(line, column)` — the search walks each
 /// file's bytes once, left to right, so two matches on one line are always
 /// adjacent — which is what makes a simple [`slice::chunk_by`] correct here
 /// without a re-sort.
 fn match_groups<'a>(hits: &'a [Hit], opts: &Options) -> Vec<&'a [Hit]> {
-    if opts.only_matching {
+    if opts.only_matching || opts.vimgrep {
         hits.iter().map(std::slice::from_ref).collect()
     } else {
         hits.chunk_by(|a, b| a.line == b.line).collect()
@@ -1009,6 +1023,18 @@ pub fn run(
         OutputMode::FilesWithMatches => {
             for file in &files {
                 writeln!(w, "{}", file.path.display())?;
+            }
+        }
+        // The complement of `-l`: `files` only ever holds files with at
+        // least one hit (search_file returns None for the rest, filtered out
+        // in `search`), so this is targets minus that set, not a second walk.
+        OutputMode::FilesWithoutMatch => {
+            let matched: std::collections::HashSet<&Path> =
+                files.iter().map(|f| f.path.as_path()).collect();
+            for (_, rel) in targets {
+                if !matched.contains(rel.as_path()) {
+                    writeln!(w, "{}", rel.display())?;
+                }
             }
         }
         // grep and rg both count matching *lines* for `-c`; only
@@ -1385,6 +1411,46 @@ mod tests {
             "-o prints one line per match, even sharing a source line"
         );
         assert!(groups.iter().all(|g| g.len() == 1));
+    }
+
+    /// `--vimgrep` is the same exception as `-o`, for a different reason —
+    /// quickfix format, not "nothing left to group by".
+    #[test]
+    fn vimgrep_keeps_each_match_as_its_own_group() {
+        let two_on_one_line = "fn alpha() { fn nested() {} }\nfn beta() {}\n";
+        let mut opts = Options::new(vec!["fn".into()]);
+        opts.vimgrep = true;
+        let found = hits(two_on_one_line, &opts);
+        let groups = match_groups(&found, &opts);
+        assert_eq!(groups.len(), 3, "one line per match, even sharing a source line");
+        assert!(groups.iter().all(|g| g.len() == 1));
+    }
+
+    /// `--vimgrep` reaches `--json` too, through the same `match_groups`
+    /// call `-o` already goes through there — not a special case, the same
+    /// rule applied uniformly.
+    #[test]
+    fn vimgrep_splits_json_events_back_to_one_per_match() {
+        let two_on_one_line = "fn alpha() { fn nested() {} }\nfn beta() {}\n";
+        let mut opts = Options::new(vec!["fn".into()]);
+        opts.json = true;
+        opts.vimgrep = true;
+        let files = vec![FileHits {
+            path: PathBuf::from("a.rs"),
+            hits: hits(two_on_one_line, &opts),
+            total: 3,
+            context: Vec::new(),
+        }];
+        let mut buf = Vec::new();
+        print_json(&mut buf, &files, &opts, None, 0).unwrap();
+        let events: Vec<serde_json::Value> = String::from_utf8(buf)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let matches: Vec<&serde_json::Value> =
+            events.iter().filter(|e| e["type"] == "match").collect();
+        assert_eq!(matches.len(), 3, "one event per match, not per line: {matches:?}");
     }
 
     #[test]

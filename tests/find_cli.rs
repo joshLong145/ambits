@@ -296,3 +296,76 @@ fn a_second_identical_search_still_reports_unknown_depth() {
         second.stdout
     );
 }
+
+// ---------------------------------------------------------------------------
+// --files-without-match
+// ---------------------------------------------------------------------------
+
+/// The complement of `-l`, not of `-v`: files with zero matching lines.
+#[test]
+fn files_without_match_lists_the_complement_of_files_with_matches() {
+    let dir = fixture();
+
+    let out = find(dir.path(), &["needle", "-t", "rust", "--files-without-match"]);
+    assert!(out.stdout.contains("src/util.rs"), "{:?}", out.stdout);
+    assert!(!out.stdout.contains("src/lib.rs"), "lib.rs matched, so it is excluded: {:?}", out.stdout);
+}
+
+#[test]
+fn files_without_match_conflicts_with_files_with_matches() {
+    let dir = fixture();
+    let out = find(dir.path(), &["needle", "-l", "--files-without-match"]);
+    assert_eq!(out.code, 2, "clap rejects the combination: {:?}", out.stderr);
+}
+
+// ---------------------------------------------------------------------------
+// --type-list
+// ---------------------------------------------------------------------------
+
+/// Takes no PATTERN — reuses the same TypesBuilder `-t` itself builds.
+#[test]
+fn type_list_needs_no_pattern_and_lists_known_types() {
+    let dir = fixture();
+    let out = find(dir.path(), &["--type-list"]);
+    assert_eq!(out.code, 0, "{:?}", out.stderr);
+    assert!(out.stdout.lines().any(|l| l.starts_with("rust:") && l.contains(".rs")), "{:?}", out.stdout);
+}
+
+// ---------------------------------------------------------------------------
+// -f / --file
+// ---------------------------------------------------------------------------
+
+/// One pattern per non-empty line, combined into the same alternation -e is.
+#[test]
+fn pattern_file_patterns_join_the_alternation() {
+    let dir = fixture();
+    let patterns = dir.path().join("patterns.txt");
+    std::fs::write(&patterns, "needle\n\nunrelated\n").unwrap();
+
+    let out = find(dir.path(), &["-t", "rust", "-l", "-f", patterns.to_str().unwrap()]);
+    assert!(out.stdout.contains("src/lib.rs"), "needle: {:?}", out.stdout);
+    assert!(out.stdout.contains("src/util.rs"), "unrelated: {:?}", out.stdout);
+}
+
+/// A missing pattern file is an expected, actionable failure — exit 2 with
+/// a clear message, not a panic and not a silent empty result.
+#[test]
+fn a_missing_pattern_file_is_an_error() {
+    let dir = fixture();
+    let out = find(dir.path(), &["-f", "does-not-exist.txt"]);
+    assert_eq!(out.code, 2);
+    assert!(out.stderr.contains("does-not-exist.txt"), "{:?}", out.stderr);
+}
+
+/// An empty pattern file, with no -e/PATTERN either, is "no pattern given" —
+/// the same error as running find with nothing at all.
+#[test]
+fn an_empty_pattern_file_alone_is_no_pattern_given() {
+    let dir = fixture();
+    let patterns = dir.path().join("empty.txt");
+    std::fs::write(&patterns, "\n\n").unwrap();
+
+    let out = find(dir.path(), &["-f", patterns.to_str().unwrap()]);
+    assert_eq!(out.code, 2);
+    assert!(out.stderr.contains("no pattern given"), "{:?}", out.stderr);
+}
