@@ -195,6 +195,19 @@ impl Options {
 #[derive(Debug)]
 pub struct Matcher {
     re: Regex,
+    /// Same pattern as `re`, always compiled `multi_line(true)`.
+    ///
+    /// `worth_searching` runs against the *whole file's* bytes, not one line
+    /// at a time, so a `^`/`$` in `re` needs multi-line semantics there even
+    /// when the caller never asked for `-U` — otherwise the anchor binds to
+    /// the true start/end of the buffer, the prefilter rejects any file
+    /// whose first line does not itself satisfy the pattern, and every later
+    /// line's real match is silently dropped. Kept as a second `Regex`
+    /// rather than always compiling `re` multi-line, because the per-line
+    /// path must not gain multi-line semantics on its own — see `re`'s use
+    /// in `hits_in`, one line at a time, where `^`/`$` already mean what the
+    /// caller expects.
+    prefilter_re: Regex,
     invert: bool,
     multiline: bool,
 }
@@ -240,8 +253,19 @@ impl Matcher {
             .build()
             .wrap_err_with(|| format!("invalid pattern: {alternation}"))?;
 
+        // Always multi-line, regardless of `opts.multiline` — see the field
+        // doc on `prefilter_re`. Same alternation, so it stays in lockstep
+        // with `re` (line-regexp/word-regexp/case-insensitive all already
+        // baked into the string) without re-deriving any of that here.
+        let prefilter_re = RegexBuilder::new(&alternation)
+            .case_insensitive(opts.ignore_case)
+            .multi_line(true)
+            .build()
+            .wrap_err_with(|| format!("invalid pattern: {alternation}"))?;
+
         Ok(Self {
             re,
+            prefilter_re,
             invert: opts.invert_match,
             multiline: opts.multiline,
         })
@@ -251,8 +275,11 @@ impl Matcher {
     ///
     /// Under `-v` every file qualifies — a file with no match is nothing but
     /// inverted matches — so the prefilter is skipped rather than inverted.
+    /// Uses `prefilter_re`, not `re`: this runs against the whole file's
+    /// bytes in one shot, so an anchor needs multi-line semantics here even
+    /// when the caller is not searching with `-U`.
     fn worth_searching(&self, buf: &[u8]) -> bool {
-        self.invert || self.re.is_match(buf)
+        self.invert || self.prefilter_re.is_match(buf)
     }
 }
 
@@ -1923,5 +1950,41 @@ mod prefilter_tests {
 
         let found = search_file(&matcher, &registry(), &abs, &rel, &opts, None).unwrap();
         assert_eq!(found.hits.len(), 1, "it matched, it just was not parsed");
+    }
+
+    /// The whole-file prefilter used to run `re` — compiled multi-line only
+    /// under `-U` — against the entire buffer at once, so `^` bound to the
+    /// true start of the *file*, not of a line. A file whose first line did
+    /// not itself satisfy an anchored pattern was rejected outright, silently
+    /// dropping every real match on the lines below. `prefilter_re` is always
+    /// multi-line, specifically so this file is not skipped.
+    #[test]
+    fn an_anchored_pattern_still_finds_a_match_past_the_first_line() {
+        let (_dir, abs, rel) =
+            probe("first line has nothing to do with it\nneedle shows up here\n");
+        let mut opts = Options::new(vec!["^needle".into()]);
+        // This suite's registry explodes on parse; attribution is not what
+        // this test is about, so skip it the same way the tests above do.
+        opts.mode = OutputMode::FilesWithMatches;
+        let matcher = Matcher::new(&opts).unwrap();
+
+        let found = search_file(&matcher, &registry(), &abs, &rel, &opts, None)
+            .expect("the prefilter must not reject this file");
+        assert_eq!(found.hits.len(), 1);
+        assert_eq!(found.hits[0].line, 2);
+    }
+
+    /// Same shape, for `$`.
+    #[test]
+    fn an_end_anchored_pattern_still_finds_a_match_past_the_first_line() {
+        let (_dir, abs, rel) = probe("first line\nthis one ends with needle\n");
+        let mut opts = Options::new(vec!["needle$".into()]);
+        opts.mode = OutputMode::FilesWithMatches;
+        let matcher = Matcher::new(&opts).unwrap();
+
+        let found = search_file(&matcher, &registry(), &abs, &rel, &opts, None)
+            .expect("the prefilter must not reject this file");
+        assert_eq!(found.hits.len(), 1);
+        assert_eq!(found.hits[0].line, 2);
     }
 }
