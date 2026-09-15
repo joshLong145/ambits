@@ -445,7 +445,7 @@ scan included, which is both worse and harder to notice.
 
 ## The read journal
 
-While the TUI runs it maintains an append-only NDJSON record at `.ambit/coverage/<session>.ndjson` — one entry per `(symbol, agent)` read. `ambits find` keeps its own record of what it showed alongside it, in `<session>.find.ndjson`, rather than appending to the TUI's file — the two are folded together as one session wherever it matters (`restore-context`, `cache status`, `cache clear`). This is what lets `restore-context` answer after the fact, and it survives restarts.
+While the TUI runs it maintains an append-only NDJSON record at `.ambit/coverage/<session>.ndjson` — one entry per `(symbol, agent)` read. The TUI is the only writer: a `find` or `show` run with no TUI attached to the session earns no coverage credit, a deliberate trade for never needing two processes to reason about writing the same journal. This is what lets `restore-context` answer after the fact, and it survives restarts.
 
 ```bash
 ambits -p . cache status              # sessions, symbols, size on disk

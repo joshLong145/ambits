@@ -255,96 +255,44 @@ fn find_then_show_composes_on_the_emitted_id() {
 // Journaling
 // ---------------------------------------------------------------------------
 
+/// `find` no longer writes its own journal entries — the TUI is the sole
+/// writer now (see `journal.rs`'s module doc: relying on it exclusively means
+/// a session with no TUI attached earns no coverage credit from searches, an
+/// accepted trade for never having two processes able to write the same
+/// session's journal). A search that matched and printed source still leaves
+/// the journal untouched, in every mode, and regardless of `--no-journal` or
+/// the `[cache]` stanza — there is nothing left for either to suppress.
 #[test]
-fn a_search_journals_the_symbols_it_showed() {
+fn a_search_never_journals_its_own_reads() {
     let dir = fixture();
     assert!(journal(dir.path()).is_empty(), "no journal to start with");
 
     find(dir.path(), &["fn needle", "-t", "rust"]);
-
-    let written = journal(dir.path());
-    assert!(written.contains("\"kind\":\"header\""), "header first");
-    assert!(
-        written.contains("\"sym\":\"src/lib.rs::needle\"") && written.contains("full_body"),
-        "the symbol it showed is recorded at full depth: {written}"
-    );
-    assert!(
-        !written.contains("src/util.rs"),
-        "a file that never matched is not recorded"
-    );
-}
-
-/// The credit rule at the process boundary: `-l` prints no source, so it can
-/// credit no read.
-#[test]
-fn modes_that_print_no_source_journal_nothing() {
-    let dir = fixture();
-    find(dir.path(), &["needle", "-l"]);
     assert!(
         journal(dir.path()).is_empty(),
-        "a file listing is not a read"
+        "a search that matched and printed source still writes nothing"
     );
 
-    find(dir.path(), &["needle", "-c"]);
-    assert!(journal(dir.path()).is_empty(), "nor is a count");
-
-    find(dir.path(), &["needle", "-q"]);
-    assert!(journal(dir.path()).is_empty(), "nor is an exit code");
+    for silent in [&["needle", "-l"][..], &["needle", "-c"], &["needle", "-q"]] {
+        find(dir.path(), silent);
+        assert!(journal(dir.path()).is_empty());
+    }
 }
 
+/// Without its own journal write, a second search has nothing recorded to
+/// read back — depth stays unknown, not "read" and not "unread", across
+/// repeated identical searches.
 #[test]
-fn no_journal_suppresses_the_write() {
-    let dir = fixture();
-    let out = run(
-        dir.path(),
-        &["-s", "sess", "--no-journal", "find", "fn needle"],
-    );
-
-    assert_eq!(out.code, 0, "the search still answers");
-    assert!(journal(dir.path()).is_empty(), "but records nothing");
-}
-
-#[test]
-fn cache_disabled_in_tools_toml_suppresses_the_write() {
-    let dir = fixture();
-    let config = dir.path().join("tools.toml");
-    std::fs::write(&config, "version = 1\n\n[cache]\nenabled = false\n").unwrap();
-
-    let out = run(
-        dir.path(),
-        &[
-            "-s",
-            "sess",
-            "--tools-config",
-            config.to_str().unwrap(),
-            "find",
-            "fn needle",
-        ],
-    );
-
-    assert_eq!(out.code, 0);
-    assert!(
-        journal(dir.path()).is_empty(),
-        "the [cache] stanza disables find's writes too"
-    );
-}
-
-/// The loop closes: what one search records, the next one reports.
-#[test]
-fn a_second_search_reports_what_the_first_recorded() {
+fn a_second_identical_search_still_reports_unknown_depth() {
     let dir = fixture();
 
     let first = find(dir.path(), &["fn needle", "-t", "rust"]);
-    assert!(
-        first.stdout.contains("[needle]"),
-        "no journal existed yet, so depth is unknown rather than unread: {:?}",
-        first.stdout
-    );
+    assert!(first.stdout.contains("[needle]"), "{:?}", first.stdout);
 
     let second = find(dir.path(), &["fn needle", "-t", "rust"]);
     assert!(
-        second.stdout.contains("[full needle]"),
-        "the journal the first search wrote is read back: {:?}",
+        second.stdout.contains("[needle]") && !second.stdout.contains("[full needle]"),
+        "no journal write means no read history to recover: {:?}",
         second.stdout
     );
 }

@@ -59,28 +59,32 @@
 //! only ever *under*-reports coverage. Under-reporting is the safe direction —
 //! the agent re-reads something it already knew.
 //!
-//! The TUI is no longer the only writer: `ambits find` shows source, so it
-//! records what it showed too. Rather than have two processes append to one
-//! file and lean on `O_APPEND` to keep their writes from interleaving badly,
-//! each writer gets its own file: the long-running TUI writes
-//! `<session>.ndjson`, and every `ambits find` invocation folds its hits into
-//! `<session>.find.ndjson` ([`Journal::open_shard`]). No writer ever opens a
-//! file another *kind* of writer might also have open, so there is nothing
-//! shared for a lock to protect between them. [`session_shard_paths`]
-//! enumerates a session's shards and [`read_journal_session`] folds them into
-//! one view with the same [`fold`] rule used within a file: a new hash
-//! supersedes, an equal hash keeps the deeper read. Readers (`restore-context`)
-//! still never open a file for writing.
+//! ## One writer
 //!
-//! This narrows the race rather than closing it: two `ambits find`
-//! invocations racing in the *same* session still share `<session>.find.ndjson`,
-//! so the single-`write_all`-under-`O_APPEND` guarantee above remains the
-//! safety net for that case (`concurrent_appends_all_parse` below exercises it
-//! directly, now against a shard rather than the primary file). A real mutex
-//! around a shard's open-diff-write sequence would close that gap too; this is
-//! the file-layout half of that fix, landed first because it is what makes the
-//! remaining race small enough to be worth locking deliberately rather than
-//! papering over.
+//! The TUI is the *only* process that ever opens a journal for writing.
+//! `ambits find` briefly was a second writer — it showed source too, so it
+//! seemed fair for it to record what it showed — first sharing the primary
+//! file under an `O_APPEND` safety net, then (once that stopped feeling
+//! sound to lean on as the only guarantee) writing its own shard,
+//! `<session>.find.ndjson`, so the two processes never touched the same file
+//! at all. Both were real fixes to a real problem, but they were fixing the
+//! wrong layer: the actual goal was never "make two writers safe," it was
+//! "never need to ask whether two writers are safe." `find` no longer writes
+//! to the journal. A search run with no TUI attached to the session earns no
+//! coverage credit — an accepted, deliberate trade. Re-deriving credit from
+//! the session log after the fact was considered and rejected: replaying a
+//! `find` command and re-running its search would stamp *today's* file
+//! content against a read that happened whenever the TUI's tailer catches up
+//! to it, which is exactly the "vacuous comparison" this journal exists to
+//! avoid (see "Why this exists," above) — the very failure mode a `find`-only
+//! journal write was supposed to prevent in the first place.
+//!
+//! [`Journal::open_shard`], [`session_shard_paths`], and
+//! [`read_journal_session`] are kept rather than torn back out: they cost
+//! nothing to leave in place, they read a `<session>.find.ndjson` shard left
+//! over from before this change exactly as before (so upgrading does not
+//! orphan history), and shard-per-writer is still the right shape if a second
+//! writer is ever reintroduced deliberately, with a real reason to exist.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -598,12 +602,13 @@ impl Journal {
 
     /// Open a named shard of `session_id`'s journal: a file distinct from the
     /// primary `<session>.ndjson`, so this writer never appends to a file
-    /// another *kind* of writer might have open. `ambits find` opens the
-    /// `"find"` shard.
+    /// another *kind* of writer might have open.
     ///
-    /// Two callers opening the *same* shard concurrently (two `find`
-    /// invocations racing in one session) still share a file — see the
-    /// module doc's "Durability" section for why that remains safe.
+    /// Unused by anything today — see the module doc's "One writer" section —
+    /// kept as infrastructure a deliberately-reintroduced second writer could
+    /// use, and so an old `<session>.find.ndjson` shard from before that
+    /// section's change still reads back correctly via
+    /// [`session_shard_paths`]/[`read_journal_session`].
     pub fn open_shard(
         project_root: &Path,
         session_id: &str,

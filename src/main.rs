@@ -416,38 +416,6 @@ enum SkillCommands {
     },
 }
 
-/// Record the symbols a search showed, in this session's coverage journal.
-///
-/// Failure is never fatal: a search that answered correctly has done its job,
-/// and a journal that cannot be written costs coverage rather than an answer.
-fn journal_find_reads(
-    outcome: &ambits::find::Outcome,
-    session_id: &str,
-    project_path: &Path,
-    serena_backend: bool,
-    registry: &ParserRegistry,
-    filter: Option<&PathFilter>,
-) {
-    let backend = if serena_backend { "serena" } else { "tree-sitter" };
-    ambits::find::journal_reads(project_path, session_id, &outcome.shown, || {
-        // Only called when a header has to be written — once per session — so
-        // the whole-tree scan a fingerprint needs is not on the search path.
-        let tree = scan_tree(serena_backend, registry, project_path, filter)
-            .unwrap_or_else(|e| {
-                eprintln!("[ambit warning] journal header: {e}");
-                ambits::symbols::ProjectTree {
-                    root: project_path.to_path_buf(),
-                    files: Vec::new(),
-                }
-            });
-        ambits::journal::EnvironmentManifest::capture(
-            &tree,
-            backend,
-            filter.map(|f| f.display()),
-        )
-    });
-}
-
 /// Map `find`'s CLI arguments onto a walk and a search.
 ///
 /// Splitting positionals the way ripgrep does — the first is the pattern unless
@@ -704,18 +672,11 @@ fn main() -> Result<()> {
             coverage_index.as_ref(),
         ) {
             Ok(outcome) => {
-                if journal_enabled {
-                    if let Some(session) = session_id.as_deref() {
-                        journal_find_reads(
-                            &outcome,
-                            session,
-                            &project_path,
-                            cli.serena,
-                            &registry,
-                            filter.as_ref(),
-                        );
-                    }
-                }
+                // `find` no longer journals its own reads — the TUI is the
+                // sole journal writer now (see journal.rs's module doc). A
+                // search run with no TUI attached to the session earns no
+                // coverage credit; that is an accepted trade for never having
+                // two processes able to write the same session's journal.
                 if outcome.matched {
                     return Ok(());
                 }
