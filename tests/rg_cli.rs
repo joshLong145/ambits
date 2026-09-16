@@ -1,4 +1,4 @@
-//! Process-level tests for `ambits find`.
+//! Process-level tests for `ambits rg` — the ripgrep dialect.
 //!
 //! These run the built binary rather than the library, because the things worth
 //! pinning here only exist at that boundary: exit codes, which stream output
@@ -60,15 +60,16 @@ fn run(root: &Path, args: &[&str]) -> Output {
     }
 }
 
-/// `find` with a session, so journal writes have somewhere to go.
-fn find(root: &Path, args: &[&str]) -> Output {
-    let mut all = vec!["-s", "sess", "find"];
+/// `rg` with a session resolved, so coverage annotation has somewhere to look.
+fn rg(root: &Path, args: &[&str]) -> Output {
+    let mut all = vec!["-s", "sess", "rg"];
     all.extend_from_slice(args);
     run(root, &all)
 }
 
 fn journal(root: &Path) -> String {
-    // `find` writes its own shard, distinct from the primary file a running
+    // The `find` shard name is an on-disk format constant from when the CLI
+    // wrote its own journal, unrelated to the command's name — distinct from
     // TUI would write — see `journal::Journal::open_shard`.
     std::fs::read_to_string(root.join(".ambit/coverage/sess.find.ndjson")).unwrap_or_default()
 }
@@ -83,10 +84,10 @@ fn journal(root: &Path) -> String {
 fn exit_codes_follow_grep() {
     let dir = fixture();
 
-    assert_eq!(find(dir.path(), &["needle"]).code, 0, "matched");
-    assert_eq!(find(dir.path(), &["nosuchtext"]).code, 1, "no match");
+    assert_eq!(rg(dir.path(), &["needle"]).code, 0, "matched");
+    assert_eq!(rg(dir.path(), &["nosuchtext"]).code, 1, "no match");
 
-    let broken = find(dir.path(), &["fn ("]);
+    let broken = rg(dir.path(), &["fn ("]);
     assert_eq!(broken.code, 2, "a pattern that cannot compile is an error");
     assert!(
         broken.stderr.contains("invalid pattern"),
@@ -99,7 +100,7 @@ fn exit_codes_follow_grep() {
 #[test]
 fn a_path_outside_the_project_root_is_an_error() {
     let dir = fixture();
-    let outside = find(dir.path(), &["needle", "/etc"]);
+    let outside = rg(dir.path(), &["needle", "/etc"]);
 
     assert_eq!(outside.code, 2);
     assert!(
@@ -112,7 +113,7 @@ fn a_path_outside_the_project_root_is_an_error() {
 #[test]
 fn a_path_that_does_not_exist_is_an_error() {
     let dir = fixture();
-    let missing = find(dir.path(), &["needle", "src/nope"]);
+    let missing = rg(dir.path(), &["needle", "src/nope"]);
     assert_eq!(missing.code, 2);
     assert!(missing.stderr.contains("src/nope"), "{:?}", missing.stderr);
 }
@@ -125,14 +126,14 @@ fn a_path_that_does_not_exist_is_an_error() {
 fn path_arguments_narrow_the_search() {
     let dir = fixture();
 
-    let everywhere = find(dir.path(), &["needle", "-l"]);
+    let everywhere = rg(dir.path(), &["needle", "-l"]);
     assert!(everywhere.stdout.contains("src/lib.rs"));
     assert!(
         everywhere.stdout.contains("docs/notes.md"),
         "every text file is searched, not only parseable ones"
     );
 
-    let scoped = find(dir.path(), &["needle", "-l", "src"]);
+    let scoped = rg(dir.path(), &["needle", "-l", "src"]);
     assert!(scoped.stdout.contains("src/lib.rs"));
     assert!(!scoped.stdout.contains("docs/notes.md"), "PATH narrows it");
 }
@@ -141,15 +142,15 @@ fn path_arguments_narrow_the_search() {
 fn glob_and_type_filters_narrow_the_walk() {
     let dir = fixture();
 
-    let typed = find(dir.path(), &["needle", "-l", "-t", "rust"]);
+    let typed = rg(dir.path(), &["needle", "-l", "-t", "rust"]);
     assert!(typed.stdout.contains("src/lib.rs"));
     assert!(!typed.stdout.contains("notes.md"), "-t rust excludes md");
 
-    let globbed = find(dir.path(), &["needle", "-l", "-g", "*.md"]);
+    let globbed = rg(dir.path(), &["needle", "-l", "-g", "*.md"]);
     assert!(globbed.stdout.contains("notes.md"));
     assert!(!globbed.stdout.contains("lib.rs"), "-g selects");
 
-    let negated = find(dir.path(), &["needle", "-l", "-g", "!*.md"]);
+    let negated = rg(dir.path(), &["needle", "-l", "-g", "!*.md"]);
     assert!(!negated.stdout.contains("notes.md"), "!glob excludes");
 }
 
@@ -158,10 +159,10 @@ fn glob_and_type_filters_narrow_the_walk() {
 fn gitignored_files_are_skipped_unless_no_ignore() {
     let dir = fixture();
 
-    let default = find(dir.path(), &["needle", "-l"]);
+    let default = rg(dir.path(), &["needle", "-l"]);
     assert!(!default.stdout.contains("target/"), "/target is ignored");
 
-    let forced = find(dir.path(), &["needle", "-l", "--no-ignore"]);
+    let forced = rg(dir.path(), &["needle", "-l", "--no-ignore"]);
     assert!(forced.stdout.contains("target/generated.rs"));
 }
 
@@ -174,7 +175,7 @@ fn gitignored_files_are_skipped_unless_no_ignore() {
 #[test]
 fn the_withheld_trailer_goes_to_stderr_not_stdout() {
     let dir = fixture();
-    let capped = find(dir.path(), &["needle", "--head-limit", "1"]);
+    let capped = rg(dir.path(), &["needle", "--head-limit", "1"]);
 
     assert_eq!(capped.stdout.lines().count(), 1, "one match printed");
     assert!(!capped.stdout.contains("withheld"));
@@ -188,7 +189,7 @@ fn the_withheld_trailer_goes_to_stderr_not_stdout() {
 #[test]
 fn piped_output_is_one_flat_line_per_match() {
     let dir = fixture();
-    let out = find(dir.path(), &["needle", "-t", "rust"]);
+    let out = rg(dir.path(), &["needle", "-t", "rust"]);
 
     for line in out.stdout.lines() {
         let mut fields = line.splitn(4, ':');
@@ -208,7 +209,7 @@ fn piped_output_is_one_flat_line_per_match() {
 #[test]
 fn json_is_one_event_per_line() {
     let dir = fixture();
-    let out = find(dir.path(), &["needle", "-t", "rust", "--json"]);
+    let out = rg(dir.path(), &["needle", "-t", "rust", "--json"]);
 
     let events: Vec<serde_json::Value> = out
         .stdout
@@ -227,9 +228,9 @@ fn json_is_one_event_per_line() {
 
 /// The composition the whole pair exists for: search, then fetch.
 #[test]
-fn find_then_show_composes_on_the_emitted_id() {
+fn rg_then_show_composes_on_the_emitted_id() {
     let dir = fixture();
-    let out = find(dir.path(), &["fn needle", "-t", "rust", "--json"]);
+    let out = rg(dir.path(), &["fn needle", "-t", "rust", "--json"]);
     let id = out
         .stdout
         .lines()
@@ -255,7 +256,7 @@ fn find_then_show_composes_on_the_emitted_id() {
 // Journaling
 // ---------------------------------------------------------------------------
 
-/// `find` no longer writes its own journal entries — the TUI is the sole
+/// Neither dialect writes its own journal entries — the TUI is the sole
 /// writer now (see `journal.rs`'s module doc: relying on it exclusively means
 /// a session with no TUI attached earns no coverage credit from searches, an
 /// accepted trade for never having two processes able to write the same
@@ -267,14 +268,14 @@ fn a_search_never_journals_its_own_reads() {
     let dir = fixture();
     assert!(journal(dir.path()).is_empty(), "no journal to start with");
 
-    find(dir.path(), &["fn needle", "-t", "rust"]);
+    rg(dir.path(), &["fn needle", "-t", "rust"]);
     assert!(
         journal(dir.path()).is_empty(),
         "a search that matched and printed source still writes nothing"
     );
 
     for silent in [&["needle", "-l"][..], &["needle", "-c"], &["needle", "-q"]] {
-        find(dir.path(), silent);
+        rg(dir.path(), silent);
         assert!(journal(dir.path()).is_empty());
     }
 }
@@ -286,10 +287,10 @@ fn a_search_never_journals_its_own_reads() {
 fn a_second_identical_search_still_reports_unknown_depth() {
     let dir = fixture();
 
-    let first = find(dir.path(), &["fn needle", "-t", "rust"]);
+    let first = rg(dir.path(), &["fn needle", "-t", "rust"]);
     assert!(first.stdout.contains("[needle]"), "{:?}", first.stdout);
 
-    let second = find(dir.path(), &["fn needle", "-t", "rust"]);
+    let second = rg(dir.path(), &["fn needle", "-t", "rust"]);
     assert!(
         second.stdout.contains("[needle]") && !second.stdout.contains("[full needle]"),
         "no journal write means no read history to recover: {:?}",
@@ -306,7 +307,7 @@ fn a_second_identical_search_still_reports_unknown_depth() {
 fn files_without_match_lists_the_complement_of_files_with_matches() {
     let dir = fixture();
 
-    let out = find(dir.path(), &["needle", "-t", "rust", "--files-without-match"]);
+    let out = rg(dir.path(), &["needle", "-t", "rust", "--files-without-match"]);
     assert!(out.stdout.contains("src/util.rs"), "{:?}", out.stdout);
     assert!(!out.stdout.contains("src/lib.rs"), "lib.rs matched, so it is excluded: {:?}", out.stdout);
 }
@@ -314,7 +315,7 @@ fn files_without_match_lists_the_complement_of_files_with_matches() {
 #[test]
 fn files_without_match_conflicts_with_files_with_matches() {
     let dir = fixture();
-    let out = find(dir.path(), &["needle", "-l", "--files-without-match"]);
+    let out = rg(dir.path(), &["needle", "-l", "--files-without-match"]);
     assert_eq!(out.code, 2, "clap rejects the combination: {:?}", out.stderr);
 }
 
@@ -326,7 +327,7 @@ fn files_without_match_conflicts_with_files_with_matches() {
 #[test]
 fn type_list_needs_no_pattern_and_lists_known_types() {
     let dir = fixture();
-    let out = find(dir.path(), &["--type-list"]);
+    let out = rg(dir.path(), &["--type-list"]);
     assert_eq!(out.code, 0, "{:?}", out.stderr);
     assert!(out.stdout.lines().any(|l| l.starts_with("rust:") && l.contains(".rs")), "{:?}", out.stdout);
 }
@@ -342,7 +343,7 @@ fn pattern_file_patterns_join_the_alternation() {
     let patterns = dir.path().join("patterns.txt");
     std::fs::write(&patterns, "needle\n\nunrelated\n").unwrap();
 
-    let out = find(dir.path(), &["-t", "rust", "-l", "-f", patterns.to_str().unwrap()]);
+    let out = rg(dir.path(), &["-t", "rust", "-l", "-f", patterns.to_str().unwrap()]);
     assert!(out.stdout.contains("src/lib.rs"), "needle: {:?}", out.stdout);
     assert!(out.stdout.contains("src/util.rs"), "unrelated: {:?}", out.stdout);
 }
@@ -352,20 +353,20 @@ fn pattern_file_patterns_join_the_alternation() {
 #[test]
 fn a_missing_pattern_file_is_an_error() {
     let dir = fixture();
-    let out = find(dir.path(), &["-f", "does-not-exist.txt"]);
+    let out = rg(dir.path(), &["-f", "does-not-exist.txt"]);
     assert_eq!(out.code, 2);
     assert!(out.stderr.contains("does-not-exist.txt"), "{:?}", out.stderr);
 }
 
 /// An empty pattern file, with no -e/PATTERN either, is "no pattern given" —
-/// the same error as running find with nothing at all.
+/// the same error as running a search with nothing at all.
 #[test]
 fn an_empty_pattern_file_alone_is_no_pattern_given() {
     let dir = fixture();
     let patterns = dir.path().join("empty.txt");
     std::fs::write(&patterns, "\n\n").unwrap();
 
-    let out = find(dir.path(), &["-f", patterns.to_str().unwrap()]);
+    let out = rg(dir.path(), &["-f", patterns.to_str().unwrap()]);
     assert_eq!(out.code, 2);
     assert!(out.stderr.contains("no pattern given"), "{:?}", out.stderr);
 }

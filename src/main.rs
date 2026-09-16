@@ -180,17 +180,38 @@ enum Commands {
         max_bytes: Option<usize>,
     },
 
-    /// Search file contents, ripgrep-style, reporting the symbol each match
-    /// lands in and how deeply it has already been read.
+    /// Search file contents with ripgrep's flag set, reporting the symbol each
+    /// match lands in and how deeply it has already been read.
     ///
-    /// The flag set is ripgrep's, because Claude Code's `Grep` tool is
-    /// ripgrep-backed and that is the dialect agents already speak. Four
-    /// defaults deviate on purpose: results are always sorted by
-    /// `(path, line, column)`; `--head-limit` and `--max-columns` are capped,
-    /// because this output lands in a context window; and `--column` is on.
+    /// The dialect Claude Code's own `Grep` tool speaks, so it is the one an
+    /// agent most likely already knows. Four defaults deviate on purpose:
+    /// results are always sorted by `(path, line, column)`; `--head-limit` and
+    /// `--max-columns` are capped, because this output lands in a context
+    /// window; and `--column` is on.
     ///
     /// Exits 0 when something matched, 1 when nothing did, 2 on error.
-    Find(FindArgs),
+    Rg(RgArgs),
+
+    /// The same search with GNU grep's flag set.
+    ///
+    /// Exists because grep and ripgrep give the same short flags opposite
+    /// meanings — `-L`, `-z` and `-r` each mean one thing in one tool and
+    /// something else in the other — so no single namespace can be faithful to
+    /// both. Line numbers and columns are off by default here, as in grep;
+    /// `-h` is `--no-filename`, not help.
+    ///
+    /// One deliberate infidelity: the search is recursive by default. Scoping
+    /// to a project is what ambit is for, and `-r`/`-R` are accepted as no-ops
+    /// so a habitual `grep -r` still works.
+    ///
+    /// Exits 0 when something matched, 1 when nothing did, 2 on error.
+    // `-h` belongs to --no-filename here, so clap's auto-generated help flag
+    // has to be removed and replaced by the long-only one on `GrepArgs`.
+    // Without this, clap panics on a duplicate short — but only in debug
+    // builds, where its assertions run, so a release smoke test will not
+    // notice.
+    #[command(disable_help_flag = true)]
+    Grep(GrepArgs),
 
     /// List the call sites of a function, and which symbol each sits in.
     ///
@@ -216,9 +237,9 @@ enum Commands {
     },
 }
 
-/// `ambits find` — ripgrep's flag set, plus the symbol column.
+/// `ambits rg` — ripgrep's flag set, plus the symbol column.
 #[derive(clap::Args, Debug)]
-struct FindArgs {
+struct RgArgs {
         /// PATTERN, then optional PATHs. Every argument is a PATH when `-e` is
         /// given, exactly as in ripgrep.
         #[arg(value_name = "PATTERN|PATH")]
@@ -368,6 +389,173 @@ struct FindArgs {
         json: bool,
 }
 
+/// `ambits grep` — GNU grep's flag set over the same engine.
+///
+/// Only the flags whose *meaning* differs from `ambits rg` need explaining
+/// here; everything shared (`-i`, `-v`, `-w`, `-x`, `-F`, `-e`, `-f`, context,
+/// `-m`, `-q`, `-o`, `-c`, `-l`) means what it means in both tools.
+#[derive(clap::Args, Debug)]
+struct GrepArgs {
+    /// PATTERN, then optional PATHs. Every argument is a PATH when -e or -f
+    /// is given.
+    #[arg(value_name = "PATTERN|PATH")]
+    args: Vec<String>,
+
+    /// Additional pattern. Repeatable; combined as an alternation.
+    #[arg(short = 'e', long = "regexp", value_name = "PATTERN")]
+    regexp: Vec<String>,
+
+    /// Additional pattern(s), one per line, read from a file.
+    #[arg(short = 'f', long = "file", value_name = "PATTERNFILE")]
+    pattern_file: Vec<PathBuf>,
+
+    /// Treat patterns as literal strings.
+    #[arg(short = 'F', long)]
+    fixed_strings: bool,
+
+    /// Accepted for compatibility. One regex engine, close enough to ERE for
+    /// anything portable; no behaviour change.
+    #[arg(short = 'E', long)]
+    extended_regexp: bool,
+
+    /// Accepted for compatibility. See --extended-regexp.
+    #[arg(short = 'G', long)]
+    basic_regexp: bool,
+
+    /// Rejected, deliberately. The regex crate has no lookaround or
+    /// backreferences, so a PCRE pattern would silently match something else
+    /// rather than fail.
+    #[arg(short = 'P', long)]
+    perl_regexp: bool,
+
+    /// Case-insensitive matching.
+    #[arg(short, long)]
+    ignore_case: bool,
+
+    /// Match only whole words.
+    #[arg(short, long)]
+    word_regexp: bool,
+
+    /// Match only whole lines.
+    #[arg(short = 'x', long)]
+    line_regexp: bool,
+
+    /// Report non-matching lines instead.
+    #[arg(short = 'v', long)]
+    invert_match: bool,
+
+    /// Accepted as a no-op: the search is always recursive.
+    #[arg(short = 'r', long)]
+    recursive: bool,
+
+    /// Accepted as a no-op. See --recursive.
+    #[arg(short = 'R', long)]
+    dereference_recursive: bool,
+
+    /// Search only files matching this glob. Repeatable.
+    #[arg(long, value_name = "GLOB")]
+    include: Vec<String>,
+
+    /// Skip files matching this glob. Repeatable.
+    #[arg(long, value_name = "GLOB")]
+    exclude: Vec<String>,
+
+    /// Skip directories matching this glob, and everything under them.
+    #[arg(long, value_name = "DIR")]
+    exclude_dir: Vec<String>,
+
+    /// Prefix each match with its line number. Off by default, as in grep.
+    #[arg(short = 'n', long)]
+    line_number: bool,
+
+    /// Also print the column of each match. Not a grep flag; ambit's own
+    /// output carries one when asked.
+    #[arg(long)]
+    column: bool,
+
+    /// Print the path on each line (the default).
+    #[arg(short = 'H', long, overrides_with = "no_filename")]
+    with_filename: bool,
+
+    /// Omit the path from each line.
+    #[arg(short = 'h', long)]
+    no_filename: bool,
+
+    /// Terminate each path with NUL instead of the usual separator, for
+    /// `xargs -0`.
+    #[arg(short = 'Z', long = "null")]
+    null: bool,
+
+    /// Rejected: NUL-separated *input* lines would change what a line is for
+    /// matching, attribution and context alike.
+    #[arg(short = 'z', long)]
+    null_data: bool,
+
+    /// Print only the matched part of each line.
+    #[arg(short, long)]
+    only_matching: bool,
+
+    /// Print only the paths of files with a match.
+    #[arg(short = 'l', long, conflicts_with_all = ["count", "quiet", "files_without_match"])]
+    files_with_matches: bool,
+
+    /// Print only the paths of files with no match.
+    #[arg(short = 'L', long, conflicts_with_all = ["count", "quiet"])]
+    files_without_match: bool,
+
+    /// Print only a count of matching lines per file.
+    #[arg(short, long, conflicts_with = "quiet")]
+    count: bool,
+
+    /// Print nothing; the exit code is the answer.
+    #[arg(short, long)]
+    quiet: bool,
+
+    /// Lines of context after each match.
+    #[arg(short = 'A', long, default_value_t = 0, value_name = "N")]
+    after_context: usize,
+
+    /// Lines of context before each match.
+    #[arg(short = 'B', long, default_value_t = 0, value_name = "N")]
+    before_context: usize,
+
+    /// Lines of context around each match.
+    #[arg(short = 'C', long, value_name = "N")]
+    context: Option<usize>,
+
+    /// Stop after this many matches per file.
+    #[arg(short = 'm', long, value_name = "NUM")]
+    max_count: Option<usize>,
+
+    /// Truncate lines longer than this, marking the cut. 0 for unlimited.
+    #[arg(long, default_value_t = ambits::search::DEFAULT_MAX_COLUMNS, value_name = "NUM")]
+    max_columns: usize,
+
+    /// Cap total matches across all files. 0 for unlimited.
+    #[arg(long, default_value_t = ambits::search::DEFAULT_HEAD_LIMIT, value_name = "NUM")]
+    head_limit: usize,
+
+    /// Search hidden files and directories.
+    #[arg(long)]
+    hidden: bool,
+
+    /// Ignore .gitignore and friends.
+    #[arg(long)]
+    no_ignore: bool,
+
+    /// Omit the symbol column.
+    #[arg(long)]
+    no_symbol: bool,
+
+    /// When to colorize output.
+    #[arg(long, value_enum, default_value = "auto", value_name = "WHEN")]
+    color: ColorWhen,
+
+    /// Print help. Long-only: `-h` is --no-filename here, as in grep.
+    #[arg(long, action = clap::ArgAction::Help)]
+    help: Option<bool>,
+}
+
 #[derive(Subcommand, Debug)]
 enum CacheCommands {
     /// List the coverage journals on disk with their size and age.
@@ -449,37 +637,45 @@ enum SkillCommands {
     },
 }
 
-/// Map `find`'s CLI arguments onto a walk and a search.
+/// What a dialect hands the shared search engine.
 ///
-/// Splitting positionals the way ripgrep does — the first is the pattern unless
-/// `-e` was given, in which case every one of them is a path — is the only part
-/// of this that is not a direct field-for-field mapping.
-fn run_find(
-    args: &FindArgs,
-    registry: &ParserRegistry,
-    project_path: &Path,
-    filter: Option<&PathFilter>,
-    coverage: Option<&ambits::restore::CoverageIndex>,
-) -> Result<ambits::search::Outcome> {
-    use ambits::search::{ColorChoice, Options, OutputMode};
-    use ambits::parser::{walk_files, WalkOptions};
+/// Both `ambits grep` and `ambits rg` reduce to this; nothing below here knows
+/// which one was typed.
+struct SearchRequest {
+    options: ambits::search::Options,
+    roots: Vec<PathBuf>,
+    overrides: Option<ignore::overrides::Override>,
+    types: Option<ignore::types::Types>,
+    hidden: bool,
+    no_ignore: bool,
+}
+
+/// Split positionals into patterns and paths, then fold in `-e` and `-f`.
+///
+/// The first positional is the pattern unless `-e`/`-f` supplied one, in which
+/// case every positional is a path — ripgrep's rule, and grep's.
+fn assemble_patterns(
+    positional: &[String],
+    regexp: &[String],
+    pattern_files: &[PathBuf],
+) -> Result<(Vec<String>, Vec<String>)> {
     use color_eyre::eyre::eyre;
 
-    let (mut patterns, paths): (Vec<String>, &[String]) = if args.regexp.is_empty() {
-        match args.args.split_first() {
-            Some((pattern, rest)) => (vec![pattern.clone()], rest),
-            None => (Vec::new(), &[]),
-        }
+    let supplied = !regexp.is_empty() || !pattern_files.is_empty();
+    let (mut patterns, paths): (Vec<String>, Vec<String>) = if supplied {
+        (regexp.to_vec(), positional.to_vec())
     } else {
-        (args.regexp.clone(), args.args.as_slice())
+        match positional.split_first() {
+            Some((pattern, rest)) => (vec![pattern.clone()], rest.to_vec()),
+            None => (Vec::new(), Vec::new()),
+        }
     };
 
-    // `-f`: one pattern per non-empty line, combined into the same
-    // alternation as -e/PATTERN — the contract already documented for -e.
-    // A missing or unreadable file is an expected, actionable failure (not a
-    // bug), so it propagates through `?` to the tool's own "2 on error" exit
-    // code rather than panicking or being silently skipped.
-    for path in &args.pattern_file {
+    // One pattern per non-empty line, joined into the same alternation as
+    // -e/PATTERN. A missing or unreadable file is an expected, actionable
+    // failure, so it propagates to the "2 on error" exit code rather than
+    // panicking or being silently skipped.
+    for path in pattern_files {
         let text = std::fs::read_to_string(path)
             .map_err(|e| eyre!("{}: {e}", path.display()))?;
         patterns.extend(text.lines().filter(|l| !l.is_empty()).map(str::to_string));
@@ -488,14 +684,19 @@ fn run_find(
     if patterns.is_empty() {
         return Err(eyre!("no pattern given"));
     }
+    Ok((patterns, paths))
+}
 
-    // PATH arguments resolve against the working directory, as grep's do, and
-    // are then walked directly — walking only what was asked for beats walking
-    // the project and discarding most of it.
+/// Resolve PATH arguments against the working directory, as grep's are.
+///
+/// Walking only what was asked for beats walking the project and discarding
+/// most of it, so these become walk roots rather than another filter.
+fn resolve_roots(paths: &[String], project_path: &Path) -> Result<Vec<PathBuf>> {
+    use color_eyre::eyre::eyre;
+
     let mut roots = Vec::with_capacity(paths.len());
     for raw in paths {
-        let resolved = std::fs::canonicalize(raw)
-            .map_err(|e| eyre!("{raw}: {e}"))?;
+        let resolved = std::fs::canonicalize(raw).map_err(|e| eyre!("{raw}: {e}"))?;
         if !resolved.starts_with(project_path) {
             return Err(eyre!(
                 "{raw} is outside the project root {}",
@@ -504,27 +705,57 @@ fn run_find(
         }
         roots.push(resolved);
     }
+    Ok(roots)
+}
 
-    let overrides = if args.glob.is_empty() {
-        None
-    } else {
-        let mut builder = ignore::overrides::OverrideBuilder::new(project_path);
-        for glob in &args.glob {
-            builder.add(glob).map_err(|e| eyre!("invalid glob {glob:?}: {e}"))?;
-        }
-        Some(builder.build()?)
-    };
+fn build_overrides(
+    globs: &[String],
+    project_path: &Path,
+) -> Result<Option<ignore::overrides::Override>> {
+    use color_eyre::eyre::eyre;
 
-    let types = if args.file_type.is_empty() {
-        None
-    } else {
-        let mut builder = ignore::types::TypesBuilder::new();
-        builder.add_defaults();
-        for name in &args.file_type {
-            builder.select(name);
-        }
-        Some(builder.build().map_err(|e| eyre!("invalid --type: {e}"))?)
-    };
+    if globs.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = ignore::overrides::OverrideBuilder::new(project_path);
+    for glob in globs {
+        builder
+            .add(glob)
+            .map_err(|e| eyre!("invalid glob {glob:?}: {e}"))?;
+    }
+    Ok(Some(builder.build()?))
+}
+
+fn build_types(names: &[String]) -> Result<Option<ignore::types::Types>> {
+    use color_eyre::eyre::eyre;
+
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = ignore::types::TypesBuilder::new();
+    builder.add_defaults();
+    for name in names {
+        builder.select(name);
+    }
+    Ok(Some(
+        builder.build().map_err(|e| eyre!("invalid --type: {e}"))?,
+    ))
+}
+
+fn color_choice(when: ColorWhen) -> ambits::search::ColorChoice {
+    use ambits::search::ColorChoice;
+    match when {
+        ColorWhen::Auto => ColorChoice::Auto,
+        ColorWhen::Always => ColorChoice::Always,
+        ColorWhen::Never => ColorChoice::Never,
+    }
+}
+
+/// `ambits rg` — ripgrep's dialect.
+fn request_from_rg(args: &RgArgs, project_path: &Path) -> Result<SearchRequest> {
+    use ambits::search::{Options, OutputMode};
+
+    let (patterns, paths) = assemble_patterns(&args.args, &args.regexp, &args.pattern_file)?;
 
     let mode = if args.quiet {
         OutputMode::Quiet
@@ -540,52 +771,157 @@ fn run_find(
         OutputMode::Content
     };
 
-    let options = Options {
-        patterns,
-        fixed_strings: args.fixed_strings,
-        ignore_case: args.ignore_case,
-        word_regexp: args.word_regexp,
-        line_regexp: args.line_regexp,
-        multiline: args.multiline,
-        invert_match: args.invert_match,
-        mode,
-        json: args.json,
-        heading: match (args.heading, args.no_heading) {
-            (true, false) => Some(true),
-            (false, true) => Some(false),
-            // Neither, or both via `overrides_with`: follow the terminal.
-            _ => None,
+    Ok(SearchRequest {
+        options: Options {
+            patterns,
+            fixed_strings: args.fixed_strings,
+            ignore_case: args.ignore_case,
+            word_regexp: args.word_regexp,
+            line_regexp: args.line_regexp,
+            multiline: args.multiline,
+            invert_match: args.invert_match,
+            mode,
+            json: args.json,
+            heading: match (args.heading, args.no_heading) {
+                (true, false) => Some(true),
+                (false, true) => Some(false),
+                // Neither, or both via `overrides_with`: follow the terminal.
+                _ => None,
+            },
+            line_number: !args.no_line_number,
+            column: !args.no_column,
+            only_matching: args.only_matching,
+            vimgrep: args.vimgrep,
+            before_context: args.context.unwrap_or(args.before_context),
+            after_context: args.context.unwrap_or(args.after_context),
+            max_columns: args.max_columns,
+            max_count: args.max_count,
+            head_limit: args.head_limit,
+            no_symbol: args.no_symbol,
+            show_filename: true,
+            null_separator: false,
+            color: color_choice(args.color),
         },
-        line_number: !args.no_line_number,
-        column: !args.no_column,
-        only_matching: args.only_matching,
-        vimgrep: args.vimgrep,
-        before_context: args.context.unwrap_or(args.before_context),
-        after_context: args.context.unwrap_or(args.after_context),
-        max_columns: args.max_columns,
-        max_count: args.max_count,
-        head_limit: args.head_limit,
-        no_symbol: args.no_symbol,
-        color: match args.color {
-            ColorWhen::Auto => ColorChoice::Auto,
-            ColorWhen::Always => ColorChoice::Always,
-            ColorWhen::Never => ColorChoice::Never,
-        },
+        roots: resolve_roots(&paths, project_path)?,
+        overrides: build_overrides(&args.glob, project_path)?,
+        types: build_types(&args.file_type)?,
+        hidden: args.hidden,
+        no_ignore: args.no_ignore,
+    })
+}
+
+/// `ambits grep` — GNU grep's dialect.
+///
+/// The translation is mostly one-to-one; what differs is which letters carry
+/// which meaning, plus three flags that cannot be honoured and say so rather
+/// than pretending.
+fn request_from_grep(args: &GrepArgs, project_path: &Path) -> Result<SearchRequest> {
+    use ambits::search::{Options, OutputMode};
+    use color_eyre::eyre::eyre;
+
+    if args.perl_regexp {
+        return Err(eyre!(
+            "-P/--perl-regexp is not supported: this searches with the regex crate, \
+             which has no lookaround or backreferences, so a PCRE pattern would \
+             match something other than what it says"
+        ));
+    }
+    if args.null_data {
+        return Err(eyre!(
+            "-z/--null-data is not supported: NUL-separated input would change what \
+             a line is for matching, symbol attribution and context alike"
+        ));
+    }
+
+    let (patterns, paths) = assemble_patterns(&args.args, &args.regexp, &args.pattern_file)?;
+
+    // grep's include/exclude map onto the same glob engine `rg -g` uses; the
+    // only translation is that grep spells exclusion with a separate flag
+    // where rg spells it with a leading `!`.
+    let mut globs: Vec<String> = args.include.clone();
+    globs.extend(args.exclude.iter().map(|g| format!("!{g}")));
+    // A directory exclusion has to name what is *under* it, since the globs
+    // are matched against file paths.
+    globs.extend(
+        args.exclude_dir
+            .iter()
+            .flat_map(|d| [format!("!{d}/**"), format!("!**/{d}/**")]),
+    );
+
+    let mode = if args.quiet {
+        OutputMode::Quiet
+    } else if args.files_with_matches {
+        OutputMode::FilesWithMatches
+    } else if args.files_without_match {
+        OutputMode::FilesWithoutMatch
+    } else if args.count {
+        OutputMode::Count
+    } else {
+        OutputMode::Content
     };
+
+    Ok(SearchRequest {
+        options: Options {
+            patterns,
+            fixed_strings: args.fixed_strings,
+            ignore_case: args.ignore_case,
+            word_regexp: args.word_regexp,
+            line_regexp: args.line_regexp,
+            // grep has no multiline mode; a pattern that wants one can still
+            // say `(?m)` for itself.
+            multiline: false,
+            invert_match: args.invert_match,
+            mode,
+            json: false,
+            // grep has no heading mode at all.
+            heading: Some(false),
+            // Both off by default here, unlike the rg dialect: `grep -n` is
+            // opt-in, and grep has no column at all.
+            line_number: args.line_number,
+            column: args.column,
+            only_matching: args.only_matching,
+            vimgrep: false,
+            before_context: args.context.unwrap_or(args.before_context),
+            after_context: args.context.unwrap_or(args.after_context),
+            max_columns: args.max_columns,
+            max_count: args.max_count,
+            head_limit: args.head_limit,
+            no_symbol: args.no_symbol,
+            show_filename: !args.no_filename,
+            null_separator: args.null,
+            color: color_choice(args.color),
+        },
+        roots: resolve_roots(&paths, project_path)?,
+        overrides: build_overrides(&globs, project_path)?,
+        types: None,
+        hidden: args.hidden,
+        no_ignore: args.no_ignore,
+    })
+}
+
+/// Walk, search, and report — the half both dialects share.
+fn execute(
+    request: SearchRequest,
+    registry: &ParserRegistry,
+    project_path: &Path,
+    filter: Option<&PathFilter>,
+    coverage: Option<&ambits::restore::CoverageIndex>,
+) -> Result<ambits::search::Outcome> {
+    use ambits::parser::{walk_files, WalkOptions};
 
     let targets = walk_files(
         project_path,
         &WalkOptions {
             filter,
-            overrides,
-            types,
-            hidden: args.hidden,
-            no_ignore: args.no_ignore,
-            roots,
+            overrides: request.overrides,
+            types: request.types,
+            hidden: request.hidden,
+            no_ignore: request.no_ignore,
+            roots: request.roots,
         },
     );
 
-    ambits::search::run(registry, &targets, &options, coverage)
+    ambits::search::run(registry, &targets, &request.options, coverage)
 }
 
 /// Build the project symbol tree with whichever backend was selected.
@@ -701,52 +1037,63 @@ fn main() -> Result<()> {
     // not confuse with "nothing has been read".
     let coverage_index = ambits::restore::CoverageIndex::load(&project_path, session_id.as_deref());
 
-    // `find` runs before the project-wide scan, the way `cache` does. A content
-    // search reads the files it walks and parses only the ones that match, so
-    // paying for a full parse first would be paying for work it discards. The
-    // tree it still asks for here is temporary scaffolding.
-    if let Some(Commands::Find(args)) = &command {
+    // Both search dialects run before the project-wide scan, the way `cache`
+    // does. A content search reads the files it walks and parses only the ones
+    // that match, so paying for a full parse first would be paying for work it
+    // discards.
+    let search = match &command {
+        Some(Commands::Rg(args)) => {
+            // Takes no PATTERN, so it is handled before the pattern-required
+            // path — reuses the same TypesBuilder `-t` itself builds, calling
+            // `.definitions()` on it before `.build()`.
+            if args.type_list {
+                let mut builder = ignore::types::TypesBuilder::new();
+                builder.add_defaults();
+                let mut defs = builder.definitions();
+                defs.sort_by(|a, b| a.name().cmp(b.name()));
+                for def in defs {
+                    println!("{}: {}", def.name(), def.globs().join(", "));
+                }
+                return Ok(());
+            }
+            Some(("rg", request_from_rg(args, &project_path)))
+        }
+        Some(Commands::Grep(args)) => Some(("grep", request_from_grep(args, &project_path))),
+        _ => None,
+    };
+
+    if let Some((dialect, request)) = search {
         for w in &config_warnings {
             eprintln!("[ambit warning] {w}");
-        }
-
-        // Takes no PATTERN, so it is handled before the pattern-required
-        // path below ever runs — reuses the same TypesBuilder that `-t`
-        // itself builds, just calling `.definitions()` on it before `.build()`.
-        if args.type_list {
-            let mut builder = ignore::types::TypesBuilder::new();
-            builder.add_defaults();
-            let mut defs = builder.definitions();
-            defs.sort_by(|a, b| a.name().cmp(b.name()));
-            for def in defs {
-                println!("{}: {}", def.name(), def.globs().join(", "));
-            }
-            return Ok(());
         }
 
         // grep's exit codes, which agents chain on: 0 matched, 1 did not,
         // 2 something went wrong. `color_eyre` would exit 1 for an error,
         // which is indistinguishable from an honest "no match".
-        match run_find(
-            args,
-            &registry,
-            &project_path,
-            filter.as_ref(),
-            coverage_index.as_ref(),
-        ) {
+        let outcome = request.and_then(|request| {
+            execute(
+                request,
+                &registry,
+                &project_path,
+                filter.as_ref(),
+                coverage_index.as_ref(),
+            )
+        });
+
+        match outcome {
             Ok(outcome) => {
-                // `find` no longer journals its own reads — the TUI is the
-                // sole journal writer now (see journal.rs's module doc). A
-                // search run with no TUI attached to the session earns no
-                // coverage credit; that is an accepted trade for never having
-                // two processes able to write the same session's journal.
+                // Neither dialect journals its own reads — the TUI is the sole
+                // journal writer (see journal.rs's module doc). A search run
+                // with no TUI attached to the session earns no coverage credit;
+                // that is an accepted trade for never having two processes able
+                // to write the same session's journal.
                 if outcome.matched {
                     return Ok(());
                 }
                 std::process::exit(1)
             }
             Err(e) => {
-                eprintln!("ambits find: {e:#}");
+                eprintln!("ambits {dialect}: {e:#}");
                 std::process::exit(2);
             }
         }

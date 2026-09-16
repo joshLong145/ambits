@@ -180,6 +180,13 @@ pub struct Options {
     pub head_limit: usize,
     /// Drop the attribution field entirely, for byte-identical rg output.
     pub no_symbol: bool,
+    /// Print the path on each match line. `grep`'s `-h`/`-H`; ripgrep has no
+    /// equivalent, so the rg dialect leaves this `true`.
+    pub show_filename: bool,
+    /// Terminate the path with NUL instead of the field separator — `grep -Z`,
+    /// for piping into `xargs -0`. Only the path is affected; line and column
+    /// keep their separators, as in GNU grep.
+    pub null_separator: bool,
     pub color: ColorChoice,
 }
 
@@ -195,6 +202,7 @@ impl Options {
             column: true,
             max_columns: DEFAULT_MAX_COLUMNS,
             head_limit: DEFAULT_HEAD_LIMIT,
+            show_filename: true,
             ..Default::default()
         }
     }
@@ -711,9 +719,30 @@ fn body(hit: &Hit, opts: &Options, color: bool) -> (String, bool) {
     (shown, truncated)
 }
 
+/// What ends a bare path in the listing modes.
+///
+/// `grep -lZ` NUL-terminates each path so it can be piped into `xargs -0`,
+/// where a newline would split a path containing one. The rg dialect never sets
+/// this and gets the newline.
+fn path_terminator(opts: &Options) -> char {
+    if opts.null_separator {
+        '\0'
+    } else {
+        '\n'
+    }
+}
+
 /// `path:line:col:` — or the `-` separated form context lines use.
 fn locate(path: &Path, line: u32, column: Option<u32>, opts: &Options, sep: char) -> String {
-    let mut out = format!("{}{sep}", path.display());
+    let mut out = if !opts.show_filename {
+        String::new()
+    } else if opts.null_separator {
+        // GNU grep's `-Z` replaces only the separator that follows the path,
+        // so `-nZ` still prints `path\0line:`.
+        format!("{}\0", path.display())
+    } else {
+        format!("{}{sep}", path.display())
+    };
     if opts.line_number {
         out.push_str(&format!("{line}{sep}"));
         if let Some(c) = column {
@@ -1028,7 +1057,7 @@ pub fn run(
         OutputMode::Content => print_content(&mut w, &files, opts, coverage.is_some())?,
         OutputMode::FilesWithMatches => {
             for file in &files {
-                writeln!(w, "{}", file.path.display())?;
+                write!(w, "{}{}", file.path.display(), path_terminator(opts))?;
             }
         }
         // The complement of `-l`: `files` only ever holds files with at
@@ -1039,7 +1068,7 @@ pub fn run(
                 files.iter().map(|f| f.path.as_path()).collect();
             for (_, rel) in targets {
                 if !matched.contains(rel.as_path()) {
-                    writeln!(w, "{}", rel.display())?;
+                    write!(w, "{}{}", rel.display(), path_terminator(opts))?;
                 }
             }
         }
