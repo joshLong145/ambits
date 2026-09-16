@@ -1,15 +1,21 @@
-//! Content search with symbol attribution, for `ambits find`.
+//! Content search with symbol attribution: the engine behind `ambits grep` and
+//! `ambits rg`.
 //!
-//! ## Why this is shaped like ripgrep
+//! ## One engine, two dialects
 //!
-//! The interface is not ours to invent. Claude Code's `Grep` tool is
-//! ripgrep-backed, so every agent that reaches for this already knows `-g`,
-//! `-t`, `-i`, `-A/-B/-C`, `-l`, `-c`. A bespoke grammar — this command had one
-//! — is a second dialect to learn for no gain. Where `grep(1)` and `rg`
-//! disagree, `rg` wins; where `rg` and ambit's own conventions disagree, `rg`
-//! still wins.
+//! The interface is not ours to invent, and there is no single interface to
+//! borrow: `grep(1)` and ripgrep assign *opposite* meanings to the same short
+//! flags. `-L` is `--files-without-match` in grep and `--follow` in rg; `-z` is
+//! `--null-data` against `--search-zip`; `-r` is `--recursive` against
+//! `--replace`. No one flag namespace can be faithful to both, so the CLI
+//! carries two — `ambits grep` and `ambits rg` — and both translate down to the
+//! [`Options`] this module executes. Nothing here knows which one called it.
 //!
-//! We deviate in four places, each on purpose: output is always sorted by
+//! Claude Code's own `Grep` tool is ripgrep-backed, so `rg` is the dialect an
+//! agent is most likely to already speak; `grep` exists for the muscle memory
+//! of everyone else.
+//!
+//! We deviate from both in four places, each on purpose: output is always sorted by
 //! `(path, line, column)`, because determinism is worth more to an agent than
 //! the microseconds; `--head-limit` and `--max-columns` carry non-zero defaults,
 //! because this output lands in a context window rather than a terminal; and

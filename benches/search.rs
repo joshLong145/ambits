@@ -1,4 +1,4 @@
-//! Benchmarks for `ambits find`.
+//! Benchmarks for the search engine shared by `ambits grep` and `ambits rg`.
 //!
 //! The pair that matters is `search_without_matches` against
 //! `search_with_matches` over the same corpus. A search parses only the files
@@ -12,7 +12,7 @@ mod fixtures;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use ambits::find::{search, Matcher, Options};
+use ambits::search::{search, Matcher, Options};
 use ambits::parser::ParserRegistry;
 use fixtures::rust_source;
 

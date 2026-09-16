@@ -68,7 +68,7 @@ name = "symbol_pipeline"
 harness = false
 
 [[bench]]
-name = "find"
+name = "search"
 harness = false
 
 [[bin]]

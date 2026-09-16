@@ -331,12 +331,12 @@ struct FindArgs {
         max_count: Option<usize>,
 
         /// Truncate lines longer than this, marking the cut. 0 for unlimited.
-        #[arg(short = 'M', long, default_value_t = ambits::find::DEFAULT_MAX_COLUMNS, value_name = "NUM")]
+        #[arg(short = 'M', long, default_value_t = ambits::search::DEFAULT_MAX_COLUMNS, value_name = "NUM")]
         max_columns: usize,
 
         /// Cap total matches across all files. 0 for unlimited. Not a ripgrep
         /// flag: unbounded output is a hazard in a context window.
-        #[arg(long, default_value_t = ambits::find::DEFAULT_HEAD_LIMIT, value_name = "NUM")]
+        #[arg(long, default_value_t = ambits::search::DEFAULT_HEAD_LIMIT, value_name = "NUM")]
         head_limit: usize,
 
         /// Search hidden files and directories.
@@ -460,8 +460,8 @@ fn run_find(
     project_path: &Path,
     filter: Option<&PathFilter>,
     coverage: Option<&ambits::restore::CoverageIndex>,
-) -> Result<ambits::find::Outcome> {
-    use ambits::find::{ColorChoice, Options, OutputMode};
+) -> Result<ambits::search::Outcome> {
+    use ambits::search::{ColorChoice, Options, OutputMode};
     use ambits::parser::{walk_files, WalkOptions};
     use color_eyre::eyre::eyre;
 
@@ -585,7 +585,7 @@ fn run_find(
         },
     );
 
-    ambits::find::run(registry, &targets, &options, coverage)
+    ambits::search::run(registry, &targets, &options, coverage)
 }
 
 /// Build the project symbol tree with whichever backend was selected.
