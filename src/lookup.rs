@@ -77,7 +77,7 @@ pub fn parse_selector(query: &str) -> Selector {
     }
 }
 
-/// One matched symbol. Shared with `ambits find` so both commands describe a
+/// One matched symbol. Shared with the search commands so they describe a
 /// symbol identically and their output composes — `find` locates, `show`
 /// reads, and a caller can hand the `id` straight from one to the other.
 #[derive(Serialize)]

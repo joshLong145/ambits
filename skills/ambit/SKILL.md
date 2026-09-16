@@ -125,18 +125,30 @@ is safe to re-run. When there is nothing to restore it emits nothing.
 
 ### Searching code
 
-`find` is a grep. The pattern is a regular expression over file **content**, and
-the flags are ripgrep's — which is what your own `Grep` tool is built on, so the
-dialect you already know applies here:
+Two commands, one search. **Use `ambits rg`** — it is ripgrep's flag set, which
+is what your own `Grep` tool is built on, so the dialect you already know
+applies:
 
 ```bash
-ambits -p . find 'depth_of'                  # every use and definition
-ambits -p . find 'fn enclosing' -t rust      # one file type
-ambits -p . find 'TODO' -g '!tests/**'       # globs; ! excludes
-ambits -p . find 'Journal::open' -A 3        # with trailing context
-ambits -p . find 'unwrap\(\)' -c             # matching lines per file
-ambits -p . find 'Matcher' src/find.rs       # scoped to paths
+ambits -p . rg 'depth_of'                  # every use and definition
+ambits -p . rg 'fn enclosing' -t rust      # one file type
+ambits -p . rg 'TODO' -g '!tests/**'       # globs; ! excludes
+ambits -p . rg 'Journal::open' -A 3        # with trailing context
+ambits -p . rg 'unwrap\(\)' -c             # matching lines per file
+ambits -p . rg 'Matcher' src/search.rs     # scoped to paths
 ```
+
+`ambits grep` runs the same search with GNU grep's flags instead. It exists
+because the two tools give the same letters opposite meanings — `-L` is
+`--files-without-match` in grep and `--follow` in rg, `-z` is `--null-data`
+against `--search-zip`, `-r` is `--recursive` against `--replace` — so one
+command could not be honest about both. Reach for it only if you are writing
+grep by habit; everything below describes `rg`.
+
+Under `grep`, line numbers are opt-in (`-n`) and there is no column, as in real
+grep; `-h` is `--no-filename`, so help is `--help` only. `-P` is refused rather
+than accepted, because this engine has no lookaround and would otherwise match
+something other than what your pattern says.
 
 What makes it worth using over `Grep`: every match says which symbol it landed
 in, and how deeply you have already read that symbol.
@@ -193,7 +205,7 @@ Matching is by callee **name** — tree-sitter does not resolve which definition
 a call binds to. Most names are unique, but `callers new` returns calls to
 every `new`. `--format json` marks this with `name_matched_only: true`.
 
-Prefer this over `find` when you want calls specifically: `find 'centered_rect'`
+Prefer this over a search when you want calls specifically: `rg 'centered_rect'`
 returns the definition, the doc comments mentioning it, and the call sites all
 mixed together, while `callers` returns call nodes only.
 

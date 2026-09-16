@@ -433,7 +433,7 @@ fn tool_bash_show_command_credits_its_selectors() {
 #[test]
 fn tool_bash_find_pattern_credits_nothing() {
     let cfg = builtin();
-    let input = serde_json::json!({ "command": "ambits -p . find 'src/app.rs::App/render'" });
+    let input = serde_json::json!({ "command": "ambits -p . rg 'src/app.rs::App/render'" });
     let call = map_tool_call(&cfg, "Bash", &input, "a", "ts").unwrap();
 
     assert!(

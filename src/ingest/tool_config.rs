@@ -216,7 +216,7 @@ pub struct TargetSelectorSpec {
     /// everything before the subcommand is a global flag and cannot be a
     /// selector anyway.
     ///
-    /// Without it, `ambits find 'src/app.rs::App'` credited a full read of that
+    /// Without it, `ambits rg 'src/app.rs::App'` credited a full read of that
     /// symbol. A search pattern is a regex over file content, not a request for
     /// a definition, and `find` already journals precisely what it displayed.
     /// Optional, so a tool whose every invocation returns definitions needs no
@@ -715,7 +715,7 @@ mod tests {
     fn a_search_pattern_that_looks_like_an_id_is_not_credited() {
         let cfg = ToolMappingConfig::builtin().unwrap();
         assert!(selector_spec(&cfg)
-            .resolve(&bash_input("ambits -p . find 'src/app.rs::App'"))
+            .resolve(&bash_input("ambits -p . rg 'src/app.rs::App'"))
             .is_none());
     }
 
@@ -726,7 +726,7 @@ mod tests {
         let cfg = ToolMappingConfig::builtin().unwrap();
         let got = selector_spec(&cfg)
             .resolve(&bash_input(
-                "ambits -p . find 'a.rs::pattern' && ambits -p . show b.rs::real",
+                "ambits -p . rg 'a.rs::pattern' && ambits -p . show b.rs::real",
             ))
             .unwrap();
         assert_eq!(got, vec![("b.rs::real".to_string(), ReadDepth::FullBody)]);

@@ -40,14 +40,14 @@ ambits -p .
 
 ## Searching code
 
-`find` is a grep whose every hit knows which symbol it landed in.
+A grep whose every hit knows which symbol it landed in.
 
 ```bash
-ambits -p . find 'is_binary'                 # every use and definition
-ambits -p . find 'fn enclosing' -t rust      # one file type
-ambits -p . find 'TODO' -g '!tests/**'       # globs; ! excludes
-ambits -p . find 'Journal::open' -A 3        # with trailing context
-ambits -p . find 'unwrap\(\)' -c             # matching lines per file
+ambits -p . rg 'is_binary'                 # every use and definition
+ambits -p . rg 'fn enclosing' -t rust      # one file type
+ambits -p . rg 'TODO' -g '!tests/**'       # globs; ! excludes
+ambits -p . rg 'Journal::open' -A 3        # with trailing context
+ambits -p . rg 'unwrap\(\)' -c             # matching lines per file
 ```
 
 ```
@@ -60,6 +60,32 @@ src/find.rs:442:8:[full search_file]     if is_binary(&buf) || !matcher.worth_se
 `file:line:column:` — the prefix every grep consumer already parses — then the
 symbol the match sits in and how deeply this session has read it, then the line.
 `--no-symbol` drops that field for output byte-identical to ripgrep's.
+
+### Why two commands
+
+`grep(1)` and ripgrep assign **opposite meanings to the same short flags**, so
+no single command can be faithful to both:
+
+| Flag | GNU grep | ripgrep |
+|---|---|---|
+| `-L` | `--files-without-match` | `--follow` (symlinks) |
+| `-z` | `--null-data` | `--search-zip` |
+| `-r` | `--recursive` | `--replace` |
+| `-h` | `--no-filename` | help |
+
+`ambits rg` and `ambits grep` are two front ends over one engine — the same
+matcher, the same symbol attribution, the same output contract — each faithful
+to the tool it is named after. `rg` is the one to reach for: Claude Code's own
+`Grep` tool is ripgrep-backed, so it is the dialect agents already speak.
+
+`ambits grep` keeps grep's defaults rather than ours: line numbers are opt-in,
+there is no column, and `-h` is `--no-filename`. Three flags it cannot honour
+say so rather than pretending — `-P` (no lookaround in this engine, so a PCRE
+pattern would match something other than what it says) and `-z` (NUL-separated
+input would change what a line is) are refused; `-r`/`-R` are accepted no-ops,
+since the search is always recursive.
+
+### The flag set
 
 The flags **are** ripgrep's, down to the regex engine: `-i -w -x -F -v -U -e -g
 -t -A -B -C -n -N -o -l -c -m -M -q --hidden --no-ignore --heading --color
@@ -108,7 +134,7 @@ Every other command scans the project first: walk, parse every file, then
 answer. A search inverts that — walk, read, reject on the raw bytes, and parse
 only the survivors. Searching this repo for `classify` reads 61 files and parses
 the 5 that matched, in about 0.01s; a pattern that matches nothing parses
-nothing and costs 0.00s, where the old symbol-index `find` paid for a full parse
+nothing and costs 0.00s, where a symbol-index search would pay for a full parse
 every time.
 
 ## Finding callers
@@ -135,9 +161,9 @@ most answers are exact — but `callers new` returns every call to anything name
 `new`. `--format json` sets `name_matched_only: true` so a consumer cannot
 mistake this for a resolved call graph.
 
-References are extracted on demand rather than stored, so `find`, `show`, and
+References are extracted on demand rather than stored, so `rg`, `show`, and
 the TUI pay nothing for this. It costs about 0.06s on this repo against under
-0.01s for `find` — and unlike a search, it reports call nodes only, so the
+0.01s for a search — and unlike one, it reports call nodes only, so the
 definition and the doc comments mentioning it do not come back with them.
 
 ## Reading code by symbol
@@ -445,7 +471,7 @@ scan included, which is both worse and harder to notice.
 
 ## The read journal
 
-While the TUI runs it maintains an append-only NDJSON record at `.ambit/coverage/<session>.ndjson` — one entry per `(symbol, agent)` read. The TUI is the only writer: a `find` or `show` run with no TUI attached to the session earns no coverage credit, a deliberate trade for never needing two processes to reason about writing the same journal. This is what lets `restore-context` answer after the fact, and it survives restarts.
+While the TUI runs it maintains an append-only NDJSON record at `.ambit/coverage/<session>.ndjson` — one entry per `(symbol, agent)` read. The TUI is the only writer: a search or `show` run with no TUI attached to the session earns no coverage credit, a deliberate trade for never needing two processes to reason about writing the same journal. This is what lets `restore-context` answer after the fact, and it survives restarts.
 
 ```bash
 ambits -p . cache status              # sessions, symbols, size on disk
@@ -508,7 +534,8 @@ Installs a [skill](https://code.claude.com/docs/en/skills) that teaches the agen
 | Command | Description |
 |---|---|
 | `ambits -p <path>` | Launch the TUI |
-| `ambits … find <pattern> [path…]` | Grep file contents; every hit names its symbol |
+| `ambits … rg <pattern> [path…]` | Grep file contents, ripgrep's flags; every hit names its symbol |
+| `ambits … grep <pattern> [path…]` | The same search, GNU grep's flags |
 | `ambits … callers <name>…` | List call sites and their enclosing symbol |
 | `ambits … show <selector>…` | Print symbol definitions as JSON |
 | `ambits … restore-context` | Print this session's read history |

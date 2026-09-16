@@ -59,7 +59,8 @@ pub fn journal_dir(project_root: &Path) -> PathBuf {
 /// Gather stats for every session, newest first.
 ///
 /// A session's journal may be split across shards (`<id>.ndjson` from the
-/// TUI, `<id>.find.ndjson` from `ambits find`); this groups them by session
+/// TUI, `<id>.find.ndjson` from when the CLI briefly wrote its own); this
+/// groups them by session
 /// id first, so `status`/`clear` reason about sessions rather than files. A
 /// shard that cannot be read is skipped rather than failing the listing —
 /// the point of `status` is to show what is there, and one unreadable file

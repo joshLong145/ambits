@@ -135,10 +135,10 @@ description   = "Bash {pattern|cmd}"
 # pulling whole files. Tokens that do not parse as a symbol id or content hash
 # are ignored, so flags need no listing here.
 #
-# `subcommand` narrows it to the one command that returns definitions. `find`
-# takes a regex over file content, so `ambits find 'src/app.rs::App'` is a
-# search for that text and not a request for that symbol — and `find` journals
-# what it actually displayed by itself.
+# `subcommand` narrows it to the one command that returns definitions. The
+# search commands take a regex over file content, so `ambits rg
+# 'src/app.rs::App'` asks for that *text* — crediting it as a read of that
+# symbol would claim knowledge of a definition the search may never have shown.
 target_selectors = { key = "command", requires = "ambits", subcommand = "show", depth = "FullBody", shallow_flag = "--no-body", shallow_depth = "NameOnly" }
 
 [[tool]]
