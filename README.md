@@ -289,7 +289,7 @@ Symbols carried over from before a compaction render dimmed — the read happene
 |---|---|
 | `j` / `k` | Navigate up/down (tree or agent list, depending on focus) |
 | `h` / `l` | Collapse / expand tree nodes |
-| `Enter` | Expand node, or select agent when Stats is focused |
+| `Enter` | Expand node (if it has children), or open it in your editor; selects an agent when Stats is focused |
 | `Tab` | Cycle panel focus (Tree / Stats / Activity) |
 | `Shift+Tab` | Cycle agent filter backward |
 | `/` | Search symbols |
@@ -322,6 +322,56 @@ Symbols carried over from before a compaction render dimmed — the read happene
 | Amber | Partially covered |
 | Yellow-green | All symbols seen, not all at full depth |
 | Green | Every symbol read in full |
+
+### Opening a symbol in your editor
+
+`Enter` on a leaf row — a symbol with no children, or a file with none — opens
+that file in an external editor, jumped to the symbol's declaration line. A
+row with children still expands/collapses as before; only the previously
+dead "Enter on a leaf" case gained a behavior, so no existing keystroke
+changed meaning.
+
+The editor is resolved in this order:
+
+1. `--editor <TEMPLATE>` on the command line
+2. `[editor]` in `.ambit/tools.toml` (project, then user-global — same merge as [Tool mappings](#tool-mappings))
+3. `$VISUAL`
+4. `$EDITOR`
+5. none — Enter shows a message in the status bar instead of guessing
+
+A resolved value is a command template. Plain `EDITOR=vim` or `--editor code`
+still jumps to the right line: a short built-in table supplies the line-jump
+syntax for common editors, keyed off the command's basename —
+
+| Editor | Template |
+|---|---|
+| `vim`, `nvim`, `vi` | `{editor} +{line} {file}` |
+| `emacs`, `emacsclient` | `{editor} +{line} {file}` |
+| `nano` | `{editor} +{line} {file}` |
+| `code`, `code-insiders` | `{editor} --goto {file}:{line}` |
+| `subl`, `sublime_text` | `{editor} {file}:{line}` |
+| `zed` | `{editor} {file}:{line}` |
+| anything else | `{editor} {file}` (opens the file, no line jump) |
+
+— or write the template explicitly if your editor isn't in that table, or its
+binary goes by a different name (e.g. it's invoked by full path). A template
+containing `{file}`/`{line}` is used verbatim, no basename guessing:
+
+```toml
+[editor]
+command = "/path/to/some-editor --line {line} {file}"
+```
+
+Project config:
+
+```toml
+# .ambit/tools.toml
+[editor]
+command = "zed"
+```
+
+A spawn failure or nonzero exit doesn't crash the TUI — it shows the error in
+the status bar and leaves everything else running.
 
 ## Coverage reports
 
@@ -554,6 +604,7 @@ Installs a [skill](https://code.claude.com/docs/en/skills) that teaches the agen
 | `--format` | `table` (default) or `json` |
 | `--serena` | Use Serena's LSP symbol cache |
 | `--tools-config` | Custom tool-mapping TOML |
+| `--editor` | Editor command template for `Enter` in the TUI (see [Opening a symbol in your editor](#opening-a-symbol-in-your-editor)) |
 | `--no-journal` | Disable the read journal |
 | `--flush-interval-ms` | Journal write interval |
 | `--log-dir` | Claude Code log directory (auto-derived) |
