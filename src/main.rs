@@ -86,6 +86,13 @@ struct Cli {
     #[arg(long)]
     tools_config: Option<PathBuf>,
 
+    /// Editor command template for "open in editor" (Enter on a symbol row
+    /// in the TUI). Supports `{file}`/`{line}` placeholders, e.g.
+    /// "code -g {file}:{line}". Overrides tools.toml `[editor]` and
+    /// $VISUAL/$EDITOR.
+    #[arg(long)]
+    editor: Option<String>,
+
     /// Output format for --coverage. Ignored when --coverage is not set.
     #[arg(long, value_enum, default_value = "table")]
     format: CoverageFormat,
@@ -971,9 +978,16 @@ fn main() -> Result<()> {
     let (tool_config, config_warnings) =
         ToolMappingConfig::resolve(cli.tools_config.as_deref());
 
-    // Capture the `[cache]` stanza before `tool_config` is coerced into the
-    // mapper trait object below and its concrete type is no longer reachable.
+    // Capture the `[cache]`/`[editor]` stanzas before `tool_config` is
+    // coerced into the mapper trait object below and its concrete type is no
+    // longer reachable.
     let cache_cfg = tool_config.cache.clone();
+    let editor_template = ambits::editor::resolve_editor_template(
+        cli.editor.as_deref(),
+        tool_config.editor.command.as_deref(),
+        std::env::var("VISUAL").ok().as_deref(),
+        std::env::var("EDITOR").ok().as_deref(),
+    );
 
     // Both the TUI and `find` write to the journal, and `find` dispatches long
     // before the TUI is built, so the decision is made once here. CLI flags win
@@ -1197,6 +1211,7 @@ fn main() -> Result<()> {
     };
 
     let mut app = App::new(project_tree, project_path.clone(), event_log);
+    app.set_editor_template(editor_template);
     app.filter = filter.map(Arc::new);
     app.set_session_id(session_id.clone());
     app.session_slug = log_dir.as_ref()
@@ -1432,8 +1447,92 @@ fn run_tui(
             Err(flume::RecvTimeoutError::Disconnected) => break,
         }
 
+        if let Some((path, line)) = app.pending_editor_request.take() {
+            let template = app.editor_template.clone();
+            suspend_for_editor(
+                terminal,
+                &rx,
+                app,
+                &mut session,
+                project_path,
+                log_dir,
+                registry,
+                serena_mode,
+                &path,
+                line,
+                template.as_deref(),
+            )?;
+        }
+
         if app.should_quit {
             break;
+        }
+    }
+
+    Ok(())
+}
+
+/// Suspend the TUI, run the editor synchronously to let the user look at (and
+/// possibly edit) the symbol's file, then resume.
+///
+/// `template = None` means nothing resolved to launch — the terminal is left
+/// untouched. A spawn failure or nonzero exit is captured into
+/// `app.last_editor_error` rather than propagated: many editors exit nonzero
+/// for reasons that have nothing to do with whether the visit worked, so
+/// treating it as fatal to the TUI would be wrong.
+#[allow(clippy::too_many_arguments)]
+fn suspend_for_editor(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    rx: &flume::Receiver<AppEvent>,
+    app: &mut App,
+    session: &mut tui::TuiSession,
+    project_path: &Path,
+    log_dir: &Option<PathBuf>,
+    registry: &ParserRegistry,
+    serena_mode: bool,
+    path: &Path,
+    line: u32,
+    template: Option<&str>,
+) -> Result<()> {
+    let Some(template) = template else {
+        app.last_editor_error =
+            Some("no editor configured (set $VISUAL, $EDITOR, or --editor)".to_string());
+        return Ok(());
+    };
+
+    disable_raw_mode()?;
+    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+
+    let argv = ambits::editor::build_editor_argv(template, path, line);
+    app.last_editor_error = match argv.split_first() {
+        Some((cmd, args)) => match std::process::Command::new(cmd).args(args).status() {
+            Ok(status) if status.success() => None,
+            Ok(status) => Some(format!("'{cmd}' exited with {status}")),
+            Err(e) => Some(format!("failed to launch '{cmd}': {e}")),
+        },
+        None => Some("no editor command resolved".to_string()),
+    };
+
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    terminal.clear()?;
+
+    // Drain input queued while the editor had the terminal — those keys and
+    // clicks were meant for the editor, not the TUI. Other event kinds
+    // (file-watch, tick) are still real state changes and get applied
+    // normally so nothing goes stale across the suspension.
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            AppEvent::Key(_) | AppEvent::Mouse(_) => {}
+            AppEvent::FileChanged(p) => {
+                tui::TuiSession::handle_file_changed(p, project_path, registry, app);
+            }
+            AppEvent::FileRemoved(p) => {
+                tui::TuiSession::handle_file_removed(p, project_path, app);
+            }
+            AppEvent::Tick => {
+                session.handle_tick(log_dir, app, serena_mode, project_path);
+            }
         }
     }
 

@@ -48,7 +48,12 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     use ratatui::text::{Line, Span};
     use ratatui::widgets::Paragraph;
 
-    let status = if app.search_mode {
+    let status = if let Some(ref message) = app.last_editor_error {
+        Line::from(vec![Span::styled(
+            format!(" {message}"),
+            Style::default().fg(Color::Red),
+        )])
+    } else if app.search_mode {
         Line::from(vec![
             Span::styled(" /", Style::default().fg(Color::Yellow)),
             Span::raw(&app.search_query),
@@ -62,6 +67,8 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             Span::raw("nav "),
             Span::styled("[h/l]", Style::default().fg(Color::DarkGray)),
             Span::raw("expand "),
+            Span::styled("[enter]", Style::default().fg(Color::DarkGray)),
+            Span::raw("open "),
             Span::styled("[/]", Style::default().fg(Color::DarkGray)),
             Span::raw("search "),
             Span::styled("[s]", Style::default().fg(Color::DarkGray)),

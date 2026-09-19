@@ -585,3 +585,40 @@ fn user_cache_settings_survive_merge_with_builtin() {
     // Tool mappings must still come through.
     assert!(!merged.tools.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// [editor] stanza — "open in editor" settings
+// ---------------------------------------------------------------------------
+
+#[test]
+fn editor_stanza_is_optional() {
+    // The built-in config has no [editor]; absence must mean "fall through to
+    // $VISUAL/$EDITOR", not "no editor ever".
+    let cfg = builtin();
+    assert_eq!(cfg.editor.command, None);
+}
+
+#[test]
+fn editor_stanza_parses() {
+    let cfg = load_cfg("version = 1\n[editor]\ncommand = \"code -g {file}:{line}\"\n");
+    assert_eq!(cfg.editor.command, Some("code -g {file}:{line}".to_string()));
+}
+
+#[test]
+fn user_editor_settings_survive_merge_with_builtin() {
+    let user = load_cfg("version = 1\n[editor]\ncommand = \"nvim\"\n");
+    let mut warnings = Vec::new();
+    let merged = ToolMappingConfig::merge(builtin(), user, &mut warnings);
+    assert_eq!(merged.editor.command, Some("nvim".to_string()));
+    // Tool mappings must still come through.
+    assert!(!merged.tools.is_empty());
+}
+
+#[test]
+fn editor_absent_in_user_falls_back_to_base() {
+    let base = load_cfg("version = 1\n[editor]\ncommand = \"nvim\"\n");
+    let user = load_cfg("version = 1\n");
+    let mut warnings = Vec::new();
+    let merged = ToolMappingConfig::merge(base, user, &mut warnings);
+    assert_eq!(merged.editor.command, Some("nvim".to_string()));
+}

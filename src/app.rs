@@ -135,6 +135,17 @@ pub struct App {
     /// after the initial filtered scan. `None` means no filter — track
     /// everything.
     pub filter: Option<Arc<PathFilter>>,
+
+    /// Resolved "open in editor" command template (see [`crate::editor`]).
+    /// `None` means no editor could be resolved from CLI/config/env.
+    pub editor_template: Option<String>,
+    /// Set by [`App::open_selected_in_editor`] and consumed by the TUI loop,
+    /// which owns the terminal handle `App` does not have — this is how the
+    /// request to suspend the TUI and launch an editor gets signaled up.
+    pub pending_editor_request: Option<(PathBuf, u32)>,
+    /// Set when the last "open in editor" attempt failed (no editor
+    /// resolved, spawn failure, nonzero exit). Cleared on the next keypress.
+    pub last_editor_error: Option<String>,
 }
 
 impl App {
@@ -176,9 +187,21 @@ impl App {
             event_log,
             journal: None,
             filter: None,
+            editor_template: None,
+            pending_editor_request: None,
+            last_editor_error: None,
         };
         app.rebuild_tree_rows();
         app
+    }
+
+    /// Set the resolved "open in editor" command template. Separate from
+    /// [`App::new`] rather than a constructor parameter: `App::new` has
+    /// several call sites across tests, and threading one more optional
+    /// argument through all of them for a setting that's `None` in every
+    /// test is unnecessary churn.
+    pub fn set_editor_template(&mut self, template: Option<String>) {
+        self.editor_template = template;
     }
 
     /// Start journaling this session's reads to `.ambit/coverage/`.
@@ -481,6 +504,8 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        self.last_editor_error = None;
+
         if self.search_mode {
             self.handle_search_key(key);
             return;
@@ -505,11 +530,24 @@ impl App {
                     self.move_selection(-1);
                 }
             }
-            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+            KeyCode::Char('l') | KeyCode::Right => {
                 if self.focus == FocusPanel::Stats {
                     self.apply_agent_selection();
                 } else {
                     self.toggle_expand();
+                }
+            }
+            KeyCode::Enter => {
+                if self.focus == FocusPanel::Stats {
+                    self.apply_agent_selection();
+                } else if self
+                    .tree_rows
+                    .get(self.selected_index)
+                    .is_some_and(|row| row.has_children)
+                {
+                    self.toggle_expand();
+                } else {
+                    self.open_selected_in_editor();
                 }
             }
             KeyCode::Char('h') | KeyCode::Left => self.collapse_current(),
@@ -635,6 +673,49 @@ impl App {
                 self.rebuild_tree_rows();
             }
         }
+    }
+
+    /// Resolve the selected row to a `(file, line)` and stash it in
+    /// `pending_editor_request` for the TUI loop to act on. `App` owns no
+    /// terminal handle, so it can only signal the request upward, not launch
+    /// the editor itself.
+    ///
+    /// A no-op (defense in depth — `handle_key` already gates this) for a row
+    /// with children, and a silent no-op if the row no longer resolves to a
+    /// file/symbol (e.g. the tree changed since the row was rendered) rather
+    /// than requesting a bogus path.
+    fn open_selected_in_editor(&mut self) {
+        let Some(row) = self.tree_rows.get(self.selected_index) else {
+            return;
+        };
+        if row.has_children {
+            return;
+        }
+
+        if row.is_file {
+            let Some(file) = self
+                .project_tree
+                .files
+                .iter()
+                .find(|f| f.file_path.to_string_lossy() == row.symbol_id)
+            else {
+                return;
+            };
+            self.pending_editor_request =
+                Some((self.project_root.join(&file.file_path), 1));
+            return;
+        }
+
+        let Some((path, sym)) = self
+            .project_tree
+            .walk()
+            .into_iter()
+            .find(|(_, sym)| sym.id == row.symbol_id)
+        else {
+            return;
+        };
+        self.pending_editor_request =
+            Some((self.project_root.join(path), sym.line_range.start));
     }
 
     /// The agent ids the stats panel lists, in the order it lists them.
@@ -1499,6 +1580,67 @@ mod tests {
     fn test_app(files: Vec<FileSymbols>) -> App {
         let tree = project(files);
         App::new(tree, PathBuf::from("/test/project"), None)
+    }
+
+    // --- open_selected_in_editor ---
+
+    #[test]
+    fn open_selected_in_editor_resolves_a_leaf_symbol_row() {
+        let leaf = sym_with_lines("mock/f.rs::alpha", "alpha", 42, 50);
+        let mut app = test_app(vec![file("mock/f.rs", vec![leaf])]);
+        // The file row has children (its one symbol), so expand it first to
+        // put the leaf symbol row into `tree_rows`.
+        app.collapsed.remove("mock/f.rs");
+        app.rebuild_tree_rows();
+        app.selected_index = app
+            .tree_rows
+            .iter()
+            .position(|r| r.symbol_id == "mock/f.rs::alpha")
+            .expect("leaf row present");
+
+        app.open_selected_in_editor();
+
+        assert_eq!(
+            app.pending_editor_request,
+            Some((PathBuf::from("/test/project/mock/f.rs"), 42))
+        );
+    }
+
+    #[test]
+    fn open_selected_in_editor_on_a_file_row_opens_at_line_one() {
+        // A file with no symbols renders a leaf (childless) file-header row.
+        let mut app = test_app(vec![file("mock/empty.rs", vec![])]);
+        app.selected_index = 0;
+        assert!(app.tree_rows[0].is_file);
+        assert!(!app.tree_rows[0].has_children);
+
+        app.open_selected_in_editor();
+
+        assert_eq!(
+            app.pending_editor_request,
+            Some((PathBuf::from("/test/project/mock/empty.rs"), 1))
+        );
+    }
+
+    #[test]
+    fn open_selected_in_editor_on_a_row_with_children_is_a_no_op() {
+        let child = sym("mock/f.rs::child", "child");
+        let parent = sym_with_children("mock/f.rs::parent", "parent", vec![child]);
+        let mut app = test_app(vec![file("mock/f.rs", vec![parent])]);
+        // Selected row is the file header, which has children (its symbol).
+        app.selected_index = 0;
+        assert!(app.tree_rows[0].has_children);
+
+        app.open_selected_in_editor();
+
+        assert_eq!(app.pending_editor_request, None);
+    }
+
+    #[test]
+    fn open_selected_in_editor_on_an_empty_tree_does_not_panic() {
+        let mut app = test_app(vec![]);
+        app.open_selected_in_editor();
+        assert_eq!(app.pending_editor_request, None);
     }
 
     /// End-to-end wiring for cold-start rehydrate: the journal is found by

@@ -23,6 +23,17 @@ pub struct CacheConfig {
     pub flush_interval_ms: Option<u64>,
 }
 
+/// `[editor]` stanza: how to open a symbol's file in an external editor.
+/// Every field is optional; an absent stanza (or absent field) falls through
+/// to `$VISUAL`/`$EDITOR`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EditorConfig {
+    /// Editor command, e.g. `"code"`, `"nvim"`, or a template containing
+    /// `{file}`/`{line}` placeholders, e.g. `"code -g {file}:{line}"`.
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToolMappingConfig {
     pub version: u32,
@@ -31,6 +42,9 @@ pub struct ToolMappingConfig {
     /// Coverage-journal settings. See [`CacheConfig`].
     #[serde(default)]
     pub cache: CacheConfig,
+    /// "Open in editor" settings. See [`EditorConfig`].
+    #[serde(default)]
+    pub editor: EditorConfig,
     /// Name → index into `tools`. Built after deserialization via `build_index()`.
     #[serde(skip)]
     pub(crate) index: HashMap<String, usize>,
@@ -444,6 +458,10 @@ impl ToolMappingConfig {
             enabled: user.cache.enabled.or(base.cache.enabled),
             flush_interval_ms: user.cache.flush_interval_ms.or(base.cache.flush_interval_ms),
         };
+        // `[editor]` follows the same plain-scalar merge as `[cache]`.
+        let editor = EditorConfig {
+            command: user.editor.command.clone().or(base.editor.command.clone()),
+        };
         // Step A — deduplicate user stanzas (last stanza per name wins).
         // Stanzas with empty `names` are passed through to Step B for warning emission.
         let mut name_to_winner: HashMap<&str, usize> = HashMap::new();
@@ -541,6 +559,7 @@ impl ToolMappingConfig {
             version: base.version,
             tools: result,
             cache,
+            editor,
             index: HashMap::new(),
         };
         merged.build_index();
@@ -593,6 +612,7 @@ impl ToolMappingConfig {
             version: Self::SUPPORTED_VERSION,
             tools: vec![],
             cache: CacheConfig::default(),
+            editor: EditorConfig::default(),
             index: HashMap::new(),
         }
     }
