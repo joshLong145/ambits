@@ -427,9 +427,14 @@ fn tool_bash_show_command_credits_its_selectors() {
     );
 }
 
-/// …and `find` does not. Its pattern is a regex over file content, so a search
-/// for text shaped like an id is not a request for that symbol — and `find`
-/// journals what it actually displayed on its own.
+/// …and `rg`/`grep` do not earn selector (symbol-level) credit. Their pattern
+/// is a regex over file content, so a search for text shaped like an id is
+/// not a request for that symbol — and the search subcommands journal what
+/// they actually displayed on their own.
+///
+/// The overall depth is a different question: `ambits rg`/`ambits grep` do
+/// the same exploratory search as bare `rg`/`grep`, so they earn the same
+/// `Overview` depth those commands get — not the generic Bash fallback.
 #[test]
 fn tool_bash_find_pattern_credits_nothing() {
     let cfg = builtin();
@@ -443,8 +448,8 @@ fn tool_bash_find_pattern_credits_nothing() {
     );
     assert_eq!(
         call.read_depth,
-        ReadDepth::NameOnly,
-        "and the command falls back to the generic Bash depth"
+        ReadDepth::Overview,
+        "search depth matches bare rg/grep, not the generic Bash default"
     );
 }
 

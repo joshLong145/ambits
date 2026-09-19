@@ -122,6 +122,16 @@ depth         = { type = "pattern_match", key = "command", default = "NameOnly",
     { prefix = "tail ", depth = "Signature" },
     { prefix = "grep ", depth = "Overview" },
     { prefix = "rg ",   depth = "Overview" },
+    # `ambits grep`/`ambits rg` do the same regex-over-content search as the
+    # bare commands above, just through ambit's own dialect-split subcommands
+    # (see target_selectors below for why they don't earn full-symbol credit).
+    # `ambits_subcommand` (not `contains`) because global flags sit between the
+    # binary and the subcommand, e.g. `ambits -p . grep ...` — a literal
+    # substring match on "ambits grep" misses that invocation entirely.
+    # Without these, the default NameOnly undercredits them relative to plain
+    # grep/rg, which rewards bypassing ambit's own coverage-aware search.
+    { prefix = "grep", match_type = "ambits_subcommand", depth = "Overview" },
+    { prefix = "rg",   match_type = "ambits_subcommand", depth = "Overview" },
     { prefix = "awk ",  depth = "Overview" },
     { prefix = "sed ",   depth = "Overview"  },
     { prefix = "ugrep ", depth = "Overview"  },

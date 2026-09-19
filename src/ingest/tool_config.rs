@@ -122,6 +122,10 @@ impl DepthSpec {
                         MatchType::Prefix   => cmd.starts_with(p.prefix.as_str()),
                         MatchType::Contains => cmd.contains(p.prefix.as_str()),
                         MatchType::Exact    => cmd == p.prefix.as_str(),
+                        MatchType::AmbitsSubcommand => {
+                            cmd.contains("ambits")
+                                && cmd.split_whitespace().any(|t| t == p.prefix.as_str())
+                        }
                     })
                     .map(|p| ReadDepth::from(p.depth))
                     .unwrap_or_else(|| ReadDepth::from(*default))
@@ -141,6 +145,12 @@ pub enum MatchType {
     Contains,
     /// `value == prefix` — exact equality.
     Exact,
+    /// `prefix` names an `ambits` subcommand (e.g. `"grep"`); matches when any
+    /// whitespace-separated token of the command equals it. Global flags sit
+    /// between the binary and its subcommand (`ambits -p . grep ...`), so a
+    /// `starts_with`/`contains` test on a fixed literal can't span the two —
+    /// this mirrors `TargetSelectorSpec`'s own token scan for the same reason.
+    AmbitsSubcommand,
 }
 
 /// A single pattern entry in a `PatternMatch` depth spec.
@@ -1211,6 +1221,34 @@ description  = "empty names"
         );
     }
 
+    /// `ambits grep`/`ambits rg` do the same regex-over-content search as bare
+    /// `grep`/`rg`, just through ambit's own subcommands — they must not fall
+    /// through to the pattern_match default, or an agent using ambit's search
+    /// would be credited *less* than one bypassing it with raw grep/rg.
+    ///
+    /// The `-p .` case is the regression this test guards: a live transcript
+    /// capture showed Claude Code actually invoking `ambits -p . grep ...`,
+    /// which a literal `contains("ambits grep")` check does not match because
+    /// the global flag sits between the binary and the subcommand.
+    #[test]
+    fn ambits_grep_and_rg_earn_overview_depth() {
+        let cfg = ToolMappingConfig::builtin().unwrap();
+        let idx = *cfg.index.get("Bash").unwrap();
+        let depth = cfg.tools[idx].depth.as_ref().unwrap();
+        for cmd in [
+            "ambits grep 'foo' -p .",
+            "ambits rg 'foo' --max-bytes 100",
+            "ambits -p . grep \"fn dirs_home\" src/ingest/claude.rs 2>&1",
+            "cd /repo && ambits -p . rg 'fn dirs_home' src/ingest/claude.rs",
+        ] {
+            assert_eq!(
+                depth.resolve(&bash_input(cmd)),
+                ReadDepth::Overview,
+                "{cmd} should earn Overview depth"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // 24. command_pattern_default_match_type_is_prefix
     // -----------------------------------------------------------------------
@@ -1288,6 +1326,47 @@ description = "T {pattern}"
             _ => panic!("expected PatternMatch"),
         };
         assert!(matches!(patterns[0].match_type, MatchType::Exact));
+    }
+
+    // -----------------------------------------------------------------------
+    // 27. command_pattern_ambits_subcommand_match_type_deserializes
+    // -----------------------------------------------------------------------
+    #[test]
+    fn command_pattern_ambits_subcommand_match_type_deserializes() {
+        let toml = r#"
+version = 1
+[[tool]]
+names         = ["T"]
+path_keys     = []
+path_required = false
+pattern_keys  = ["command"]
+depth         = { type = "pattern_match", key = "command", default = "NameOnly", patterns = [
+    { prefix = "grep", match_type = "ambits_subcommand", depth = "Overview" },
+] }
+description = "T {pattern}"
+"#;
+        let cfg: ToolMappingConfig = toml::from_str(toml).unwrap();
+        let mapping = cfg.tools.first().unwrap();
+        let patterns = match mapping.depth.as_ref().unwrap() {
+            DepthSpec::PatternMatch { patterns, .. } => patterns,
+            _ => panic!("expected PatternMatch"),
+        };
+        assert!(matches!(patterns[0].match_type, MatchType::AmbitsSubcommand));
+    }
+
+    /// A command that merely mentions "ambits" without the subcommand as its
+    /// own token must not match — otherwise a path or description containing
+    /// the word would falsely earn credit.
+    #[test]
+    fn ambits_subcommand_requires_both_marker_and_token() {
+        let cfg = ToolMappingConfig::builtin().unwrap();
+        let idx = *cfg.index.get("Bash").unwrap();
+        let depth = cfg.tools[idx].depth.as_ref().unwrap();
+        assert_eq!(
+            depth.resolve(&bash_input("echo 'no ambits binary here' && rgrep foo")),
+            ReadDepth::NameOnly,
+            "no literal 'ambits' token, and 'rgrep' is not the 'rg' token, so this must not match"
+        );
     }
 
     // -----------------------------------------------------------------------
