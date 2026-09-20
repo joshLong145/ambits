@@ -22,9 +22,13 @@ const DEBUG_LOG_NAME: &str = "ambits.debug.log";
 
 /// Install the logger if `log_output_dir` is `Some`; otherwise do nothing.
 ///
-/// `RUST_LOG` (e.g. `RUST_LOG=ambits=debug`) controls the level threshold
-/// once logging is active; with no `--log-output`, `RUST_LOG` has no effect
-/// since no logger is ever registered.
+/// `--log-output` alone is enough to see the five subsystems' debug output —
+/// asking for a log file and getting an empty one because a second env var
+/// was also required is exactly the surprise this avoids. The baseline level
+/// is `Debug`; `RUST_LOG` (e.g. `RUST_LOG=ambits=trace` for more, or
+/// `RUST_LOG=off` for less) still overrides it when set, same as any
+/// `env_logger` use. With no `--log-output`, `RUST_LOG` has no effect since
+/// no logger is ever registered.
 pub fn init(log_output_dir: Option<&Path>) {
     let Some(dir) = log_output_dir else {
         return;
@@ -44,7 +48,9 @@ pub fn init(log_output_dir: Option<&Path>) {
 
     // Errors here mean a logger is already installed (e.g. called twice in a
     // test) — never fatal, so `try_init` rather than `init`.
-    let _ = env_logger::Builder::from_default_env()
+    let _ = env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Debug)
+        .parse_default_env() // RUST_LOG, if set, overrides the Debug baseline above.
         .target(env_logger::Target::Pipe(Box::new(file)))
         .try_init();
 }
