@@ -1,3 +1,4 @@
+pub mod markdown;
 pub mod python;
 pub mod rust;
 pub mod typescript;
@@ -187,6 +188,7 @@ impl ParserRegistry {
         registry.register(Box::new(rust::RustParser::new()));
         registry.register(Box::new(python::PythonParser::new()));
         registry.register(Box::new(typescript::TypescriptParser::new()));
+        registry.register(Box::new(markdown::MarkdownParser::new()));
         registry
     }
 
