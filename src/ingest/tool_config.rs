@@ -119,16 +119,16 @@ impl DepthSpec {
     /// Centralises the dispatch logic so callers don't duplicate `match` arms.
     pub fn resolve(&self, input: &serde_json::Value) -> crate::tracking::ReadDepth {
         use crate::tracking::ReadDepth;
-        let (depth, reason) = match self {
-            DepthSpec::Fixed { value } => (ReadDepth::from(*value), "fixed".to_string()),
+        let (depth, variant, detail) = match self {
+            DepthSpec::Fixed { value } => (ReadDepth::from(*value), "fixed", String::new()),
             DepthSpec::Conditional { condition_key, if_true, if_false, default } => {
                 match input.get(condition_key) {
                     Some(serde_json::Value::Bool(true)) =>
-                        (ReadDepth::from(*if_true), format!("conditional: {condition_key}=true")),
+                        (ReadDepth::from(*if_true), "conditional", format!("{condition_key}=true")),
                     Some(serde_json::Value::Bool(false)) =>
-                        (ReadDepth::from(*if_false), format!("conditional: {condition_key}=false")),
+                        (ReadDepth::from(*if_false), "conditional", format!("{condition_key}=false")),
                     _ =>
-                        (ReadDepth::from(*default), format!("conditional: {condition_key} absent/non-bool, default")),
+                        (ReadDepth::from(*default), "conditional", format!("{condition_key} absent/non-bool, default")),
                 }
             }
             DepthSpec::PatternMatch { key, patterns, default } => {
@@ -146,13 +146,19 @@ impl DepthSpec {
                         }
                     }) {
                     Some((i, p)) =>
-                        (ReadDepth::from(p.depth), format!("pattern_match: pattern[{i}] '{}' ({:?})", p.prefix, p.match_type)),
+                        (ReadDepth::from(p.depth), "pattern_match", format!("pattern[{i}] '{}' ({:?})", p.prefix, p.match_type)),
                     None =>
-                        (ReadDepth::from(*default), "pattern_match: no pattern matched, default".to_string()),
+                        (ReadDepth::from(*default), "pattern_match", "no pattern matched, default".to_string()),
                 }
             }
         };
-        log::debug!(target: "ambits::depth_resolution", "{reason} -> {depth:?}");
+        log::debug!(
+            target: "ambits::depth_resolution",
+            variant = variant,
+            detail = detail,
+            depth:? = depth;
+            "resolved"
+        );
         depth
     }
 }

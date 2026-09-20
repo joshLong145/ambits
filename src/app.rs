@@ -1,5 +1,3 @@
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -120,9 +118,6 @@ pub struct App {
     /// back out of `ledger`.
     pub depth_cache: crate::tracking::alignment::DepthOrdinalCache,
 
-    // Optional event log writer.
-    pub event_log: Option<BufWriter<File>>,
-
     /// Durable record of which symbols were read and what they looked like at
     /// the time. `None` when journaling is disabled, or when no session id is
     /// known (the journal is keyed by session, and guessing a filename would
@@ -149,7 +144,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(project_tree: ProjectTree, project_root: PathBuf, event_log: Option<BufWriter<File>>) -> Self {
+    pub fn new(project_tree: ProjectTree, project_root: PathBuf) -> Self {
         // Start with all files collapsed.
         let collapsed: std::collections::HashSet<String> = project_tree
             .files
@@ -184,7 +179,6 @@ impl App {
             show_alignment_overlay: false,
             agent_alignment: Vec::new(),
             depth_cache: crate::tracking::alignment::DepthOrdinalCache::new(),
-            event_log,
             journal: None,
             filter: None,
             editor_template: None,
@@ -986,22 +980,6 @@ impl App {
             &mut self.ledger,
             &mut self.depth_cache,
         );
-        // Write to event log if configured.
-        if let Some(ref mut writer) = self.event_log {
-            let (path_str, target) = event_log_path_and_target(&self.project_tree, &event);
-            let _ = writeln!(
-                writer,
-                "[{}] agent={} tool={} depth={:?} path={} target={} desc=\"{}\"",
-                event.timestamp_str,
-                event.agent_id,
-                event.tool_name,
-                event.read_depth,
-                path_str,
-                target,
-                event.description,
-            );
-            let _ = writer.flush();
-        }
 
         // Only push tracked events to the activity feed.
         if event.read_depth != ReadDepth::Unseen {
@@ -1100,12 +1078,23 @@ pub fn apply_tool_call(
     ledger: &mut ContextLedger,
     depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
 ) {
+    // The one structured line per tool call — the activity record. Replaces
+    // both the old hand-rolled `<session>.log` writer and the separate
+    // debug-level dispatch logs this function used to carry per branch below;
+    // those were redundant with this once it names its own dispatch choice.
+    let (path_str, symbol_target) = event_log_path_and_target(tree, event);
+    log::info!(
+        target: "ambits::activity",
+        agent_id = event.agent_id.as_ref(),
+        tool = event.tool_name.as_ref(),
+        depth:? = event.read_depth,
+        path = path_str,
+        symbol_target = symbol_target,
+        description = event.description;
+        "tool call"
+    );
+
     if !event.target_selectors.is_empty() {
-        log::debug!(
-            target: "ambits::symbol_update",
-            "apply_tool_call: agent={} tool={} via {} selector(s)",
-            event.agent_id, event.tool_name, event.target_selectors.len()
-        );
         mark_selected_symbols(tree, event, ledger, depth_cache);
     }
 
@@ -1118,18 +1107,8 @@ pub fn apply_tool_call(
             continue;
         }
         if event.target_symbol.is_some() || event.target_lines.is_some() {
-            log::debug!(
-                target: "ambits::symbol_update",
-                "apply_tool_call: agent={} tool={} path={} via mark_targeted_symbols",
-                event.agent_id, event.tool_name, tool_rel.display()
-            );
             mark_targeted_symbols(&file.symbols, event, ledger, depth_cache);
         } else {
-            log::debug!(
-                target: "ambits::symbol_update",
-                "apply_tool_call: agent={} tool={} path={} via mark_file_symbols ({} top-level symbols)",
-                event.agent_id, event.tool_name, tool_rel.display(), file.symbols.len()
-            );
             mark_file_symbols(&file.symbols, event, ledger, depth_cache);
         }
     }
@@ -1655,7 +1634,7 @@ mod tests {
 
     fn test_app(files: Vec<FileSymbols>) -> App {
         let tree = project(files);
-        App::new(tree, PathBuf::from("/test/project"), None)
+        App::new(tree, PathBuf::from("/test/project"))
     }
 
     // --- open_selected_in_editor ---
@@ -1731,7 +1710,7 @@ mod tests {
         let tree = project(vec![file("mock/f.rs", syms)]);
         let current = tree.files[0].symbols[0].content_hash;
 
-        let mut app = App::new(tree, dir.path().to_path_buf(), None);
+        let mut app = App::new(tree, dir.path().to_path_buf());
         app.set_session_id(Some("sess-1".into()));
         write_journal(dir.path(), "sess-1", &[("mock/f.rs::alpha", "agent-9", current)]);
 
@@ -1755,7 +1734,6 @@ mod tests {
         let mut app = App::new(
             project(vec![file("mock/f.rs", vec![sym("mock/f.rs::alpha", "alpha")])]),
             dir.path().to_path_buf(),
-            None,
         );
         app.set_session_id(Some("sess-none".into()));
         assert!(app.rehydrate_from_journal().is_none());
@@ -1766,7 +1744,7 @@ mod tests {
     #[test]
     fn rehydrate_from_journal_needs_a_session_id() {
         let dir = tempfile::tempdir().unwrap();
-        let mut app = App::new(project(vec![]), dir.path().to_path_buf(), None);
+        let mut app = App::new(project(vec![]), dir.path().to_path_buf());
         assert!(app.rehydrate_from_journal().is_none());
     }
 
@@ -2100,7 +2078,7 @@ mod tests {
         let tree = project(vec![file("mock/f.rs", syms)]);
         let beta_hash = tree.files[0].symbols[1].content_hash;
 
-        let mut app = App::new(tree, dir.path().to_path_buf(), None);
+        let mut app = App::new(tree, dir.path().to_path_buf());
         app.set_session_id(Some("sess-1".into()));
 
         // The live replay only produces the root session's own read of alpha.

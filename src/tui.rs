@@ -402,7 +402,7 @@ mod tests {
             root: root.to_path_buf(),
             files: Vec::new(),
         };
-        let mut app = App::new(tree, root.to_path_buf(), None);
+        let mut app = App::new(tree, root.to_path_buf());
         app.set_session_id(Some(session_id.to_string()));
         app
     }
@@ -583,7 +583,7 @@ mod tests {
             .unwrap();
         assert_eq!(tree.files.len(), 2);
 
-        let app = App::new(tree, dir.path().to_path_buf(), None);
+        let app = App::new(tree, dir.path().to_path_buf());
         (dir, app)
     }
 

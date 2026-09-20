@@ -316,7 +316,7 @@ mod tests {
                 FileSymbols { file_path: "mock/a.rs".into(), symbols: vec![sym("a1", "alpha")], total_lines: 50 },
             ],
         };
-        App::new(tree, PathBuf::from("/test"), None)
+        App::new(tree, PathBuf::from("/test"))
     }
 
     /// Find the foreground color of the first cell matching `text` in the entire buffer.

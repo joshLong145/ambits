@@ -106,7 +106,7 @@ fn write_jsonl(lines: &[String]) -> NamedTempFile {
 
 fn make_app(files: Vec<FileSymbols>) -> App {
     let tree = project(files);
-    App::new(tree, PathBuf::from("/test/project"), None)
+    App::new(tree, PathBuf::from("/test/project"))
 }
 
 // ---------------------------------------------------------------------------
@@ -391,7 +391,7 @@ fn journal_records_symbols_read_through_app() {
         root: root.clone(),
         files: vec![file("a.rs", vec![sym("a.rs::x", "x"), sym("a.rs::y", "y")])],
     };
-    let mut app = App::new(tree, root.clone(), None);
+    let mut app = App::new(tree, root.clone());
     app.set_session_id(Some("sess-1".into()));
     app.enable_journal("tree-sitter", std::time::Duration::from_millis(0));
 
@@ -438,7 +438,7 @@ fn journal_survives_compaction() {
         root: root.clone(),
         files: vec![file("a.rs", vec![sym("a.rs::x", "x")])],
     };
-    let mut app = App::new(tree, root.clone(), None);
+    let mut app = App::new(tree, root.clone());
     app.set_session_id(Some("sess-2".into()));
     app.enable_journal("tree-sitter", std::time::Duration::from_millis(0));
 
@@ -499,7 +499,7 @@ fn journal_round_trips_to_the_ledgers_seen_set() {
         ],
     };
 
-    let mut app = App::new(tree.clone(), root.clone(), None);
+    let mut app = App::new(tree.clone(), root.clone());
     app.set_session_id(Some("rt".into()));
     app.enable_journal("tree-sitter", std::time::Duration::from_millis(0));
     app.process_agent_event(read_call(&root, "a.rs"));
@@ -542,7 +542,7 @@ fn edited_symbols_are_withheld_but_neighbours_survive() {
         files: vec![file("a.rs", vec![sym("a.rs::kept", "kept"), sym("a.rs::edited", "edited")])],
     };
 
-    let mut app = App::new(tree.clone(), root.clone(), None);
+    let mut app = App::new(tree.clone(), root.clone());
     app.set_session_id(Some("drift".into()));
     app.enable_journal("tree-sitter", std::time::Duration::from_millis(0));
     app.process_agent_event(read_call(&root, "a.rs"));
@@ -575,7 +575,7 @@ fn deleted_symbols_are_reported_as_removed() {
         files: vec![file("a.rs", vec![sym("a.rs::doomed", "doomed")])],
     };
 
-    let mut app = App::new(tree.clone(), root.clone(), None);
+    let mut app = App::new(tree.clone(), root.clone());
     app.set_session_id(Some("gone".into()));
     app.enable_journal("tree-sitter", std::time::Duration::from_millis(0));
     app.process_agent_event(read_call(&root, "a.rs"));

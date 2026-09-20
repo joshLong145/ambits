@@ -10,9 +10,7 @@ mod skill;
 mod tui;
 mod ui;
 
-use std::fs;
 use std::io;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -951,7 +949,6 @@ fn scan_tree(
 fn main() -> Result<()> {
     color_eyre::install()?;
     let mut cli = Cli::parse();
-    ambits::logging::init(cli.log_output.as_deref());
 
     // `skill` is the only subcommand that doesn't need --project, so it is
     // handled here. `restore-context` needs a scanned tree to compare against,
@@ -1045,6 +1042,8 @@ fn main() -> Result<()> {
             .as_ref()
             .and_then(|d| ingester.find_latest_session(d))
     });
+
+    ambits::logging::init(cli.log_output.as_deref(), session_id.as_deref());
 
     // Coverage context for `find` and `show`. Loaded once, from the journal
     // the TUI maintains, so both can report whether a symbol has already been
@@ -1198,20 +1197,7 @@ fn main() -> Result<()> {
     // terminal swallowing input with the panic message painted on an alternate
     // screen nobody would ever see again.
 
-    // Set up event log writer if --log-output is specified.
-    let event_log = if let Some(ref log_output_dir) = cli.log_output {
-        fs::create_dir_all(log_output_dir)?;
-        let log_name = session_id
-            .as_deref()
-            .unwrap_or("unknown-session");
-        let log_path = log_output_dir.join(format!("{log_name}.log"));
-        let file = fs::File::create(&log_path)?;
-        Some(io::BufWriter::new(file))
-    } else {
-        None
-    };
-
-    let mut app = App::new(project_tree, project_path.clone(), event_log);
+    let mut app = App::new(project_tree, project_path.clone());
     app.set_editor_template(editor_template);
     app.filter = filter.map(Arc::new);
     app.set_session_id(session_id.clone());
@@ -1289,10 +1275,8 @@ fn main() -> Result<()> {
     // last interval tick.
     app.sync_journal();
 
-    // Flush event log before exiting.
-    if let Some(ref mut writer) = app.event_log {
-        let _ = writer.flush();
-    }
+    // Flush the log file before exiting.
+    log::logger().flush();
 
     // `_guard` restores the rest as it drops.
     terminal.show_cursor()?;

@@ -270,15 +270,18 @@ impl ParserRegistry {
                                     Ok(file_symbols) => {
                                         log::debug!(
                                             target: "ambits::parsing",
-                                            "parsed {} ({} top-level symbols)",
-                                            rel.display(), file_symbols.symbols.len()
+                                            path:? = rel,
+                                            symbol_count = file_symbols.symbols.len() as u64;
+                                            "parsed"
                                         );
                                         out.push(file_symbols);
                                     }
                                     Err(e) => {
                                         log::warn!(
                                             target: "ambits::parsing",
-                                            "failed to parse {}: {e}", abs.display()
+                                            path:? = abs,
+                                            error = e.to_string();
+                                            "failed to parse"
                                         );
                                         eprintln!(
                                             "Warning: failed to parse {}: {}",

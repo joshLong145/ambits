@@ -133,15 +133,21 @@ impl ContextLedger {
         if depth > *agent_depth {
             log::debug!(
                 target: "ambits::symbol_update",
-                "record: {symbol_id} agent={agent_id} upgraded {:?} -> {depth:?}",
-                *agent_depth
+                symbol_id = symbol_id.as_str(),
+                agent_id = agent_id.as_str(),
+                from:? = *agent_depth,
+                to:? = depth;
+                "upgraded"
             );
             *agent_depth = depth;
         } else {
             log::debug!(
                 target: "ambits::symbol_update",
-                "record: {symbol_id} agent={agent_id} no-op, already at {:?} >= {depth:?}",
-                *agent_depth
+                symbol_id = symbol_id.as_str(),
+                agent_id = agent_id.as_str(),
+                current:? = *agent_depth,
+                attempted:? = depth;
+                "no-op, already at or above attempted depth"
             );
         }
 

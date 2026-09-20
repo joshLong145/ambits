@@ -139,7 +139,7 @@ mod tests {
                 FileSymbols { file_path: "mock/a.rs".into(), symbols: Vec::new(), total_lines: 10 },
             ],
         };
-        App::new(tree, PathBuf::from("/test"), None)
+        App::new(tree, PathBuf::from("/test"))
     }
 
     /// Find the foreground color of the first cell in `row` that contains part of `text`.
