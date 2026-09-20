@@ -486,20 +486,33 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
         };
 
         let input = block.get("input").cloned().unwrap_or(Value::Null);
+        log::debug!(target: "ambits::ingest", "tool_use recognized: agent={agent_id} tool={tool_name}");
 
-        let event = mapper.map_tool_call(tool_name, &input, &agent_id, &timestamp_str)
-            .unwrap_or_else(|| AgentToolCall {
-                agent_id: agent_id.clone(),
-                tool_name: Arc::from(tool_name),
-                file_path: None,
-                read_depth: ReadDepth::Unseen,
-                description: format!("{tool_name} (untracked)"),
-                timestamp_str: timestamp_str.clone(),
-                target_symbol: None,
-                target_lines: None,
-        target_selectors: Vec::new(),
-                label: agent_id.clone(),
-            });
+        let event = match mapper.map_tool_call(tool_name, &input, &agent_id, &timestamp_str) {
+            Some(event) => {
+                log::debug!(
+                    target: "ambits::ingest",
+                    "mapped: tool={tool_name} depth={:?} path={:?}",
+                    event.read_depth, event.file_path
+                );
+                event
+            }
+            None => {
+                log::debug!(target: "ambits::ingest", "untracked: no mapping for tool={tool_name}");
+                AgentToolCall {
+                    agent_id: agent_id.clone(),
+                    tool_name: Arc::from(tool_name),
+                    file_path: None,
+                    read_depth: ReadDepth::Unseen,
+                    description: format!("{tool_name} (untracked)"),
+                    timestamp_str: timestamp_str.clone(),
+                    target_symbol: None,
+                    target_lines: None,
+                    target_selectors: Vec::new(),
+                    label: agent_id.clone(),
+                }
+            }
+        };
         events.push(event);
     }
 
@@ -610,8 +623,16 @@ pub fn map_tool_call(
     timestamp_str: &str,
 ) -> Option<AgentToolCall> {
     // O(1) lookup via pre-built index.
-    let &idx = config.index.get(tool_name)?;
+    let Some(&idx) = config.index.get(tool_name) else {
+        log::debug!(target: "ambits::tool_resolution", "no stanza for tool={tool_name}");
+        return None;
+    };
     let mapping = &config.tools[idx];
+    log::debug!(
+        target: "ambits::tool_resolution",
+        "tool={tool_name} resolved to stanza names={:?}",
+        mapping.names
+    );
 
     // Extract file_path from the first matching path_key.
     let file_path_str: Option<&str> = mapping

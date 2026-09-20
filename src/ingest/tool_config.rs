@@ -119,20 +119,24 @@ impl DepthSpec {
     /// Centralises the dispatch logic so callers don't duplicate `match` arms.
     pub fn resolve(&self, input: &serde_json::Value) -> crate::tracking::ReadDepth {
         use crate::tracking::ReadDepth;
-        match self {
-            DepthSpec::Fixed { value } => ReadDepth::from(*value),
+        let (depth, reason) = match self {
+            DepthSpec::Fixed { value } => (ReadDepth::from(*value), "fixed".to_string()),
             DepthSpec::Conditional { condition_key, if_true, if_false, default } => {
                 match input.get(condition_key) {
-                    Some(serde_json::Value::Bool(true))  => ReadDepth::from(*if_true),
-                    Some(serde_json::Value::Bool(false)) => ReadDepth::from(*if_false),
-                    _                                    => ReadDepth::from(*default),
+                    Some(serde_json::Value::Bool(true)) =>
+                        (ReadDepth::from(*if_true), format!("conditional: {condition_key}=true")),
+                    Some(serde_json::Value::Bool(false)) =>
+                        (ReadDepth::from(*if_false), format!("conditional: {condition_key}=false")),
+                    _ =>
+                        (ReadDepth::from(*default), format!("conditional: {condition_key} absent/non-bool, default")),
                 }
             }
             DepthSpec::PatternMatch { key, patterns, default } => {
                 let cmd = input.get(key).and_then(|v| v.as_str()).unwrap_or("");
-                patterns
+                match patterns
                     .iter()
-                    .find(|p| match p.match_type {
+                    .enumerate()
+                    .find(|(_, p)| match p.match_type {
                         MatchType::Prefix   => cmd.starts_with(p.prefix.as_str()),
                         MatchType::Contains => cmd.contains(p.prefix.as_str()),
                         MatchType::Exact    => cmd == p.prefix.as_str(),
@@ -140,11 +144,16 @@ impl DepthSpec {
                             cmd.contains("ambits")
                                 && cmd.split_whitespace().any(|t| t == p.prefix.as_str())
                         }
-                    })
-                    .map(|p| ReadDepth::from(p.depth))
-                    .unwrap_or_else(|| ReadDepth::from(*default))
+                    }) {
+                    Some((i, p)) =>
+                        (ReadDepth::from(p.depth), format!("pattern_match: pattern[{i}] '{}' ({:?})", p.prefix, p.match_type)),
+                    None =>
+                        (ReadDepth::from(*default), "pattern_match: no pattern matched, default".to_string()),
+                }
             }
-        }
+        };
+        log::debug!(target: "ambits::depth_resolution", "{reason} -> {depth:?}");
+        depth
     }
 }
 

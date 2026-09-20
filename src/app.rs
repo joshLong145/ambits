@@ -988,18 +988,7 @@ impl App {
         );
         // Write to event log if configured.
         if let Some(ref mut writer) = self.event_log {
-            let path_str = event
-                .file_path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "-".to_string());
-            let target = if let Some(ref sym) = event.target_symbol {
-                sym.clone()
-            } else if let Some(ref lines) = event.target_lines {
-                format!("L{}-{}", lines.start, lines.end)
-            } else {
-                "-".to_string()
-            };
+            let (path_str, target) = event_log_path_and_target(&self.project_tree, &event);
             let _ = writeln!(
                 writer,
                 "[{}] agent={} tool={} depth={:?} path={} target={} desc=\"{}\"",
@@ -1026,6 +1015,78 @@ impl App {
     }
 }
 
+/// Resolve the `path`/`target` display strings for one activity-log line.
+///
+/// `file_path`/`target_symbol`/`target_lines` cover most tools, but a
+/// selector-driven call (`ambits show <id>`) populates none of those — only
+/// `target_selectors` — so without this both columns printed `-` even though
+/// real data existed. `target` falls back to the joined selector tokens;
+/// `path` falls back to [`resolve_selector_path`], which looks the first
+/// selector up in the tree the same way [`mark_selected_symbols`] already
+/// does. A tool call with none of the above (e.g. an untracked tool) still
+/// prints `-` for both — there is nothing to hydrate from.
+fn event_log_path_and_target(tree: &ProjectTree, event: &AgentToolCall) -> (String, String) {
+    let target = match (&event.target_symbol, &event.target_lines) {
+        (Some(sym), _) => sym.clone(),
+        (None, Some(lines)) => format!("L{}-{}", lines.start, lines.end),
+        (None, None) if !event.target_selectors.is_empty() => event
+            .target_selectors
+            .iter()
+            .map(|(sel, _)| sel.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        (None, None) => "-".to_string(),
+    };
+
+    let path_str = match &event.file_path {
+        Some(p) => p.display().to_string(),
+        None => resolve_selector_path(tree, event).unwrap_or_else(|| "-".to_string()),
+    };
+
+    (path_str, target)
+}
+
+/// The file path of the first `target_selectors` entry that resolves to a
+/// symbol in `tree`, matched the same way [`mark_selected_symbols`] matches
+/// by id or content-hash prefix. `None` if there are no selectors, or none of
+/// them resolve.
+///
+/// The activity log has one `path` column but a selector-driven command can
+/// touch several files (`ambits show a.rs::X b.rs::Y`); rather than pick a
+/// column-per-file shape for one log line, the first resolved path is shown
+/// with `" (+N more)"` appended when others resolve to different files.
+fn resolve_selector_path(tree: &ProjectTree, event: &AgentToolCall) -> Option<String> {
+    if event.target_selectors.is_empty() {
+        return None;
+    }
+
+    let symbols = tree.walk();
+    let mut paths: Vec<&Path> = Vec::new();
+    for (sel, _) in &event.target_selectors {
+        let matched = match crate::lookup::parse_selector(sel) {
+            crate::lookup::Selector::Id(_) => {
+                symbols.iter().find(|(_, sym)| sym.id == *sel).map(|(p, _)| *p)
+            }
+            crate::lookup::Selector::Hash(h) => symbols
+                .iter()
+                .find(|(_, sym)| crate::journal::hash_hex(&sym.content_hash).starts_with(h.as_str()))
+                .map(|(p, _)| *p),
+            crate::lookup::Selector::Unrecognized(_) => None,
+        };
+        if let Some(p) = matched {
+            if !paths.contains(&p) {
+                paths.push(p);
+            }
+        }
+    }
+
+    let first = paths.first()?.display().to_string();
+    Some(match paths.len() {
+        1 => first,
+        n => format!("{first} (+{} more)", n - 1),
+    })
+}
+
 /// Apply one tool call to the ledger.
 ///
 /// The single place that decides how a tool call becomes symbol reads. It had
@@ -1040,6 +1101,11 @@ pub fn apply_tool_call(
     depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
 ) {
     if !event.target_selectors.is_empty() {
+        log::debug!(
+            target: "ambits::symbol_update",
+            "apply_tool_call: agent={} tool={} via {} selector(s)",
+            event.agent_id, event.tool_name, event.target_selectors.len()
+        );
         mark_selected_symbols(tree, event, ledger, depth_cache);
     }
 
@@ -1052,8 +1118,18 @@ pub fn apply_tool_call(
             continue;
         }
         if event.target_symbol.is_some() || event.target_lines.is_some() {
+            log::debug!(
+                target: "ambits::symbol_update",
+                "apply_tool_call: agent={} tool={} path={} via mark_targeted_symbols",
+                event.agent_id, event.tool_name, tool_rel.display()
+            );
             mark_targeted_symbols(&file.symbols, event, ledger, depth_cache);
         } else {
+            log::debug!(
+                target: "ambits::symbol_update",
+                "apply_tool_call: agent={} tool={} path={} via mark_file_symbols ({} top-level symbols)",
+                event.agent_id, event.tool_name, tool_rel.display(), file.symbols.len()
+            );
             mark_file_symbols(&file.symbols, event, ledger, depth_cache);
         }
     }
@@ -1776,6 +1852,70 @@ mod tests {
         app.process_agent_event(event);
 
         assert_eq!(app.ledger.depth_of("a.rs::only"), ReadDepth::FullBody);
+    }
+
+    // --- event_log_path_and_target / resolve_selector_path ---
+
+    /// The regression this exists for: a selector-driven event (`ambits show
+    /// <id>`) has neither `file_path` nor `target_symbol`/`target_lines`, so
+    /// both columns used to print `-` even though real data existed.
+    #[test]
+    fn selector_driven_event_hydrates_both_columns() {
+        let app = test_app(vec![file("a.rs", vec![sym("a.rs::one", "one")])]);
+
+        let mut event = tool_call("Bash", "", ReadDepth::FullBody);
+        event.file_path = None;
+        event.target_selectors = vec![("a.rs::one".into(), ReadDepth::FullBody)];
+
+        let (path, target) = event_log_path_and_target(&app.project_tree, &event);
+        assert_eq!(path, "a.rs");
+        assert_eq!(target, "a.rs::one");
+    }
+
+    #[test]
+    fn multiple_selectors_join_the_target_and_note_extra_paths() {
+        let app = test_app(vec![
+            file("a.rs", vec![sym("a.rs::one", "one")]),
+            file("b.rs", vec![sym("b.rs::two", "two")]),
+        ]);
+
+        let mut event = tool_call("Bash", "", ReadDepth::FullBody);
+        event.file_path = None;
+        event.target_selectors = vec![
+            ("a.rs::one".into(), ReadDepth::FullBody),
+            ("b.rs::two".into(), ReadDepth::FullBody),
+        ];
+
+        let (path, target) = event_log_path_and_target(&app.project_tree, &event);
+        assert_eq!(path, "a.rs (+1 more)");
+        assert_eq!(target, "a.rs::one, b.rs::two");
+    }
+
+    /// A selector naming a symbol that no longer resolves shouldn't crash the
+    /// log line — it just can't hydrate a path from nothing real.
+    #[test]
+    fn an_unmatched_selector_falls_back_to_dash_in_the_log() {
+        let app = test_app(vec![file("a.rs", vec![sym("a.rs::one", "one")])]);
+
+        let mut event = tool_call("Bash", "", ReadDepth::FullBody);
+        event.file_path = None;
+        event.target_selectors = vec![("a.rs::nope".into(), ReadDepth::FullBody)];
+
+        let (path, target) = event_log_path_and_target(&app.project_tree, &event);
+        assert_eq!(path, "-");
+        assert_eq!(target, "a.rs::nope");
+    }
+
+    /// A tool call with a real `file_path` and `target_symbol` is unaffected
+    /// by the selector-hydration fallback — the existing fields still win.
+    #[test]
+    fn ordinary_file_and_symbol_targeted_events_are_unaffected() {
+        let app = test_app(vec![file("a.rs", vec![sym("a.rs::one", "one")])]);
+        let event = tool_call_targeted("Read", "/test/project/a.rs", ReadDepth::FullBody, "a.rs::one");
+
+        let (path, target) = event_log_path_and_target(&app.project_tree, &event);
+        assert_eq!(path, "/test/project/a.rs");
+        assert_eq!(target, "a.rs::one");
     }
 
     /// A selector naming nothing is not an error and must not disturb the

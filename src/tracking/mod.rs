@@ -131,7 +131,18 @@ impl ContextLedger {
         // Update per-agent depth (only upgrade, never downgrade).
         let agent_depth = entry.agent_depths.entry(agent_id.clone()).or_insert(ReadDepth::Unseen);
         if depth > *agent_depth {
+            log::debug!(
+                target: "ambits::symbol_update",
+                "record: {symbol_id} agent={agent_id} upgraded {:?} -> {depth:?}",
+                *agent_depth
+            );
             *agent_depth = depth;
+        } else {
+            log::debug!(
+                target: "ambits::symbol_update",
+                "record: {symbol_id} agent={agent_id} no-op, already at {:?} >= {depth:?}",
+                *agent_depth
+            );
         }
 
         // Recompute aggregate depth as max across all agents.

@@ -951,6 +951,7 @@ fn scan_tree(
 fn main() -> Result<()> {
     color_eyre::install()?;
     let mut cli = Cli::parse();
+    ambits::logging::init(cli.log_output.as_deref());
 
     // `skill` is the only subcommand that doesn't need --project, so it is
     // handled here. `restore-context` needs a scanned tree to compare against,

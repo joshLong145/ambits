@@ -267,8 +267,19 @@ impl ParserRegistry {
                                 };
                                 let source = fs::read_to_string(abs)?;
                                 match parser.parse_file(rel, &source) {
-                                    Ok(file_symbols) => out.push(file_symbols),
+                                    Ok(file_symbols) => {
+                                        log::debug!(
+                                            target: "ambits::parsing",
+                                            "parsed {} ({} top-level symbols)",
+                                            rel.display(), file_symbols.symbols.len()
+                                        );
+                                        out.push(file_symbols);
+                                    }
                                     Err(e) => {
+                                        log::warn!(
+                                            target: "ambits::parsing",
+                                            "failed to parse {}: {e}", abs.display()
+                                        );
                                         eprintln!(
                                             "Warning: failed to parse {}: {}",
                                             abs.display(),
