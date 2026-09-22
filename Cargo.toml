@@ -1,6 +1,6 @@
 [package]
 name = "ambits"
-version = "0.17.0"
+version = "0.20.0"
 edition = "2021"
 # `Option::is_none_or` (src/ui/activity.rs) stabilized here.
 rust-version = "1.82"
