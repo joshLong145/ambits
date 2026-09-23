@@ -11,6 +11,10 @@ node_modules/
 .perf-baseline/
 dhat-heap.json
 
-# Coverage journals — per-session derived state, not shared config.
-# `.ambit/tools.toml` is deliberately still committable.
-.ambit/coverage/
+# Local tool state — per-machine, not shared.
+.ambit/
+.ambits/
+.beads/
+
+# macOS Finder metadata
+.DS_Store
