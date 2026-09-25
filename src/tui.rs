@@ -340,6 +340,7 @@ fn existing_session_ids(log_dir: &Path) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ambits::expansion::RowKind;
     use ambits::ingest::{SessionEvent, TailerOutput};
     use ambits::symbols::ProjectTree;
     use std::sync::Mutex;
@@ -653,5 +654,65 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope");
         assert!(existing_session_ids(&missing).is_empty());
+    }
+
+    // --- expansion of files arriving after startup ---
+
+    /// Write `name` and deliver it to the TUI as the file watcher would.
+    fn save(dir: &Path, app: &mut App, name: &str, src: &str) {
+        let path = dir.join(name);
+        fs::write(&path, src).unwrap();
+        TuiSession::handle_file_changed(path, dir, &ambits::parser::ParserRegistry::new(), app);
+    }
+
+    fn row<'a>(app: &'a App, id: &str) -> Option<&'a ambits::app::TreeRow> {
+        app.tree_rows.iter().find(|r| r.symbol_id == id)
+    }
+
+    #[test]
+    fn files_present_at_startup_start_collapsed() {
+        let (_dir, app) = scanned_project();
+        assert!(app.tree_rows.iter().all(|r| r.is_file() && !r.is_expanded));
+    }
+
+    /// A file created while the TUI runs used to arrive expanded: the
+    /// collapsed set was seeded once at startup, so nothing ever collapsed a
+    /// later arrival.
+    #[test]
+    fn a_file_created_after_startup_starts_collapsed() {
+        let (dir, mut app) = scanned_project();
+
+        save(dir.path(), &mut app, "gamma.rs", "pub fn gamma() {}\n");
+
+        assert!(!row(&app, "gamma.rs").expect("gamma.rs row").is_expanded);
+        assert!(
+            row(&app, "gamma.rs::gamma").is_none(),
+            "a collapsed file's symbols must not be flattened into rows"
+        );
+    }
+
+    #[test]
+    fn a_reparsed_file_keeps_its_expansion() {
+        let (dir, mut app) = scanned_project();
+        app.set_expanded("alpha.rs", RowKind::File, true);
+
+        save(dir.path(), &mut app, "alpha.rs", "pub fn alpha() {}\npub fn alpha2() {}\n");
+
+        assert!(row(&app, "alpha.rs").unwrap().is_expanded);
+        assert!(row(&app, "alpha.rs::alpha2").is_some(), "the new symbol is visible");
+    }
+
+    /// An editor's atomic save arrives as Remove + Create; the file must not
+    /// snap shut on every save.
+    #[test]
+    fn an_expanded_file_deleted_and_recreated_stays_expanded() {
+        let (dir, mut app) = scanned_project();
+        app.set_expanded("beta.rs", RowKind::File, true);
+
+        TuiSession::handle_file_removed(dir.path().join("beta.rs"), dir.path(), &mut app);
+        assert!(row(&app, "beta.rs").is_none());
+        save(dir.path(), &mut app, "beta.rs", "pub fn beta() {}\n");
+
+        assert!(row(&app, "beta.rs").unwrap().is_expanded);
     }
 }

@@ -26,7 +26,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|row| {
             let indent = "  ".repeat(row.depth);
-            let icon = if row.is_file {
+            let icon = if row.is_file() {
                 if row.is_expanded { "▼ " } else { "▶ " }
             } else if row.has_children {
                 if row.is_expanded { "▾ " } else { "▸ " }
@@ -41,7 +41,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled(icon, Style::default().fg(Color::DarkGray)),
             ];
 
-            if row.is_file {
+            if row.is_file() {
                 let file_color = file_coverage_color(row.coverage_status);
                 spans.push(Span::styled(
                     &row.display_name,
@@ -252,7 +252,7 @@ mod tests {
     fn render_expanded_symbol_has_depth_color() {
         let mut app = test_app();
         app.selected_index = 2;
-        app.collapsed.remove("mock/a.rs");
+        app.set_expanded("mock/a.rs", ambits::expansion::RowKind::File, true);
         app.ledger.record("a1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
         app.rebuild_tree_rows();
 
