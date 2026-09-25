@@ -9,6 +9,10 @@ ambits -p .
 Tails the session log and updates live. Three panels — symbol tree, coverage
 stats, activity feed — cycled with `Tab`.
 
+Files start collapsed, including ones created while the TUI is running;
+expanding a file shows its full outline. A file you expanded stays expanded
+across edits and editor saves.
+
 It watches your source files too, re-parsing one when it changes so the tree
 and the coverage numbers follow your edits without a restart. The watcher
 honours the project's `.gitignore`, so generated code stays out of the tree —

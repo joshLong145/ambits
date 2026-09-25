@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 use crate::coverage::count_symbols;
+use crate::expansion::{Expansion, RowKind};
 use crate::filter::PathFilter;
 use crate::symbols::{ProjectTree, SymbolNode};
 use crate::tracking::ReadDepth;
@@ -35,7 +36,7 @@ pub struct TreeRow {
     pub display_name: String,
     pub label: &'static str,  // Language-specific label (e.g., "class", "def", "fn")
     pub depth: usize,         // nesting depth for indentation
-    pub is_file: bool,        // true for file headers
+    pub kind: RowKind,
     pub is_expanded: bool,
     pub has_children: bool,
     pub line_range: String,
@@ -48,6 +49,13 @@ pub struct TreeRow {
     pub coverage_status: Option<FileCoverageStatus>,
     pub file_coverage_seen: usize,
     pub file_coverage_total: usize,
+}
+
+impl TreeRow {
+    /// True for file headers.
+    pub fn is_file(&self) -> bool {
+        self.kind == RowKind::File
+    }
 }
 
 /// Which panel is focused.
@@ -67,7 +75,9 @@ pub struct App {
     // Tree view state.
     pub tree_rows: Vec<TreeRow>,
     pub selected_index: usize,
-    pub collapsed: std::collections::HashSet<String>,
+    /// Private: every change must rebuild `tree_rows`, so it goes through
+    /// [`App::set_expanded`].
+    expansion: Expansion,
 
     // Activity feed.
     pub activity: Vec<AgentToolCall>,
@@ -145,13 +155,6 @@ pub struct App {
 
 impl App {
     pub fn new(project_tree: ProjectTree, project_root: PathBuf) -> Self {
-        // Start with all files collapsed.
-        let collapsed: std::collections::HashSet<String> = project_tree
-            .files
-            .iter()
-            .map(|f| f.file_path.to_string_lossy().to_string())
-            .collect();
-
         let mut app = Self {
             project_tree,
             project_root,
@@ -159,7 +162,7 @@ impl App {
             should_quit: false,
             tree_rows: Vec::new(),
             selected_index: 0,
-            collapsed,
+            expansion: Expansion::default(),
             activity: Vec::new(),
             activity_scroll_offset: 0,
             agents_seen: Vec::new(),
@@ -427,7 +430,7 @@ impl App {
         self.rebuild_tree_rows();
     }
 
-    /// Rebuild the flattened tree rows from the project tree + collapsed state.
+    /// Rebuild the flattened tree rows from the project tree + expansion state.
     pub fn rebuild_tree_rows(&mut self) {
         let mut rows = Vec::new();
         let agent_filter = self.agent_filter.as_deref();
@@ -458,7 +461,7 @@ impl App {
             let file = &self.project_tree.files[idx];
             let file_path = file.file_path.to_string_lossy().to_string();
             let file_id = file_path.clone();
-            let is_expanded = !self.collapsed.contains(&file_id);
+            let is_expanded = self.expansion.is_expanded(&file_id, RowKind::File);
 
             let (total, seen, full) = count_symbols(&file.symbols, &self.ledger, agent_filter);
             let status = coverage_status_from_counts(total, seen, full);
@@ -473,7 +476,7 @@ impl App {
                 display_name: file_path.clone(),
                 label: "",
                 depth: 0,
-                is_file: true,
+                kind: RowKind::File,
                 is_expanded,
                 has_children: !file.symbols.is_empty(),
                 line_range: format!("{} lines", file.total_lines),
@@ -489,7 +492,7 @@ impl App {
 
             if is_expanded {
                 for sym in &file.symbols {
-                    flatten_symbol(sym, 1, &self.collapsed, &self.ledger, agent_filter, &mut rows);
+                    flatten_symbol(sym, 1, &self.expansion, &self.ledger, agent_filter, &mut rows);
                 }
             }
         }
@@ -534,11 +537,7 @@ impl App {
             KeyCode::Enter => {
                 if self.focus == FocusPanel::Stats {
                     self.apply_agent_selection();
-                } else if self
-                    .tree_rows
-                    .get(self.selected_index)
-                    .is_some_and(|row| row.has_children)
-                {
+                } else if self.selected_expandable().is_some() {
                     self.toggle_expand();
                 } else {
                     self.open_selected_in_editor();
@@ -645,27 +644,31 @@ impl App {
         }
     }
 
+    /// The only way to open or close a row. Rebuilds only on an actual change.
+    pub fn set_expanded(&mut self, id: &str, kind: RowKind, expanded: bool) {
+        if self.expansion.set(id, kind, expanded) {
+            self.rebuild_tree_rows();
+        }
+    }
+
+    /// The highlighted row, if it can be expanded.
+    fn selected_expandable(&self) -> Option<(String, RowKind)> {
+        self.tree_rows
+            .get(self.selected_index)
+            .filter(|row| row.has_children)
+            .map(|row| (row.symbol_id.clone(), row.kind))
+    }
+
     fn toggle_expand(&mut self) {
-        if let Some(row) = self.tree_rows.get(self.selected_index) {
-            if row.has_children {
-                let id = row.symbol_id.clone();
-                if self.collapsed.contains(&id) {
-                    self.collapsed.remove(&id);
-                } else {
-                    self.collapsed.insert(id);
-                }
-                self.rebuild_tree_rows();
-            }
+        if let Some((id, kind)) = self.selected_expandable() {
+            let expanded = self.expansion.is_expanded(&id, kind);
+            self.set_expanded(&id, kind, !expanded);
         }
     }
 
     fn collapse_current(&mut self) {
-        if let Some(row) = self.tree_rows.get(self.selected_index) {
-            let id = row.symbol_id.clone();
-            if row.has_children && !self.collapsed.contains(&id) {
-                self.collapsed.insert(id);
-                self.rebuild_tree_rows();
-            }
+        if let Some((id, kind)) = self.selected_expandable() {
+            self.set_expanded(&id, kind, false);
         }
     }
 
@@ -686,7 +689,7 @@ impl App {
             return;
         }
 
-        if row.is_file {
+        if row.is_file() {
             let Some(file) = self
                 .project_tree
                 .files
@@ -1171,12 +1174,12 @@ fn mark_selected_symbols(
 fn flatten_symbol(
     sym: &SymbolNode,
     depth: usize,
-    collapsed: &std::collections::HashSet<String>,
+    expansion: &Expansion,
     ledger: &ContextLedger,
     agent_filter: Option<&str>,
     rows: &mut Vec<TreeRow>,
 ) {
-    let is_expanded = !collapsed.contains(&sym.id);
+    let is_expanded = expansion.is_expanded(&sym.id, RowKind::Symbol);
     let read_depth = match agent_filter {
         Some(agent_id) => ledger.depth_of_for_agent(&sym.id, agent_id),
         None => ledger.depth_of(&sym.id),
@@ -1187,7 +1190,7 @@ fn flatten_symbol(
         display_name: sym.name.to_string(),
         label: sym.label,
         depth,
-        is_file: false,
+        kind: RowKind::Symbol,
         is_expanded,
         has_children: !sym.children.is_empty(),
         line_range: format!("L{}-{}", sym.line_range.start, sym.line_range.end),
@@ -1202,7 +1205,7 @@ fn flatten_symbol(
 
     if is_expanded {
         for child in &sym.children {
-            flatten_symbol(child, depth + 1, collapsed, ledger, agent_filter, rows);
+            flatten_symbol(child, depth + 1, expansion, ledger, agent_filter, rows);
         }
     }
 }
@@ -1645,8 +1648,7 @@ mod tests {
         let mut app = test_app(vec![file("mock/f.rs", vec![leaf])]);
         // The file row has children (its one symbol), so expand it first to
         // put the leaf symbol row into `tree_rows`.
-        app.collapsed.remove("mock/f.rs");
-        app.rebuild_tree_rows();
+        app.set_expanded("mock/f.rs", RowKind::File, true);
         app.selected_index = app
             .tree_rows
             .iter()
@@ -1666,7 +1668,7 @@ mod tests {
         // A file with no symbols renders a leaf (childless) file-header row.
         let mut app = test_app(vec![file("mock/empty.rs", vec![])]);
         app.selected_index = 0;
-        assert!(app.tree_rows[0].is_file);
+        assert!(app.tree_rows[0].is_file());
         assert!(!app.tree_rows[0].has_children);
 
         app.open_selected_in_editor();
@@ -2175,7 +2177,7 @@ mod tests {
         ]);
         // Alphabetical mode preserves the file insertion order.
         let file_rows: Vec<&str> = app.tree_rows.iter()
-            .filter(|r| r.is_file)
+            .filter(|r| r.is_file())
             .map(|r| r.display_name.as_str())
             .collect();
         assert_eq!(file_rows, vec!["mock/a.rs", "mock/z.rs"]);
@@ -2196,7 +2198,7 @@ mod tests {
         app.rebuild_tree_rows();
 
         let file_rows: Vec<&str> = app.tree_rows.iter()
-            .filter(|r| r.is_file)
+            .filter(|r| r.is_file())
             .map(|r| r.display_name.as_str())
             .collect();
         // PartiallyCovered (mock/a.rs) sorts before NotCovered (mock/b.rs).

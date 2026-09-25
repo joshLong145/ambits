@@ -13,6 +13,7 @@ pub mod callers;
 pub mod coverage;
 pub mod digest;
 pub mod editor;
+pub mod expansion;
 pub mod filter;
 pub mod fmt;
 pub mod ingest;
