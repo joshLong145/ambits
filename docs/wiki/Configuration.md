@@ -3,7 +3,7 @@
 ## The read journal
 
 While the [TUI](TUI) runs it maintains an append-only NDJSON record at
-`.ambit/coverage/<session>.ndjson` — one entry per `(symbol, agent)` read,
+`.ambits/coverage/<session>.ndjson` — one entry per `(symbol, agent)` read,
 including the content hash the symbol had at the time. This is what lets
 `restore-context` answer after the fact, and it survives restarts.
 
@@ -49,8 +49,13 @@ One file configures tool mappings, the editor and the journal. Only one user
 file is used — the first found of:
 
 1. `--tools-config <path>`
-2. `.ambit/tools.toml` in the **current working directory** (not the `-p` path)
+2. `.ambits/tools.toml` in the **current working directory** (not the `-p` path)
 3. `~/.config/ambit/tools.toml`
+
+A `tools.toml` left in the pre-0.21 location, `.ambit/tools.toml`, is still
+read when no `.ambits/tools.toml` exists, with a warning to move it. Journals
+in the old `.ambit/coverage/` are moved to `.ambits/coverage/` automatically
+the first time any command needs them.
 
 That file merges over the built-in defaults
 ([`src/ingest/default_tools.toml`](https://github.com/joshLong145/ambits/blob/main/src/ingest/default_tools.toml)),

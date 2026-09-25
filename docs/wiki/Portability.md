@@ -21,7 +21,7 @@ consume it — no MCP server, no SDK, no wire protocol.
   `SessionIngester` (`src/ingest/mod.rs`) is the extension point — "implement
   this to add support for a new LLM session format."
 - **Tool mappings** are data, not code. Another provider's tool names are
-  taught in `.ambit/tools.toml` rather than patched in (see
+  taught in `.ambits/tools.toml` rather than patched in (see
   [Configuration](Configuration#tool-mappings)); `ToolCallMapper` exists to
   "plug in alternative tool-name conventions."
 - **`restore-context --format hook`** emits Claude Code's `SessionStart`

@@ -349,6 +349,7 @@ pub enum ConfigWarning {
     ConditionalKeyNonBoolean { tool_name: String, key: String },
     EmptyPatterns          { tool_name: String },
     MissingDepth           { stanza_index: usize },
+    LegacyConfigPath       { path: String, moved_to: String },
 }
 
 impl std::fmt::Display for ConfigWarning {
@@ -373,6 +374,9 @@ impl std::fmt::Display for ConfigWarning {
             ConfigWarning::MissingDepth { stanza_index } =>
                 write!(f, "tool config stanza {} has no 'depth' and no 'extends'; skipping",
                     stanza_index),
+            ConfigWarning::LegacyConfigPath { path, moved_to } =>
+                write!(f, "tool config '{}' is in the legacy .ambit/ directory; move it to '{}'",
+                    path, moved_to),
         }
     }
 }
@@ -448,7 +452,7 @@ impl ToolMappingConfig {
             }
         };
 
-        let user_path = Self::find_user_config(cli);
+        let user_path = Self::find_user_config(cli, &mut warnings);
         let (user, mut uw) = match user_path {
             Some(p) => Self::load(&p),
             None    => (None, vec![]),
@@ -593,8 +597,10 @@ impl ToolMappingConfig {
     }
 
     /// Discover user config path:
-    /// 1. CLI override, 2. `.ambit/tools.toml` in CWD, 3. `~/.config/ambit/tools.toml`
-    fn find_user_config(cli: Option<&Path>) -> Option<PathBuf> {
+    /// 1. CLI override
+    /// 2. `.ambits/tools.toml` in CWD, else the legacy `.ambit/tools.toml` with a warning
+    /// 3. `~/.config/ambit/tools.toml`
+    fn find_user_config(cli: Option<&Path>, warnings: &mut Vec<ConfigWarning>) -> Option<PathBuf> {
         if let Some(p) = cli {
             if p.exists() {
                 return Some(p.to_path_buf());
@@ -602,9 +608,17 @@ impl ToolMappingConfig {
         }
 
         if let Ok(cwd) = std::env::current_dir() {
-            let local = cwd.join(".ambit/tools.toml");
+            let local = cwd.join(crate::state_dir::STATE_DIR).join("tools.toml");
             if local.exists() {
                 return Some(local);
+            }
+            let legacy = cwd.join(crate::state_dir::LEGACY_STATE_DIR).join("tools.toml");
+            if legacy.exists() {
+                warnings.push(ConfigWarning::LegacyConfigPath {
+                    path: legacy.display().to_string(),
+                    moved_to: local.display().to_string(),
+                });
+                return Some(legacy);
             }
         }
 

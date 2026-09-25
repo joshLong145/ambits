@@ -71,7 +71,7 @@ fn journal(root: &Path) -> String {
     // The `find` shard name is an on-disk format constant from when the CLI
     // wrote its own journal, unrelated to the command's name — distinct from
     // TUI would write — see `journal::Journal::open_shard`.
-    std::fs::read_to_string(root.join(".ambit/coverage/sess.find.ndjson")).unwrap_or_default()
+    std::fs::read_to_string(root.join(".ambits/coverage/sess.find.ndjson")).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------

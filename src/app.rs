@@ -198,7 +198,7 @@ impl App {
         self.editor_template = template;
     }
 
-    /// Start journaling this session's reads to `.ambit/coverage/`.
+    /// Start journaling this session's reads to `.ambits/coverage/`.
     ///
     /// Deliberately separate from [`App::set_session_id`], which already does
     /// double duty seeding the agent tree — opening a file is a side effect
@@ -242,7 +242,7 @@ impl App {
     /// scoring a cold-started session as if no agent had read anything.
     pub fn rehydrate_from_journal(&mut self) -> Option<crate::restore::RehydrateStats> {
         let session_id = self.session_id.clone()?;
-        let dir = self.project_root.join(crate::journal::JOURNAL_SUBDIR);
+        let dir = crate::journal::journal_dir(&self.project_root);
         let contents = crate::journal::read_journal_session(&dir, &session_id);
         if contents.reads.is_empty() {
             return None;

@@ -80,7 +80,7 @@ struct Cli {
     log_output: Option<PathBuf>,
 
     /// Path to a custom tool call mapping config (TOML).
-    /// Overrides project-local (.ambit/tools.toml) and user-global configs.
+    /// Overrides project-local (.ambits/tools.toml) and user-global configs.
     #[arg(long)]
     tools_config: Option<PathBuf>,
 
@@ -108,7 +108,7 @@ struct Cli {
     #[arg(long, conflicts_with = "filter")]
     filter_regex: Option<String>,
 
-    /// Disable the coverage journal (`.ambit/coverage/<session>.ndjson`), which
+    /// Disable the coverage journal (`.ambits/coverage/<session>.ndjson`), which
     /// records which symbols were read and what they looked like at the time.
     /// Overrides `enabled` in the `[cache]` section of tools.toml.
     #[arg(long)]
@@ -235,7 +235,7 @@ enum Commands {
         format: FindFormat,
     },
 
-    /// Inspect or remove the coverage journals under .ambit/coverage.
+    /// Inspect or remove the coverage journals under .ambits/coverage.
     Cache {
         #[command(subcommand)]
         command: CacheCommands,

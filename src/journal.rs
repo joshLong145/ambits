@@ -115,7 +115,17 @@ pub const SUPPORTED_SCHEMA_VERSION: u32 = 2;
 pub const MIN_READABLE_SCHEMA_VERSION: u32 = 1;
 
 /// Directory, relative to the project root, holding per-session journals.
-pub const JOURNAL_SUBDIR: &str = ".ambit/coverage";
+/// Under [`crate::state_dir::STATE_DIR`]; resolve it with [`journal_dir`],
+/// which also brings journals across from the legacy location.
+pub const JOURNAL_SUBDIR: &str = ".ambits/coverage";
+
+/// Directory holding this project's journals, after migrating any left in the
+/// legacy `.ambit/coverage/`. Every reader and the writer go through here, so
+/// whichever runs first performs the one-time move.
+pub fn journal_dir(project_root: &Path) -> PathBuf {
+    crate::state_dir::migrate_legacy_journals(project_root);
+    project_root.join(JOURNAL_SUBDIR)
+}
 
 /// Default interval between ledger diffs.
 pub const DEFAULT_FLUSH_INTERVAL_MS: u64 = 5_000;
@@ -487,7 +497,7 @@ pub fn read_journal(path: &Path) -> JournalContents {
 }
 
 /// Every on-disk shard of `session_id`'s journal under `dir` (the
-/// `.ambit/coverage` directory) — the primary `<session>.ndjson` first, if it
+/// `.ambits/coverage` directory) — the primary `<session>.ndjson` first, if it
 /// exists, then any named shards such as `<session>.find.ndjson`, sorted for
 /// a deterministic merge order.
 ///
@@ -626,7 +636,7 @@ impl Journal {
         interval: Duration,
         manifest: impl FnOnce() -> EnvironmentManifest,
     ) -> Self {
-        let dir = project_root.join(JOURNAL_SUBDIR);
+        let dir = journal_dir(project_root);
         let path = match shard {
             Some(s) => dir.join(format!("{session_id}.{s}.ndjson")),
             None => dir.join(format!("{session_id}.ndjson")),

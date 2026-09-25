@@ -13,7 +13,7 @@ flowchart LR
   LOG[("session JSONL<br/>+ subagents/*.jsonl")]
   TUI["ambits TUI"]
   LED["ContextLedger<br/>symbol → depth, per agent"]
-  JRN[(".ambit/coverage/<br/>&lt;session&gt;.ndjson")]
+  JRN[(".ambits/coverage/<br/>&lt;session&gt;.ndjson")]
   HOOK["SessionStart hook<br/>matcher: compact"]
   DIG["restore-context<br/>→ digest"]
 

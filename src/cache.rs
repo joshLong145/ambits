@@ -1,4 +1,4 @@
-//! Inspect and remove the coverage journals under `.ambit/coverage`.
+//! Inspect and remove the coverage journals under `.ambits/coverage`.
 //!
 //! ## Why there is no automatic pruning
 //!
@@ -29,7 +29,8 @@ use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Result, WrapErr};
 
-use crate::journal::{read_journal_session, session_shard_paths, JOURNAL_SUBDIR};
+pub use crate::journal::journal_dir;
+use crate::journal::{read_journal_session, session_shard_paths};
 
 /// One session's journal, possibly folded from several on-disk shards — see
 /// the journal module's "Durability" section. There is deliberately no
@@ -51,10 +52,6 @@ pub struct JournalStat {
     pub schema_version: Option<u32>,
 }
 
-/// Directory holding this project's journals.
-pub fn journal_dir(project_root: &Path) -> PathBuf {
-    project_root.join(JOURNAL_SUBDIR)
-}
 
 /// Gather stats for every session, newest first.
 ///
