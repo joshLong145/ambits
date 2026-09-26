@@ -216,7 +216,7 @@ To get the source of something the digest listed, without a `Read` or a
 
 ```bash
 ambits -p . show 'src/app.rs::App/process_compaction'
-ambits -p . show b3:5a60f75c 'src/digest.rs::grouped'   # batched
+ambits -p . show 'src/digest.rs::grouped' 'src/app.rs::App/handle_key'   # batched
 ```
 
 Selectors are either a symbol id (`<path>::<name-path>` — the `###` heading

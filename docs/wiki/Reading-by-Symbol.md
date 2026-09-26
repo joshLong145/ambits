@@ -48,6 +48,23 @@ definition and flags it `"truncated": true`; it is unlimited by default,
 because a cut definition is no longer valid source and shortening one is the
 caller's decision.
 
+## What a symbol's span covers
+
+A definition includes what is *about* the item directly above it, so editing
+any of it marks the symbol changed and a search hit inside it is attributed to
+it:
+
+- its doc comments and any comments glued above it (no blank line between);
+- in Rust, its attributes — `#[derive(..)]`, `#[test]`, `#[cfg(..)]` — and the
+  docs above those.
+
+And leaves out what is about something else:
+
+- a comment separated from the item by a blank line;
+- module docs (`//!`, `/*! */`) and inner attributes (`#![..]`), which describe
+  the enclosing module;
+- a comment trailing the previous line's code (`const A: u8 = 1; // about A`).
+
 ## Ambiguity is reported, not resolved
 
 `matches` is an array because ids are not guaranteed unique — Rust allows a

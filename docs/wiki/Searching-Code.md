@@ -86,7 +86,10 @@ Flags it cannot honour say so rather than pretending:
   terminal. `0` lifts either.
 - **`--column` is on by default** — it is what disambiguates two matches on
   one line. `--no-column` turns it off.
-- **Exit codes are grep's**: `0` matched, `1` nothing matched, `2` error.
+- **Exit codes are grep's**: `0` matched, `1` nothing matched, `2` error. A
+  reader that stops early (`… | head`) ends the search quietly with the same
+  code it would have given had it read everything — never a crash, and never
+  `2`.
 
 `--json` emits ripgrep's JSON Lines events with an added `symbol` field; see
 the [CLI Reference](CLI-Reference#ambits-rg) for the full flag list.
