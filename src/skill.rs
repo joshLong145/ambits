@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 use color_eyre::eyre::{Result, WrapErr};
@@ -16,6 +17,7 @@ const SKILL_FILES: &[(&str, &str)] = &[
 ];
 
 pub fn install(global: bool, project: Option<PathBuf>) -> Result<()> {
+    let mut out = std::io::stdout().lock();
     let target_dir = if global {
         let home = std::env::var("HOME")
             .wrap_err("HOME environment variable not set")?;
@@ -41,10 +43,10 @@ pub fn install(global: bool, project: Option<PathBuf>) -> Result<()> {
         "for this project"
     };
 
-    println!("Installed ambit skill {} to:", scope);
-    println!("  {}", target_dir.display());
-    println!();
-    println!("Use /ambit in Claude Code to check coverage.");
+    writeln!(out, "Installed ambit skill {} to:", scope)?;
+    writeln!(out, "  {}", target_dir.display())?;
+    writeln!(out)?;
+    writeln!(out, "Use /ambit in Claude Code to check coverage.")?;
 
     Ok(())
 }

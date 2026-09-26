@@ -25,6 +25,7 @@
 //! disappearance of the session transcript — at that point the session cannot
 //! be resumed and the journal has nothing left to serve.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Result, WrapErr};
@@ -124,23 +125,26 @@ pub fn collect(project_root: &Path) -> Vec<JournalStat> {
 pub fn status(project_root: &Path) -> Result<()> {
     let stats = collect(project_root);
     let dir = journal_dir(project_root);
+    let mut out = std::io::stdout().lock();
 
     if stats.is_empty() {
-        println!("No coverage journals in {}", dir.display());
-        println!();
-        println!("Journals are written by the TUI. Without one,");
-        println!("`restore-context` rebuilds the history from session logs instead.");
+        writeln!(out, "No coverage journals in {}", dir.display())?;
+        writeln!(out)?;
+        writeln!(out, "Journals are written by the TUI. Without one,")?;
+        writeln!(out, "`restore-context` rebuilds the history from session logs instead.")?;
         return Ok(());
     }
 
-    println!("{}", dir.display());
-    println!();
-    println!(
+    writeln!(out, "{}", dir.display())?;
+    writeln!(out)?;
+    writeln!(
+        out,
         "{:<40}  {:>8}  {:>8}  {:>9}  {:>4}  AGE",
         "SESSION", "SYMBOLS", "RECORDS", "SIZE", "VER"
-    );
+    )?;
     for s in &stats {
-        println!(
+        writeln!(
+            out,
             "{:<40}  {:>8}  {:>8}  {:>9}  {:>4}  {}",
             s.session_id,
             s.symbols,
@@ -152,17 +156,18 @@ pub fn status(project_root: &Path) -> Result<()> {
             s.age_days
                 .map(|d| if d == 0 { "today".to_string() } else { format!("{d}d") })
                 .unwrap_or_else(|| "-".into()),
-        );
+        )?;
     }
 
     let total_bytes: u64 = stats.iter().map(|s| s.bytes).sum();
-    println!();
-    println!(
+    writeln!(out)?;
+    writeln!(
+        out,
         "{} journal{}, {} on disk",
         stats.len(),
         if stats.len() == 1 { "" } else { "s" },
         crate::fmt::bytes(total_bytes)
-    );
+    )?;
 
     Ok(())
 }
@@ -170,12 +175,13 @@ pub fn status(project_root: &Path) -> Result<()> {
 /// Delete journals. Exactly one of `session` / `all` must be given.
 pub fn clear(project_root: &Path, session: Option<&str>, all: bool) -> Result<()> {
     let dir = journal_dir(project_root);
+    let mut out = std::io::stdout().lock();
 
     let targets: Vec<PathBuf> = match (session, all) {
         (Some(id), _) => {
             let shards = session_shard_paths(&dir, id);
             if shards.is_empty() {
-                println!("No journal for session {id} in {}", dir.display());
+                writeln!(out, "No journal for session {id} in {}", dir.display())?;
                 return Ok(());
             }
             shards
@@ -200,7 +206,7 @@ pub fn clear(project_root: &Path, session: Option<&str>, all: bool) -> Result<()
     };
 
     if targets.is_empty() {
-        println!("No coverage journals in {}", dir.display());
+        writeln!(out, "No coverage journals in {}", dir.display())?;
         return Ok(());
     }
 
@@ -211,11 +217,12 @@ pub fn clear(project_root: &Path, session: Option<&str>, all: bool) -> Result<()
         removed += 1;
     }
 
-    println!(
+    writeln!(
+        out,
         "Removed {removed} journal{}.",
         if removed == 1 { "" } else { "s" }
-    );
-    println!("Restores for those sessions now reconstruct from session logs instead.");
+    )?;
+    writeln!(out, "Restores for those sessions now reconstruct from session logs instead.")?;
     Ok(())
 }
 

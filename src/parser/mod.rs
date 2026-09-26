@@ -283,7 +283,7 @@ impl ParserRegistry {
                                             error = e.to_string();
                                             "failed to parse"
                                         );
-                                        eprintln!(
+                                        crate::try_eprintln!(
                                             "Warning: failed to parse {}: {}",
                                             abs.display(),
                                             e

@@ -37,6 +37,7 @@
 //! this one command a fraction of a second and costs the rest nothing.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Result, WrapErr};
@@ -327,6 +328,7 @@ pub fn run(
     json: bool,
 ) -> Result<()> {
     let sites = find_callers(project_root, tree, registry, names);
+    let mut out = std::io::stdout().lock();
 
     let mut by_callee: HashMap<&str, Vec<&CallSite>> = HashMap::new();
     for s in &sites {
@@ -357,7 +359,8 @@ pub fn run(
                 }
             })
             .collect();
-        println!(
+        writeln!(
+            out,
             "{}",
             serde_json::to_string(&CallersDto {
                 schema_version: SCHEMA_VERSION,
@@ -365,34 +368,33 @@ pub fn run(
                 results,
             })
             .wrap_err("serializing caller results")?
-        );
+        )?;
         return Ok(());
     }
 
     for (i, name) in names.iter().enumerate() {
         if i > 0 {
-            println!();
+            writeln!(out)?;
         }
         let group = by_callee.get(name.as_str()).cloned().unwrap_or_default();
         if group.is_empty() {
-            println!("{name} — no call sites");
+            writeln!(out, "{name} — no call sites")?;
             continue;
         }
         let mut distinct: Vec<&str> = group.iter().filter_map(|s| s.caller.as_deref()).collect();
         distinct.sort_unstable();
         distinct.dedup();
-        println!(
+        writeln!(
+            out,
             "{name} — {} call site{} in {} caller{}",
             group.len(),
             if group.len() == 1 { "" } else { "s" },
             distinct.len(),
             if distinct.len() == 1 { "" } else { "s" },
-        );
+        )?;
         for s in &group {
-            match &s.caller {
-                Some(c) => println!("  {c}  ({}:{})", s.file.display(), s.line),
-                None => println!("  <file scope>  ({}:{})", s.file.display(), s.line),
-            }
+            let caller = s.caller.as_deref().unwrap_or("<file scope>");
+            writeln!(out, "  {caller}  ({}:{})", s.file.display(), s.line)?;
         }
     }
     Ok(())

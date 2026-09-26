@@ -19,6 +19,7 @@ pub mod ingest;
 pub mod journal;
 pub mod logging;
 pub mod lookup;
+pub mod output;
 pub mod parser;
 pub mod restore;
 pub mod search;

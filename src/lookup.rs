@@ -30,6 +30,7 @@
 //! information; silently returning the first would be a lie.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Result, WrapErr};
@@ -241,10 +242,11 @@ pub fn run(
     let out = resolve(project_root, tree, queries, include_body, max_bytes, coverage);
     // Single line, like the other JSON surfaces, so it survives being piped
     // through line-oriented tooling.
-    println!(
+    writeln!(
+        std::io::stdout().lock(),
         "{}",
         serde_json::to_string(&out).wrap_err("serializing lookup results")?
-    );
+    )?;
     Ok(())
 }
 
