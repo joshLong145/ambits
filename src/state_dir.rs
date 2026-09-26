@@ -43,6 +43,26 @@ pub fn migrate_legacy_journals(project_root: &Path) {
 
 const COVERAGE: &str = "coverage";
 
+/// The project `start` belongs to, for when `--project` is not given: the
+/// nearest directory — `start` itself or an ancestor — holding `.git` (a
+/// directory, or a file in a worktree or submodule) or [`STATE_DIR`].
+///
+/// An ancestor rather than `start` itself, because the project path is what
+/// locates everything else: Claude Code keys a session's logs by the
+/// directory it was launched in, normally the repository root, and the
+/// journals live in that root's `.ambits/`. Run from `src/`, `start` alone
+/// would find neither.
+///
+/// With no marker anywhere above, `start` is the project — the same scope a
+/// bare `rg` would search.
+pub fn find_project_root(start: &Path) -> std::path::PathBuf {
+    start
+        .ancestors()
+        .find(|dir| dir.join(".git").exists() || dir.join(STATE_DIR).exists())
+        .unwrap_or(start)
+        .to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,6 +111,51 @@ mod tests {
 
         assert!(dir.path().join(".ambit/coverage/old.ndjson").is_file());
         assert!(!dir.path().join(".ambits/coverage/old.ndjson").exists());
+    }
+
+    #[test]
+    fn the_root_is_found_from_a_nested_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let nested = dir.path().join("src/parser");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(find_project_root(&nested), dir.path());
+    }
+
+    #[test]
+    fn a_state_dir_marks_a_root_too() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(STATE_DIR)).unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        assert_eq!(find_project_root(&dir.path().join("a/b")), dir.path());
+    }
+
+    /// Worktrees and submodules have a `.git` *file* pointing elsewhere.
+    #[test]
+    fn a_git_file_marks_a_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        assert_eq!(find_project_root(&dir.path().join("src")), dir.path());
+    }
+
+    /// A submodule inside a repository is its own project.
+    #[test]
+    fn the_nearest_marker_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let sub = dir.path().join("vendor/lib");
+        std::fs::create_dir_all(sub.join(".git")).unwrap();
+        std::fs::create_dir_all(sub.join("src")).unwrap();
+        assert_eq!(find_project_root(&sub.join("src")), sub);
+    }
+
+    #[test]
+    fn with_no_marker_the_start_is_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(find_project_root(&nested), nested);
     }
 
     #[test]

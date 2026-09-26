@@ -350,6 +350,7 @@ pub enum ConfigWarning {
     EmptyPatterns          { tool_name: String },
     MissingDepth           { stanza_index: usize },
     LegacyConfigPath       { path: String, moved_to: String },
+    MissingOverride        { path: String },
 }
 
 impl std::fmt::Display for ConfigWarning {
@@ -377,6 +378,9 @@ impl std::fmt::Display for ConfigWarning {
             ConfigWarning::LegacyConfigPath { path, moved_to } =>
                 write!(f, "tool config '{}' is in the legacy .ambit/ directory; move it to '{}'",
                     path, moved_to),
+            ConfigWarning::MissingOverride { path } =>
+                write!(f, "--tools-config '{}' does not exist; using the project and user configs instead",
+                    path),
         }
     }
 }
@@ -436,9 +440,19 @@ impl ToolMappingConfig {
         (Some(cfg), warnings)
     }
 
-    /// Discover user config (CLI override → project-local → user-global) and
+    /// Discover user config (CLI override → `project_root`'s → user-global) and
     /// merge with built-ins. Returns `(Arc<config>, warnings)`.
-    pub fn resolve(cli: Option<&Path>) -> (Arc<Self>, Vec<ConfigWarning>) {
+    pub fn resolve(cli: Option<&Path>, project_root: &Path) -> (Arc<Self>, Vec<ConfigWarning>) {
+        Self::resolve_with(cli, project_root, Self::user_global_config().as_deref())
+    }
+
+    /// [`resolve`](Self::resolve) with the user-global config path given
+    /// rather than read from `$HOME`, so tests control every layer.
+    fn resolve_with(
+        cli: Option<&Path>,
+        project_root: &Path,
+        global: Option<&Path>,
+    ) -> (Arc<Self>, Vec<ConfigWarning>) {
         let mut warnings = Vec::new();
 
         let builtin = match Self::builtin() {
@@ -452,17 +466,16 @@ impl ToolMappingConfig {
             }
         };
 
-        let user_path = Self::find_user_config(cli, &mut warnings);
-        let (user, mut uw) = match user_path {
-            Some(p) => Self::load(&p),
-            None    => (None, vec![]),
-        };
-        warnings.append(&mut uw);
-
-        let merged = match user {
-            Some(u) => Self::merge(builtin, u, &mut warnings),
-            None    => builtin,
-        };
+        // Each layer merges over everything before it, so a later layer wins
+        // stanza by stanza and `[cache]`/`[editor]` field by field.
+        let mut merged = builtin;
+        for path in Self::config_layers(cli, project_root, global, &mut warnings) {
+            let (layer, mut lw) = Self::load(&path);
+            warnings.append(&mut lw);
+            if let Some(layer) = layer {
+                merged = Self::merge(merged, layer, &mut warnings);
+            }
+        }
 
         (Arc::new(merged), warnings)
     }
@@ -596,43 +609,58 @@ impl ToolMappingConfig {
         }
     }
 
-    /// Discover user config path:
-    /// 1. CLI override
-    /// 2. `.ambits/tools.toml` in CWD, else the legacy `.ambit/tools.toml` with a warning
-    /// 3. `~/.config/ambit/tools.toml`
-    fn find_user_config(cli: Option<&Path>, warnings: &mut Vec<ConfigWarning>) -> Option<PathBuf> {
+    /// The config files to merge over the built-ins, lowest precedence first:
+    ///
+    /// 1. `global` — the user's `~/.config/ambit/tools.toml`
+    /// 2. `.ambits/tools.toml` in the project root, else the legacy
+    ///    `.ambit/tools.toml` there with a warning
+    ///
+    /// so a project setting overrides a personal one, and a personal setting
+    /// the project says nothing about still applies. `--tools-config` replaces
+    /// both, as its help promises; one that does not exist is warned about and
+    /// the normal layers are used instead, rather than silently ignoring a
+    /// file the user named.
+    ///
+    /// The project root, not the working directory: the config belongs to the
+    /// project, and `ambits -p ../other` or a run from `src/` must pick up the
+    /// same file as a run from the root.
+    fn config_layers(
+        cli: Option<&Path>,
+        project_root: &Path,
+        global: Option<&Path>,
+        warnings: &mut Vec<ConfigWarning>,
+    ) -> Vec<PathBuf> {
         if let Some(p) = cli {
             if p.exists() {
-                return Some(p.to_path_buf());
+                return vec![p.to_path_buf()];
             }
+            warnings.push(ConfigWarning::MissingOverride {
+                path: p.display().to_string(),
+            });
         }
 
-        if let Ok(cwd) = std::env::current_dir() {
-            let local = cwd.join(crate::state_dir::STATE_DIR).join("tools.toml");
-            if local.exists() {
-                return Some(local);
-            }
-            let legacy = cwd.join(crate::state_dir::LEGACY_STATE_DIR).join("tools.toml");
-            if legacy.exists() {
-                warnings.push(ConfigWarning::LegacyConfigPath {
-                    path: legacy.display().to_string(),
-                    moved_to: local.display().to_string(),
-                });
-                return Some(legacy);
-            }
+        let mut layers: Vec<PathBuf> = global.map(Path::to_path_buf).into_iter().collect();
+
+        let local = project_root.join(crate::state_dir::STATE_DIR).join("tools.toml");
+        let legacy = project_root.join(crate::state_dir::LEGACY_STATE_DIR).join("tools.toml");
+        if local.exists() {
+            layers.push(local);
+        } else if legacy.exists() {
+            warnings.push(ConfigWarning::LegacyConfigPath {
+                path: legacy.display().to_string(),
+                moved_to: local.display().to_string(),
+            });
+            layers.push(legacy);
         }
 
-        let home = std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from);
-        if let Some(home) = home {
-            let global = home.join(".config/ambit/tools.toml");
-            if global.exists() {
-                return Some(global);
-            }
-        }
+        layers
+    }
 
-        None
+    /// `~/.config/ambit/tools.toml`, when it exists.
+    fn user_global_config() -> Option<PathBuf> {
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+        let global = PathBuf::from(home).join(".config/ambit/tools.toml");
+        global.exists().then_some(global)
     }
 
     /// Empty config — fallback when built-in fails to parse.
@@ -1130,13 +1158,130 @@ description  = "Foo"
     // -----------------------------------------------------------------------
     // 14. resolve_falls_back_to_builtin
     // -----------------------------------------------------------------------
+    /// Write `body` (prefixed with `version = 1`) to `dir/rel`.
+    fn write_config(dir: &Path, rel: &str, body: &str) -> PathBuf {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("version = 1\n{body}")).unwrap();
+        path
+    }
+
+    /// A minimal valid stanza for a tool named `name`, at `depth`.
+    fn stanza(name: &str, depth: &str) -> String {
+        format!(
+            "[[tool]]\nnames = [\"{name}\"]\npath_keys = [\"path\"]\n\
+             depth = {{ type = \"fixed\", value = \"{depth}\" }}\ndescription = \"{name}\"\n"
+        )
+    }
+
+    fn tool<'c>(cfg: &'c ToolMappingConfig, name: &str) -> Option<&'c ToolMapping> {
+        cfg.tools.iter().find(|t| t.names.iter().any(|n| n == name))
+    }
+
+    /// A `--tools-config` that does not exist is warned about — it used to be
+    /// skipped silently, so a typo quietly ran on other settings — and the
+    /// normal layers apply instead (here: none, so the built-ins).
     #[test]
-    fn resolve_falls_back_to_builtin() {
-        // Pass a non-existent path — resolve() should silently fall back.
-        let (cfg, warnings) = ToolMappingConfig::resolve(Some(std::path::Path::new("/nonexistent/tools.toml")));
+    fn a_missing_override_warns_and_falls_back() {
+        let root = tempfile::tempdir().unwrap();
+        let (cfg, warnings) = ToolMappingConfig::resolve_with(
+            Some(Path::new("/nonexistent/tools.toml")),
+            root.path(),
+            None,
+        );
         assert_eq!(cfg.tools.len(), 22, "should have 22 built-in tools");
-        // No warnings since the file simply doesn't exist (no ParseError).
-        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(
+            matches!(warnings.as_slice(), [ConfigWarning::MissingOverride { path }] if path == "/nonexistent/tools.toml"),
+            "{warnings:?}"
+        );
+    }
+
+    /// The project's config is found under the project root, whatever the
+    /// working directory — `cargo test` runs from the crate root, which is
+    /// not this temp dir.
+    #[test]
+    fn the_project_config_is_found_under_the_project_root() {
+        let root = tempfile::tempdir().unwrap();
+        write_config(root.path(), ".ambits/tools.toml", "[editor]\ncommand = \"from-project-root\"\n");
+
+        let (cfg, _) = ToolMappingConfig::resolve_with(None, root.path(), None);
+        assert_eq!(cfg.editor.command.as_deref(), Some("from-project-root"));
+    }
+
+    #[test]
+    fn a_legacy_config_under_the_project_root_is_read_with_a_warning() {
+        let root = tempfile::tempdir().unwrap();
+        write_config(root.path(), ".ambit/tools.toml", "[editor]\ncommand = \"from-legacy\"\n");
+
+        let (cfg, warnings) = ToolMappingConfig::resolve_with(None, root.path(), None);
+        assert_eq!(cfg.editor.command.as_deref(), Some("from-legacy"));
+        assert!(
+            warnings.iter().any(|w| matches!(w, ConfigWarning::LegacyConfigPath { .. })),
+            "{warnings:?}"
+        );
+    }
+
+    /// User-global and project configs layer rather than one hiding the
+    /// other: a personal setting the project says nothing about still applies.
+    /// Before, the first file found won outright, so any project config
+    /// silently dropped every user-global setting.
+    #[test]
+    fn global_and_project_configs_layer() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let global = write_config(
+            home.path(),
+            "tools.toml",
+            &format!("[editor]\ncommand = \"global-editor\"\n[cache]\nflush_interval_ms = 1234\n{}",
+                stanza("GlobalTool", "Overview")),
+        );
+        write_config(
+            root.path(),
+            ".ambits/tools.toml",
+            &format!("[editor]\ncommand = \"project-editor\"\n{}", stanza("ProjectTool", "FullBody")),
+        );
+
+        let (cfg, warnings) = ToolMappingConfig::resolve_with(None, root.path(), Some(&global));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(cfg.editor.command.as_deref(), Some("project-editor"), "project wins where both speak");
+        assert_eq!(cfg.cache.flush_interval_ms, Some(1234), "global applies where the project is silent");
+        assert!(tool(&cfg, "GlobalTool").is_some(), "global stanzas survive");
+        assert!(tool(&cfg, "ProjectTool").is_some(), "project stanzas are added");
+        assert!(tool(&cfg, "Read").is_some(), "built-ins remain underneath");
+    }
+
+    /// A stanza for the same tool in both layers: the project's replaces the
+    /// global's, exactly as either replaces a built-in.
+    #[test]
+    fn a_project_stanza_overrides_the_global_one() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let global = write_config(home.path(), "tools.toml", &stanza("Shared", "Overview"));
+        write_config(root.path(), ".ambits/tools.toml", &stanza("Shared", "FullBody"));
+
+        let (cfg, _) = ToolMappingConfig::resolve_with(None, root.path(), Some(&global));
+        let shared: Vec<_> = cfg.tools.iter().filter(|t| t.names.iter().any(|n| n == "Shared")).collect();
+        assert_eq!(shared.len(), 1, "one stanza per name");
+        assert!(
+            matches!(shared[0].depth, Some(DepthSpec::Fixed { value: ReadDepthDe::FullBody })),
+            "the project's stanza: {:?}",
+            shared[0].depth
+        );
+    }
+
+    /// `--tools-config` replaces both layers, as its help says.
+    #[test]
+    fn an_existing_override_replaces_both_layers() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let global = write_config(home.path(), "tools.toml", "[editor]\ncommand = \"global-editor\"\n");
+        write_config(root.path(), ".ambits/tools.toml", &stanza("ProjectTool", "FullBody"));
+        let over = write_config(home.path(), "override.toml", "[cache]\nflush_interval_ms = 42\n");
+
+        let (cfg, _) = ToolMappingConfig::resolve_with(Some(&over), root.path(), Some(&global));
+        assert_eq!(cfg.cache.flush_interval_ms, Some(42));
+        assert_eq!(cfg.editor.command, None, "the global layer does not apply");
+        assert!(tool(&cfg, "ProjectTool").is_none(), "nor does the project layer");
     }
 
     // -----------------------------------------------------------------------

@@ -44,12 +44,17 @@ struct Output {
 }
 
 fn run(root: &Path, args: &[&str]) -> Output {
+    // PATH arguments resolve against the working directory, as grep's do,
+    // so the tests run from inside the project the way a caller would.
+    let mut all = vec!["-p", root.to_str().unwrap()];
+    all.extend_from_slice(args);
+    run_in(root, &all)
+}
+
+/// Run from `cwd` with exactly `args` — no `-p` added.
+fn run_in(cwd: &Path, args: &[&str]) -> Output {
     let out = Command::new(env!("CARGO_BIN_EXE_ambits"))
-        // PATH arguments resolve against the working directory, as grep's do,
-        // so the tests run from inside the project the way a caller would.
-        .current_dir(root)
-        .arg("-p")
-        .arg(root)
+        .current_dir(cwd)
         .args(args)
         .output()
         .expect("the binary must run");
@@ -136,6 +141,48 @@ fn path_arguments_narrow_the_search() {
     let scoped = rg(dir.path(), &["needle", "-l", "src"]);
     assert!(scoped.stdout.contains("src/lib.rs"));
     assert!(!scoped.stdout.contains("docs/notes.md"), "PATH narrows it");
+}
+
+/// Without `-p`, the project is the nearest enclosing directory with `.git`
+/// (the fixture has one), so a search from a subdirectory still covers the
+/// whole project — while PATH arguments keep resolving against the working
+/// directory, as grep's do.
+#[test]
+fn without_p_the_project_is_the_enclosing_repository() {
+    let dir = fixture();
+    let src = dir.path().join("src");
+
+    let whole = run_in(&src, &["rg", "needle", "-l"]);
+    assert_eq!(whole.code, 0, "{:?}", whole.stderr);
+    assert!(whole.stdout.contains("src/lib.rs"), "{:?}", whole.stdout);
+    assert!(
+        whole.stdout.contains("docs/notes.md"),
+        "the whole project, not just the working directory: {:?}",
+        whole.stdout
+    );
+
+    let scoped = run_in(&src, &["rg", "needle", "-l", "lib.rs"]);
+    assert_eq!(scoped.code, 0, "{:?}", scoped.stderr);
+    assert!(scoped.stdout.contains("src/lib.rs"));
+    assert!(!scoped.stdout.contains("docs/notes.md"), "lib.rs resolved against src/");
+}
+
+/// The project's `tools.toml` is looked up under the project root, not the
+/// working directory — run from `src/`, the root's config still applies. An
+/// unsupported version makes the lookup visible: it warns, naming the file.
+#[test]
+fn the_project_config_applies_from_a_subdirectory() {
+    let dir = fixture();
+    std::fs::create_dir_all(dir.path().join(".ambits")).unwrap();
+    std::fs::write(dir.path().join(".ambits/tools.toml"), "version = 99\n").unwrap();
+
+    let out = run_in(&dir.path().join("src"), &["rg", "needle", "-l"]);
+    assert_eq!(out.code, 0, "{:?}", out.stderr);
+    assert!(
+        out.stderr.contains("unsupported version 99") && out.stderr.contains(".ambits/tools.toml"),
+        "the root's config was not read: {:?}",
+        out.stderr
+    );
 }
 
 #[test]
