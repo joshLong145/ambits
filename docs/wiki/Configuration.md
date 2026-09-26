@@ -45,21 +45,27 @@ unanchored unless you anchor it. The two are mutually exclusive.
 
 ## `tools.toml`
 
-One file configures tool mappings, the editor and the journal. Only one user
-file is used — the first found of:
+`tools.toml` configures tool mappings, the editor and the journal. Settings are
+layered, each layer overriding the ones before it:
 
-1. `--tools-config <path>`
-2. `.ambits/tools.toml` in the **current working directory** (not the `-p` path)
-3. `~/.config/ambit/tools.toml`
+1. the built-in defaults
+   ([`src/ingest/default_tools.toml`](https://github.com/joshLong145/ambits/blob/main/src/ingest/default_tools.toml)),
+   which are also the best reference for the format
+2. `~/.config/ambit/tools.toml` — your personal settings
+3. `.ambits/tools.toml` in the **project root** — the `-p` path, or the
+   discovered root when `-p` is omitted
+
+A later layer wins tool by tool (a stanza naming the same tool replaces the
+earlier one) and setting by setting in `[editor]` and `[cache]`, so a project
+config that only adds a tool mapping keeps your personal editor.
+
+`--tools-config <path>` replaces layers 2 and 3 entirely. If the path does not
+exist, ambits warns and uses layers 2 and 3 as usual.
 
 A `tools.toml` left in the pre-0.21 location, `.ambit/tools.toml`, is still
 read when no `.ambits/tools.toml` exists, with a warning to move it. Journals
 in the old `.ambit/coverage/` are moved to `.ambits/coverage/` automatically
 the first time any command needs them.
-
-That file merges over the built-in defaults
-([`src/ingest/default_tools.toml`](https://github.com/joshLong145/ambits/blob/main/src/ingest/default_tools.toml)),
-which are also the best reference for the format.
 
 ### Tool mappings
 

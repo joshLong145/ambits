@@ -23,7 +23,7 @@ collects them in one place.
 
 | Flag | Description |
 |---|---|
-| `-p`, `--project <PATH>` | Project root. Required by every command that reads the project |
+| `-p`, `--project <PATH>` | Project root. Defaults to the nearest enclosing directory with `.git` or `.ambits`, else the current directory |
 | `-s`, `--session <ID>` | Session to track (auto-detects the latest) |
 | `-a`, `--agent <ID>` | Filter coverage to one agent (prefix match) |
 | `--log-dir <DIR>` | Claude Code log directory (auto-derived) |

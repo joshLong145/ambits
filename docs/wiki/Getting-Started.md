@@ -54,7 +54,10 @@ ambits -p . restore-context                        # what has this session read?
 ambits -p . --coverage                             # how much of the project is that?
 ```
 
-`-p/--project` is required on every command that reads the project.
+`-p/--project` is optional: without it, the project is the nearest enclosing
+directory containing `.git` or `.ambits`, so `ambits rg foo` works from
+anywhere inside a repository. PATH arguments still resolve against the
+current directory, and with none the whole project is searched.
 
 ## Supported languages
 

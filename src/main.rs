@@ -36,7 +36,8 @@ use ambits::parser::ParserRegistry;
 #[derive(ClapParser, Debug)]
 #[command(name = "ambits", about = "Visualize LLM agent context coverage")]
 struct Cli {
-    /// Path to the project root to analyze.
+    /// Path to the project root to analyze. Defaults to the nearest enclosing
+    /// directory containing `.git` or `.ambits`, else the current directory.
     #[arg(short, long)]
     project: Option<PathBuf>,
 
@@ -990,9 +991,18 @@ fn run() -> Result<()> {
         _ => {}
     }
 
-    // Resolve tool call mapping config. Warnings are displayed to stdout before TUI launch.
+    // Without `--project`, the project containing the working directory — so
+    // `ambits rg foo` works from anywhere inside it, as `rg foo` would.
+    // Resolved before the config, which is looked up relative to it.
+    let project = match cli.project {
+        Some(p) => p,
+        None => ambits::state_dir::find_project_root(&std::env::current_dir()?),
+    };
+    let project_path = project.canonicalize().unwrap_or(project);
+
+    // Resolve tool call mapping config. Warnings go to stderr via `report_warnings`.
     let (tool_config, config_warnings) =
-        ToolMappingConfig::resolve(cli.tools_config.as_deref());
+        ToolMappingConfig::resolve(cli.tools_config.as_deref(), &project_path);
 
     // Capture the `[cache]`/`[editor]` stanzas before `tool_config` is
     // coerced into the mapper trait object below and its concrete type is no
@@ -1014,12 +1024,6 @@ fn run() -> Result<()> {
     let mapper: Arc<dyn ToolCallMapper> = tool_config;
     let ingester: Arc<dyn SessionIngester> =
         Arc::new(ingest::claude::ClaudeIngester::new(Arc::clone(&mapper)));
-
-    // Original behavior — require --project for all other modes.
-    let project = cli.project.ok_or_else(|| {
-        color_eyre::eyre::eyre!("--project is required (use `ambits --project <path>`)")
-    })?;
-    let project_path = project.canonicalize().unwrap_or(project);
 
     // Build the optional path filter. clap already enforces mutual exclusion
     // between --filter and --filter-regex, so at most one branch fires.
