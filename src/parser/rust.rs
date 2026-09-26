@@ -101,17 +101,22 @@ const STATIC: SymbolMeta = SymbolMeta { category: SymbolCategory::Variable, labe
 const TYPE_ALIAS: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "type" };
 const MACRO: SymbolMeta = SymbolMeta { category: SymbolCategory::Macro, label: "macro" };
 
-/// Rust's two comment node kinds. `///`, `//!`, and plain `//` are all
-/// `line_comment`; `/* */` and `/** */` are `block_comment`.
-const COMMENT_KINDS: &[&str] = &["line_comment", "block_comment"];
+/// Node kinds that belong to the item below them. Rust's two comment kinds —
+/// `///`, `//!` and plain `//` are all `line_comment`; `/* */` and `/** */`
+/// are `block_comment` — plus `attribute_item`: tree-sitter parses
+/// `#[derive(..)]` / `#[test]` as a sibling *between* an item and its docs,
+/// so without it both the attribute and the doc above it were cut off.
+/// Inner attributes (`#![..]`) are `inner_attribute_item`, deliberately not
+/// listed: like `//!`, they are about the enclosing module.
+const LEADING_KINDS: &[&str] = &["line_comment", "block_comment", "attribute_item"];
 
 /// `(start_byte, start_line)` for `node`, widened to include an unbroken run
-/// of comments immediately above it — see `parser::leading_comment_start`.
-/// Applied at every symbol construction site, so a method's own leading
-/// comment attaches to the method (a sibling inside its `impl` block's
-/// body), never to the `impl` block itself.
+/// of comments and attributes immediately above it — see
+/// `parser::leading_comment_start`. Applied at every symbol construction
+/// site, so a method's own leading comment attaches to the method (a sibling
+/// inside its `impl` block's body), never to the `impl` block itself.
 fn symbol_start(node: Node) -> (usize, usize) {
-    match super::leading_comment_start(node, COMMENT_KINDS) {
+    match super::leading_comment_start(node, LEADING_KINDS) {
         Some(leading) => (leading.start_byte(), leading.start_position().row + 1),
         None => (node.start_byte(), node.start_position().row + 1),
     }
@@ -440,5 +445,82 @@ impl Display for P {
         let syms = parse(src);
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].byte_range.start, 0);
+    }
+
+    /// Where the last top-level symbol in `src` — the item at the bottom, the
+    /// one the comments and attributes above are candidates for — should
+    /// start: the byte offset of `from`.
+    fn assert_starts_at(src: &str, from: &str) {
+        let syms = parse(src);
+        let last = syms.last().unwrap_or_else(|| panic!("no symbols in {src:?}"));
+        assert_eq!(
+            last.byte_range.start as usize,
+            src.find(from).unwrap(),
+            "{src:?} should start at {from:?}"
+        );
+    }
+
+    /// The shape of `src/fmt.rs`: module docs, a blank line, then an item's
+    /// own docs. `//!` doc comments carry their trailing newline, so the
+    /// blank line used to read as no gap and the function swallowed the
+    /// module docs — `show` returned them and the content hash covered them.
+    #[test]
+    fn module_docs_above_a_blank_line_stay_out_of_the_first_item() {
+        assert_starts_at(
+            "//! Module docs.\n//! More.\n\n/// Item docs.\npub fn f() {}\n",
+            "/// Item docs.",
+        );
+    }
+
+    /// `//!` documents the enclosing module, never the item below it, so
+    /// even glued directly above an item it is not absorbed — nor is a plain
+    /// comment above it.
+    #[test]
+    fn inner_doc_comments_never_widen_an_item() {
+        assert_starts_at("//! Module docs.\npub fn f() {}\n", "pub fn f");
+        assert_starts_at("/*! Module docs. */\npub fn f() {}\n", "pub fn f");
+        assert_starts_at("// note\n//! Module docs.\n/// Item docs.\nfn f() {}\n", "/// Item docs.");
+    }
+
+    /// The same newline quirk, one level down: a `///` comment followed by a
+    /// blank line ended "on" the blank line, so it still looked glued to the
+    /// item below. Contiguity is judged on the rows the comment occupies.
+    #[test]
+    fn a_doc_comment_above_a_blank_line_is_separated() {
+        assert_starts_at("/// Orphan.\n\nfn f() {}\n", "fn f");
+        assert_starts_at("/// Orphan.\n\n/// Item docs.\nfn f() {}\n", "/// Item docs.");
+    }
+
+    /// tree-sitter parses an attribute as a sibling between an item and its
+    /// docs. Stopping there cut off the attribute *and* the doc above it —
+    /// every `#[derive]` type and `#[test]` fn lost part of what it says.
+    #[test]
+    fn attributes_and_the_docs_above_them_belong_to_the_item() {
+        assert_starts_at("/// Docs.\n#[derive(Debug)]\npub struct S;\n", "/// Docs.");
+        assert_starts_at("#[test]\nfn t() {}\n", "#[test]");
+        assert_starts_at("#[inline]\n/// Docs.\nfn f() {}\n", "#[inline]");
+        assert_starts_at(
+            "/// Docs.\n#[derive(Debug)]\n#[serde(rename_all = \"snake_case\")]\nenum E { A }\n",
+            "/// Docs.",
+        );
+    }
+
+    /// Attributes follow the same contiguity rule as comments, and an inner
+    /// attribute (`#![..]`) is about the enclosing module, like `//!`.
+    #[test]
+    fn detached_and_inner_attributes_stay_out() {
+        assert_starts_at("/// Orphan.\n\n#[test]\nfn t() {}\n", "#[test]");
+        assert_starts_at("#![allow(dead_code)]\nfn f() {}\n", "fn f");
+    }
+
+    /// A comment trailing code on its own row is about that code. It used to
+    /// be the next item's leading comment, so the next item's span began in
+    /// the middle of the previous item's line.
+    #[test]
+    fn a_trailing_comment_belongs_to_the_code_before_it() {
+        assert_starts_at("const A: u8 = 1; // about A\nfn f() {}\n", "fn f");
+        assert_starts_at("const A: u8 = 1; // about A\nconst B: u8 = 2;\n", "const B");
+        // Two comments sharing a row above an item are still one leading run.
+        assert_starts_at("/* a */ /* b */\nfn f() {}\n", "/* a */");
     }
 }

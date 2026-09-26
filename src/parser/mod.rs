@@ -43,6 +43,16 @@ pub struct SymbolMeta {
 /// `a_hit_between_symbols_has_no_symbol`: widening symbols is all this
 /// does, never inventing one.
 ///
+/// Two exceptions to "contiguity, not syntax": a comment that documents its
+/// *enclosing* scope — Rust's `//!` and `/*! */` module docs — is about the
+/// module, glued above an item or not; and a comment trailing code on its own
+/// row is about that code. The walk stops at either.
+///
+/// `comment_kinds` may also name non-comment nodes that belong to the item
+/// below them in the same way. Rust passes `attribute_item`, since tree-sitter
+/// parses `#[derive(..)]` as a sibling between an item and its doc comment,
+/// and without it the walk would stop at the attribute and drop both.
+///
 /// Called once per symbol at parse time, not per search, so walking
 /// `prev_sibling()` a few times costs nothing worth avoiding.
 pub fn leading_comment_start<'a>(
@@ -54,12 +64,15 @@ pub fn leading_comment_start<'a>(
     let mut sibling = node.prev_sibling();
 
     while let Some(sib) = sibling {
-        if !comment_kinds.contains(&sib.kind()) {
+        if !comment_kinds.contains(&sib.kind())
+            || documents_enclosing_scope(sib)
+            || trails_previous_code(sib, comment_kinds)
+        {
             break;
         }
         // More than one row of gap between this comment and whatever sits
         // just below it means a blank line separates them.
-        if boundary_row.saturating_sub(sib.end_position().row) > 1 {
+        if boundary_row.saturating_sub(last_row(sib)) > 1 {
             break;
         }
         boundary_row = sib.start_position().row;
@@ -68,6 +81,41 @@ pub fn leading_comment_start<'a>(
     }
 
     result
+}
+
+/// The last row `node` occupies. Rust's line doc comments (`///`, `//!`)
+/// include their trailing newline, so they *end* at column 0 of the next row;
+/// counting that row would make the blank line below one look like no gap at
+/// all. Every other comment kind ends on its own last row and is unaffected.
+fn last_row(node: tree_sitter::Node) -> usize {
+    let end = node.end_position();
+    if end.column == 0 && end.row > node.start_position().row {
+        end.row - 1
+    } else {
+        end.row
+    }
+}
+
+/// Whether `comment` starts on the row where the code before it ends — a
+/// trailing comment like `const A: u8 = 1; // about A`. It is about that code,
+/// not about whatever follows on the next line. A preceding *comment* on the
+/// same row does not count: `/* a */ /* b */` is still one leading run.
+fn trails_previous_code(comment: tree_sitter::Node, comment_kinds: &[&str]) -> bool {
+    comment.prev_sibling().is_some_and(|prev| {
+        !comment_kinds.contains(&prev.kind())
+            && prev.end_position().row == comment.start_position().row
+    })
+}
+
+/// Whether `comment` documents its enclosing scope rather than what follows
+/// it: Rust's `//!` and `/*! */`, which the grammar marks with an
+/// `inner_doc_comment_marker` child. No other grammar here has that node.
+fn documents_enclosing_scope(comment: tree_sitter::Node) -> bool {
+    let mut cursor = comment.walk();
+    let found = comment
+        .children(&mut cursor)
+        .any(|child| child.kind() == "inner_doc_comment_marker");
+    found
 }
 
 /// Trait for language-specific parsers.
