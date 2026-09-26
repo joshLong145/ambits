@@ -657,11 +657,11 @@ pub fn run_report(
         match matches.len() {
             1 => matches[0].clone(),
             0 => {
-                eprintln!("Warning: no agent matching prefix '{}'", prefix);
+                crate::try_eprintln!("Warning: no agent matching prefix '{}'", prefix);
                 prefix.clone()
             }
             _ => {
-                eprintln!(
+                crate::try_eprintln!(
                     "Warning: multiple agents match prefix '{}': {:?}",
                     prefix,
                     matches.iter().take(5).collect::<Vec<_>>()
@@ -677,7 +677,7 @@ pub fn run_report(
     report.filter = filter.map(|f| f.display());
     report.compactions = compactions;
 
-    print!("{}", formatter.format(&report));
+    write!(std::io::stdout().lock(), "{}", formatter.format(&report))?;
 
     Ok(())
 }
@@ -693,9 +693,8 @@ pub fn dump_tree(
     project_tree: &ProjectTree,
     filter: Option<&crate::filter::PathFilter>,
     depth: Option<usize>,
-) {
-    let stdout = std::io::stdout();
-    let _ = write_tree(&mut stdout.lock(), root, project_tree, filter, depth);
+) -> std::io::Result<()> {
+    write_tree(&mut std::io::stdout().lock(), root, project_tree, filter, depth)
 }
 
 /// The writer-generic core of [`dump_tree`], split out so the depth/`+N`
@@ -743,9 +742,8 @@ fn write_tree(
 /// (direct children only, not a deep count) rather than silently hidden —
 /// hiding a method count instead of showing zero methods would misreport
 /// what is actually there, not just omit detail about it.
-pub fn print_symbol(sym: &SymbolNode, indent: usize, depth: Option<usize>) {
-    let stdout = std::io::stdout();
-    let _ = write_symbol(&mut stdout.lock(), sym, indent, depth);
+pub fn print_symbol(sym: &SymbolNode, indent: usize, depth: Option<usize>) -> std::io::Result<()> {
+    write_symbol(&mut std::io::stdout().lock(), sym, indent, depth)
 }
 
 fn write_symbol(

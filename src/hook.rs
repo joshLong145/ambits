@@ -16,6 +16,7 @@
 //! The cache would poison itself. A hook has Claude Code do the injection, and
 //! we write nothing.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Result, WrapErr};
@@ -73,6 +74,7 @@ fn is_ambit_entry(entry: &Value) -> bool {
 /// file we cannot parse is left strictly alone — we print the snippet instead
 /// of risking clobbering it.
 pub fn install(global: bool, project: Option<PathBuf>) -> Result<()> {
+    let mut out = std::io::stdout().lock();
     let project_root = project
         .clone()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -93,9 +95,9 @@ pub fn install(global: bool, project: Option<PathBuf>) -> Result<()> {
             Err(e) => {
                 // Refuse to guess at a malformed file. Losing the user's
                 // settings is far worse than making them paste four lines.
-                eprintln!("[ambit] {} is not valid JSON: {e}", settings_path.display());
-                eprintln!("[ambit] Not modifying it. Add this to \"hooks\" yourself:\n");
-                println!("{}", serde_json::to_string_pretty(&hook_entry(&project_root))?);
+                ambits::try_eprintln!("[ambit] {} is not valid JSON: {e}", settings_path.display());
+                ambits::try_eprintln!("[ambit] Not modifying it. Add this to \"hooks\" yourself:\n");
+                writeln!(out, "{}", serde_json::to_string_pretty(&hook_entry(&project_root))?)?;
                 return Ok(());
             }
         },
@@ -104,7 +106,7 @@ pub fn install(global: bool, project: Option<PathBuf>) -> Result<()> {
     };
 
     if !settings.is_object() {
-        eprintln!(
+        ambits::try_eprintln!(
             "[ambit] {} is valid JSON but not an object; not modifying it.",
             settings_path.display()
         );
@@ -151,15 +153,15 @@ pub fn install(global: bool, project: Option<PathBuf>) -> Result<()> {
             .wrap_err_with(|| format!("writing {}", settings_path.display()))?;
     }
 
-    println!("SessionStart hook {action}: {}", settings_path.display());
-    println!("  {}", hook_command(&project_root));
-    println!();
-    println!("After a compaction, Claude Code will run this and inject the symbols");
-    println!("this session has already read.");
-    println!();
-    println!("Requires `ambits` on PATH. Coverage must have been journaled by the");
-    println!("TUI for this session, otherwise the digest is reconstructed from");
-    println!("session logs and says so.");
+    writeln!(out, "SessionStart hook {action}: {}", settings_path.display())?;
+    writeln!(out, "  {}", hook_command(&project_root))?;
+    writeln!(out)?;
+    writeln!(out, "After a compaction, Claude Code will run this and inject the symbols")?;
+    writeln!(out, "this session has already read.")?;
+    writeln!(out)?;
+    writeln!(out, "Requires `ambits` on PATH. Coverage must have been journaled by the")?;
+    writeln!(out, "TUI for this session, otherwise the digest is reconstructed from")?;
+    writeln!(out, "session logs and says so.")?;
 
     Ok(())
 }

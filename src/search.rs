@@ -1044,19 +1044,45 @@ pub fn run(
         return Ok(Outcome { matched, shown });
     }
 
-    let stdout = std::io::stdout();
-    let mut w = std::io::BufWriter::new(stdout.lock());
+    let mut w = std::io::BufWriter::new(std::io::stdout().lock());
+    match print_results(&mut w, &files, targets, opts, coverage, withheld).and_then(|()| w.flush()) {
+        // The reader went away (`… | head`). Stop writing, but report the
+        // outcome as if it had read everything: the exit code answers "was
+        // there a match", which does not depend on who stopped listening.
+        // `--files-without-match` prints when nothing matched, so "output was
+        // being written" is not the same as "matched". See `crate::output`.
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            return Ok(Outcome { matched, shown })
+        }
+        result => result?,
+    }
 
+    // stderr, so stdout stays exactly what a grep consumer expects to parse.
+    // JSON carries the count in its summary event instead.
+    if withheld > 0 && !opts.json {
+        crate::try_eprintln!("… {withheld} more matches withheld (--head-limit 0 for all)");
+    }
+
+    Ok(Outcome { matched, shown })
+}
+
+/// Everything `run` prints, in the shape `opts` asks for.
+fn print_results(
+    w: &mut impl Write,
+    files: &[FileHits],
+    targets: &[(PathBuf, PathBuf)],
+    opts: &Options,
+    coverage: Option<&CoverageIndex>,
+    withheld: usize,
+) -> std::io::Result<()> {
     if opts.json {
-        print_json(&mut w, &files, opts, coverage, withheld)?;
-        w.flush()?;
-        return Ok(Outcome { matched, shown });
+        return print_json(w, files, opts, coverage, withheld);
     }
 
     match opts.mode {
-        OutputMode::Content => print_content(&mut w, &files, opts, coverage.is_some())?,
+        OutputMode::Content => print_content(w, files, opts, coverage.is_some())?,
         OutputMode::FilesWithMatches => {
-            for file in &files {
+            for file in files {
                 write!(w, "{}{}", file.path.display(), path_terminator(opts))?;
             }
         }
@@ -1076,25 +1102,18 @@ pub fn run(
         // `--count-matches` counts the matches themselves. A line with two
         // matches is one line and two matches.
         OutputMode::Count => {
-            for file in &files {
+            for file in files {
                 writeln!(w, "{}:{}", file.path.display(), file.matched_lines())?;
             }
         }
         OutputMode::CountMatches => {
-            for file in &files {
+            for file in files {
                 writeln!(w, "{}:{}", file.path.display(), file.hits.len())?;
             }
         }
-        OutputMode::Quiet => unreachable!("returned above"),
+        OutputMode::Quiet => unreachable!("run returns before printing"),
     }
-    w.flush()?;
-
-    // stderr, so stdout stays exactly what a grep consumer expects to parse.
-    if withheld > 0 {
-        eprintln!("… {withheld} more matches withheld (--head-limit 0 for all)");
-    }
-
-    Ok(Outcome { matched, shown })
+    Ok(())
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ mod skill;
 mod tui;
 mod ui;
 
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -946,7 +946,25 @@ fn scan_tree(
     }
 }
 
+/// Config and journal warnings. Always stderr: every command's stdout is data
+/// someone may be parsing (`--coverage --format json | jq`), and a warning
+/// there would corrupt it.
+fn report_warnings<W: std::fmt::Display>(warnings: impl IntoIterator<Item = W>) {
+    for w in warnings {
+        ambits::try_eprintln!("[ambit warning] {w}");
+    }
+}
+
 fn main() -> Result<()> {
+    match run() {
+        // The reader went away (`ambits … | head`): the consumer ended the
+        // conversation, which is not a failure. See `ambits::output`.
+        Err(e) if ambits::output::is_broken_pipe(&e) => Ok(()),
+        result => result,
+    }
+}
+
+fn run() -> Result<()> {
     color_eyre::install()?;
     let mut cli = Cli::parse();
 
@@ -1065,8 +1083,9 @@ fn main() -> Result<()> {
                 builder.add_defaults();
                 let mut defs = builder.definitions();
                 defs.sort_by(|a, b| a.name().cmp(b.name()));
+                let mut out = io::stdout().lock();
                 for def in defs {
-                    println!("{}: {}", def.name(), def.globs().join(", "));
+                    writeln!(out, "{}: {}", def.name(), def.globs().join(", "))?;
                 }
                 return Ok(());
             }
@@ -1077,9 +1096,7 @@ fn main() -> Result<()> {
     };
 
     if let Some((dialect, request)) = search {
-        for w in &config_warnings {
-            eprintln!("[ambit warning] {w}");
-        }
+        report_warnings(&config_warnings);
 
         // grep's exit codes, which agents chain on: 0 matched, 1 did not,
         // 2 something went wrong. `color_eyre` would exit 1 for an error,
@@ -1107,7 +1124,7 @@ fn main() -> Result<()> {
                 std::process::exit(1)
             }
             Err(e) => {
-                eprintln!("ambits {dialect}: {e:#}");
+                ambits::try_eprintln!("ambits {dialect}: {e:#}");
                 std::process::exit(2);
             }
         }
@@ -1116,18 +1133,14 @@ fn main() -> Result<()> {
     let project_tree = scan_tree(cli.serena, &registry, &project_path, filter.as_ref())?;
 
     if cli.dump {
-        for w in &config_warnings {
-            println!("[ambit warning] {w}");
-        }
+        report_warnings(&config_warnings);
         let depth = if cli.full { None } else { Some(cli.depth) };
-        coverage::dump_tree(&project_path, &project_tree, filter.as_ref(), depth);
+        coverage::dump_tree(&project_path, &project_tree, filter.as_ref(), depth)?;
         return Ok(());
     }
 
     if cli.coverage {
-        for w in &config_warnings {
-            println!("[ambit warning] {w}");
-        }
+        report_warnings(&config_warnings);
         let formatter: Box<dyn coverage::CoverageFormatter> = match cli.format {
             CoverageFormat::Table => Box::new(coverage::TextFormatter::default()),
             CoverageFormat::Json => Box::new(coverage::JsonFormatter),
@@ -1150,9 +1163,7 @@ fn main() -> Result<()> {
         max_bytes,
     }) = &command
     {
-        for w in &config_warnings {
-            eprintln!("[ambit warning] {w}");
-        }
+        report_warnings(&config_warnings);
         return ambits::lookup::run(
             &project_path,
             &project_tree,
@@ -1164,9 +1175,7 @@ fn main() -> Result<()> {
     }
 
     if let Some(Commands::Callers { name, format }) = &command {
-        for w in &config_warnings {
-            eprintln!("[ambit warning] {w}");
-        }
+        report_warnings(&config_warnings);
         return ambits::callers::run(
             &project_path,
             &project_tree,
@@ -1177,9 +1186,7 @@ fn main() -> Result<()> {
     }
 
     if let Some(Commands::RestoreContext { max_tokens, format }) = command {
-        for w in &config_warnings {
-            eprintln!("[ambit warning] {w}");
-        }
+        report_warnings(&config_warnings);
         return run_restore_context(
             &project_path,
             &project_tree,
@@ -1231,7 +1238,7 @@ fn main() -> Result<()> {
     if journal_enabled {
         if let Some(stats) = app.rehydrate_from_journal() {
             if stats.drifted > 0 || stats.inserted > 0 || stats.moved > 0 {
-                eprintln!(
+                ambits::try_eprintln!(
                     "[ambit] rehydrated from journal: {} corrected, {} recovered, {} moved, {} stale",
                     stats.corrected, stats.inserted, stats.moved, stats.drifted
                 );
@@ -1251,9 +1258,7 @@ fn main() -> Result<()> {
                 .unwrap_or(ambits::journal::DEFAULT_FLUSH_INTERVAL_MS),
         );
         let backend = if serena_mode { "serena" } else { "tree-sitter" };
-        for warning in app.enable_journal(backend, interval) {
-            eprintln!("[ambit warning] {warning}");
-        }
+        report_warnings(app.enable_journal(backend, interval));
         app.sync_journal();
     }
 
@@ -1383,7 +1388,7 @@ fn run_restore_context(
     // restore; printing a bare newline there would be stdout Claude Code has
     // to parse and reject.
     if !rendered.is_empty() {
-        println!("{rendered}");
+        writeln!(io::stdout().lock(), "{rendered}")?;
     }
     Ok(())
 }
