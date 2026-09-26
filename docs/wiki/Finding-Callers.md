@@ -15,8 +15,15 @@ inside a string literal is never reported — the answer is a call node or it is
 not there. Each site is attributed to the innermost symbol containing it, and
 that id goes straight into [`show`](Reading-by-Symbol).
 
-Several names can be passed at once. `--format json` returns match objects
-shaped exactly like `show --no-body`.
+Several names can be passed at once. `--format json` gives, per name, the
+counts and a `sites` list of `{file, line, caller}`, where `caller` is the
+enclosing symbol's id — absent for a call at file scope:
+
+```json
+{"schema_version":1,"name_matched_only":true,"results":[{"callee":"centered_rect",
+"call_sites":2,"callers":2,"sites":[{"file":"src/ui/alignment.rs","line":16,
+"caller":"src/ui/alignment.rs::render"}, …]}]}
+```
 
 ## Matching is by name, not by resolution
 

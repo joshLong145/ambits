@@ -76,7 +76,10 @@ struct Cli {
     #[arg(short, long)]
     agent: Option<String>,
 
-    /// Output directory for event logs. If set, writes processed events to <dir>/<session>.log.
+    /// Directory for a structured JSON-lines debug log, one file per session:
+    /// <dir>/<session>.log. Records session-log ingest, tool/depth resolution
+    /// and one activity line per tool call; `RUST_LOG=ambits=debug` adds
+    /// internal diagnostics. Nothing is logged without this flag.
     #[arg(long)]
     log_output: Option<PathBuf>,
 
@@ -233,7 +236,7 @@ enum Commands {
 
         /// Output format.
         #[arg(long, value_enum, default_value = "text")]
-        format: FindFormat,
+        format: CallersFormat,
     },
 
     /// Inspect or remove the coverage journals under .ambits/coverage.
@@ -593,11 +596,12 @@ enum ColorWhen {
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
-enum FindFormat {
-    /// Aligned listing, one symbol per line (default).
+enum CallersFormat {
+    /// A heading per name with its call-site and caller counts, then one line
+    /// per call site: the enclosing symbol's id and `file:line` (default).
     Text,
-    /// Schema-versioned JSON. Match objects are shaped exactly like
-    /// `show --no-body`, so `find` output feeds straight into `show`.
+    /// Schema-versioned JSON: per name, `sites` of `{file, line, caller}`.
+    /// `caller` is a symbol id, so it feeds straight into `show`.
     Json,
 }
 
@@ -1185,7 +1189,7 @@ fn run() -> Result<()> {
             &project_tree,
             &registry,
             name,
-            matches!(format, FindFormat::Json),
+            matches!(format, CallersFormat::Json),
         );
     }
 
