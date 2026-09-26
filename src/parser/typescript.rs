@@ -1315,6 +1315,17 @@ declare function require(id: string): any;
         assert_eq!(syms[0].byte_range.start as usize, src.find("function").unwrap());
     }
 
+    /// A comment trailing code on its own row is about that code, not the
+    /// declaration on the next line — which used to start mid-way through the
+    /// previous statement's line.
+    #[test]
+    fn a_trailing_comment_belongs_to_the_code_before_it() {
+        let src = "const a = 1; // about a\nfunction f() {}\n";
+        let syms = parse(src);
+        let f = syms.last().unwrap();
+        assert_eq!(f.byte_range.start as usize, src.find("function").unwrap());
+    }
+
     /// A comment above a method inside a class attaches to the method, not
     /// the class — the two have different preceding-sibling contexts.
     #[test]
