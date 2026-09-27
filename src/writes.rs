@@ -301,10 +301,11 @@ pub fn attribute(
     let hunks = match diff {
         Diff::Hunks(hunks) => hunks,
         Diff::Created => {
-            let mut touched = BTreeSet::new();
-            for_each_leaf(&after_syms, &mut |s| {
-                touched.insert((s.id.clone(), s.content_hash));
-            });
+            let touched: BTreeSet<_> = crate::symbols::walk_symbols(&after_syms)
+                .into_iter()
+                .filter(|s| s.children.is_empty())
+                .map(|s| (s.id.clone(), s.content_hash))
+                .collect();
             // A created line in no symbol is as much a change outside
             // symbols as an edited one; without this, a file with no
             // symbols would record a write that changed nothing.
@@ -431,34 +432,12 @@ fn apply_hunks<'a>(before: &[&'a str], hunks: &'a [Hunk]) -> Option<Vec<&'a str>
 
 /// The deepest symbol whose inclusive line range contains `line`.
 fn innermost_at(symbols: &[SymbolNode], line: u32) -> Option<&SymbolNode> {
-    let hit = symbols
-        .iter()
-        .find(|s| s.line_range.start <= line && line <= s.line_range.end)?;
-    innermost_at(&hit.children, line).or(Some(hit))
+    crate::symbols::innermost(symbols, &|s| s.line_range.start <= line && line <= s.line_range.end)
 }
 
 /// Every symbol, at any depth, whose id is `id`.
 fn with_id<'a>(symbols: &'a [SymbolNode], id: &str) -> Vec<&'a SymbolNode> {
-    let mut out = Vec::new();
-    let mut stack: Vec<&SymbolNode> = symbols.iter().collect();
-    while let Some(s) = stack.pop() {
-        if &*s.id == id {
-            out.push(s);
-        }
-        stack.extend(s.children.iter());
-    }
-    out
-}
-
-/// Visit every symbol with no children.
-fn for_each_leaf<'a>(symbols: &'a [SymbolNode], f: &mut impl FnMut(&'a SymbolNode)) {
-    for s in symbols {
-        if s.children.is_empty() {
-            f(s);
-        } else {
-            for_each_leaf(&s.children, f);
-        }
-    }
+    crate::symbols::walk_symbols(symbols).into_iter().filter(|s| &*s.id == id).collect()
 }
 
 #[cfg(test)]

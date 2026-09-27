@@ -158,16 +158,17 @@ impl FileSymbols {
 }
 
 /// Recursive half of [`FileSymbols::enclosing`].
-///
-/// Descends before returning, so the deepest containing symbol wins; a symbol
-/// whose children do not contain `byte` is itself the answer.
 fn enclosing(symbols: &[SymbolNode], byte: u32) -> Option<&SymbolNode> {
-    for sym in symbols {
-        if sym.byte_range.start <= byte && byte < sym.byte_range.end {
-            return enclosing(&sym.children, byte).or(Some(sym));
-        }
-    }
-    None
+    innermost(symbols, &|sym| sym.byte_range.start <= byte && byte < sym.byte_range.end)
+}
+
+/// The deepest symbol `contains` accepts, descending only into symbols it
+/// accepts: the one containment search, whatever the position is measured
+/// in (a byte for `enclosing`, a line for write attribution). A symbol whose
+/// children do not contain the position is itself the answer.
+pub fn innermost<'a>(symbols: &'a [SymbolNode], contains: &dyn Fn(&SymbolNode) -> bool) -> Option<&'a SymbolNode> {
+    let hit = symbols.iter().find(|s| contains(s))?;
+    innermost(&hit.children, contains).or(Some(hit))
 }
 
 impl FileSymbols {

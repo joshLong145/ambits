@@ -46,7 +46,7 @@ impl SyncIgnore {
 
     /// Whether the symbol `id` (`<path>::<name-path>`) lives in an ignored file.
     pub fn ignores_symbol(&self, id: &str) -> bool {
-        self.is_ignored(id.split("::").next().unwrap_or(id))
+        self.is_ignored(crate::symbols::split_id(id).0)
     }
 
     /// Digest of the effective patterns, a snapshot input (§6.1).

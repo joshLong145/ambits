@@ -125,13 +125,9 @@ pub fn write_tree(
 }
 
 fn write_file(store: &Store, file: &FileSymbols, parser: &str, count: &mut usize) -> Result<ObjectId> {
-    // Ids are built from the path as the parser saw it — separators and
-    // Unicode form untouched — so that is the prefix to strip; `name_path`
-    // is normalized afterwards.
-    let prefix = format!("{}::", file.file_path.to_string_lossy());
     let mut ids = Vec::with_capacity(file.symbols.len());
     for sym in &file.symbols {
-        ids.push(write_symbol(store, sym, &prefix, count)?);
+        ids.push(write_symbol(store, sym, count)?);
     }
     let payload = json!({
         "lines": file.total_lines,
@@ -146,12 +142,14 @@ fn write_file(store: &Store, file: &FileSymbols, parser: &str, count: &mut usize
 /// its parent's (an inherent impl is `impl App`, its methods `App/…`), and
 /// leaving the file out keeps the object shared when the file is renamed.
 /// `estimated_tokens` is left out: it is recomputed on restore (§5.1).
-fn write_symbol(store: &Store, sym: &SymbolNode, prefix: &str, count: &mut usize) -> Result<ObjectId> {
+fn write_symbol(store: &Store, sym: &SymbolNode, count: &mut usize) -> Result<ObjectId> {
     let mut children = Vec::with_capacity(sym.children.len());
     for child in &sym.children {
-        children.push(write_symbol(store, child, prefix, count)?.hex());
+        children.push(write_symbol(store, child, count)?.hex());
     }
-    let name_path = sym.id.strip_prefix(prefix).unwrap_or(&sym.id);
+    // Split off at the first `::`, whatever form the parser was given the
+    // path in (separators, Unicode); normalized below.
+    let name_path = sym.name_path();
     let payload = json!({
         "bytes": [sym.byte_range.start, sym.byte_range.end],
         "category": sym.category.to_string(),
