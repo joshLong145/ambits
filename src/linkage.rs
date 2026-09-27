@@ -124,6 +124,17 @@ pub struct Resolver {
     registry: ParserRegistry,
     logs: HashMap<u64, Vec<Commit>>,
     tips: String,
+    /// What each `(commit, path)` contains, computed once: many units share
+    /// a file, and a refresh walks the same commits for all of them.
+    contents: HashMap<(String, String), Contents>,
+}
+
+/// A committed file's identity, as units are matched against it.
+#[derive(Default)]
+struct Contents {
+    file_hash: Option<String>,
+    /// `(name_path, content hash)` of every symbol.
+    symbols: std::collections::HashSet<(String, String)>,
 }
 
 impl Resolver {
@@ -137,6 +148,7 @@ impl Resolver {
             registry: ParserRegistry::new(),
             logs: HashMap::new(),
             tips,
+            contents: HashMap::new(),
         })
     }
 
@@ -247,10 +259,16 @@ impl Resolver {
 
     /// Whether commit `sha`'s version of `path` (repo-relative; `rel` is
     /// the same file relative to the project) contains `unit`.
-    fn contains(&self, sha: &str, path: &str, rel: &str, unit: &Unit) -> bool {
+    fn contains(&mut self, sha: &str, path: &str, rel: &str, unit: &Unit) -> bool {
+        let key = (sha.to_string(), path.to_string());
+        if !self.contents.contains_key(&key) {
+            let contents = self.blob(sha, path).map(|b| self.read_contents(rel, &b)).unwrap_or_default();
+            self.contents.insert(key.clone(), contents);
+        }
+        let contents = &self.contents[&key];
         match &unit.proof {
-            Proof::FileHash(fh) => self.blob(sha, path).is_some_and(|b| b3(blake3::hash(&b).as_bytes()) == *fh),
-            Proof::Symbol { name_path, hash } => self.blob(sha, path).is_some_and(|b| self.has_symbol(rel, &b, name_path, hash)),
+            Proof::FileHash(fh) => contents.file_hash.as_deref() == Some(fh.as_str()),
+            Proof::Symbol { name_path, hash } => contents.symbols.contains(&(name_path.clone(), hash.clone())),
             Proof::None => false,
         }
     }
@@ -266,23 +284,26 @@ impl Resolver {
         }
     }
 
-    /// Whether `blob`, parsed as project file `rel`, has a symbol at
-    /// `name_path` with content hash `hash`.
-    fn has_symbol(&self, rel: &str, blob: &[u8], name_path: &str, hash: &str) -> bool {
-        let Ok(source) = std::str::from_utf8(blob) else { return false };
+    /// The file hash of `blob`, and every symbol in it when parsed as
+    /// project file `rel`. The blob itself is dropped (§9.6).
+    fn read_contents(&self, rel: &str, blob: &[u8]) -> Contents {
+        let mut out = Contents { file_hash: Some(b3(blake3::hash(blob).as_bytes())), ..Default::default() };
         let path = Path::new(rel);
-        let Some(parsed) = self.registry.parser_for(path).and_then(|p| p.parse_file(path, source).ok()) else {
-            return false;
-        };
-        let prefix = format!("{rel}::");
-        let mut stack: Vec<&crate::symbols::SymbolNode> = parsed.symbols.iter().collect();
-        while let Some(s) = stack.pop() {
-            if s.id.strip_prefix(&prefix) == Some(name_path) && b3(&s.content_hash) == hash {
-                return true;
+        let parsed = std::str::from_utf8(blob)
+            .ok()
+            .zip(self.registry.parser_for(path))
+            .and_then(|(source, parser)| parser.parse_file(path, source).ok());
+        if let Some(parsed) = parsed {
+            let prefix = format!("{rel}::");
+            let mut stack: Vec<&crate::symbols::SymbolNode> = parsed.symbols.iter().collect();
+            while let Some(s) = stack.pop() {
+                if let Some(name_path) = s.id.strip_prefix(&prefix) {
+                    out.symbols.insert((name_path.to_string(), b3(&s.content_hash)));
+                }
+                stack.extend(s.children.iter());
             }
-            stack.extend(s.children.iter());
         }
-        false
+        out
     }
 
     /// `path` (repo-relative) as committed in `sha`.
