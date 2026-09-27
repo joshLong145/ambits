@@ -43,6 +43,25 @@ pub fn migrate_legacy_journals(project_root: &Path) {
 
 const COVERAGE: &str = "coverage";
 
+// The snapshot store's layout under `STATE_DIR` (spec §8). Named once so
+// writers, readers and gc's temp-file sweep cannot disagree.
+
+/// Loose objects, `objects/ab/cdef….json`.
+pub const OBJECTS: &str = "objects";
+/// Refs, `refs/sessions/<id>`.
+pub const REFS: &str = "refs";
+/// Reflogs, mirroring `refs/`.
+pub const LOGS: &str = "logs";
+/// Snapshot notes, `notes/<id>.json`.
+pub const NOTES: &str = "notes";
+/// The links index (where agent writes landed).
+pub const LINKS: &str = "links";
+/// Local-only caches, such as `cache/never-landed/`.
+pub const CACHE: &str = "cache";
+/// Every directory ambits writes files into atomically — and so may leave
+/// a `.tmp-*` in after a crash.
+pub const STORE_DIRS: &[&str] = &[OBJECTS, REFS, LOGS, NOTES, LINKS, CACHE];
+
 /// The project `start` belongs to, for when `--project` is not given: the
 /// nearest directory — `start` itself or an ancestor — holding `.git` (a
 /// directory, or a file in a worktree or submodule) or [`STATE_DIR`].

@@ -17,7 +17,6 @@ use color_eyre::eyre::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::git::{git, is_commit_id, Repo};
-use crate::objects::store::create_private_dir;
 use crate::objects::{b3, valid_record_path};
 use crate::parser::ParserRegistry;
 use crate::writes::{Level, WriteRecord};
@@ -205,8 +204,8 @@ impl Resolver {
     /// a store that cannot be written costs speed, never the answer.
     pub fn landing(&mut self, write: &WriteRecord, unit: &Unit) -> Result<Landing> {
         let key = link_key(&write.op, &unit.target, unit.hash());
-        let link_path = self.state.join("links").join(format!("{key}.json"));
-        let never_path = self.state.join("cache").join("never-landed").join(format!("{key}.json"));
+        let link_path = self.state.join(crate::state_dir::LINKS).join(format!("{key}.json"));
+        let never_path = self.state.join(crate::state_dir::CACHE).join("never-landed").join(format!("{key}.json"));
 
         if let Some(link) = std::fs::read_to_string(&link_path).ok().and_then(|s| serde_json::from_str::<Link>(&s).ok()) {
             if is_commit_id(&link.commit) && self.reachable(&link.commit) {
@@ -455,17 +454,10 @@ fn tips(dir: &Path) -> Vec<String> {
     tips
 }
 
-/// Write a cache file: atomic by rename, but not fsynced — losing one to a
-/// crash only means resolving it again.
+/// Write a cache file: private and atomic, but not fsynced — losing one
+/// to a crash only means resolving it again.
 fn write_cache(path: &Path, bytes: &[u8]) -> Result<()> {
-    let dir = path.parent().expect("cache files live in a directory");
-    create_private_dir(dir)?;
-    let tmp = dir.join(format!(".tmp-{}", crate::objects::store::random_token()));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })?;
-    Ok(())
+    crate::objects::store::write_atomic_with(path, bytes, crate::objects::store::Durability::NoSync)
 }
 
 /// The file name of a unit's entry: a hash of `(op, target, hash)`, so

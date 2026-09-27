@@ -23,7 +23,7 @@ use serde_json::Value;
 
 use super::refs;
 use super::snapshot::Snapshot;
-use super::store::{create_private_dir, Store};
+use super::store::{create_private_dir, is_temp, walk_files, Store};
 use super::{canonical, tree, Kind, ObjectId};
 
 /// Unreachable objects younger than this are kept (§8).
@@ -117,27 +117,18 @@ pub fn gc(store: &Store, grace: Duration, reflog_expiry: Duration) -> Result<GcS
     stats.kept = unreachable.len() - stats.deleted.len();
 
     // Notes of snapshots that no longer exist.
-    for entry in fs::read_dir(store.root().join("notes")).into_iter().flatten().flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
+    for path in walk_files(&store.root().join(crate::state_dir::NOTES)) {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let orphan = name.strip_suffix(".json").and_then(|n| ObjectId::parse(n).ok()).is_some_and(|id| !store.contains(&id));
-        if orphan && fs::remove_file(entry.path()).is_ok() {
+        if orphan && fs::remove_file(&path).is_ok() {
             stats.notes_removed += 1;
         }
     }
-    // Temp files a crash left, anywhere a writer makes them: each directory
-    // visited once.
-    for dir in ["objects", "refs", "logs", "notes"] {
-        let mut stack = vec![store.root().join(dir)];
-        while let Some(d) = stack.pop() {
-            for entry in fs::read_dir(&d).into_iter().flatten().flatten() {
-                let path = entry.path();
-                match fs::symlink_metadata(&path) {
-                    Ok(m) if m.is_dir() => stack.push(path),
-                    Ok(m) if m.is_file() && entry.file_name().to_string_lossy().starts_with(".tmp-") && older_than(&path, grace) => {
-                        stats.temp_files_removed += usize::from(fs::remove_file(&path).is_ok());
-                    }
-                    _ => {}
-                }
+    // Temp files a crash left, wherever ambits writes atomically.
+    for dir in crate::state_dir::STORE_DIRS {
+        for path in walk_files(&store.root().join(dir)) {
+            if is_temp(&path) && older_than(&path, grace) && fs::remove_file(&path).is_ok() {
+                stats.temp_files_removed += 1;
             }
         }
     }

@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use color_eyre::eyre::{bail, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 
-use super::store::{create_private_dir, random_token, write_atomic, Store};
+use super::store::{create_private_dir, is_temp, private_options, random_token, walk_files, write_atomic, Store};
 use super::ObjectId;
 
 /// Default age after which reflog entries stop protecting objects from gc
@@ -50,7 +50,7 @@ fn ref_path(store: &Store, name: &RefName) -> PathBuf {
 }
 
 fn reflog_path(store: &Store, name: &RefName) -> PathBuf {
-    store.root().join("logs").join(name.as_str())
+    store.root().join(crate::state_dir::LOGS).join(name.as_str())
 }
 
 /// The snapshot `name` points at, if any.
@@ -64,25 +64,15 @@ pub fn read(store: &Store, name: &RefName) -> Result<Option<ObjectId>> {
 
 /// Every ref under `.ambits/refs/`, local and remote-tracking, with its tip.
 pub fn all(store: &Store) -> Vec<(String, ObjectId)> {
-    let mut out = Vec::new();
-    let mut stack = vec![store.root().join("refs")];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            let Ok(meta) = fs::symlink_metadata(&path) else { continue };
-            if meta.is_dir() {
-                stack.push(path);
-            } else if meta.is_file()
-                && path.extension().is_none_or(|e| e != "lock")
-                && !entry.file_name().to_string_lossy().starts_with('.')
-            {
-                if let Some(id) = fs::read_to_string(&path).ok().and_then(|s| ObjectId::parse(s.trim()).ok()) {
-                    let name = path.strip_prefix(store.root()).unwrap_or(&path).to_string_lossy().replace('\\', "/");
-                    out.push((name, id));
-                }
-            }
-        }
-    }
+    let mut out: Vec<(String, ObjectId)> = walk_files(&store.root().join(crate::state_dir::REFS))
+        .into_iter()
+        .filter(|p| !is_temp(p) && p.extension().is_none_or(|e| e != "lock"))
+        .filter_map(|path| {
+            let id = ObjectId::parse(fs::read_to_string(&path).ok()?.trim()).ok()?;
+            let name = path.strip_prefix(store.root()).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+            Some((name, id))
+        })
+        .collect();
     out.sort();
     out
 }
@@ -96,14 +86,7 @@ impl RefLock {
     fn acquire(path: &Path) -> Result<Self> {
         let lock = path.with_extension("lock");
         create_private_dir(lock.parent().unwrap_or(path))?;
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = match options.open(&lock) {
+        let mut file = match private_options().create_new(true).open(&lock) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let holder = fs::read_to_string(&lock).unwrap_or_default();
@@ -153,14 +136,10 @@ pub struct ReflogEntry {
 fn append_reflog(store: &Store, name: &RefName, entry: &ReflogEntry) -> Result<()> {
     let path = reflog_path(store, name);
     create_private_dir(path.parent().unwrap_or(&path))?;
-    let mut options = fs::OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&path).wrap_err_with(|| format!("opening {}", path.display()))?;
+    let mut file = private_options()
+        .create(true)
+        .append(true)
+        .open(&path).wrap_err_with(|| format!("opening {}", path.display()))?;
     file.write_all(format!("{}\n", serde_json::to_string(entry)?).as_bytes())?;
     file.sync_all()?;
     Ok(())
@@ -168,26 +147,18 @@ fn append_reflog(store: &Store, name: &RefName, entry: &ReflogEntry) -> Result<(
 
 /// Every reflog, as `(file, entries)`. Unparseable lines are skipped.
 pub fn reflogs(store: &Store) -> Vec<(PathBuf, Vec<ReflogEntry>)> {
-    let mut out = Vec::new();
-    let mut stack = vec![store.root().join("logs")];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            match fs::symlink_metadata(&path) {
-                Ok(m) if m.is_dir() => stack.push(path),
-                Ok(m) if m.is_file() && !entry.file_name().to_string_lossy().starts_with('.') => {
-                    let entries = fs::read_to_string(&path)
-                        .unwrap_or_default()
-                        .lines()
-                        .filter_map(|l| serde_json::from_str(l).ok())
-                        .collect();
-                    out.push((path, entries));
-                }
-                _ => {}
-            }
-        }
-    }
-    out
+    walk_files(&store.root().join(crate::state_dir::LOGS))
+        .into_iter()
+        .filter(|p| !is_temp(p))
+        .map(|path| {
+            let entries = fs::read_to_string(&path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+            (path, entries)
+        })
+        .collect()
 }
 
 /// Drop reflog entries older than `expiry`, rewriting each log atomically.
@@ -217,7 +188,7 @@ pub struct Note {
 }
 
 pub fn note_path(store: &Store, id: &ObjectId) -> PathBuf {
-    store.root().join("notes").join(format!("{id}.json"))
+    store.root().join(crate::state_dir::NOTES).join(format!("{id}.json"))
 }
 
 pub fn write_note(store: &Store, id: &ObjectId, message: Option<&str>) -> Result<()> {

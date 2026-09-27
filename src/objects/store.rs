@@ -59,7 +59,7 @@ impl Store {
     }
 
     fn objects(&self) -> PathBuf {
-        self.root.join("objects")
+        self.root.join(crate::state_dir::OBJECTS)
     }
 
     /// Where the object `id` lives: `objects/ab/cdef….json`.
@@ -161,23 +161,46 @@ pub fn create_private_dir(dir: &Path) -> Result<()> {
     builder.create(dir).wrap_err_with(|| format!("creating {}", dir.display()))
 }
 
-/// Write `bytes` to `path` atomically: a private temp file beside it, fsync,
-/// rename. A reader sees the old file or the new one, never a torn one.
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let dir = path.parent().ok_or_else(|| eyre!("{} has no parent", path.display()))?;
-    create_private_dir(dir)?;
-    let tmp = dir.join(format!(".tmp-{}", random_token()));
+/// How far [`write_atomic_with`] goes to make a write survive a crash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durability {
+    /// fsync before the rename: for anything the store's integrity rests on.
+    Fsync,
+    /// Rename only: for caches, where a lost write costs recomputation.
+    NoSync,
+}
+
+/// Options for creating a new private file (`0600`, §8); callers choose
+/// `create_new` or `append`.
+pub fn private_options() -> fs::OpenOptions {
     let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    options.write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
+    options
+}
+
+/// [`write_atomic_with`], fsynced.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_with(path, bytes, Durability::Fsync)
+}
+
+/// Write `bytes` to `path` atomically: a private temp file beside it,
+/// optionally fsynced, then renamed over `path`. A reader sees the old file
+/// or the new one, never a torn one, and a failed write leaves no temp file.
+pub fn write_atomic_with(path: &Path, bytes: &[u8], durability: Durability) -> Result<()> {
+    let dir = path.parent().ok_or_else(|| eyre!("{} has no parent", path.display()))?;
+    create_private_dir(dir)?;
+    let tmp = dir.join(format!(".tmp-{}", random_token()));
     let result = (|| -> Result<()> {
-        let mut file = options.open(&tmp)?;
+        let mut file = private_options().create_new(true).open(&tmp)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        if durability == Durability::Fsync {
+            file.sync_all()?;
+        }
         fs::rename(&tmp, path)?;
         Ok(())
     })();
@@ -185,6 +208,28 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result.wrap_err_with(|| format!("writing {}", path.display()))
+}
+
+/// Every regular file under `dir`, recursively, never following symlinks
+/// (§9.1). Unreadable entries are skipped.
+pub fn walk_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in fs::read_dir(&d).into_iter().flatten().flatten() {
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => stack.push(entry.path()),
+                Ok(t) if t.is_file() => out.push(entry.path()),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// A file ambits' own writes leave behind only when interrupted.
+pub fn is_temp(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| n.to_string_lossy().starts_with(".tmp-"))
 }
 
 /// Flush a directory's entries to disk, so renames into it survive a power

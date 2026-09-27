@@ -392,3 +392,29 @@ fn the_git_hook_records_links() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
+
+/// The links index is part of the private store: files `0600`, and gc
+/// sweeps the temp files an interrupted write leaves there.
+#[cfg(unix)]
+#[test]
+fn links_are_private_and_their_temp_files_are_swept() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = Repo::new();
+    repo.write_file("src/a.rs", EDITED);
+    let w = write("toolu_1", Level::Symbol, vec![("src/a.rs::alpha", hash_of(EDITED, "alpha"))], None);
+    repo.commit_all("edit alpha");
+    repo.landed(&w);
+    let links = repo.root.join(".ambits/links");
+    let link = std::fs::read_dir(&links).unwrap().next().unwrap().unwrap().path();
+    assert_eq!(std::fs::metadata(&link).unwrap().permissions().mode() & 0o777, 0o600);
+
+    let stray = [links.join(".tmp-1"), repo.root.join(".ambits/cache/never-landed/.tmp-2")];
+    for s in &stray {
+        std::fs::create_dir_all(s.parent().unwrap()).unwrap();
+        std::fs::write(s, "x").unwrap();
+    }
+    let store = ambits::objects::store::Store::at(&repo.root);
+    let stats = ambits::objects::gc::gc(&store, std::time::Duration::ZERO, ambits::objects::refs::REFLOG_EXPIRY).unwrap();
+    assert_eq!(stats.temp_files_removed, 2);
+    assert!(stray.iter().all(|s| !s.exists()));
+}
