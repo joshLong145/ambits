@@ -304,6 +304,14 @@ so amends and rebases re-resolve.
 |---|---|
 | `ambits touched <file\|symbol-id>` | Latest agent write: agent, session, time, landed commit (verified, unverified, or *uncommitted*), still current or changed since. Origin (local or which remote) from phase 6 |
 
+For a symbol target, `touched` counts only **definite** touches: a
+symbol-level write naming the symbol or a descendant by name path (writes
+record innermost symbols, D11; `App` covers `App/handle_key`). A symbol-level
+write that names neither did not touch it (§2.3 completeness). A file-level
+write is not reported for a symbol. Ask about the file to see it. Status for
+a parent: every written descendant still at its hash and every removed one
+still absent is *current*. The name path absent entirely is *removed*.
+
 `ambits blame` is deferred (D20).
 
 ---

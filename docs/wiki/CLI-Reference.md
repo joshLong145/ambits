@@ -91,7 +91,9 @@ default budget 3000 tokens, default format `markdown`.
 
 `ambits -p . touched [--format text|json] <file|symbol-id>` — the latest agent
 write across every session's journal, and whether it is `current`, `changed`,
-`removed`, or `unknown` (a file-level edit, no hash to compare).
+`removed`, or `unknown` (a file-level edit, no hash to compare). A symbol
+covers everything nested under it, and counts only symbol-level writes. Exits
+0 whether or not a write was found (JSON: `"last_write": null`).
 
 ## `ambits cache`
 

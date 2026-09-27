@@ -49,14 +49,25 @@ impl Target {
         }
     }
 
+    /// Whether `write` changed this target. A symbol is touched through
+    /// itself or any descendant: writes record innermost symbols only (D11),
+    /// so an edit inside `App/handle_key` is an edit to `App`. Only
+    /// symbol-level writes count for a symbol — a file-level write cannot say
+    /// which symbols it changed, and a symbol-level one names every symbol it
+    /// did (spec §2.3).
     fn is_touched_by(&self, write: &WriteRecord) -> bool {
         match self {
             Target::File(f) => write.file == *f,
             Target::Symbol(id) => {
-                write.syms.iter().any(|(s, _)| s == id) || write.removed.iter().any(|s| s == id)
+                write.syms.iter().any(|(s, _)| within(s, id)) || write.removed.iter().any(|s| within(s, id))
             }
         }
     }
+}
+
+/// `symbol` is `id` or nested inside it.
+fn within(symbol: &str, id: &str) -> bool {
+    symbol.strip_prefix(id).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// Whether the agent's version is still what is on disk.
@@ -75,8 +86,9 @@ pub enum Status {
 
 /// The latest write touching `target`, across every session: `(session, write)`.
 ///
-/// Ordered by timestamp (RFC 3339 from the log, so lexicographic order is
-/// chronological), then by `op` so ties resolve the same way every time.
+/// Ordered by timestamp (RFC 3339 UTC from the log, so lexicographic order is
+/// chronological; a record with no timestamp sorts oldest), then by `op` so
+/// ties resolve the same way every time.
 pub fn latest(project_root: &Path, target: &Target) -> Option<(String, WriteRecord)> {
     let dir = journal_dir(project_root);
     session_ids(&dir)
@@ -104,23 +116,10 @@ pub fn status(project_root: &Path, registry: &ParserRegistry, target: &Target, w
             let now = encode_hash(blake3::hash(source.as_bytes()).as_bytes());
             return if &now == fh { Status::Current } else { Status::Changed };
         }
-    }
-
-    // A symbol the agent deleted is `removed` while it stays absent; if it
-    // is back, something re-added it since, so it has changed.
-    let deleted = match target {
-        Target::Symbol(id) if write.removed.iter().any(|r| r == id) => Some(id.as_str()),
-        _ => None,
-    };
-
-    let expected: Vec<(&str, &str)> = match target {
-        Target::Symbol(_) if deleted.is_some() => Vec::new(),
-        Target::Symbol(id) => write.syms.iter().filter(|(s, _)| s == id).map(|(s, h)| (s.as_str(), h.as_str())).collect(),
-        Target::File(_) if write.level == Level::Symbol && !write.syms.is_empty() => {
-            write.syms.iter().map(|(s, h)| (s.as_str(), h.as_str())).collect()
+        if write.level == Level::File || write.syms.is_empty() {
+            return Status::Unknown;
         }
-        Target::File(_) => return Status::Unknown,
-    };
+    }
 
     let Some(symbols) = registry
         .parser_for(Path::new(target.file()))
@@ -128,36 +127,41 @@ pub fn status(project_root: &Path, registry: &ParserRegistry, target: &Target, w
     else {
         return Status::Unknown;
     };
-    let current = |id: &str| -> Vec<String> {
+    // Current hashes of every symbol whose id passes `matches`.
+    let hashes = |matches: &dyn Fn(&str) -> bool| -> Vec<String> {
         let mut out = Vec::new();
         let mut stack: Vec<&SymbolNode> = symbols.symbols.iter().collect();
         while let Some(s) = stack.pop() {
-            if &*s.id == id {
+            if matches(&s.id) {
                 out.push(encode_hash(&s.content_hash));
             }
             stack.extend(s.children.iter());
         }
         out
     };
+    // Ids are not unique: every symbol with this one.
+    let current = |id: &str| hashes(&|s| s == id);
+    let unchanged = |id: &str, hash: &str| current(id).iter().any(|h| h == hash);
 
-    if let Some(id) = deleted {
-        return if current(id).is_empty() { Status::Removed } else { Status::Changed };
-    }
-
-    let mut any_missing = false;
-    for (id, hash) in &expected {
-        let now = current(id);
-        if now.is_empty() {
-            any_missing = true;
-        } else if !now.iter().any(|h| h == hash) {
-            return Status::Changed;
+    match target {
+        Target::Symbol(id) => {
+            // Present if anything by that name path is: an inherent impl is
+            // `impl App`, but its methods are `App/…`, so `App` can have
+            // children on disk with no symbol of its own.
+            if hashes(&|s| within(s, id)).is_empty() {
+                return Status::Removed;
+            }
+            // Everything the write left under `id` must be as it left it:
+            // written symbols at their hash, deleted ones still gone. That
+            // includes `id` itself, which is back if the write deleted it.
+            let written_intact = write.syms.iter().filter(|(s, _)| within(s, id)).all(|(s, h)| unchanged(s, h));
+            let deleted_gone = write.removed.iter().filter(|s| within(s, id)).all(|s| current(s).is_empty());
+            if written_intact && deleted_gone { Status::Current } else { Status::Changed }
         }
-    }
-    match (&target, any_missing) {
-        (Target::Symbol(_), true) => Status::Removed,
-        // A file whose written symbols partly vanished has changed since.
-        (Target::File(_), true) => Status::Changed,
-        _ => Status::Current,
+        // A file whose written symbols changed or vanished has changed since.
+        Target::File(_) => {
+            if write.syms.iter().all(|(s, h)| unchanged(s, h)) { Status::Current } else { Status::Changed }
+        }
     }
 }
 
@@ -327,6 +331,50 @@ mod tests {
     fn a_removed_symbol_that_came_back_has_changed() {
         let dir = project(&[("s1", write("toolu_1", "t", Level::Symbol, vec![], vec!["src/lib.rs::beta"], None))]);
         assert_eq!(check(&dir, "src/lib.rs::beta").unwrap().2, Status::Changed);
+    }
+
+    /// Writes name innermost symbols; asking about the enclosing one must
+    /// still find them.
+    #[test]
+    fn a_parent_is_touched_through_its_children() {
+        let src = "impl S {\n    fn a() {}\n    fn b() {}\n}\n";
+        let a = {
+            let file = ParserRegistry::new().parser_for(Path::new("src/lib.rs")).unwrap()
+                .parse_file(Path::new("src/lib.rs"), src).unwrap();
+            let child = &file.symbols[0].children[0];
+            (child.id.clone(), encode_hash(&child.content_hash))
+        };
+        let dir = project(&[("s1", write("toolu_1", "t", Level::Symbol, vec![(a.0.as_str(), a.1.clone())], vec![], None))]);
+        std::fs::write(dir.path().join("src/lib.rs"), src).unwrap();
+        let parent = a.0.rsplit_once('/').unwrap().0.to_string();
+
+        assert_eq!(check(&dir, &parent).unwrap().2, Status::Current);
+        std::fs::write(dir.path().join("src/lib.rs"), src.replace("fn a() {}", "fn a() { 1; }")).unwrap();
+        assert_eq!(check(&dir, &parent).unwrap().2, Status::Changed);
+        assert_eq!(check(&dir, &format!("{parent}X")), None, "a longer name is not a child");
+    }
+
+    /// A symbol-level write names every symbol it changed, so one that
+    /// omits the target did not touch it; a file-level write proves nothing.
+    #[test]
+    fn only_a_symbol_level_write_naming_it_touches_a_symbol() {
+        let dir = project(&[
+            ("s1", write("toolu_1", "2026-09-26T09:00:00Z", Level::Symbol, vec![("src/lib.rs::alpha", hash_of(SRC, "alpha"))], vec![], None)),
+            ("s1", write("toolu_2", "2026-09-26T10:00:00Z", Level::Symbol, vec![("src/lib.rs::beta", hash_of(SRC, "beta"))], vec![], None)),
+            ("s1", write("toolu_3", "2026-09-26T11:00:00Z", Level::File, vec![], vec![], None)),
+        ]);
+        assert_eq!(check(&dir, "src/lib.rs::alpha").unwrap().1, "toolu_1");
+    }
+
+    /// Equal timestamps resolve by `op`, the same way every time.
+    #[test]
+    fn a_timestamp_tie_resolves_by_op() {
+        let a = hash_of(SRC, "alpha");
+        let dir = project(&[
+            ("s2", write("toolu_b", "2026-09-26T09:00:00Z", Level::Symbol, vec![("src/lib.rs::alpha", a.clone())], vec![], None)),
+            ("s1", write("toolu_a", "2026-09-26T09:00:00Z", Level::Symbol, vec![("src/lib.rs::alpha", a)], vec![], None)),
+        ]);
+        assert_eq!(check(&dir, "src/lib.rs::alpha").unwrap().1, "toolu_b");
     }
 
     /// A file-level `Write` is judged by its content hash; a file-level

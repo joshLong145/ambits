@@ -52,6 +52,11 @@ src/app.rs::App/handle_key — last written 2026-09-27T10:00:01Z by agent-3f9c (
   unchanged since the agent wrote it
 ```
 
+For a symbol, only writes attributed to that symbol count — or to one nested
+inside it, so `App` finds an edit to `App/handle_key`. A file-level write
+changed *something* in the file, but not provably this symbol, so it is not
+reported. Ask about the file to see it.
+
 It searches every session's journal and reports whether the agent's version
 is still on disk: `current`, `changed`, `removed` (still absent — a symbol
 that came back after the agent deleted it is `changed`), or `unknown` for a
