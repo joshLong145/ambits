@@ -52,11 +52,12 @@ fn tool_read_missing_path_returns_none() {
 // 2. Edit
 // ---------------------------------------------------------------------------
 #[test]
-fn tool_edit_full_body() {
+fn tool_edit_is_a_write() {
     let cfg = builtin();
     let input = serde_json::json!({ "file_path": "/src/foo.rs" });
     let call = map_tool_call(&cfg, "Edit", &input, "a", "ts").unwrap();
-    assert_eq!(call.read_depth, ReadDepth::FullBody);
+    assert_eq!(call.read_depth, ReadDepth::Unseen, "a write grants no read credit (D9)");
+    assert_eq!(call.effect, ambits::ingest::Effect::Write);
     assert!(call.description.contains("foo.rs"));
 }
 
@@ -64,11 +65,12 @@ fn tool_edit_full_body() {
 // 3. Write
 // ---------------------------------------------------------------------------
 #[test]
-fn tool_write_full_body() {
+fn tool_write_is_a_write() {
     let cfg = builtin();
     let input = serde_json::json!({ "file_path": "/new/file.rs" });
     let call = map_tool_call(&cfg, "Write", &input, "a", "ts").unwrap();
-    assert_eq!(call.read_depth, ReadDepth::FullBody);
+    assert_eq!(call.read_depth, ReadDepth::Unseen, "a write grants no read credit (D9)");
+    assert_eq!(call.effect, ambits::ingest::Effect::Write);
 }
 
 // ---------------------------------------------------------------------------
@@ -173,7 +175,8 @@ fn tool_replace_symbol_body() {
     let cfg = builtin();
     let input = serde_json::json!({ "relative_path": "src/foo.rs", "name_path": "MyFn" });
     let call = map_tool_call(&cfg, "mcp__serena__replace_symbol_body", &input, "a", "ts").unwrap();
-    assert_eq!(call.read_depth, ReadDepth::FullBody);
+    assert_eq!(call.read_depth, ReadDepth::Unseen, "a write grants no read credit (D9)");
+    assert_eq!(call.effect, ambits::ingest::Effect::Write);
     assert_eq!(call.target_symbol.as_deref(), Some("MyFn"));
 }
 
@@ -185,7 +188,8 @@ fn tool_insert_after_symbol() {
     let cfg = builtin();
     let input = serde_json::json!({ "relative_path": "src/foo.rs", "name_path": "last_fn" });
     let call = map_tool_call(&cfg, "mcp__serena__insert_after_symbol", &input, "a", "ts").unwrap();
-    assert_eq!(call.read_depth, ReadDepth::FullBody);
+    assert_eq!(call.read_depth, ReadDepth::Unseen, "a write grants no read credit (D9)");
+    assert_eq!(call.effect, ambits::ingest::Effect::Write);
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +200,8 @@ fn tool_insert_before_symbol() {
     let cfg = builtin();
     let input = serde_json::json!({ "relative_path": "src/foo.rs", "name_path": "first_fn" });
     let call = map_tool_call(&cfg, "mcp__serena__insert_before_symbol", &input, "a", "ts").unwrap();
-    assert_eq!(call.read_depth, ReadDepth::FullBody);
+    assert_eq!(call.read_depth, ReadDepth::Unseen, "a write grants no read credit (D9)");
+    assert_eq!(call.effect, ambits::ingest::Effect::Write);
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +212,8 @@ fn tool_rename_symbol() {
     let cfg = builtin();
     let input = serde_json::json!({ "relative_path": "src/foo.rs", "name_path": "old_name" });
     let call = map_tool_call(&cfg, "mcp__serena__rename_symbol", &input, "a", "ts").unwrap();
-    assert_eq!(call.read_depth, ReadDepth::FullBody);
+    assert_eq!(call.read_depth, ReadDepth::Unseen, "a write grants no read credit (D9)");
+    assert_eq!(call.effect, ambits::ingest::Effect::Write);
     assert_eq!(call.target_symbol.as_deref(), Some("old_name"));
 }
 
@@ -219,7 +225,8 @@ fn tool_notebook_edit() {
     let cfg = builtin();
     let input = serde_json::json!({ "notebook_path": "/work/notebook.ipynb" });
     let call = map_tool_call(&cfg, "NotebookEdit", &input, "a", "ts").unwrap();
-    assert_eq!(call.read_depth, ReadDepth::FullBody);
+    assert_eq!(call.read_depth, ReadDepth::Unseen, "a write grants no read credit (D9)");
+    assert_eq!(call.effect, ambits::ingest::Effect::Write);
     assert!(call.file_path.is_some());
 }
 
@@ -340,7 +347,8 @@ fn mcp_acp_edit_alias() {
     let cfg = builtin();
     let input = serde_json::json!({ "file_path": "/alias.rs" });
     let call = map_tool_call(&cfg, "mcp__acp__Edit", &input, "a", "ts").unwrap();
-    assert_eq!(call.read_depth, ReadDepth::FullBody);
+    assert_eq!(call.read_depth, ReadDepth::Unseen, "a write grants no read credit (D9)");
+    assert_eq!(call.effect, ambits::ingest::Effect::Write);
 }
 
 // ---------------------------------------------------------------------------

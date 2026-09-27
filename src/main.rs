@@ -222,6 +222,17 @@ enum Commands {
     #[command(disable_help_flag = true)]
     Grep(GrepArgs),
 
+    /// When an agent last wrote a file or symbol, across every session's
+    /// journal, and whether that version is still on disk.
+    Touched {
+        /// A project-relative path, or a symbol id (`<path>::<name-path>`).
+        target: String,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value = "text")]
+        format: TouchedFormat,
+    },
+
     /// List the call sites of a function, and which symbol each sits in.
     ///
     /// Call sites come from the grammar's own tags query, so a mention in a
@@ -593,6 +604,15 @@ enum ColorWhen {
     Auto,
     Always,
     Never,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum TouchedFormat {
+    /// The last write, and whether it is still on disk (default).
+    Text,
+    /// Schema-versioned JSON: `last_write` with session, op, agent, time,
+    /// tool, level and status, or null.
+    Json,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -1043,6 +1063,11 @@ fn run() -> Result<()> {
     // Dispatched before the tree scan: inspecting or deleting journal files
     // needs the project path and nothing else, and scanning first would make
     // `cache status` pay seconds for an answer it does not use.
+    // Like `cache`, reads journals plus at most one file; no scan needed.
+    if let Some(Commands::Touched { target, format }) = &command {
+        return ambits::touched::run(&project_path, target, matches!(format, TouchedFormat::Json));
+    }
+
     if let Some(Commands::Cache { command }) = &command {
         return match command {
             CacheCommands::Status => ambits::cache::status(&project_path),

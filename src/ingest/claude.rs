@@ -1242,7 +1242,8 @@ mod tests {
     fn map_edit_tool() {
         let line = jsonl_assistant("mcp__acp__Edit", r#"{"file_path":"/src/app.rs","old_string":"a","new_string":"b"}"#);
         let events = parse_events(&line, "d");
-        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+        assert_eq!(events[0].read_depth, ReadDepth::Unseen, "a write grants no read credit (D9)");
+        assert_eq!(events[0].effect, Effect::Write);
         assert_eq!(events[0].file_path.as_ref().unwrap(), &PathBuf::from("/src/app.rs"));
     }
 
@@ -1250,7 +1251,8 @@ mod tests {
     fn map_write_tool() {
         let line = jsonl_assistant("mcp__acp__Write", r#"{"file_path":"/src/new.rs","content":"fn main(){}"}"#);
         let events = parse_events(&line, "d");
-        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+        assert_eq!(events[0].read_depth, ReadDepth::Unseen, "a write grants no read credit (D9)");
+        assert_eq!(events[0].effect, Effect::Write);
     }
 
     #[test]
@@ -1331,7 +1333,8 @@ mod tests {
     fn map_replace_symbol() {
         let line = jsonl_assistant("mcp__serena__replace_symbol_body", r#"{"name_path":"App/new","relative_path":"src/app.rs","body":"pub fn new() {}"}"#);
         let events = parse_events(&line, "d");
-        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+        assert_eq!(events[0].read_depth, ReadDepth::Unseen, "a write grants no read credit (D9)");
+        assert_eq!(events[0].effect, Effect::Write);
         assert_eq!(events[0].target_symbol.as_deref(), Some("App/new"));
     }
 
@@ -1339,7 +1342,8 @@ mod tests {
     fn map_insert_after() {
         let line = jsonl_assistant("mcp__serena__insert_after_symbol", r#"{"name_path":"App","relative_path":"src/app.rs","body":"fn foo() {}"}"#);
         let events = parse_events(&line, "d");
-        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+        assert_eq!(events[0].read_depth, ReadDepth::Unseen, "a write grants no read credit (D9)");
+        assert_eq!(events[0].effect, Effect::Write);
         assert_eq!(events[0].target_symbol.as_deref(), Some("App"));
     }
 
@@ -1347,7 +1351,8 @@ mod tests {
     fn map_rename_symbol() {
         let line = jsonl_assistant("mcp__serena__rename_symbol", r#"{"name_path":"old_fn","relative_path":"src/app.rs","new_name":"new_fn"}"#);
         let events = parse_events(&line, "d");
-        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+        assert_eq!(events[0].read_depth, ReadDepth::Unseen, "a write grants no read credit (D9)");
+        assert_eq!(events[0].effect, Effect::Write);
         assert_eq!(events[0].target_symbol.as_deref(), Some("old_fn"));
     }
 
@@ -1355,7 +1360,8 @@ mod tests {
     fn map_notebook_edit() {
         let line = jsonl_assistant("NotebookEdit", r#"{"notebook_path":"/nb/analysis.ipynb","new_source":"print(1)"}"#);
         let events = parse_events(&line, "d");
-        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+        assert_eq!(events[0].read_depth, ReadDepth::Unseen, "a write grants no read credit (D9)");
+        assert_eq!(events[0].effect, Effect::Write);
         assert_eq!(events[0].file_path.as_ref().unwrap(), &PathBuf::from("/nb/analysis.ipynb"));
     }
 

@@ -54,6 +54,29 @@ pub struct JournalStat {
 }
 
 
+/// Every session with a journal under `dir` (the `.ambits/coverage`
+/// directory), sorted.
+///
+/// `<id>.ndjson` and `<id>.<shard>.ndjson` both end in `.ndjson`, which
+/// `file_stem` strips; the session id is what remains up to the first `.`,
+/// since session ids (Claude Code UUIDs) never contain one.
+pub fn session_ids(dir: &Path) -> std::collections::BTreeSet<String> {
+    let mut ids = std::collections::BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return ids;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("ndjson") {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            ids.insert(stem.split('.').next().unwrap_or(stem).to_string());
+        }
+    }
+    ids
+}
+
 /// Gather stats for every session, newest first.
 ///
 /// A session's journal may be split across shards (`<id>.ndjson` from the
@@ -65,26 +88,8 @@ pub struct JournalStat {
 /// should not hide the rest.
 pub fn collect(project_root: &Path) -> Vec<JournalStat> {
     let dir = journal_dir(project_root);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-
-    // `<id>.ndjson` and `<id>.<shard>.ndjson` both end in `.ndjson`, which
-    // `file_stem` strips; the session id is what remains up to the first
-    // `.`, since session ids (Claude Code UUIDs) never contain one.
-    let mut session_ids = std::collections::BTreeSet::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("ndjson") {
-            continue;
-        }
-        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            session_ids.insert(stem.split('.').next().unwrap_or(stem).to_string());
-        }
-    }
-
     let mut out = Vec::new();
-    for session_id in session_ids {
+    for session_id in session_ids(&dir) {
         let shards = session_shard_paths(&dir, &session_id);
         if shards.is_empty() {
             continue;

@@ -880,7 +880,7 @@ mod tests {
     #[test]
     fn builtin_config_parses() {
         let cfg = ToolMappingConfig::builtin().expect("built-in config must parse");
-        assert_eq!(cfg.tools.len(), 22);
+        assert_eq!(cfg.tools.len(), 23);
         assert!(!cfg.index.is_empty());
     }
 
@@ -1218,7 +1218,7 @@ description  = "Foo"
             root.path(),
             None,
         );
-        assert_eq!(cfg.tools.len(), 22, "should have 22 built-in tools");
+        assert_eq!(cfg.tools.len(), 23, "should have 23 built-in tools");
         assert!(
             matches!(warnings.as_slice(), [ConfigWarning::MissingOverride { path }] if path == "/nonexistent/tools.toml"),
             "{warnings:?}"

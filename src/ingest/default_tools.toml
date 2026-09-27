@@ -12,14 +12,14 @@ target_lines = { offset_key = "offset", limit_key = "limit" }
 names        = ["Edit", "mcp__acp__Edit", "mcp__plugin_serena_serena__replace_content"]
 path_keys    = ["file_path", "relative_path"]
 pattern_keys = []
-depth        = { type = "fixed", value = "FullBody" }
+effect       = "write"
 description  = "Edit {file_path|short}"
 
 [[tool]]
 names        = ["Write", "mcp__acp__Write", "mcp__plugin_serena_serena__create_text_file"]
 path_keys    = ["file_path", "relative_path"]
 pattern_keys = []
-depth        = { type = "fixed", value = "FullBody" }
+effect       = "write"
 description  = "Write {file_path|short}"
 
 [[tool]]
@@ -71,7 +71,7 @@ names        = ["mcp__serena__replace_symbol_body",
                 "mcp__plugin_serena_serena__replace_symbol_body"]
 path_keys    = ["relative_path"]
 pattern_keys = []
-depth        = { type = "fixed", value = "FullBody" }
+effect       = "write"
 description  = "ReplaceSymbol {name_path}"
 target_symbol = { key = "name_path" }
 
@@ -80,7 +80,7 @@ names        = ["mcp__serena__insert_after_symbol",
                 "mcp__plugin_serena_serena__insert_after_symbol"]
 path_keys    = ["relative_path"]
 pattern_keys = []
-depth        = { type = "fixed", value = "FullBody" }
+effect       = "write"
 description  = "InsertAfter {name_path}"
 target_symbol = { key = "name_path" }
 
@@ -89,7 +89,7 @@ names        = ["mcp__serena__insert_before_symbol",
                 "mcp__plugin_serena_serena__insert_before_symbol"]
 path_keys    = ["relative_path"]
 pattern_keys = []
-depth        = { type = "fixed", value = "FullBody" }
+effect       = "write"
 description  = "InsertBefore {name_path}"
 target_symbol = { key = "name_path" }
 
@@ -97,15 +97,22 @@ target_symbol = { key = "name_path" }
 names        = ["mcp__serena__rename_symbol", "mcp__plugin_serena_serena__rename_symbol"]
 path_keys    = ["relative_path"]
 pattern_keys = []
-depth        = { type = "fixed", value = "FullBody" }
+effect       = "write"
 description  = "Rename {name_path}"
 target_symbol = { key = "name_path" }
+
+[[tool]]
+names        = ["MultiEdit"]
+path_keys    = ["file_path"]
+pattern_keys = []
+effect       = "write"
+description  = "MultiEdit {file_path|short}"
 
 [[tool]]
 names        = ["NotebookEdit"]
 path_keys    = ["notebook_path"]
 pattern_keys = []
-depth        = { type = "fixed", value = "FullBody" }
+effect       = "write"
 description  = "NotebookEdit {notebook_path|short}"
 
 [[tool]]

@@ -26,5 +26,6 @@ pub mod restore;
 pub mod search;
 pub mod state_dir;
 pub mod symbols;
+pub mod touched;
 pub mod tracking;
 pub mod writes;
