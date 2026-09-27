@@ -17,9 +17,9 @@ use color_eyre::eyre::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::git::{git, is_commit_id, Repo};
-use crate::objects::{b3, valid_record_path};
+use crate::objects::valid_record_path;
 use crate::parser::ParserRegistry;
-use crate::writes::{Level, WriteRecord};
+use crate::writes::{FileContents, Level, WriteRecord};
 
 /// What landed: one part of one write.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,7 +56,6 @@ impl Unit {
 /// neither is anything the write did outside symbols; the file-level
 /// fallback covers a write that names no symbol at all.
 pub fn units(write: &WriteRecord) -> Vec<Unit> {
-    let prefix = format!("{}::", write.file);
     if write.level == Level::Symbol && !write.syms.is_empty() {
         return write
             .syms
@@ -64,7 +63,7 @@ pub fn units(write: &WriteRecord) -> Vec<Unit> {
             .map(|(id, hash)| Unit {
                 target: id.clone(),
                 proof: Proof::Symbol {
-                    name_path: id.strip_prefix(&prefix).unwrap_or(id).to_string(),
+                    name_path: crate::symbols::split_id(id).1.to_string(),
                     hash: hash.clone(),
                 },
             })
@@ -142,17 +141,9 @@ pub struct Resolver {
     tips: Vec<String>,
     /// What each `(commit, path)` contains, computed once: many units share
     /// a file, and a refresh walks the same commits for all of them.
-    contents: HashMap<(String, String), Contents>,
+    contents: HashMap<(String, String), FileContents>,
     /// Whether each commit is reachable, asked once: many links share one.
     reachable: HashMap<String, bool>,
-}
-
-/// A committed file's identity, as units are matched against it.
-#[derive(Default)]
-struct Contents {
-    file_hash: Option<String>,
-    /// `(name_path, content hash)` of every symbol.
-    symbols: std::collections::HashSet<(String, String)>,
 }
 
 /// Arguments every `git log` here runs with, overriding user config that
@@ -328,13 +319,14 @@ impl Resolver {
     fn contains(&mut self, sha: &str, path: &str, rel: &str, unit: &Unit) -> bool {
         let key = (sha.to_string(), path.to_string());
         if !self.contents.contains_key(&key) {
-            let contents = self.blob(sha, path).map(|b| self.read_contents(rel, &b)).unwrap_or_default();
+            let contents = self.blob(sha, path).map(|b| FileContents::read(rel, &b, &self.registry)).unwrap_or_default();
             self.contents.insert(key.clone(), contents);
         }
         let contents = &self.contents[&key];
         match &unit.proof {
-            Proof::FileHash(fh) => contents.file_hash.as_deref() == Some(fh.as_str()),
-            Proof::Symbol { name_path, hash } => contents.symbols.contains(&(name_path.clone(), hash.clone())),
+            // A missing blob reads as empty contents, whose hash is empty.
+            Proof::FileHash(fh) => contents.hash == *fh,
+            Proof::Symbol { name_path, hash } => contents.has(name_path, hash),
             Proof::None => false,
         }
     }
@@ -348,28 +340,6 @@ impl Resolver {
             verified: !matches!(unit.proof, Proof::None),
             path: rel,
         }
-    }
-
-    /// The file hash of `blob`, and every symbol in it when parsed as
-    /// project file `rel`. The blob itself is dropped (§9.6).
-    fn read_contents(&self, rel: &str, blob: &[u8]) -> Contents {
-        let mut out = Contents { file_hash: Some(b3(blake3::hash(blob).as_bytes())), ..Default::default() };
-        let path = Path::new(rel);
-        let parsed = std::str::from_utf8(blob)
-            .ok()
-            .zip(self.registry.parser_for(path))
-            .and_then(|(source, parser)| parser.parse_file(path, source).ok());
-        if let Some(parsed) = parsed {
-            let prefix = format!("{rel}::");
-            let mut stack: Vec<&crate::symbols::SymbolNode> = parsed.symbols.iter().collect();
-            while let Some(s) = stack.pop() {
-                if let Some(name_path) = s.id.strip_prefix(&prefix) {
-                    out.symbols.insert((name_path.to_string(), b3(&s.content_hash)));
-                }
-                stack.extend(s.children.iter());
-            }
-        }
-        out
     }
 
     /// `path` (repo-relative) as committed in `sha`.
@@ -620,7 +590,7 @@ mod tests {
             outside_symbols: false,
             syms: vec![],
             removed: vec![],
-            fh: Some(b3(blake3::hash(b"x").as_bytes())),
+            fh: Some(crate::objects::file_hash(b"x")),
         };
         let unit = &units(&write)[0];
         let mut resolver = Resolver::new(&root).unwrap();

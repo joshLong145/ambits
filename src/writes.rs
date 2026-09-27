@@ -93,6 +93,54 @@ pub struct WriteRecord {
     pub fh: Option<String>,
 }
 
+/// What one version of a file holds, as writes are checked against it:
+/// the hash of its raw bytes, and each symbol's content hash by name path.
+/// The one reading of "is the agent's version still there" — for the file
+/// on disk (`touched`) and for a committed blob (linkage) alike.
+#[derive(Debug, Default)]
+pub struct FileContents {
+    /// [`crate::objects::file_hash`] of the bytes.
+    pub hash: String,
+    /// Name path → content hashes (ids are not unique, so possibly several).
+    symbols: std::collections::HashMap<String, Vec<String>>,
+    /// Whether the bytes parsed; without that, only `hash` means anything.
+    pub parsed: bool,
+}
+
+impl FileContents {
+    /// Read `bytes` as project file `rel`. The bytes are not kept (§9.6).
+    pub fn read(rel: &str, bytes: &[u8], registry: &ParserRegistry) -> Self {
+        let mut out = Self { hash: crate::objects::file_hash(bytes), ..Default::default() };
+        let path = Path::new(rel);
+        let parsed = std::str::from_utf8(bytes)
+            .ok()
+            .zip(registry.parser_for(path))
+            .and_then(|(source, parser)| parser.parse_file(path, source).ok());
+        if let Some(parsed) = parsed {
+            out.parsed = true;
+            for sym in parsed.walk() {
+                out.symbols.entry(sym.name_path().to_string()).or_default().push(crate::journal::encode_hash(&sym.content_hash));
+            }
+        }
+        out
+    }
+
+    /// Whether a symbol at `name_path` has content hash `hash`.
+    pub fn has(&self, name_path: &str, hash: &str) -> bool {
+        self.hashes(name_path).iter().any(|h| h == hash)
+    }
+
+    /// Content hashes of the symbols at `name_path`; empty when none is.
+    pub fn hashes(&self, name_path: &str) -> &[String] {
+        self.symbols.get(name_path).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether any symbol is at `name_path` or nested in it.
+    pub fn any_within(&self, name_path: &str) -> bool {
+        self.symbols.keys().any(|k| crate::symbols::nested_in(k, name_path))
+    }
+}
+
 /// Turn a write event into its journal record (spec §2.2).
 ///
 /// `None` for a write outside `project_root` (spec §2.6): neither portable

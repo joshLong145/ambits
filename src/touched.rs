@@ -13,10 +13,10 @@ use color_eyre::eyre::Result;
 use serde::Serialize;
 
 use crate::cache::{journal_dir, session_ids};
-use crate::journal::{encode_hash, read_session_writes};
+use crate::journal::read_session_writes;
 use crate::parser::ParserRegistry;
-use crate::symbols::SymbolNode;
-use crate::writes::{Level, WriteRecord};
+use crate::symbols::{nested_in, split_id};
+use crate::writes::{FileContents, Level, WriteRecord};
 
 /// Bumped on any breaking change to the JSON shape.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -45,7 +45,7 @@ impl Target {
     fn file(&self) -> &str {
         match self {
             Target::File(f) => f,
-            Target::Symbol(id) => id.split("::").next().unwrap_or(id),
+            Target::Symbol(id) => split_id(id).0,
         }
     }
 
@@ -59,15 +59,10 @@ impl Target {
         match self {
             Target::File(f) => write.file == *f,
             Target::Symbol(id) => {
-                write.syms.iter().any(|(s, _)| within(s, id)) || write.removed.iter().any(|s| within(s, id))
+                write.syms.iter().any(|(s, _)| nested_in(s, id)) || write.removed.iter().any(|s| nested_in(s, id))
             }
         }
     }
-}
-
-/// `symbol` is `id` or nested inside it.
-fn within(symbol: &str, id: &str) -> bool {
-    symbol.strip_prefix(id).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// Whether the agent's version is still what is on disk.
@@ -105,56 +100,41 @@ pub fn latest(project_root: &Path, target: &Target) -> Option<(String, WriteReco
 
 /// Whether `write`'s version of `target` is still on disk.
 pub fn status(project_root: &Path, registry: &ParserRegistry, target: &Target, write: &WriteRecord) -> Status {
-    let path = project_root.join(target.file());
-    let Ok(source) = std::fs::read_to_string(&path) else {
+    // Raw bytes, never through a symlink (§9.1): a file that is not UTF-8
+    // is still there, and hashes the way the write's `fh` did.
+    let Some(bytes) = crate::objects::read_regular(&project_root.join(target.file())) else {
         return Status::Removed;
     };
 
     if let Target::File(_) = target {
         if let Some(fh) = &write.fh {
-            let now = encode_hash(blake3::hash(source.as_bytes()).as_bytes());
-            return if &now == fh { Status::Current } else { Status::Changed };
+            return if crate::objects::file_hash(&bytes) == *fh { Status::Current } else { Status::Changed };
         }
         if write.level == Level::File || write.syms.is_empty() {
             return Status::Unknown;
         }
     }
 
-    let Some(symbols) = registry
-        .parser_for(Path::new(target.file()))
-        .and_then(|p| p.parse_file(Path::new(target.file()), &source).ok())
-    else {
+    let now = FileContents::read(target.file(), &bytes, registry);
+    if !now.parsed {
         return Status::Unknown;
-    };
-    // Current hashes of every symbol whose id passes `matches`.
-    let hashes = |matches: &dyn Fn(&str) -> bool| -> Vec<String> {
-        let mut out = Vec::new();
-        let mut stack: Vec<&SymbolNode> = symbols.symbols.iter().collect();
-        while let Some(s) = stack.pop() {
-            if matches(&s.id) {
-                out.push(encode_hash(&s.content_hash));
-            }
-            stack.extend(s.children.iter());
-        }
-        out
-    };
-    // Ids are not unique: every symbol with this one.
-    let current = |id: &str| hashes(&|s| s == id);
-    let unchanged = |id: &str, hash: &str| current(id).iter().any(|h| h == hash);
+    }
+    let name = |id: &str| split_id(id).1.to_string();
+    let unchanged = |id: &str, hash: &str| now.has(&name(id), hash);
 
     match target {
         Target::Symbol(id) => {
             // Present if anything by that name path is: an inherent impl is
             // `impl App`, but its methods are `App/…`, so `App` can have
             // children on disk with no symbol of its own.
-            if hashes(&|s| within(s, id)).is_empty() {
+            if !now.any_within(&name(id)) {
                 return Status::Removed;
             }
             // Everything the write left under `id` must be as it left it:
             // written symbols at their hash, deleted ones still gone. That
             // includes `id` itself, which is back if the write deleted it.
-            let written_intact = write.syms.iter().filter(|(s, _)| within(s, id)).all(|(s, h)| unchanged(s, h));
-            let deleted_gone = write.removed.iter().filter(|s| within(s, id)).all(|s| current(s).is_empty());
+            let written_intact = write.syms.iter().filter(|(s, _)| nested_in(s, id)).all(|(s, h)| unchanged(s, h));
+            let deleted_gone = write.removed.iter().filter(|s| nested_in(s, id)).all(|s| now.hashes(&name(s)).is_empty());
             if written_intact && deleted_gone { Status::Current } else { Status::Changed }
         }
         // A file whose written symbols changed or vanished has changed since.
@@ -195,7 +175,7 @@ pub fn run(project_root: &Path, arg: &str, json: bool) -> Result<()> {
     let landed = match &found {
         Some((_, w)) => {
             let keep = |u: &crate::linkage::Unit| match &target {
-                Target::Symbol(id) => within(&u.target, id),
+                Target::Symbol(id) => nested_in(&u.target, id),
                 Target::File(_) => true,
             };
             Some(crate::linkage::landed(crate::linkage::Resolver::new(project_root).as_mut(), w, &keep)?)
@@ -263,6 +243,7 @@ fn landed_line(landed: &crate::linkage::Landed) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::encode_hash;
 
     const SRC: &str = "fn alpha() {}\nfn beta() {}\n";
 
@@ -410,6 +391,25 @@ mod tests {
             ("s1", write("toolu_a", "2026-09-26T09:00:00Z", Level::Symbol, vec![("src/lib.rs::alpha", a)], vec![], None)),
         ]);
         assert_eq!(check(&dir, "src/lib.rs::alpha").unwrap().1, "toolu_b");
+    }
+
+    /// Presence is read from raw bytes: a file that is not UTF-8 is still
+    /// there (it used to read as removed), and a symlink is never followed.
+    #[test]
+    fn a_non_utf8_file_is_present_and_a_symlink_is_not_followed() {
+        let bytes = [0xffu8, 0xfe, b'\n'];
+        let fh = crate::objects::file_hash(&bytes);
+        let dir = project(&[("s1", write("toolu_1", "t", Level::File, vec![], vec![], Some(fh)))]);
+        std::fs::write(dir.path().join("src/lib.rs"), bytes).unwrap();
+        assert_eq!(check(&dir, "src/lib.rs").unwrap().2, Status::Current);
+
+        #[cfg(unix)]
+        {
+            let real = dir.path().join("elsewhere.rs");
+            std::fs::rename(dir.path().join("src/lib.rs"), &real).unwrap();
+            std::os::unix::fs::symlink(&real, dir.path().join("src/lib.rs")).unwrap();
+            assert_eq!(check(&dir, "src/lib.rs").unwrap().2, Status::Removed);
+        }
     }
 
     /// A file-level `Write` is judged by its content hash; a file-level

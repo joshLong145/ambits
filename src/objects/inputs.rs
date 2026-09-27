@@ -151,9 +151,9 @@ pub fn environment(project_root: &Path, tree: &ProjectTree, filter: Option<&str>
     let mut dirty = Vec::with_capacity(candidates.len());
     let mut contents = Vec::with_capacity(candidates.len());
     for (path, raw) in candidates {
-        let bytes = read_regular(&project_root.join(&raw));
+        let bytes = super::read_regular(&project_root.join(&raw));
         let hash = match (&bytes, std::fs::symlink_metadata(project_root.join(&raw))) {
-            (Some(b), _) => b3(blake3::hash(b).as_bytes()),
+            (Some(b), _) => super::file_hash(b),
             (None, Ok(m)) if !m.is_file() => "not-a-file".into(),
             (None, Ok(_)) => "unreadable".into(),
             (None, Err(_)) => "deleted".into(),
@@ -198,13 +198,6 @@ pub fn environment(project_root: &Path, tree: &ProjectTree, filter: Option<&str>
         dirty,
         contents,
     })
-}
-
-/// A regular file's bytes; `None` for anything else, which is never
-/// followed (§9.1), or when it is gone.
-fn read_regular(path: &Path) -> Option<Vec<u8>> {
-    std::fs::symlink_metadata(path).ok().filter(|m| m.is_file())?;
-    std::fs::read(path).ok()
 }
 
 /// `b3:` hash of a regular file, streamed, or `null` when there is none.

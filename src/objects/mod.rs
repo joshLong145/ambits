@@ -127,6 +127,19 @@ pub fn normalize_path(path: &str) -> String {
     path.replace('\\', "/").nfc().collect()
 }
 
+/// `b3:` hash of a file's raw bytes: the `fh` of a write, a dirty file's
+/// fingerprint, and what a committed blob is compared by.
+pub fn file_hash(bytes: &[u8]) -> String {
+    b3(blake3::hash(bytes).as_bytes())
+}
+
+/// A regular file's bytes; `None` when it is gone or is anything else — a
+/// symlink is never followed (§9.1).
+pub fn read_regular(path: &std::path::Path) -> Option<Vec<u8>> {
+    std::fs::symlink_metadata(path).ok().filter(|m| m.is_file())?;
+    std::fs::read(path).ok()
+}
+
 /// NFC form of a name.
 pub fn nfc(s: &str) -> String {
     s.nfc().collect()

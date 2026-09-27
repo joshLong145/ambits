@@ -126,10 +126,7 @@ impl SymbolNode {
     /// `<file>::` prefix. Deriving it here keeps the id's shape from being
     /// re-implemented by every caller that needs the other half.
     pub fn name_path(&self) -> &str {
-        match self.id.split_once("::") {
-            Some((_, name)) => name,
-            None => &self.id,
-        }
+        split_id(&self.id).1
     }
 }
 
@@ -173,6 +170,44 @@ fn enclosing(symbols: &[SymbolNode], byte: u32) -> Option<&SymbolNode> {
     None
 }
 
+impl FileSymbols {
+    /// Every symbol in the file, depth-first — the one descent through
+    /// `children` for a single file (see [`ProjectTree::walk`]).
+    pub fn walk(&self) -> Vec<&SymbolNode> {
+        walk_symbols(&self.symbols)
+    }
+}
+
+/// Every symbol in `symbols` and beneath them, depth-first.
+pub fn walk_symbols(symbols: &[SymbolNode]) -> Vec<&SymbolNode> {
+    fn descend<'a>(syms: &'a [SymbolNode], out: &mut Vec<&'a SymbolNode>) {
+        for sym in syms {
+            out.push(sym);
+            descend(&sym.children, out);
+        }
+    }
+    let mut out = Vec::new();
+    descend(symbols, &mut out);
+    out
+}
+
+/// Split a symbol id into its file and its name path within the file:
+/// `src/app.rs::App/new` → `("src/app.rs", "App/new")`. At the *first*
+/// `::`, since name paths can contain one (`impl fmt::Display for X`) and
+/// file paths in practice do not. An id without one is all name path.
+pub fn split_id(id: &str) -> (&str, &str) {
+    match id.split_once("::") {
+        Some((file, name_path)) => (file, name_path),
+        None => ("", id),
+    }
+}
+
+/// `name_path` is `ancestor` or nested inside it, by name path: `App`
+/// covers `App/handle_key` but not `Application`. Works on whole ids too.
+pub fn nested_in(name_path: &str, ancestor: &str) -> bool {
+    name_path.strip_prefix(ancestor).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 /// The full project symbol tree, organized by directory structure.
 #[derive(Debug, Clone)]
 pub struct ProjectTree {
@@ -192,21 +227,10 @@ impl ProjectTree {
     /// folds immediately, and a borrowing recursive iterator would cost more in
     /// complexity than the allocation saves.
     pub fn walk(&self) -> Vec<(&Path, &SymbolNode)> {
-        fn descend<'a>(
-            file: &'a Path,
-            syms: &'a [SymbolNode],
-            out: &mut Vec<(&'a Path, &'a SymbolNode)>,
-        ) {
-            for sym in syms {
-                out.push((file, sym));
-                descend(file, &sym.children, out);
-            }
-        }
-        let mut out = Vec::new();
-        for file in &self.files {
-            descend(&file.file_path, &file.symbols, &mut out);
-        }
-        out
+        self.files
+            .iter()
+            .flat_map(|file| file.walk().into_iter().map(move |sym| (file.file_path.as_path(), sym)))
+            .collect()
     }
 
     pub fn total_symbols(&self) -> usize {
