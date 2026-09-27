@@ -353,3 +353,30 @@ fn the_cli_snapshots_and_logs() {
     let gc = run(&["gc"]);
     assert!(gc.contains("0 deleted"), "{gc}");
 }
+
+/// File contents are never persisted (§9.6): a marker inside a function body
+/// — in a committed file and in a dirty one — appears in no object or note.
+#[test]
+fn file_contents_never_reach_objects_or_notes() {
+    const CANARY: &str = "CANARY_5e1d_never_persist";
+    let p = Project::new();
+    std::fs::write(p.root.join("src/a.rs"), format!("fn alpha() {{ let _ = \"{CANARY}\"; }}\n")).unwrap();
+    git(&p.root, &["commit", "-qam", "canary"]);
+    std::fs::write(p.root.join("src/b.rs"), format!("fn beta() {{ /* {CANARY} */ }}\n")).unwrap();
+    created(p.snap());
+
+    let mut files = vec![];
+    for dir in ["objects", "notes", "refs", "logs"] {
+        let mut stack = vec![p.root.join(".ambits").join(dir)];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                if e.path().is_dir() { stack.push(e.path()) } else { files.push(e.path()) }
+            }
+        }
+    }
+    assert!(!files.is_empty());
+    for f in files {
+        let text = std::fs::read_to_string(&f).unwrap_or_default();
+        assert!(!text.contains(CANARY), "{} leaks file contents", f.display());
+    }
+}
