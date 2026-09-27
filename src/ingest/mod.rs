@@ -34,7 +34,9 @@ pub enum WriteSource {
         old: String,
         new: String,
         replace_all: bool,
-        hunks: Vec<Hunk>,
+        /// `structuredPatch`; `None` when missing or malformed, which makes
+        /// the write file-level.
+        hunks: Option<Vec<Hunk>>,
         user_modified: bool,
     },
     /// A `Write`: the full new `content`; `original` is null on a create.
@@ -42,7 +44,8 @@ pub enum WriteSource {
         original: Option<String>,
         content: String,
         create: bool,
-        hunks: Vec<Hunk>,
+        /// As for `Edit`; unused on a create.
+        hunks: Option<Vec<Hunk>>,
         user_modified: bool,
     },
     /// A write tool whose result carries no usable text (Serena tools,

@@ -158,6 +158,7 @@ description = "Edit {file_path|short}"
 | `Write`, `type: "create"` | empty | `content` | symbol — every symbol in *after* is touched (**no hunk walk**; creates have no hunks) |
 | `Write` update with `originalFile` | `originalFile` | `content` | symbol |
 | `originalFile` null (≈79% of `Edit`s here; capped near 10 KB), `userModified: true`, no parser, reconstruction fails, Serena mode | — | — | **file** |
+| `structuredPatch` missing, or any hunk malformed (a missing field, a line not starting with ` `, `+`, `-` or `\`) — parsing is all or nothing | — | — | **file** |
 
 For files over ~10 KB, most writes are file-level. Revisit if Claude Code
 changes the cap.
@@ -177,6 +178,15 @@ over-attribute):
 
 A changed line inside no symbol (a `use` line, a gap, a detached comment) sets
 `outside_symbols` on the record (§2.6) — never a silent drop.
+
+**Completeness.** Before the walk, the hunks are applied to *before*: every
+context and `-` line must match *before* at its position, and the result must
+equal *after* exactly (a trailing newline aside). Otherwise the write is
+**file**-level. This is what makes an omission meaningful — a symbol a
+symbol-level write does not name was not changed. It also covers an empty
+patch for a real change. A create has no hunks. Any created line in no
+symbol sets `outside_symbols`, so a create with no symbols is not recorded as
+changing nothing.
 
 `SymbolNode::line_range` is a `Range<u32>` whose `end` is **inclusive**:
 containment is `start <= n && n <= end`, not `Range::contains`.
@@ -208,7 +218,8 @@ Tree ids come from the LSP cache and may not match a tree-sitter parse, so
   is not (§9.6).
 - **Keying**: one record per `(session, op)`, `op` = the tool call's
   `tool_use_id`. The fold keeps the **highest `av`** (attribution version),
-  so re-attribution after an upgrade replaces rather than duplicates. Symbol
+  so re-attribution after an upgrade replaces rather than duplicates. `av` 2
+  adds the completeness rule (§2.3); the next replay replaces v1 records. Symbol
   entries carry their hash because ids are not unique.
 - **`history` records** (defined here, used from phase 2): `{"kind":"history",
   "of":"read"|"write", …}` — kept in the journal, **ignored by the fold**,
@@ -255,7 +266,8 @@ Tree ids come from the LSP cache and may not match a tree-sitter parse, so
 Symbol writes: compare the write's hash with the symbol's current hash —
 *unchanged since agent X wrote it* / *changed since*. File-level `Write`s:
 compare `fh` with the file's current bytes. Other file-level writes report
-time only.
+time only. A symbol the write removed is *removed* while it stays absent, and
+*changed* if it has since come back.
 
 ### 3.2 Which commit did it land in?
 

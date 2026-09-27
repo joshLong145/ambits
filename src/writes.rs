@@ -44,7 +44,10 @@ use crate::symbols::{SymbolId, SymbolNode};
 /// Version of the attribution rules. Recorded on every write (`av`) so a
 /// write re-attributed after the rules change replaces the old record rather
 /// than duplicating it (spec §2.6).
-pub const ATTRIBUTION_VERSION: u32 = 1;
+///
+/// 2: a write is symbol-level only when its hunks reproduce the file exactly;
+/// a missing or malformed patch is file-level.
+pub const ATTRIBUTION_VERSION: u32 = 2;
 
 /// How precisely a write was attributed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,16 +129,27 @@ pub fn build_record(
         .then(|| registry.parser_for(rel))
         .flatten()
         .and_then(|parser| match &event.source {
-            WriteSource::Edit { original: Some(before), old, new, replace_all, hunks, user_modified: false } => {
+            WriteSource::Edit {
+                original: Some(before),
+                old,
+                new,
+                replace_all,
+                hunks: Some(hunks),
+                user_modified: false,
+            } => {
                 let after = apply_edit(before, old, new, *replace_all)?;
-                attribute(parser, rel, before, &after, Some(hunks))
+                attribute(parser, rel, before, &after, Diff::Hunks(hunks))
             }
             WriteSource::Write { create: true, content, user_modified: false, .. } => {
-                attribute(parser, rel, "", content, None)
+                attribute(parser, rel, "", content, Diff::Created)
             }
-            WriteSource::Write { original: Some(before), content, hunks, user_modified: false, .. } => {
-                attribute(parser, rel, before, content, Some(hunks))
-            }
+            WriteSource::Write {
+                original: Some(before),
+                content,
+                hunks: Some(hunks),
+                user_modified: false,
+                ..
+            } => attribute(parser, rel, before, content, Diff::Hunks(hunks)),
             _ => None,
         });
 
@@ -209,47 +223,66 @@ pub fn apply_edit(before: &str, old: &str, new: &str, replace_all: bool) -> Opti
     })
 }
 
+/// How a write changed its file, for [`attribute`].
+#[derive(Debug, Clone, Copy)]
+pub enum Diff<'a> {
+    /// The file was created: there is no diff to walk, and every innermost
+    /// symbol in `after` is touched (spec §2.2).
+    Created,
+    /// The write's hunks, which must account for every changed line.
+    Hunks(&'a [Hunk]),
+}
+
 /// Attribute a write of `path` from `before` to `after`.
 ///
-/// `hunks` = `None` means a file creation: there is no diff to walk, and
-/// every innermost symbol in `after` is touched (spec §2.2).
-///
-/// `None` when either side fails to parse, or when a hunk disagrees with the
-/// texts — a `+` line that is not the `after` line at its position, or a `-`
-/// line that is not the `before` line. The caller then records a file-level
-/// write. The check makes attribution self-verifying: `after` is usually
-/// reconstructed from `oldString`/`newString`, and anything else that
-/// changed the file in the same write (Claude Code stamps memory files'
-/// frontmatter, for one) would otherwise be attributed to the wrong lines.
-/// Against this project's logs, 80 of 82 reconstructions matched; the two
-/// that did not were such stamped memory files.
+/// `None` when either side fails to parse, or when the hunks do not turn
+/// `before` into exactly `after`: a context or `-` line that is not the
+/// `before` line at its position, or a change the hunks leave out. The caller
+/// then records a file-level write. The check makes attribution
+/// self-verifying, and complete — so a symbol a symbol-level write does not
+/// name really was left alone (spec §2.3). `after` is usually reconstructed
+/// from `oldString`/`newString`, and anything else that changed the file in
+/// the same write (Claude Code stamps memory files' frontmatter, for one)
+/// would otherwise be attributed to the wrong lines, or missed. Against this
+/// project's logs, 80 of 82 reconstructions matched; the two that did not
+/// were such stamped memory files.
 pub fn attribute(
     parser: &dyn LanguageParser,
     path: &Path,
     before: &str,
     after: &str,
-    hunks: Option<&[Hunk]>,
+    diff: Diff<'_>,
 ) -> Option<Attribution> {
     let after_syms = parser.parse_file(path, after).ok()?.symbols;
+    let after_lines = lines(after);
 
-    let Some(hunks) = hunks else {
-        let mut touched = BTreeSet::new();
-        for_each_leaf(&after_syms, &mut |s| {
-            touched.insert((s.id.clone(), s.content_hash));
-        });
-        return Some(Attribution {
-            touched: touched.into_iter().collect(),
-            ..Attribution::default()
-        });
+    let hunks = match diff {
+        Diff::Hunks(hunks) => hunks,
+        Diff::Created => {
+            let mut touched = BTreeSet::new();
+            for_each_leaf(&after_syms, &mut |s| {
+                touched.insert((s.id.clone(), s.content_hash));
+            });
+            // A created line in no symbol is as much a change outside
+            // symbols as an edited one; without this, a file with no
+            // symbols would record a write that changed nothing.
+            let outside_symbols = (1..=after_lines.len() as u32).any(|line| {
+                !after_lines[line as usize - 1].trim().is_empty()
+                    && innermost_at(&after_syms, line).is_none()
+            });
+            return Some(Attribution {
+                touched: touched.into_iter().collect(),
+                outside_symbols,
+                ..Attribution::default()
+            });
+        }
     };
 
+    let before_lines = lines(before);
+    if apply_hunks(&before_lines, hunks)? != after_lines {
+        return None;
+    }
     let before_syms = parser.parse_file(path, before).ok()?.symbols;
-    let before_lines: Vec<&str> = before.split('\n').collect();
-    let after_lines: Vec<&str> = after.split('\n').collect();
-    // 1-based `line` of `lines` equals `body`.
-    let line_is = |lines: &[&str], line: u32, body: &str| {
-        (line as usize).checked_sub(1).and_then(|i| lines.get(i)) == Some(&body)
-    };
 
     let mut touched = BTreeSet::new();
     let mut removed = BTreeSet::new();
@@ -261,9 +294,6 @@ pub fn attribute(
         for line in &hunk.lines {
             match line.as_bytes().first() {
                 Some(b'+') => {
-                    if !line_is(&after_lines, new_line, &line[1..]) {
-                        return None;
-                    }
                     match innermost_at(&after_syms, new_line) {
                         Some(s) => {
                             touched.insert((s.id.clone(), s.content_hash));
@@ -273,9 +303,6 @@ pub fn attribute(
                     new_line += 1;
                 }
                 Some(b'-') => {
-                    if !line_is(&before_lines, old_line, &line[1..]) {
-                        return None;
-                    }
                     match innermost_at(&before_syms, old_line) {
                         Some(s) => {
                             let survivors = with_id(&after_syms, &s.id);
@@ -308,6 +335,56 @@ pub fn attribute(
         removed: removed.into_iter().collect(),
         outside_symbols,
     })
+}
+
+/// A text's lines, without the empty "line" after a final newline — so a
+/// file and the same file with its trailing newline added or dropped (`\ No
+/// newline at end of file`) differ only where the hunks say they do.
+fn lines(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.strip_suffix('\n').unwrap_or(text).split('\n').collect()
+}
+
+/// Apply `hunks` to `before`, checking every context and `-` line against it.
+/// `None` when a hunk does not fit `before` — out of order, out of range, or
+/// naming a line that is not there.
+fn apply_hunks<'a>(before: &[&'a str], hunks: &'a [Hunk]) -> Option<Vec<&'a str>> {
+    let mut ordered: Vec<&Hunk> = hunks.iter().collect();
+    ordered.sort_by_key(|h| h.old_start);
+    let mut out = Vec::with_capacity(before.len());
+    let mut next = 0; // index of the first `before` line not yet consumed
+    for hunk in ordered {
+        let body = |l: &'a String| l.get(1..).unwrap_or("");
+        let consumes = hunk.lines.iter().any(|l| matches!(l.as_bytes().first(), Some(b' ' | b'-')));
+        // Unified-diff convention: a hunk with no old lines inserts *after*
+        // line `old_start`; any other starts *at* it.
+        let start = if consumes { (hunk.old_start as usize).checked_sub(1)? } else { hunk.old_start as usize };
+        if start < next || start > before.len() {
+            return None;
+        }
+        out.extend_from_slice(&before[next..start]);
+        next = start;
+        for line in &hunk.lines {
+            match line.as_bytes().first() {
+                Some(b'+') => out.push(body(line)),
+                Some(b'\\') => {}
+                Some(b'-') | Some(b' ') => {
+                    if before.get(next) != Some(&body(line)) {
+                        return None;
+                    }
+                    if line.starts_with(' ') {
+                        out.push(body(line));
+                    }
+                    next += 1;
+                }
+                _ => return None,
+            }
+        }
+    }
+    out.extend_from_slice(before.get(next..)?);
+    Some(out)
 }
 
 /// The deepest symbol whose inclusive line range contains `line`.
@@ -367,8 +444,8 @@ fn gamma() {
         Hunk { old_start, new_start, lines: lines.iter().map(|l| l.to_string()).collect() }
     }
 
-    fn run(before: &str, after: &str, hunks: Option<&[Hunk]>) -> Attribution {
-        attribute(&RustParser::new(), Path::new(PATH), before, after, hunks).expect("parses")
+    fn run(before: &str, after: &str, diff: Diff<'_>) -> Attribution {
+        attribute(&RustParser::new(), Path::new(PATH), before, after, diff).expect("parses")
     }
 
     fn touched_ids(a: &Attribution) -> Vec<&str> {
@@ -391,7 +468,7 @@ fn gamma() {
             " ",
             " fn gamma() {",
         ])];
-        let a = run(BEFORE, &after, Some(&hunks));
+        let a = run(BEFORE, &after, Diff::Hunks(&hunks));
         assert_eq!(touched_ids(&a), vec!["src/lib.rs::beta"]);
         assert!(a.removed.is_empty());
         assert!(!a.outside_symbols);
@@ -402,7 +479,7 @@ fn gamma() {
     fn the_touched_hash_is_the_post_write_hash() {
         let after = BEFORE.replace("let b = 2;", "let b = 20;");
         let hunks = [hunk(6, 6, &["-    let b = 2;", "+    let b = 20;"])];
-        let a = run(BEFORE, &after, Some(&hunks));
+        let a = run(BEFORE, &after, Diff::Hunks(&hunks));
         let after_beta = RustParser::new()
             .parse_file(Path::new(PATH), &after)
             .unwrap()
@@ -420,7 +497,7 @@ fn gamma() {
         let before = "fn alpha() {\n    let a = 1;\n    let z = 9;\n}\n";
         let after = "fn alpha() {\n    let a = 1;\n}\n";
         let hunks = [hunk(1, 1, &[" fn alpha() {", "     let a = 1;", "-    let z = 9;", " }"])];
-        let a = run(before, after, Some(&hunks));
+        let a = run(before, after, Diff::Hunks(&hunks));
         assert_eq!(touched_ids(&a), vec!["src/lib.rs::alpha"]);
         assert!(a.removed.is_empty());
     }
@@ -437,7 +514,7 @@ fn gamma() {
             "-",
             " fn gamma() {",
         ])];
-        let a = run(BEFORE, after, Some(&hunks));
+        let a = run(BEFORE, after, Diff::Hunks(&hunks));
         assert_eq!(a.removed, vec!["src/lib.rs::beta".to_string()]);
         assert!(a.touched.is_empty(), "{:?}", a.touched);
         assert!(a.outside_symbols, "the removed blank line sat between symbols");
@@ -449,7 +526,7 @@ fn gamma() {
         let before = "struct S;\nimpl S {\n    fn m(&self) {\n        let x = 1;\n    }\n}\n";
         let after = before.replace("let x = 1;", "let x = 2;");
         let hunks = [hunk(4, 4, &["-        let x = 1;", "+        let x = 2;"])];
-        let a = run(before, &after, Some(&hunks));
+        let a = run(before, &after, Diff::Hunks(&hunks));
         assert_eq!(touched_ids(&a), vec!["src/lib.rs::S/m"]);
     }
 
@@ -460,7 +537,7 @@ fn gamma() {
         let before = "/// Old docs.\nfn alpha() {}\n";
         let after = "/// New docs.\nfn alpha() {}\n";
         let hunks = [hunk(1, 1, &["-/// Old docs.", "+/// New docs."])];
-        let a = run(before, after, Some(&hunks));
+        let a = run(before, after, Diff::Hunks(&hunks));
         assert_eq!(touched_ids(&a), vec!["src/lib.rs::alpha"]);
     }
 
@@ -470,7 +547,7 @@ fn gamma() {
         let before = "use std::fmt;\n\nfn alpha() {}\n";
         let after = "use std::io;\n\nfn alpha() {}\n";
         let hunks = [hunk(1, 1, &["-use std::fmt;", "+use std::io;"])];
-        let a = run(before, after, Some(&hunks));
+        let a = run(before, after, Diff::Hunks(&hunks));
         assert!(a.touched.is_empty() && a.removed.is_empty());
         assert!(a.outside_symbols);
     }
@@ -481,7 +558,7 @@ fn gamma() {
         let before = "fn alpha() {}\n";
         let after = "fn alpha() {}\n\nfn delta() {}\n";
         let hunks = [hunk(1, 1, &[" fn alpha() {}", "+", "+fn delta() {}"])];
-        let a = run(before, after, Some(&hunks));
+        let a = run(before, after, Diff::Hunks(&hunks));
         assert_eq!(touched_ids(&a), vec!["src/lib.rs::delta"]);
         assert!(a.outside_symbols, "the added blank line is in no symbol");
     }
@@ -494,7 +571,7 @@ fn gamma() {
             hunk(2, 2, &["-    let a = 1;", "+    let a = 10;"]),
             hunk(10, 10, &["-    let c = 3;", "+    let c = 30;"]),
         ];
-        let a = run(BEFORE, &after, Some(&hunks));
+        let a = run(BEFORE, &after, Diff::Hunks(&hunks));
         assert_eq!(touched_ids(&a), vec!["src/lib.rs::alpha", "src/lib.rs::gamma"]);
     }
 
@@ -504,7 +581,7 @@ fn gamma() {
         // No `struct S`: it would be a leaf sharing the id `S` with the impl
         // (ids are not unique), which would muddy the assertion below.
         let after = "impl S {\n    fn m(&self) {}\n}\nfn free() {}\n";
-        let a = run("", after, None);
+        let a = run("", after, Diff::Created);
         let ids = touched_ids(&a);
         assert!(ids.contains(&"src/lib.rs::S/m"), "{ids:?}");
         assert!(ids.contains(&"src/lib.rs::free"), "{ids:?}");
@@ -522,7 +599,7 @@ fn gamma() {
             "+fn beta() { 1; }",
             "\\ No newline at end of file",
         ])];
-        let a = run(before, after, Some(&hunks));
+        let a = run(before, after, Diff::Hunks(&hunks));
         assert_eq!(touched_ids(&a), vec!["src/lib.rs::beta"]);
     }
 
@@ -535,8 +612,43 @@ fn gamma() {
             hunk(10, 10, &["-    let c = 3;", "+    let c = 30;"]),
             hunk(2, 2, &["-    let a = 1;", "+    let a = 10;"]),
         ];
-        let a = run(BEFORE, &after, Some(&hunks));
+        let a = run(BEFORE, &after, Diff::Hunks(&hunks));
         assert_eq!(touched_ids(&a), vec!["src/lib.rs::alpha", "src/lib.rs::gamma"]);
+    }
+
+    /// Hunks must account for every change: one the patch leaves out means
+    /// a symbol the record would not name — a false "untouched" (spec §2.3).
+    #[test]
+    fn hunks_that_leave_a_change_out_refuse_attribution() {
+        let after = BEFORE.replace("let c = 3;", "let c = 30;").replace("let a = 1;", "let a = 10;");
+        let hunks = [hunk(2, 2, &["-    let a = 1;", "+    let a = 10;"])];
+        let refused = attribute(&RustParser::new(), Path::new(PATH), BEFORE, &after, Diff::Hunks(&hunks));
+        assert_eq!(refused, None);
+    }
+
+    #[test]
+    fn a_wrong_context_line_refuses_attribution() {
+        let after = BEFORE.replace("let b = 2;", "let b = 20;");
+        let hunks = [hunk(5, 5, &[" fn not_beta() {", "-    let b = 2;", "+    let b = 20;"])];
+        let refused = attribute(&RustParser::new(), Path::new(PATH), BEFORE, &after, Diff::Hunks(&hunks));
+        assert_eq!(refused, None);
+    }
+
+    /// A hunk with no old lines inserts after `old_start`, as in unified diff.
+    #[test]
+    fn a_pure_insertion_into_an_empty_file_attributes() {
+        let after = "fn a() {}\n";
+        let a = run("", after, Diff::Hunks(&[hunk(0, 1, &["+fn a() {}"])]));
+        assert_eq!(touched_ids(&a), vec!["src/lib.rs::a"]);
+    }
+
+    /// A create with no symbols still changed something: every line is
+    /// outside any symbol.
+    #[test]
+    fn a_create_with_no_symbols_is_outside_symbols() {
+        let a = run("", "// just a comment\n", Diff::Created);
+        assert!(a.touched.is_empty());
+        assert!(a.outside_symbols);
     }
 
     /// A hunk that disagrees with the reconstructed text — here, a change the
@@ -552,7 +664,7 @@ fn gamma() {
             hunk(6, 6, &["-    let b = 2;", "+    let b = 20;"]),
         ];
         assert_eq!(
-            attribute(&RustParser::new(), Path::new(PATH), BEFORE, &after, Some(&hunks)),
+            attribute(&RustParser::new(), Path::new(PATH), BEFORE, &after, Diff::Hunks(&hunks)),
             None
         );
     }
@@ -594,11 +706,11 @@ mod record_tests {
             old: format!("let b = 2; // {CANARY}"),
             new: "let b = 20;".into(),
             replace_all: false,
-            hunks: vec![Hunk {
+            hunks: Some(vec![Hunk {
                 old_start: 2,
                 new_start: 2,
                 lines: vec![format!("-    let b = 2; // {CANARY}"), "+    let b = 20;".into()],
-            }],
+            }]),
             user_modified,
         }
     }
@@ -630,6 +742,31 @@ mod record_tests {
         }
     }
 
+    /// Without a usable patch there is no knowing which lines changed, so no
+    /// symbol-level claim — least of all "no symbol changed".
+    #[test]
+    fn an_edit_without_a_structured_patch_is_file_level() {
+        let WriteSource::Edit { original, old, new, replace_all, user_modified, .. } = edit(Some(BEFORE), false) else {
+            unreachable!()
+        };
+        let source = WriteSource::Edit { original, old, new, replace_all, hunks: None, user_modified };
+        let rec = build(&event("/proj/src/lib.rs", source)).unwrap();
+        assert_eq!(rec.level, Level::File);
+        assert!(rec.syms.is_empty() && rec.removed.is_empty());
+    }
+
+    /// An empty patch for an edit that changed text leaves a change
+    /// unaccounted for.
+    #[test]
+    fn an_edit_whose_patch_is_empty_is_file_level() {
+        let WriteSource::Edit { original, old, new, replace_all, user_modified, .. } = edit(Some(BEFORE), false) else {
+            unreachable!()
+        };
+        let source = WriteSource::Edit { original, old, new, replace_all, hunks: Some(vec![]), user_modified };
+        let rec = build(&event("/proj/src/lib.rs", source)).unwrap();
+        assert_eq!(rec.level, Level::File);
+    }
+
     #[test]
     fn serena_mode_is_file_level() {
         let ev = event("/proj/src/lib.rs", edit(Some(BEFORE), false));
@@ -643,7 +780,7 @@ mod record_tests {
             original: None,
             content: "fn a() {}\nfn b() {}\n".into(),
             create: true,
-            hunks: vec![],
+            hunks: None,
             user_modified: false,
         });
         let rec = build(&ev).unwrap();
@@ -659,7 +796,7 @@ mod record_tests {
     #[test]
     fn a_file_with_no_parser_is_file_level() {
         let ev = event("/proj/notes.txt", WriteSource::Write {
-            original: None, content: "hello".into(), create: true, hunks: vec![], user_modified: false,
+            original: None, content: "hello".into(), create: true, hunks: None, user_modified: false,
         });
         let rec = build(&ev).unwrap();
         assert_eq!((rec.level, rec.file.as_str()), (Level::File, "notes.txt"));
@@ -682,7 +819,7 @@ mod record_tests {
             original: Some(BEFORE.into()),
             content: format!("fn beta() {{ /* {CANARY} */ }}\n"),
             create: false,
-            hunks: vec![],
+            hunks: None,
             user_modified: false,
         };
         for source in [edit(Some(BEFORE), false), edit(None, false), write] {

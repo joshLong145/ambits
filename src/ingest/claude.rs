@@ -384,22 +384,28 @@ fn write_source(detail: &Value) -> WriteSource {
     WriteSource::Opaque
 }
 
-/// `structuredPatch` → hunks. Malformed hunks are skipped; attribution
-/// verifies every hunk against the texts anyway (`writes::attribute`).
-fn parse_hunks(patch: Option<&Value>) -> Vec<Hunk> {
-    let Some(Value::Array(hunks)) = patch else { return Vec::new() };
+/// `structuredPatch` → hunks, all or nothing: `None` when the patch is
+/// missing, or any hunk is malformed or has a line that is not context, `+`,
+/// `-` or a `\` annotation. A partial patch would under-report the change,
+/// so it is no patch at all (spec §2.2).
+fn parse_hunks(patch: Option<&Value>) -> Option<Vec<Hunk>> {
+    let Some(Value::Array(hunks)) = patch else { return None };
     hunks
         .iter()
-        .filter_map(|h| {
+        .map(|h| {
+            let lines = h
+                .get("lines")?
+                .as_array()?
+                .iter()
+                .map(|l| {
+                    let l = l.as_str()?;
+                    matches!(l.as_bytes().first(), Some(b' ' | b'+' | b'-' | b'\\')).then(|| l.to_string())
+                })
+                .collect::<Option<Vec<_>>>()?;
             Some(Hunk {
                 old_start: u32::try_from(h.get("oldStart")?.as_u64()?).ok()?,
                 new_start: u32::try_from(h.get("newStart")?.as_u64()?).ok()?,
-                lines: h
-                    .get("lines")?
-                    .as_array()?
-                    .iter()
-                    .map(|l| l.as_str().map(String::from))
-                    .collect::<Option<Vec<_>>>()?,
+                lines,
             })
         })
         .collect()
@@ -2091,7 +2097,7 @@ mod write_tests {
             WriteSource::Edit { original, old, new, replace_all, hunks, user_modified } => {
                 assert_eq!(original.as_deref(), Some("x\n"));
                 assert_eq!((old.as_str(), new.as_str(), *replace_all, *user_modified), ("x", "y", false, false));
-                assert_eq!(hunks, &vec![Hunk { old_start: 1, new_start: 1, lines: vec!["-x".into(), "+y".into()] }]);
+                assert_eq!(hunks, &Some(vec![Hunk { old_start: 1, new_start: 1, lines: vec!["-x".into(), "+y".into()] }]));
             }
             other => panic!("expected an Edit source, got {other:?}"),
         }
@@ -2172,5 +2178,24 @@ mod write_tests {
         let second = tailer.read_new_events();
         assert_eq!(second.writes.len(), 1);
         assert_eq!(&*second.writes[0].op, "toolu_1");
+    }
+
+    /// A partial patch would under-report the change, so any defect makes
+    /// the whole patch unusable (spec §2.2).
+    #[test]
+    fn a_structured_patch_is_all_or_nothing() {
+        use serde_json::json;
+        let good = json!({"oldStart": 1, "newStart": 1, "lines": ["-x", "+y", " z", "\\ No newline at end of file"]});
+        assert_eq!(parse_hunks(Some(&json!([good]))).map(|h| h.len()), Some(1));
+        assert_eq!(parse_hunks(Some(&json!([]))), Some(vec![]), "an empty patch is still a patch");
+
+        let missing_start = json!({"newStart": 1, "lines": ["-x"]});
+        let bad_prefix = json!({"oldStart": 1, "newStart": 1, "lines": ["-x", "y"]});
+        let not_text = json!({"oldStart": 1, "newStart": 1, "lines": ["-x", 3]});
+        for bad in [missing_start, bad_prefix, not_text] {
+            assert_eq!(parse_hunks(Some(&json!([good, bad]))), None, "{bad}");
+        }
+        assert_eq!(parse_hunks(None), None);
+        assert_eq!(parse_hunks(Some(&json!("not an array"))), None);
     }
 }

@@ -824,7 +824,7 @@ mod tests {
                 original: None,
                 content: "fn a() {}\n".into(),
                 create: true,
-                hunks: vec![],
+                hunks: None,
                 user_modified: false,
             },
         }

@@ -30,9 +30,11 @@ For each successful write, from the tool's result in the session log:
 
 Symbol-level attribution needs the file's text before the write, which Claude
 Code includes only for smaller files (about 10 KB and under) and for newly
-created files. Larger files get file-level writes. Attribution checks every
-changed line against the reconstructed text and falls back to file level
-rather than guess.
+created files. Larger files get file-level writes, and so does any write whose
+log entry carries no usable patch. Attribution checks that the logged changes
+turn the old text into exactly the new one, and falls back to file level
+rather than guess — so a symbol a symbol-level write does not name really was
+left alone.
 
 **File contents are never stored** — only paths, symbol names and hashes.
 
@@ -51,7 +53,8 @@ src/app.rs::App/handle_key — last written 2026-09-27T10:00:01Z by agent-3f9c (
 ```
 
 It searches every session's journal and reports whether the agent's version
-is still on disk: `current`, `changed`, `removed`, or `unknown` for a
+is still on disk: `current`, `changed`, `removed` (still absent — a symbol
+that came back after the agent deleted it is `changed`), or `unknown` for a
 file-level edit with no hash to compare. Which git commit a write landed in is
 planned.
 

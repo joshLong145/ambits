@@ -106,8 +106,15 @@ pub fn status(project_root: &Path, registry: &ParserRegistry, target: &Target, w
         }
     }
 
+    // A symbol the agent deleted is `removed` while it stays absent; if it
+    // is back, something re-added it since, so it has changed.
+    let deleted = match target {
+        Target::Symbol(id) if write.removed.iter().any(|r| r == id) => Some(id.as_str()),
+        _ => None,
+    };
+
     let expected: Vec<(&str, &str)> = match target {
-        Target::Symbol(id) if write.removed.iter().any(|r| r == id) => return Status::Removed,
+        Target::Symbol(_) if deleted.is_some() => Vec::new(),
         Target::Symbol(id) => write.syms.iter().filter(|(s, _)| s == id).map(|(s, h)| (s.as_str(), h.as_str())).collect(),
         Target::File(_) if write.level == Level::Symbol && !write.syms.is_empty() => {
             write.syms.iter().map(|(s, h)| (s.as_str(), h.as_str())).collect()
@@ -132,6 +139,10 @@ pub fn status(project_root: &Path, registry: &ParserRegistry, target: &Target, w
         }
         out
     };
+
+    if let Some(id) = deleted {
+        return if current(id).is_empty() { Status::Removed } else { Status::Changed };
+    }
 
     let mut any_missing = false;
     for (id, hash) in &expected {
@@ -308,6 +319,14 @@ mod tests {
     fn a_symbol_the_write_removed_is_removed() {
         let dir = project(&[("s1", write("toolu_1", "t", Level::Symbol, vec![], vec!["src/lib.rs::gone"], None))]);
         assert_eq!(check(&dir, "src/lib.rs::gone").unwrap().2, Status::Removed);
+    }
+
+    /// `removed` means still absent. A symbol that came back after the agent
+    /// deleted it has changed since.
+    #[test]
+    fn a_removed_symbol_that_came_back_has_changed() {
+        let dir = project(&[("s1", write("toolu_1", "t", Level::Symbol, vec![], vec!["src/lib.rs::beta"], None))]);
+        assert_eq!(check(&dir, "src/lib.rs::beta").unwrap().2, Status::Changed);
     }
 
     /// A file-level `Write` is judged by its content hash; a file-level
