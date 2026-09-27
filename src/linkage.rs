@@ -162,7 +162,7 @@ impl Resolver {
     /// `None` outside a git repository or before its first commit.
     pub fn new(project_root: &Path) -> Option<Self> {
         let repo = Repo::discover(project_root).filter(|r| r.head.is_some())?;
-        let tips = tips(project_root);
+        let tips = tips(&repo);
         Some(Self {
             repo,
             state: project_root.join(crate::state_dir::STATE_DIR),
@@ -412,15 +412,14 @@ fn parse_log(out: &[u8]) -> Vec<Commit> {
 /// Every local branch tip and `HEAD`, sorted and deduplicated. The
 /// never-landed cache is exact while these are unchanged, and otherwise
 /// only commits not reachable from the old tips need searching.
-fn tips(dir: &Path) -> Vec<String> {
-    let heads = git(dir, &["for-each-ref", "--format=%(objectname)", "refs/heads"]).unwrap_or_default();
-    let head = git(dir, &["rev-parse", "--verify", "--quiet", "HEAD"]).unwrap_or_default();
+fn tips(repo: &Repo) -> Vec<String> {
+    let heads = git(repo.dir(), &["for-each-ref", "--format=%(objectname)", "refs/heads"]).unwrap_or_default();
     let mut tips: Vec<String> = String::from_utf8_lossy(&heads)
         .lines()
-        .chain(String::from_utf8_lossy(&head).lines())
         .map(str::trim)
         .filter(|t| is_commit_id(t))
         .map(String::from)
+        .chain(repo.head.clone())
         .collect();
     tips.sort();
     tips.dedup();
@@ -436,12 +435,8 @@ fn write_cache(path: &Path, bytes: &[u8]) -> Result<()> {
 /// The file name of a unit's entry: a hash of `(op, target, hash)`, so
 /// untrusted strings never become paths.
 fn link_key(op: &str, target: &str, hash: Option<&str>) -> String {
-    let mut h = blake3::Hasher::new();
-    for part in [op, target, hash.unwrap_or("")] {
-        h.update(&(part.len() as u64).to_le_bytes());
-        h.update(part.as_bytes());
-    }
-    h.finalize().to_hex().to_string()
+    let parts = [op, target, hash.unwrap_or("")];
+    crate::objects::hash_framed("ambits-link v1", parts.iter().map(|p| p.as_bytes())).to_hex().to_string()
 }
 
 /// What [`refresh`] did.
@@ -577,11 +572,8 @@ mod tests {
             t: crate::time::rfc3339(crate::time::now_secs() - 60),
             tool: "Edit".into(),
             file: "a.txt".into(),
-            level: Level::File,
-            outside_symbols: false,
-            syms: vec![],
-            removed: vec![],
             fh: Some(crate::objects::file_hash(b"x")),
+            ..Default::default()
         };
         let unit = &units(&write)[0];
         let mut resolver = Resolver::new(&root).unwrap();
@@ -601,10 +593,8 @@ mod tests {
             tool: "Edit".into(),
             file: "src/a.rs".into(),
             level: Level::Symbol,
-            outside_symbols: false,
             syms: vec![("src/a.rs::A/f".into(), "b3:00".into())],
-            removed: vec![],
-            fh: None,
+            ..Default::default()
         };
         assert_eq!(units(&w)[0].proof, Proof::Symbol { name_path: "A/f".into(), hash: "b3:00".into() });
         w.level = Level::File;

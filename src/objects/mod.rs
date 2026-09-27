@@ -144,6 +144,21 @@ pub fn project_rel(path: &std::path::Path) -> Option<String> {
     (!parts.is_empty()).then(|| normalize_path(&parts.join("/")))
 }
 
+/// BLAKE3 of `parts` under a `domain` tag, each part length-prefixed so no
+/// split of one sequence can collide with another's. For ambits' local keys
+/// (link file names, the Serena fingerprint); the spec fixes its own
+/// framings for object ids and digests, which stay as they are.
+pub fn hash_framed<'a>(domain: &str, parts: impl IntoIterator<Item = &'a [u8]>) -> blake3::Hash {
+    let mut h = blake3::Hasher::new();
+    h.update(domain.as_bytes());
+    h.update(b"\0");
+    for part in parts {
+        h.update(&(part.len() as u64).to_le_bytes());
+        h.update(part);
+    }
+    h.finalize()
+}
+
 /// `b3:` hash of a file's raw bytes: the `fh` of a write, a dirty file's
 /// fingerprint, and what a committed blob is compared by.
 pub fn file_hash(bytes: &[u8]) -> String {

@@ -50,19 +50,21 @@ use crate::symbols::{SymbolId, SymbolNode};
 pub const ATTRIBUTION_VERSION: u32 = 2;
 
 /// How precisely a write was attributed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Level {
     /// Changed symbols named, from the session log (spec D15).
     Symbol,
     /// Only the file is known: the log lacked the text to attribute, the
     /// file has no parser, or the reconstruction did not verify.
+    #[default]
     File,
 }
 
 /// One agent write, as journaled (spec §2.6). One record per `(session,
-/// op)`; the fold keeps the highest `av`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// op)`; the fold keeps the highest `av`. `Default` is for building
+/// fixtures field by field.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteRecord {
     /// The tool call's `tool_use_id`.
     pub op: String,

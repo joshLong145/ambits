@@ -2745,7 +2745,7 @@ mod tests {
 mod write_tests {
     use super::*;
     use crate::helpers::*;
-    use crate::writes::{Level, WriteRecord};
+    use crate::writes::WriteRecord;
 
     fn record(op: &str) -> WriteRecord {
         WriteRecord {
@@ -2755,11 +2755,7 @@ mod write_tests {
             t: "2026-09-26T10:00:01Z".into(),
             tool: "Edit".into(),
             file: "src/a.rs".into(),
-            level: Level::File,
-            outside_symbols: false,
-            syms: vec![],
-            removed: vec![],
-            fh: None,
+            ..Default::default()
         }
     }
 

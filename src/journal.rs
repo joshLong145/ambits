@@ -1421,10 +1421,8 @@ mod write_record_tests {
             tool: "Edit".into(),
             file: "src/lib.rs".into(),
             level: Level::Symbol,
-            outside_symbols: false,
             syms: vec![(sym.into(), "b3:00".into())],
-            removed: vec![],
-            fh: None,
+            ..Default::default()
         }
     }
 

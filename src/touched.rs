@@ -249,13 +249,7 @@ mod tests {
     const SRC: &str = "fn alpha() {}\nfn beta() {}\n";
 
     fn hash_of(src: &str, name: &str) -> String {
-        let file = ParserRegistry::new()
-            .parser_for(Path::new("src/lib.rs"))
-            .unwrap()
-            .parse_file(Path::new("src/lib.rs"), src)
-            .unwrap();
-        let sym = file.symbols.iter().find(|s| &*s.name == name).unwrap();
-        encode_hash(&sym.content_hash)
+        FileContents::read("src/lib.rs", src.as_bytes(), &ParserRegistry::new()).hashes(name)[0].clone()
     }
 
     fn write(op: &str, t: &str, level: Level, syms: Vec<(&str, String)>, removed: Vec<&str>, fh: Option<String>) -> WriteRecord {
@@ -267,10 +261,10 @@ mod tests {
             tool: "Edit".into(),
             file: "src/lib.rs".into(),
             level,
-            outside_symbols: false,
             syms: syms.into_iter().map(|(s, h)| (s.to_string(), h)).collect(),
             removed: removed.into_iter().map(String::from).collect(),
             fh,
+            ..Default::default()
         }
     }
 

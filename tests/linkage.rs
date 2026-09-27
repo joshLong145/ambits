@@ -50,13 +50,7 @@ impl Repo {
 
 /// The content hash `content`'s symbol `name` has, as a write records it.
 fn hash_of(content: &str, name: &str) -> String {
-    let parsed = ParserRegistry::new()
-        .parser_for(Path::new("src/a.rs"))
-        .unwrap()
-        .parse_file(Path::new("src/a.rs"), content)
-        .unwrap();
-    let sym = parsed.symbols.iter().find(|s| &*s.name == name).unwrap();
-    ambits::journal::encode_hash(&sym.content_hash)
+    ambits::writes::FileContents::read("src/a.rs", content.as_bytes(), &ParserRegistry::new()).hashes(name)[0].clone()
 }
 
 /// A write made a minute ago.
@@ -69,10 +63,9 @@ fn write(op: &str, level: Level, syms: Vec<(&str, String)>, fh: Option<String>) 
         tool: "Edit".into(),
         file: "src/a.rs".into(),
         level,
-        outside_symbols: false,
         syms: syms.into_iter().map(|(s, h)| (s.to_string(), h)).collect(),
-        removed: vec![],
         fh,
+        ..Default::default()
     }
 }
 

@@ -1052,16 +1052,11 @@ fn serena_fingerprint(project_path: &Path) -> String {
         .map(|p| (p.strip_prefix(project_path).unwrap_or(&p).to_string_lossy().replace('\\', "/"), p))
         .collect();
     caches.sort();
-    let mut h = blake3::Hasher::new();
-    for (name, path) in caches {
-        let bytes = std::fs::read(&path).unwrap_or_default();
-        // Length-prefixed, so no name/content split can collide with another.
-        for part in [name.as_bytes(), bytes.as_slice()] {
-            h.update(&(part.len() as u64).to_le_bytes());
-            h.update(part);
-        }
-    }
-    h.finalize().to_hex()[..16].to_string()
+    let parts: Vec<Vec<u8>> = caches
+        .into_iter()
+        .flat_map(|(name, path)| [name.into_bytes(), std::fs::read(&path).unwrap_or_default()])
+        .collect();
+    ambits::objects::hash_framed("ambits-serena v1", parts.iter().map(Vec::as_slice)).to_hex()[..16].to_string()
 }
 
 /// Build the project symbol tree with whichever backend was selected.

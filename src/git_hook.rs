@@ -33,9 +33,7 @@ fn hooks_dir(repo_dir: &Path) -> Result<(PathBuf, bool)> {
             bail!("core.hooksPath is set in {} config ({path}); not installing a hook every repository would run", &scope[2..]);
         }
     }
-    let out = git(repo_dir, &["rev-parse", "--git-path", "hooks"]).ok_or_else(|| eyre!("git could not locate the hooks directory"))?;
-    let path = PathBuf::from(String::from_utf8_lossy(&out).trim());
-    let path = if path.is_absolute() { path } else { repo_dir.join(path) };
+    let path = repo.git_path("hooks").ok_or_else(|| eyre!("git could not locate the hooks directory"))?;
     let git_dir = git(repo_dir, &["rev-parse", "--absolute-git-dir"]).map(|o| PathBuf::from(String::from_utf8_lossy(&o).trim()));
     let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let (hooks, top) = (canonical(&path), canonical(&repo.top));
