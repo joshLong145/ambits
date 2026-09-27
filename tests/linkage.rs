@@ -42,7 +42,7 @@ impl Repo {
         git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["add", "."]);
         // Two hours back, well before any write a test makes.
-        let past = format!("@{} +0000", ambits::objects::refs::now_secs() - 7200);
+        let past = format!("@{} +0000", ambits::time::now_secs() - 7200);
         let ok = Command::new("git")
             .arg("-C")
             .arg(&root)
@@ -93,7 +93,7 @@ fn write(op: &str, level: Level, syms: Vec<(&str, String)>, fh: Option<String>) 
         op: op.into(),
         av: ambits::writes::ATTRIBUTION_VERSION,
         a: "agent-1".into(),
-        t: ambits::objects::refs::rfc3339(ambits::objects::refs::now_secs() - 60),
+        t: ambits::time::rfc3339(ambits::time::now_secs() - 60),
         tool: "Edit".into(),
         file: "src/a.rs".into(),
         level,

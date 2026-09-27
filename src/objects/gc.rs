@@ -26,8 +26,10 @@ use super::snapshot::Snapshot;
 use super::store::{create_private_dir, is_temp, walk_files, Store};
 use super::{canonical, tree, Kind, ObjectId};
 
-/// Unreachable objects younger than this are kept (§8).
-pub const DEFAULT_GRACE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+/// Unreachable objects younger than this many days are kept (§8).
+pub const DEFAULT_GRACE_DAYS: u64 = 14;
+/// [`DEFAULT_GRACE_DAYS`] as a duration.
+pub const DEFAULT_GRACE: Duration = Duration::from_secs(DEFAULT_GRACE_DAYS * crate::time::SECS_PER_DAY);
 
 /// `.ambits/gc.lock`, held for as long as this value lives.
 pub struct GcLock(#[allow(dead_code)] fs::File);

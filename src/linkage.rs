@@ -99,6 +99,9 @@ pub enum Landing {
     Uncommitted,
 }
 
+/// How far back `links refresh` (and so the hook) looks by default.
+pub const REFRESH_WINDOW_DAYS: u64 = 14;
+
 /// Clock skew allowed between the session log's timestamps and commit times
 /// on the same machine: commits this long before a write are still searched.
 pub const SKEW_SECS: u64 = 10 * 60;
@@ -183,7 +186,7 @@ impl Resolver {
         if self.log_since.is_some_and(|s| s <= since) {
             return;
         }
-        let since_arg = format!("--since={}", crate::objects::refs::rfc3339(since));
+        let since_arg = format!("--since={}", crate::time::rfc3339(since));
         let mut args: Vec<&str> = LOG_ARGS.to_vec();
         args.extend(["--branches", "HEAD", &since_arg]);
         self.log = parse_log(&git(self.dir(), &args).unwrap_or_default());
@@ -233,7 +236,7 @@ impl Resolver {
 
     /// Resolve from scratch (§3.2): the commits since just before the write.
     fn resolve(&mut self, write: &WriteRecord, unit: &Unit) -> (Landing, Vec<String>) {
-        let Some(written_at) = crate::objects::refs::parse_rfc3339(&write.t) else {
+        let Some(written_at) = crate::time::parse_rfc3339(&write.t) else {
             return (Landing::Uncommitted, Vec::new());
         };
         let since = written_at.saturating_sub(SKEW_SECS);
@@ -262,7 +265,7 @@ impl Resolver {
     /// the log mixes branches and a rename on one says nothing about the
     /// others. Returns the names as they stand at the end, for the cache.
     fn search(&mut self, write: &WriteRecord, unit: &Unit, commits: &[Commit], mut names: Vec<String>) -> (Landing, Vec<String>) {
-        let written_at = crate::objects::refs::parse_rfc3339(&write.t).unwrap_or(0);
+        let written_at = crate::time::parse_rfc3339(&write.t).unwrap_or(0);
         if !valid_record_path(&write.file) {
             return (Landing::Uncommitted, names);
         }
@@ -457,7 +460,7 @@ pub fn refresh(project_root: &Path, window: std::time::Duration, budget: std::ti
     let started = std::time::Instant::now();
     let mut stats = RefreshStats::default();
     let Some(mut resolver) = Resolver::new(project_root) else { return Ok(stats) };
-    let cutoff = crate::objects::refs::now_secs().saturating_sub(window.as_secs());
+    let cutoff = crate::time::now_secs().saturating_sub(window.as_secs());
     let dir = crate::journal::journal_dir(project_root);
 
     // Newest first: if the budget runs out, what goes unresolved is the
@@ -466,7 +469,7 @@ pub fn refresh(project_root: &Path, window: std::time::Duration, budget: std::ti
     let mut writes: Vec<(u64, WriteRecord)> = crate::cache::session_ids(&dir)
         .into_iter()
         .flat_map(|session| crate::journal::read_session_writes(&dir, &session).into_values())
-        .filter_map(|w| Some((crate::objects::refs::parse_rfc3339(&w.t).filter(|t| *t >= cutoff)?, w)))
+        .filter_map(|w| Some((crate::time::parse_rfc3339(&w.t).filter(|t| *t >= cutoff)?, w)))
         .collect();
     writes.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.op.cmp(&b.1.op)));
     // One history search for all of them.
@@ -583,7 +586,7 @@ mod tests {
             op: "toolu_1".into(),
             av: 2,
             a: "a".into(),
-            t: crate::objects::refs::rfc3339(crate::objects::refs::now_secs() - 60),
+            t: crate::time::rfc3339(crate::time::now_secs() - 60),
             tool: "Edit".into(),
             file: "a.txt".into(),
             level: Level::File,

@@ -201,12 +201,12 @@ enum Commands {
     /// Delete snapshot objects that no ref or recent reflog entry reaches.
     Gc {
         /// Keep unreachable objects younger than this many days.
-        #[arg(long, default_value_t = 14)]
+        #[arg(long, default_value_t = ambits::objects::gc::DEFAULT_GRACE_DAYS)]
         grace_days: u64,
 
         /// Reflog entries older than this many days stop protecting the
         /// snapshots they name.
-        #[arg(long, default_value_t = 90)]
+        #[arg(long, default_value_t = ambits::objects::refs::REFLOG_EXPIRY_DAYS)]
         reflog_expiry_days: u64,
     },
 
@@ -719,7 +719,7 @@ enum LinksCommands {
     /// index. Run by the git post-commit hook.
     Refresh {
         /// Look at writes from this many days back.
-        #[arg(long, default_value_t = 14)]
+        #[arg(long, default_value_t = ambits::linkage::REFRESH_WINDOW_DAYS)]
         days: u64,
     },
 }
@@ -1025,6 +1025,11 @@ fn execute(
     ambits::search::run(registry, &targets, &request.options, coverage)
 }
 
+/// A CLI flag given in days, as a duration.
+fn days_flag(n: u64, flag: &str) -> Result<Duration> {
+    ambits::time::days(n).ok_or_else(|| color_eyre::eyre::eyre!("{flag} {n} is too large"))
+}
+
 /// `ambits log`: the history of `reference`, or of the current session.
 fn run_log(project_path: &Path, reference: Option<&str>) -> Result<()> {
     use ambits::objects::snapshot;
@@ -1221,10 +1226,7 @@ fn run() -> Result<()> {
     ambits::logging::init(cli.log_output.as_deref(), session_id.as_deref());
 
     if let Some(Commands::Links { command: LinksCommands::Refresh { days } }) = &command {
-        let window = days
-            .checked_mul(24 * 60 * 60)
-            .map(Duration::from_secs)
-            .ok_or_else(|| color_eyre::eyre::eyre!("--days {days} is too large"))?;
+        let window = days_flag(*days, "--days")?;
         // Bounded, so a hook never leaves a process running for long.
         let stats = ambits::linkage::refresh(&project_path, window, Duration::from_secs(30))?;
         writeln!(
@@ -1243,15 +1245,10 @@ fn run() -> Result<()> {
     }
     if let Some(Commands::Gc { grace_days, reflog_expiry_days }) = &command {
         let store = ambits::objects::store::Store::at(&project_path);
-        let days = |n: u64, flag: &str| {
-            n.checked_mul(24 * 60 * 60)
-                .map(Duration::from_secs)
-                .ok_or_else(|| color_eyre::eyre::eyre!("{flag} {n} is too large"))
-        };
         let stats = ambits::objects::gc::gc(
             &store,
-            days(*grace_days, "--grace-days")?,
-            days(*reflog_expiry_days, "--reflog-expiry-days")?,
+            days_flag(*grace_days, "--grace-days")?,
+            days_flag(*reflog_expiry_days, "--reflog-expiry-days")?,
         )?;
         let mut out = io::stdout().lock();
         writeln!(

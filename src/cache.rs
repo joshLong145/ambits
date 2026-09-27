@@ -106,7 +106,7 @@ pub fn collect(project_root: &Path) -> Vec<JournalStat> {
         }
         let age_days = newest
             .and_then(|m| m.elapsed().ok())
-            .map(|d| d.as_secs() / 86_400);
+            .map(|d| d.as_secs() / crate::time::SECS_PER_DAY);
 
         let contents = read_journal_session(&dir, &session_id);
 
