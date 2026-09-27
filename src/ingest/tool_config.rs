@@ -23,6 +23,20 @@ pub struct CacheConfig {
     pub flush_interval_ms: Option<u64>,
 }
 
+/// `[sync]` stanza: what snapshots leave out (spec §4), in `.gitignore`
+/// syntax.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SyncConfig {
+    /// Patterns from the project's (or `--config`'s) layer. A later layer
+    /// replaces an earlier one's list, like every other scalar setting.
+    #[serde(default)]
+    pub ignore: Option<Vec<String>>,
+    /// Patterns from the user-global layer, kept apart: they are matched
+    /// separately and last, so a project cannot negate them (§4).
+    #[serde(skip)]
+    pub global_ignore: Vec<String>,
+}
+
 /// `[editor]` stanza: how to open a symbol's file in an external editor.
 /// Every field is optional; an absent stanza (or absent field) falls through
 /// to `$VISUAL`/`$EDITOR`.
@@ -45,6 +59,9 @@ pub struct ToolMappingConfig {
     /// "Open in editor" settings. See [`EditorConfig`].
     #[serde(default)]
     pub editor: EditorConfig,
+    /// Snapshot exclusions. See [`SyncConfig`].
+    #[serde(default)]
+    pub sync: SyncConfig,
     /// Name → index into `tools`. Built after deserialization via `build_index()`.
     #[serde(skip)]
     pub(crate) index: HashMap<String, usize>,
@@ -485,13 +502,20 @@ impl ToolMappingConfig {
         // Each layer merges over everything before it, so a later layer wins
         // stanza by stanza and `[cache]`/`[editor]` field by field.
         let mut merged = builtin;
+        let mut global_ignore = Vec::new();
         for path in Self::config_layers(cli, project_root, global, &mut warnings) {
             let (layer, mut lw) = Self::load(&path);
             warnings.append(&mut lw);
-            if let Some(layer) = layer {
+            if let Some(mut layer) = layer {
+                // The user-global layer's sync patterns stay out of the
+                // merge, where the project's list would replace them (§4).
+                if Some(path.as_path()) == global {
+                    global_ignore = layer.sync.ignore.take().unwrap_or_default();
+                }
                 merged = Self::merge(merged, layer, &mut warnings);
             }
         }
+        merged.sync.global_ignore = global_ignore;
 
         (Arc::new(merged), warnings)
     }
@@ -509,6 +533,10 @@ impl ToolMappingConfig {
         // `[editor]` follows the same plain-scalar merge as `[cache]`.
         let editor = EditorConfig {
             command: user.editor.command.clone().or(base.editor.command.clone()),
+        };
+        let sync = SyncConfig {
+            ignore: user.sync.ignore.clone().or(base.sync.ignore.clone()),
+            global_ignore: base.sync.global_ignore.clone(),
         };
         // Step A — deduplicate user stanzas (last stanza per name wins).
         // Stanzas with empty `names` are passed through to Step B for warning emission.
@@ -621,6 +649,7 @@ impl ToolMappingConfig {
             tools: result,
             cache,
             editor,
+            sync,
             index: HashMap::new(),
         };
         merged.build_index();
@@ -699,6 +728,7 @@ impl ToolMappingConfig {
             tools: vec![],
             cache: CacheConfig::default(),
             editor: EditorConfig::default(),
+            sync: SyncConfig::default(),
             index: HashMap::new(),
         }
     }

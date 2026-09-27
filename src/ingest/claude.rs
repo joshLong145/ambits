@@ -75,7 +75,7 @@ fn find_session_from_files(log_dir: &Path) -> Option<String> {
 
 /// Check if a string looks like a UUID (8-4-4-4-12 hex chars, exactly 36 bytes).
 /// Uses direct byte-position checks — no allocation.
-fn is_uuid(s: &str) -> bool {
+pub fn is_uuid(s: &str) -> bool {
     let b = s.as_bytes();
     if b.len() != 36 {
         return false;

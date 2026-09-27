@@ -220,13 +220,8 @@ impl EnvironmentManifest {
             tree_fingerprint: encode_hash(&tree_fingerprint(tree)),
             ambit_version: env!("CARGO_PKG_VERSION").to_string(),
             backend: backend.to_string(),
-            // Diagnostic only; keep in step with Cargo.toml when grammars move.
-            parsers: vec![
-                "tree-sitter=0.24".into(),
-                "rust=0.23".into(),
-                "python=0.23".into(),
-                "typescript=0.23".into(),
-            ],
+            // Diagnostic only; generated from Cargo.lock at build time.
+            parsers: crate::parser::GRAMMARS.iter().map(|(n, v)| format!("{n}={v}")).collect(),
             tool_config_version: Some(crate::ingest::tool_config::ToolMappingConfig::SUPPORTED_VERSION),
             filter,
             os: std::env::consts::OS.to_string(),
@@ -435,16 +430,18 @@ fn fold(
 /// *interior* line warns and is skipped. Losing one record costs one symbol's
 /// coverage; refusing to read the file costs all of it.
 pub fn read_journal(path: &Path) -> JournalContents {
-    let mut out = JournalContents::default();
+    match std::fs::read_to_string(path) {
+        Ok(content) => fold_journal_text(path, &content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => JournalContents::default(),
+        Err(e) => JournalContents { warnings: vec![format!("{}: {e}", path.display())], ..Default::default() },
+    }
+}
 
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return out,
-        Err(e) => {
-            out.warnings.push(format!("{}: {e}", path.display()));
-            return out;
-        }
-    };
+/// [`read_journal`] over text already in hand; `path` labels warnings.
+/// Snapshots fold exactly the bytes they digest (spec §6.2), so they read a
+/// shard once and pass its text here.
+pub fn fold_journal_text(path: &Path, content: &str) -> JournalContents {
+    let mut out = JournalContents::default();
 
     let lines: Vec<&str> = content.lines().collect();
     let last_index = lines.len().saturating_sub(1);
@@ -576,23 +573,28 @@ pub fn session_shard_paths(dir: &Path, session_id: &str) -> Vec<PathBuf> {
 pub fn read_journal_session(dir: &Path, session_id: &str) -> JournalContents {
     let mut out = JournalContents::default();
     for path in session_shard_paths(dir, session_id) {
-        let shard = read_journal(&path);
-        out.records += shard.records;
-        out.warnings.extend(shard.warnings);
-        if shard.header.is_some() {
-            out.header = shard.header;
-        }
-        for (id, (hash, depth)) in shard.reads {
-            fold(out.reads.entry(id), hash, depth);
-        }
-        for (key, (hash, depth)) in shard.agent_reads {
-            fold(out.agent_reads.entry(key), hash, depth);
-        }
-        for record in shard.writes.into_values() {
-            fold_write(&mut out.writes, record);
-        }
+        merge_shard(&mut out, read_journal(&path));
     }
     out
+}
+
+/// Fold one shard's contents into a session's, with the same rules
+/// [`fold`] applies within a file.
+pub fn merge_shard(out: &mut JournalContents, shard: JournalContents) {
+    out.records += shard.records;
+    out.warnings.extend(shard.warnings);
+    if shard.header.is_some() {
+        out.header = shard.header;
+    }
+    for (id, (hash, depth)) in shard.reads {
+        fold(out.reads.entry(id), hash, depth);
+    }
+    for (key, (hash, depth)) in shard.agent_reads {
+        fold(out.agent_reads.entry(key), hash, depth);
+    }
+    for record in shard.writes.into_values() {
+        fold_write(&mut out.writes, record);
+    }
 }
 
 // ---------------------------------------------------------------------------
