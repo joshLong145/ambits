@@ -4,7 +4,8 @@ use ratatui::style::Color;
 
 // ── Read-depth colors (symbol level) ────────────────────────────────
 pub const DEPTH_UNSEEN: Color = Color::Rgb(100, 100, 100);
-pub const DEPTH_NAME_ONLY: Color = Color::Rgb(160, 160, 160);
+// A hue of its own: a grey name-only read was indistinguishable from unseen.
+pub const DEPTH_NAME_ONLY: Color = Color::Rgb(170, 140, 200);
 pub const DEPTH_OVERVIEW: Color = Color::Rgb(120, 160, 220);
 pub const DEPTH_SIGNATURE: Color = Color::Rgb(80, 140, 255);
 pub const DEPTH_FULL_BODY: Color = Color::Rgb(80, 220, 120);

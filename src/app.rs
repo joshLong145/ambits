@@ -46,9 +46,12 @@ pub struct TreeRow {
     pub stale: bool,
     /// Read predates a compaction, so the model no longer holds it in context.
     pub restored: bool,
+    /// Coverage of what the row stands for but does not show: the whole file
+    /// for a file row, the descendants of a collapsed symbol. `None` for any
+    /// other symbol row, whose own color already tells the whole story.
     pub coverage_status: Option<FileCoverageStatus>,
-    pub file_coverage_seen: usize,
-    pub file_coverage_total: usize,
+    pub coverage_seen: usize,
+    pub coverage_total: usize,
 }
 
 impl TreeRow {
@@ -549,8 +552,8 @@ impl App {
                 stale: false,
                 restored: false,
                 coverage_status: Some(status),
-                file_coverage_seen: seen,
-                file_coverage_total: total,
+                coverage_seen: seen,
+                coverage_total: total,
             });
 
             if is_expanded {
@@ -1293,6 +1296,15 @@ fn flatten_symbol(
         Some(agent_id) => ledger.depth_of_for_agent(&sym.id, agent_id),
         None => ledger.depth_of(&sym.id),
     };
+    // A collapsed symbol summarizes its descendants, as a file row does: reads
+    // land on innermost symbols, so without this a method read inside
+    // `impl App` leaves every visible row grey under an amber file.
+    let (coverage_status, coverage_seen, coverage_total) = if !is_expanded && !sym.children.is_empty() {
+        let (total, seen, full) = count_symbols(&sym.children, ledger, agent_filter);
+        (Some(coverage_status_from_counts(total, seen, full)), seen, total)
+    } else {
+        (None, 0, 0)
+    };
 
     rows.push(TreeRow {
         symbol_id: sym.id.clone(),
@@ -1307,9 +1319,9 @@ fn flatten_symbol(
         read_depth,
         stale: ledger.is_stale(&sym.id),
         restored: ledger.is_restored(&sym.id),
-        coverage_status: None,
-        file_coverage_seen: 0,
-        file_coverage_total: 0,
+        coverage_status,
+        coverage_seen,
+        coverage_total,
     });
 
     if is_expanded {

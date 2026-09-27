@@ -47,11 +47,8 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                     &row.display_name,
                     Style::default().fg(file_color).add_modifier(Modifier::BOLD),
                 ));
-                if row.file_coverage_total > 0 {
-                    spans.push(Span::styled(
-                        format!("  {}/{}", row.file_coverage_seen, row.file_coverage_total),
-                        Style::default().fg(file_color),
-                    ));
+                if row.coverage_total > 0 {
+                    spans.push(coverage_count(row, file_color));
                 }
                 spans.push(Span::styled(
                     format!("  ({})", row.line_range),
@@ -62,7 +59,20 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                     format!("{} ", row.label),
                     Style::default().fg(Color::DarkGray),
                 ));
-                spans.push(Span::styled(&row.display_name, symbol_style(color, row.restored)));
+                // A collapsed symbol with read descendants: color an unread
+                // name by their coverage, and show how many, like a file row.
+                let inner = row
+                    .coverage_status
+                    .filter(|_| row.coverage_seen > 0)
+                    .map(|status| file_coverage_color(Some(status)));
+                let name_color = match inner {
+                    Some(c) if !row.read_depth.is_seen() => c,
+                    _ => color,
+                };
+                spans.push(Span::styled(&row.display_name, symbol_style(name_color, row.restored)));
+                if let Some(c) = inner {
+                    spans.push(coverage_count(row, c));
+                }
                 spans.push(Span::styled(
                     format!("  [{}] ~{} tok", row.line_range, row.token_count),
                     Style::default().fg(Color::DarkGray),
@@ -86,6 +96,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         );
 
     f.render_stateful_widget(list, area, &mut state);
+}
+
+/// `  seen/total` for a row that summarizes symbols it does not show.
+fn coverage_count(row: &ambits::app::TreeRow, color: Color) -> Span<'static> {
+    Span::styled(format!("  {}/{}", row.coverage_seen, row.coverage_total), Style::default().fg(color))
 }
 
 /// Restored reads keep their depth color but render dimmed, so pre-compaction
@@ -160,7 +175,9 @@ mod tests {
         let row_str: String = (0..buf.area.width)
             .map(|x| buf[(x, row)].symbol().to_string())
             .collect::<String>();
-        let col = row_str.find(text)? as u16;
+        // A column, not a byte offset: the border and the expand icons are
+        // multi-byte.
+        let col = row_str[..row_str.find(text)?].chars().count() as u16;
         Some(buf[(col, row)].fg)
     }
 
@@ -262,5 +279,64 @@ mod tests {
 
         let color = fg_color_of(terminal.backend(), 2, "alpha").unwrap();
         assert_eq!(color, colors::DEPTH_FULL_BODY);
+    }
+
+    /// Row text of `row` in the rendered buffer.
+    fn row_text(backend: &TestBackend, row: u16) -> String {
+        let buf = backend.buffer();
+        (0..buf.area.width).map(|x| buf[(x, row)].symbol().to_string()).collect()
+    }
+
+    /// An app whose only file holds `Parent` with two children, file
+    /// expanded, `Parent` collapsed, one child read.
+    fn app_with_a_read_child() -> App {
+        let mut parent = sym("p", "Parent");
+        parent.children = vec![sym("p/a", "a"), sym("p/b", "b")];
+        let tree = ProjectTree {
+            root: PathBuf::from("/test"),
+            files: vec![FileSymbols { file_path: "mock/p.rs".into(), symbols: vec![parent], total_lines: 20 }],
+        };
+        let mut app = App::new(tree, PathBuf::from("/test"));
+        app.set_expanded("mock/p.rs", ambits::expansion::RowKind::File, true);
+        app.set_expanded("p", ambits::expansion::RowKind::Symbol, false);
+        app.ledger.record("p/a".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+        app.rebuild_tree_rows();
+        app.selected_index = 0;
+        app
+    }
+
+    fn draw(app: &App) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, app, f.area())).unwrap();
+        terminal
+    }
+
+    /// Reads land on innermost symbols. A collapsed parent must show that
+    /// something inside it was read, or an amber file expands to all grey.
+    #[test]
+    fn a_collapsed_parent_shows_its_read_children() {
+        let app = app_with_a_read_child();
+        let terminal = draw(&app);
+        assert_eq!(fg_color_of(terminal.backend(), 2, "Parent"), Some(colors::FILE_PARTIALLY_COVERED));
+        assert!(row_text(terminal.backend(), 2).contains("1/2"), "{}", row_text(terminal.backend(), 2));
+    }
+
+    /// Expanded, the children speak for themselves.
+    #[test]
+    fn an_expanded_parent_keeps_its_own_color() {
+        let mut app = app_with_a_read_child();
+        app.set_expanded("p", ambits::expansion::RowKind::Symbol, true);
+        app.rebuild_tree_rows();
+        let terminal = draw(&app);
+        assert_eq!(fg_color_of(terminal.backend(), 2, "Parent"), Some(colors::DEPTH_UNSEEN));
+        assert!(!row_text(terminal.backend(), 2).contains("1/2"));
+        assert_eq!(fg_color_of(terminal.backend(), 3, "a  [L"), Some(colors::DEPTH_FULL_BODY));
+    }
+
+    /// A name-only read must not look unread.
+    #[test]
+    fn name_only_is_distinguishable_from_unseen() {
+        assert_ne!(colors::DEPTH_NAME_ONLY, colors::DEPTH_UNSEEN);
+        assert_ne!(depth_color(ReadDepth::NameOnly, false), depth_color(ReadDepth::Unseen, false));
     }
 }

@@ -60,12 +60,14 @@ While it runs, the TUI is also the sole writer of the
 | Color | Meaning |
 |---|---|
 | Dark gray | Unseen |
-| Light gray | Name only (appeared in a glob or listing) |
+| Lavender | Name only (appeared in a glob, a listing, or a `callers` / `show --no-body` result) |
 | Pale blue | Overview (grep match, symbol listing) |
 | Blue | Signature seen |
 | Green | Full body read |
 
-**File headers**, by coverage:
+**File headers**, by coverage — and a **collapsed symbol**, by the coverage of
+what is nested inside it, with the same `seen/total` count (its name keeps its
+own depth color when it was itself read):
 
 | Color | Meaning |
 |---|---|
