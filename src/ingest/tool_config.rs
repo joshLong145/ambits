@@ -78,6 +78,18 @@ pub struct ToolMapping {
     /// Name of a built-in stanza to inherit fields from.
     #[serde(default)]
     pub extends: Option<String>,
+    /// `read` (the default) or `write` (spec §2.1). A stanza has exactly one
+    /// of a `depth` or `effect = "write"`: a write grants no read credit.
+    /// `None` means unspecified, so `extends` can supply it.
+    #[serde(default)]
+    pub effect: Option<super::Effect>,
+}
+
+impl ToolMapping {
+    /// The stanza's effect, `Read` when unspecified.
+    pub fn effect(&self) -> super::Effect {
+        self.effect.unwrap_or_default()
+    }
 }
 
 fn default_path_required() -> bool {
@@ -349,6 +361,7 @@ pub enum ConfigWarning {
     ConditionalKeyNonBoolean { tool_name: String, key: String },
     EmptyPatterns          { tool_name: String },
     MissingDepth           { stanza_index: usize },
+    DepthOnWrite           { stanza_index: usize },
     LegacyConfigPath       { path: String, moved_to: String },
     MissingOverride        { path: String },
 }
@@ -374,6 +387,9 @@ impl std::fmt::Display for ConfigWarning {
                     tool_name),
             ConfigWarning::MissingDepth { stanza_index } =>
                 write!(f, "tool config stanza {} has no 'depth' and no 'extends'; skipping",
+                    stanza_index),
+            ConfigWarning::DepthOnWrite { stanza_index } =>
+                write!(f, "tool config stanza {} sets both 'depth' and effect = \"write\"; a write grants no read credit, so remove one; skipping",
                     stanza_index),
             ConfigWarning::LegacyConfigPath { path, moved_to } =>
                 write!(f, "tool config '{}' is in the legacy .ambit/ directory; move it to '{}'",
@@ -543,7 +559,12 @@ impl ToolMappingConfig {
                     if stanza.pattern_keys.is_empty() {
                         stanza.pattern_keys = base_stanza.pattern_keys.clone();
                     }
-                    if stanza.depth.is_none() {
+                    // Effect first: a stanza that makes a read tool a write
+                    // must not then inherit that tool's read depth.
+                    if stanza.effect.is_none() {
+                        stanza.effect = base_stanza.effect;
+                    }
+                    if stanza.depth.is_none() && stanza.effect() == super::Effect::Read {
                         stanza.depth = base_stanza.depth.clone();
                     }
                     if stanza.target_symbol.is_none() {
@@ -563,10 +584,18 @@ impl ToolMappingConfig {
                 // base_name not found: skip silently
             }
 
-            // depth must be Some by now (either explicit or inherited via extends).
-            if stanza.depth.is_none() {
-                warnings.push(ConfigWarning::MissingDepth { stanza_index: idx });
-                continue;
+            // Exactly one of a depth or `effect = "write"` (spec §2.1), by now
+            // either explicit or inherited via extends.
+            match (stanza.effect(), stanza.depth.is_some()) {
+                (super::Effect::Read, false) => {
+                    warnings.push(ConfigWarning::MissingDepth { stanza_index: idx });
+                    continue;
+                }
+                (super::Effect::Write, true) => {
+                    warnings.push(ConfigWarning::DepthOnWrite { stanza_index: idx });
+                    continue;
+                }
+                _ => {}
             }
 
             resolved_user.push(stanza);
@@ -1572,5 +1601,81 @@ description = "T {pattern}"
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f
+    }
+}
+
+/// `effect` (spec §2.1): a stanza has exactly one of a `depth` or
+/// `effect = "write"`, and `extends` supplies an unspecified effect.
+#[cfg(test)]
+mod effect_tests {
+    use super::*;
+    use crate::ingest::Effect;
+
+    fn merge_user(toml_src: &str) -> (ToolMappingConfig, Vec<ConfigWarning>) {
+        let user: ToolMappingConfig = toml::from_str(toml_src).expect("valid toml");
+        let mut warnings = Vec::new();
+        let cfg = ToolMappingConfig::merge(ToolMappingConfig::builtin().unwrap(), user, &mut warnings);
+        (cfg, warnings)
+    }
+
+    fn stanza<'c>(cfg: &'c ToolMappingConfig, name: &str) -> Option<&'c ToolMapping> {
+        cfg.index.get(name).map(|&i| &cfg.tools[i])
+    }
+
+    #[test]
+    fn a_write_stanza_needs_no_depth() {
+        let (cfg, warnings) = merge_user(
+            "version = 1\n[[tool]]\nnames = [\"Scribe\"]\npath_keys = [\"path\"]\neffect = \"write\"\ndescription = \"x\"\n",
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(stanza(&cfg, "Scribe").unwrap().effect(), Effect::Write);
+    }
+
+    #[test]
+    fn a_write_stanza_with_a_depth_is_rejected() {
+        let (cfg, warnings) = merge_user(
+            "version = 1\n[[tool]]\nnames = [\"Scribe\"]\npath_keys = [\"path\"]\neffect = \"write\"\n\
+             depth = { type = \"fixed\", value = \"FullBody\" }\ndescription = \"x\"\n",
+        );
+        assert!(matches!(warnings.as_slice(), [ConfigWarning::DepthOnWrite { .. }]), "{warnings:?}");
+        assert!(stanza(&cfg, "Scribe").is_none(), "skipped");
+    }
+
+    #[test]
+    fn a_read_stanza_still_needs_a_depth() {
+        let (_, warnings) = merge_user(
+            "version = 1\n[[tool]]\nnames = [\"Peek\"]\npath_keys = [\"path\"]\ndescription = \"x\"\n",
+        );
+        assert!(matches!(warnings.as_slice(), [ConfigWarning::MissingDepth { .. }]), "{warnings:?}");
+    }
+
+    /// Making a read tool a write via `extends` must not inherit its depth,
+    /// or the stanza would carry both and be rejected.
+    #[test]
+    fn a_write_extending_a_read_tool_does_not_inherit_its_depth() {
+        let (cfg, warnings) = merge_user(
+            "version = 1\n[[tool]]\nnames = [\"Edit\"]\npath_keys = []\nextends = \"Edit\"\neffect = \"write\"\ndescription = \"x\"\n",
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let edit = stanza(&cfg, "Edit").unwrap();
+        assert_eq!(edit.effect(), Effect::Write);
+        assert!(edit.depth.is_none());
+        assert_eq!(edit.path_keys, vec!["file_path".to_string(), "relative_path".to_string()], "other fields still inherited");
+    }
+
+    /// An unspecified effect is inherited.
+    #[test]
+    fn extends_inherits_the_effect() {
+        let (base, _) = merge_user(
+            "version = 1\n[[tool]]\nnames = [\"Scribe\"]\npath_keys = [\"path\"]\neffect = \"write\"\ndescription = \"x\"\n",
+        );
+        let user: ToolMappingConfig = toml::from_str(
+            "version = 1\n[[tool]]\nnames = [\"Scribe2\"]\npath_keys = []\nextends = \"Scribe\"\ndescription = \"y\"\n",
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        let cfg = ToolMappingConfig::merge(base, user, &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(stanza(&cfg, "Scribe2").unwrap().effect(), Effect::Write);
     }
 }

@@ -166,6 +166,8 @@ mod tests {
             target_lines: None,
         target_selectors: Vec::new(),
             label: "agent-abc123".into(),
+            tool_use_id: None,
+            effect: ambits::ingest::Effect::Read,
         });
 
         let backend = TestBackend::new(60, 10);

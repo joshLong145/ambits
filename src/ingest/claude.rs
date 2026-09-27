@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use crate::tracking::ReadDepth;
-use super::{AgentToolCall, CompactionMetadata, EventTailer, SessionEvent, SessionIngester, TailedCompaction, TailerOutput, ToolCallMapper};
+use super::{AgentToolCall, CompactionMetadata, Effect, EventTailer, Hunk, SessionEvent, SessionIngester, TailedCompaction, TailerOutput, ToolCallMapper, WriteEvent, WriteSource};
 use super::tool_config::ToolMappingConfig;
 
 /// Derive the Claude Code log directory for a given project path.
@@ -283,7 +283,156 @@ pub enum ParsedLine {
     /// `Compacted` event.
     CompactBoundary { metadata: CompactionMetadata, timestamp: String },
     SessionCleared,
+    /// `type:"user"` line carrying tool results — how a write tool's outcome
+    /// (and its `toolUseResult` detail) reaches us. Correlated with the call
+    /// by [`WriteCorrelator`].
+    ToolResults(Vec<ToolResult>),
     Ignored,
+}
+
+/// One `tool_result` block from a `type:"user"` line.
+#[derive(Debug, Clone)]
+pub struct ToolResult {
+    pub tool_use_id: Arc<str>,
+    /// The tool failed or was rejected (`is_error`, or a string
+    /// `toolUseResult` such as a rejection or "String to replace not found").
+    pub is_error: bool,
+    /// The line's `toolUseResult`, when it is an object and unambiguously
+    /// belongs to this block (the line holds a single `tool_result`).
+    pub detail: Option<Value>,
+    pub timestamp: String,
+}
+
+/// Pairs write tool calls with their results (spec §1).
+///
+/// A result line names only its `tool_use_id`; the tool, path and agent live
+/// on the earlier `tool_use` line. So the pairing is stateful: callers that
+/// walk a log in order — the batch parser, and the tailer across polls —
+/// feed calls in with [`note_calls`](Self::note_calls) and results with
+/// [`resolve`](Self::resolve).
+#[derive(Debug, Default)]
+pub struct WriteCorrelator {
+    pending: std::collections::HashMap<Arc<str>, AgentToolCall>,
+}
+
+impl WriteCorrelator {
+    /// Remember write calls until their results arrive.
+    pub fn note_calls(&mut self, calls: &[AgentToolCall]) {
+        for call in calls {
+            if call.effect != Effect::Write || call.file_path.is_none() {
+                continue;
+            }
+            if let Some(id) = &call.tool_use_id {
+                self.pending.insert(id.clone(), call.clone());
+            }
+        }
+    }
+
+    /// Turn results for pending write calls into write events. Failed or
+    /// rejected writes are dropped: nothing changed on disk.
+    pub fn resolve(&mut self, results: Vec<ToolResult>) -> Vec<WriteEvent> {
+        let mut out = Vec::new();
+        for result in results {
+            let Some(call) = self.pending.remove(&result.tool_use_id) else {
+                continue;
+            };
+            if result.is_error {
+                continue;
+            }
+            let Some(path) = call.file_path else { continue };
+            out.push(WriteEvent {
+                op: result.tool_use_id,
+                agent_id: call.agent_id,
+                tool_name: call.tool_name,
+                path,
+                timestamp: result.timestamp,
+                source: result.detail.as_ref().map(write_source).unwrap_or(WriteSource::Opaque),
+            });
+        }
+        out
+    }
+}
+
+/// Classify a `toolUseResult` object by shape (spec §2.2). Anything that is
+/// not a recognizable `Edit` or `Write` result is `Opaque`: file-level only.
+fn write_source(detail: &Value) -> WriteSource {
+    let text = |k: &str| detail.get(k).and_then(|v| v.as_str()).map(String::from);
+    let flag = |k: &str| detail.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+    let hunks = parse_hunks(detail.get("structuredPatch"));
+
+    if let (Some(old), Some(new)) = (text("oldString"), text("newString")) {
+        return WriteSource::Edit {
+            original: text("originalFile"),
+            old,
+            new,
+            replace_all: flag("replaceAll"),
+            hunks,
+            user_modified: flag("userModified"),
+        };
+    }
+    if let Some(content) = text("content") {
+        if let Some(kind @ ("create" | "update")) = detail.get("type").and_then(|v| v.as_str()) {
+            return WriteSource::Write {
+                original: text("originalFile"),
+                content,
+                create: kind == "create",
+                hunks,
+                user_modified: flag("userModified"),
+            };
+        }
+    }
+    WriteSource::Opaque
+}
+
+/// `structuredPatch` → hunks. Malformed hunks are skipped; attribution
+/// verifies every hunk against the texts anyway (`writes::attribute`).
+fn parse_hunks(patch: Option<&Value>) -> Vec<Hunk> {
+    let Some(Value::Array(hunks)) = patch else { return Vec::new() };
+    hunks
+        .iter()
+        .filter_map(|h| {
+            Some(Hunk {
+                old_start: u32::try_from(h.get("oldStart")?.as_u64()?).ok()?,
+                new_start: u32::try_from(h.get("newStart")?.as_u64()?).ok()?,
+                lines: h
+                    .get("lines")?
+                    .as_array()?
+                    .iter()
+                    .map(|l| l.as_str().map(String::from))
+                    .collect::<Option<Vec<_>>>()?,
+            })
+        })
+        .collect()
+}
+
+/// Every `tool_result` block on a `type:"user"` line.
+fn parse_tool_results(obj: &Value) -> Vec<ToolResult> {
+    let Some(Value::Array(blocks)) = obj.pointer("/message/content") else {
+        return Vec::new();
+    };
+    let timestamp = obj.get("timestamp").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let results: Vec<&Value> = blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_result"))
+        .collect();
+    // `toolUseResult` is one per line; it can only be attributed to a block
+    // when there is exactly one.
+    let detail = obj.get("toolUseResult");
+    let single = results.len() == 1;
+    results
+        .into_iter()
+        .filter_map(|b| {
+            let id = b.get("tool_use_id")?.as_str()?;
+            let string_result = detail.is_some_and(|d| d.is_string());
+            Some(ToolResult {
+                tool_use_id: Arc::from(id),
+                is_error: b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false)
+                    || (single && string_result),
+                detail: detail.filter(|d| single && d.is_object()).cloned(),
+                timestamp: timestamp.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Parse all events from a JSONL log file.
@@ -348,6 +497,7 @@ fn parse_log_file_with_mapper(
     // boundary immediately before the corresponding `isCompactSummary` line, so
     // we attach the buffered metadata to the next `Compacted` event we see.
     let mut pending_metadata: Option<CompactionMetadata> = None;
+    let mut writes = WriteCorrelator::default();
 
     for line in reader.lines().map_while(Result::ok) {
         match parse_jsonl_line(line.trim(), &default_id, mapper) {
@@ -362,7 +512,11 @@ fn parse_log_file_with_mapper(
                 for ev in &mut line_events {
                     ev.label = label.clone();
                 }
+                writes.note_calls(&line_events);
                 events.extend(line_events.into_iter().map(SessionEvent::ToolCall));
+            }
+            ParsedLine::ToolResults(results) => {
+                events.extend(writes.resolve(results).into_iter().map(SessionEvent::Write));
             }
             ParsedLine::CompactBoundary { metadata, .. } => {
                 pending_metadata = Some(metadata);
@@ -448,7 +602,12 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
         if content.contains("<command-name>/clear</command-name>") {
             return ParsedLine::SessionCleared;
         }
-        return ParsedLine::Ignored;
+        let results = parse_tool_results(&obj);
+        return if results.is_empty() {
+            ParsedLine::Ignored
+        } else {
+            ParsedLine::ToolResults(results)
+        };
     }
 
     if msg_type != "assistant" {
@@ -493,6 +652,8 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
             "tool_use recognized"
         );
 
+        let tool_use_id: Option<Arc<str>> =
+            block.get("id").and_then(|v| v.as_str()).map(Arc::from);
         let event = match mapper.map_tool_call(tool_name, &input, &agent_id, &timestamp_str) {
             Some(event) => {
                 log::debug!(
@@ -517,10 +678,12 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
                     target_lines: None,
                     target_selectors: Vec::new(),
                     label: agent_id.clone(),
+                    tool_use_id: None,
+                    effect: Effect::Read,
                 }
             }
         };
-        events.push(event);
+        events.push(AgentToolCall { tool_use_id, ..event });
     }
 
     ParsedLine::Events(events)
@@ -660,12 +823,17 @@ pub fn map_tool_call(
         .iter()
         .find_map(|k| input.get(k).and_then(|v| v.as_str()));
 
-    // Resolve read depth via centralised DepthSpec logic.
-    let read_depth = mapping
-        .depth
-        .as_ref()
-        .expect("depth must be Some after load/merge — MissingDepth stanzas are dropped")
-        .resolve(input);
+    // Resolve read depth via centralised DepthSpec logic. A write stanza has
+    // no depth and grants no read credit (spec D9).
+    let effect = mapping.effect();
+    let read_depth = match effect {
+        Effect::Write => ReadDepth::Unseen,
+        Effect::Read => mapping
+            .depth
+            .as_ref()
+            .expect("a read stanza has a depth after load/merge — MissingDepth stanzas are dropped")
+            .resolve(input),
+    };
 
     // For TodoWrite-style tools: if no pattern_keys matched, try to extract the
     // first todo item's "content" field as a display label.
@@ -739,6 +907,9 @@ pub fn map_tool_call(
         target_lines,
         target_selectors,
         label: agent_arc,
+        // Set by `parse_jsonl_line`, which sees the tool_use block's id.
+        tool_use_id: None,
+        effect,
     })
 }
 
@@ -767,6 +938,9 @@ pub struct LogTailer {
     /// `isCompactSummary` line arrives (usually within the same poll, but kept
     /// across polls in case the writer flushes them separately).
     pending_metadata: Option<CompactionMetadata>,
+    /// Write calls awaiting their results, kept across polls: a result can
+    /// land in a later poll than its call.
+    writes: WriteCorrelator,
 }
 
 impl LogTailer {
@@ -785,7 +959,7 @@ impl LogTailer {
             let start = fs::metadata(f).map(|m| m.len()).unwrap_or(0);
             positions.insert(f.clone(), start);
         }
-        Self { files, positions, mapper, pending_metadata: None }
+        Self { files, positions, mapper, pending_metadata: None, writes: WriteCorrelator::default() }
     }
 
 
@@ -806,6 +980,7 @@ impl LogTailer {
             events: Vec::new(),
             compactions: Vec::new(),
             session_cleared: false,
+            writes: Vec::new(),
         };
 
         // Index-based loop so we can update `positions` via `get_mut` without
@@ -836,7 +1011,13 @@ impl LogTailer {
                         match reader.read_line(&mut line) {
                             Ok(0) => break,
                             Ok(_) => match parse_jsonl_line(line.trim(), &default_id, &*self.mapper) {
-                                ParsedLine::Events(events) => output.events.extend(events),
+                                ParsedLine::Events(events) => {
+                                    self.writes.note_calls(&events);
+                                    output.events.extend(events);
+                                }
+                                ParsedLine::ToolResults(results) => {
+                                    output.writes.extend(self.writes.resolve(results));
+                                }
                                 ParsedLine::SessionCleared => output.session_cleared = true,
                                 ParsedLine::CompactBoundary { metadata, .. } => {
                                     self.pending_metadata = Some(metadata);
@@ -1681,6 +1862,7 @@ description  = "UserTool {target}"
                 ParsedLine::Compacted { .. } => "Compacted",
                 ParsedLine::CompactBoundary { .. } => "CompactBoundary",
                 ParsedLine::SessionCleared => "SessionCleared",
+                ParsedLine::ToolResults(_) => "ToolResults",
                 ParsedLine::Ignored => "Ignored",
             }),
         }
@@ -1807,5 +1989,182 @@ description  = "UserTool {target}"
         let m = out2.compactions[0].metadata.as_ref().expect("metadata pairs across polls");
         assert_eq!(m.trigger, "auto");
         assert_eq!(m.pre_tokens, 50000);
+    }
+}
+
+/// Write ingestion (spec §1): tool results parsed and correlated with their
+/// write calls by `tool_use_id`. Lines are shaped like real Claude Code logs.
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// Built-ins with `Edit` and `Write` declared as writes, as a user would
+    /// in `tools.toml` (the built-in stanzas flip in a later step).
+    fn write_config() -> ToolMappingConfig {
+        let user: ToolMappingConfig = toml::from_str(
+            r#"
+            version = 1
+            [[tool]]
+            names = ["Edit"]
+            path_keys = ["file_path"]
+            effect = "write"
+            description = "Edit {file_path}"
+            [[tool]]
+            names = ["Write"]
+            path_keys = ["file_path"]
+            effect = "write"
+            description = "Write {file_path}"
+            "#,
+        )
+        .expect("valid toml");
+        let mut warnings = Vec::new();
+        let cfg = ToolMappingConfig::merge(ToolMappingConfig::builtin().unwrap(), user, &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        cfg
+    }
+
+    fn call(id: &str, tool: &str, path: &str) -> String {
+        serde_json::json!({
+            "type": "assistant", "sessionId": "s1", "timestamp": "2026-09-26T10:00:00Z",
+            "message": {"content": [{"type": "tool_use", "id": id, "name": tool,
+                "input": {"file_path": path, "old_string": "x", "new_string": "y"}}]}
+        })
+        .to_string()
+    }
+
+    fn result(id: &str, detail: serde_json::Value, is_error: bool) -> String {
+        serde_json::json!({
+            "type": "user", "timestamp": "2026-09-26T10:00:01Z",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": "ok", "is_error": is_error}]},
+            "toolUseResult": detail
+        })
+        .to_string()
+    }
+
+    fn edit_detail(original: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "filePath": "/p/src/a.rs", "oldString": "x", "newString": "y", "replaceAll": false,
+            "originalFile": original, "userModified": false,
+            "structuredPatch": [{"oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1, "lines": ["-x", "+y"]}]
+        })
+    }
+
+    fn parse(lines: &[String]) -> Vec<SessionEvent> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.jsonl");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        parse_log_file_with_mapper(&path, &write_config(), None)
+    }
+
+    fn writes(events: &[SessionEvent]) -> Vec<&WriteEvent> {
+        events.iter().filter_map(|e| match e { SessionEvent::Write(w) => Some(w), _ => None }).collect()
+    }
+
+    #[test]
+    fn a_tool_use_carries_its_id() {
+        let line = call("toolu_1", "Edit", "/p/src/a.rs");
+        match parse_jsonl_line(&line, "d", &write_config()) {
+            ParsedLine::Events(evs) => {
+                assert_eq!(evs[0].tool_use_id.as_deref(), Some("toolu_1"));
+                assert_eq!(evs[0].effect, Effect::Write);
+                assert_eq!(evs[0].read_depth, ReadDepth::Unseen, "a write grants no read credit");
+            }
+            _ => panic!("expected events"),
+        }
+    }
+
+    #[test]
+    fn an_edit_result_becomes_a_write_with_its_source() {
+        let events = parse(&[call("toolu_1", "Edit", "/p/src/a.rs"), result("toolu_1", edit_detail(Some("x\n")), false)]);
+        let w = writes(&events);
+        assert_eq!(w.len(), 1);
+        assert_eq!(&*w[0].op, "toolu_1");
+        assert_eq!(w[0].path, PathBuf::from("/p/src/a.rs"));
+        match &w[0].source {
+            WriteSource::Edit { original, old, new, replace_all, hunks, user_modified } => {
+                assert_eq!(original.as_deref(), Some("x\n"));
+                assert_eq!((old.as_str(), new.as_str(), *replace_all, *user_modified), ("x", "y", false, false));
+                assert_eq!(hunks, &vec![Hunk { old_start: 1, new_start: 1, lines: vec!["-x".into(), "+y".into()] }]);
+            }
+            other => panic!("expected an Edit source, got {other:?}"),
+        }
+    }
+
+    /// Most logged edits omit `originalFile`; the write is still recorded.
+    #[test]
+    fn an_edit_without_original_file_is_still_a_write() {
+        let events = parse(&[call("toolu_1", "Edit", "/p/src/a.rs"), result("toolu_1", edit_detail(None), false)]);
+        match &writes(&events)[0].source {
+            WriteSource::Edit { original: None, .. } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_write_create_is_classified() {
+        let detail = serde_json::json!({"type": "create", "filePath": "/p/src/b.rs", "content": "fn b() {}\n",
+            "structuredPatch": [], "originalFile": null});
+        let events = parse(&[call("toolu_2", "Write", "/p/src/b.rs"), result("toolu_2", detail, false)]);
+        match &writes(&events)[0].source {
+            WriteSource::Write { create: true, original: None, content, .. } => assert_eq!(content, "fn b() {}\n"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Failed and rejected writes changed nothing, so they are not writes.
+    #[test]
+    fn errors_and_rejections_are_dropped() {
+        let rejected = serde_json::json!("The user doesn't want to proceed with this tool use.");
+        let events = parse(&[
+            call("toolu_1", "Edit", "/p/src/a.rs"),
+            result("toolu_1", edit_detail(Some("x\n")), true),
+            call("toolu_2", "Edit", "/p/src/a.rs"),
+            result("toolu_2", rejected, false),
+        ]);
+        assert!(writes(&events).is_empty());
+    }
+
+    /// Reads are unaffected, and a result for a read tool is not a write.
+    #[test]
+    fn read_tool_results_produce_no_writes() {
+        let read = serde_json::json!({
+            "type": "assistant", "sessionId": "s1", "timestamp": "t",
+            "message": {"content": [{"type": "tool_use", "id": "toolu_9", "name": "Read", "input": {"file_path": "/p/src/a.rs"}}]}
+        })
+        .to_string();
+        let detail = serde_json::json!({"type": "text", "file": {"filePath": "/p/src/a.rs"}});
+        let events = parse(&[read, result("toolu_9", detail, false)]);
+        assert!(writes(&events).is_empty());
+        assert!(events.iter().any(|e| matches!(e, SessionEvent::ToolCall(_))));
+    }
+
+    #[test]
+    fn an_unrecognized_result_shape_is_opaque() {
+        let events = parse(&[call("toolu_1", "Edit", "/p/src/a.rs"), result("toolu_1", serde_json::json!({"ok": true}), false)]);
+        assert_eq!(writes(&events)[0].source, WriteSource::Opaque);
+    }
+
+    /// A call and its result can arrive in different polls.
+    #[test]
+    fn the_tailer_pairs_a_call_and_result_across_polls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut tailer = LogTailer::new(vec![path.clone()], Arc::new(write_config()));
+
+        let append = |line: String| {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(f, "{line}").unwrap();
+        };
+        append(call("toolu_1", "Edit", "/p/src/a.rs"));
+        let first = tailer.read_new_events();
+        assert_eq!(first.events.len(), 1);
+        assert!(first.writes.is_empty(), "no result yet");
+
+        append(result("toolu_1", edit_detail(Some("x\n")), false));
+        let second = tailer.read_new_events();
+        assert_eq!(second.writes.len(), 1);
+        assert_eq!(&*second.writes[0].op, "toolu_1");
     }
 }

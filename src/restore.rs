@@ -308,6 +308,8 @@ pub fn replay_session_logs(
                     depth_cache = crate::tracking::alignment::DepthOrdinalCache::new();
                 }
                 SessionEvent::Compacted { .. } => {}
+                // Writes grant no read credit (spec D9).
+                SessionEvent::Write(_) => {}
             }
         }
     }

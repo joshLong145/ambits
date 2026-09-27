@@ -7,6 +7,61 @@ pub mod tool_config;
 
 use crate::tracking::ReadDepth;
 
+/// Whether a tool reads code or changes it (spec §2.1). Declared per tool
+/// stanza in `tools.toml`; a write grants no read credit (D9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effect {
+    #[default]
+    Read,
+    Write,
+}
+
+/// One diff hunk, as the session log records it. Re-exported from the
+/// attribution core so ingestion and attribution share one type.
+pub use crate::writes::Hunk;
+
+/// What a write tool's result tells us about the change (spec §2.2).
+///
+/// File contents live here only until attribution; they are never persisted
+/// or logged (spec §9.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteSource {
+    /// An `Edit`: `original` is `originalFile`, which the log omits for most
+    /// edits (capped near 10 KB) — then only a file-level write is possible.
+    Edit {
+        original: Option<String>,
+        old: String,
+        new: String,
+        replace_all: bool,
+        hunks: Vec<Hunk>,
+        user_modified: bool,
+    },
+    /// A `Write`: the full new `content`; `original` is null on a create.
+    Write {
+        original: Option<String>,
+        content: String,
+        create: bool,
+        hunks: Vec<Hunk>,
+        user_modified: bool,
+    },
+    /// A write tool whose result carries no usable text (Serena tools,
+    /// `NotebookEdit`, unrecognized shapes): file-level only.
+    Opaque,
+}
+
+/// A completed agent write: a write tool's call, correlated with its
+/// successful result by `op` (the tool call's `tool_use_id`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteEvent {
+    pub op: Arc<str>,
+    pub agent_id: Arc<str>,
+    pub tool_name: Arc<str>,
+    pub path: PathBuf,
+    pub timestamp: String,
+    pub source: WriteSource,
+}
+
 /// A parsed agent tool call event.
 #[derive(Debug, Clone)]
 pub struct AgentToolCall {
@@ -37,6 +92,12 @@ pub struct AgentToolCall {
     /// Human-readable label for the agent (e.g. "Explore parser and symbol types").
     /// Falls back to agent_id if no label could be extracted from the session log.
     pub label: Arc<str>,
+    /// The tool call's `tool_use_id`, which its result line refers back to.
+    /// `None` for calls whose log line carried no id.
+    pub tool_use_id: Option<Arc<str>>,
+    /// Read or write, from the tool's stanza. A write carries
+    /// `ReadDepth::Unseen`: it grants no read credit (D9).
+    pub effect: Effect,
 }
 
 /// Point-in-time ledger snapshot captured at a compaction boundary.
@@ -83,6 +144,8 @@ pub enum SessionEvent {
         metadata: Option<CompactionMetadata>,
     },
     SessionCleared,
+    /// A write tool call that completed successfully (spec §1).
+    Write(WriteEvent),
 }
 
 /// A compaction event surfaced by the incremental tailer (no ledger snapshot
@@ -99,6 +162,8 @@ pub struct TailerOutput {
     pub events: Vec<AgentToolCall>,
     pub compactions: Vec<TailedCompaction>,
     pub session_cleared: bool,
+    /// Write tool calls whose successful result arrived in this poll.
+    pub writes: Vec<WriteEvent>,
 }
 
 /// Maps a raw tool call (name + JSON input) to an `AgentToolCall`.

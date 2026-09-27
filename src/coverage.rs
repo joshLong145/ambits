@@ -643,6 +643,8 @@ pub fn run_report(
                         tool_call_count = 0;
                         compactions.clear();
                     }
+                    // Writes grant no read credit (spec D9).
+                    SessionEvent::Write(_) => {}
                 }
             }
         }
@@ -1299,6 +1301,8 @@ mod tests {
             target_lines: None,
             target_selectors: Vec::new(),
             label: "ag".into(),
+            tool_use_id: None,
+            effect: crate::ingest::Effect::Read,
         })
     }
 

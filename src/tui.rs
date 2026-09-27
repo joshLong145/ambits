@@ -185,6 +185,8 @@ impl TuiSession {
                                     app.process_compaction(summary, timestamp, agent_id, metadata);
                                 }
                                 ambits::ingest::SessionEvent::SessionCleared => app.reset_session(),
+                                // Journaled once write recording lands (spec phase 2, step 4).
+                                ambits::ingest::SessionEvent::Write(_) => {}
                             }
                         }
                     }
@@ -390,6 +392,7 @@ mod tests {
                 events: Vec::new(),
                 compactions: Vec::new(),
                 session_cleared: false,
+                writes: Vec::new(),
             }
         }
     }

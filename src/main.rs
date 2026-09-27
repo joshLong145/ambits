@@ -1231,6 +1231,8 @@ fn run() -> Result<()> {
                         app.process_compaction(summary, timestamp, agent_id, metadata);
                     }
                     ingest::SessionEvent::SessionCleared => app.reset_session(),
+                    // Journaled once write recording lands (spec phase 2, step 4).
+                    ingest::SessionEvent::Write(_) => {}
                 }
             }
         }

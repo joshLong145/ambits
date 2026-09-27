@@ -2596,6 +2596,8 @@ mod tests {
             target_lines: None,
         target_selectors: Vec::new(),
             label: "agent-abc".into(),
+            tool_use_id: None,
+            effect: crate::ingest::Effect::Read,
         };
         app.process_agent_event(event);
 
