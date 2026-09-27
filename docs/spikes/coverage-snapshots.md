@@ -220,6 +220,12 @@ Tree ids come from the LSP cache and may not match a tree-sitter parse, so
   `<session>.pull.ndjson`) — never to the file the TUI holds open. Writers
   seed their `op` set from **all** shards (`read_journal_session`), so replay
   never duplicates.
+- **Sessions**: a write is journaled into the session it happened in. The
+  TUI tags each queued write with its session. On a session switch it drains
+  the old tailer, syncs the outgoing journal before the reset, and keeps that
+  journal open ("retired") so a write still being attributed lands there. It
+  then opens the new session's journal after replaying its log. A write two
+  or more switches late is dropped, and routing never opens a file.
 - Paths **outside the project root** are dropped.
 - The watcher's stale marking is unchanged.
 

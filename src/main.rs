@@ -1264,13 +1264,24 @@ fn run() -> Result<()> {
 
     let serena_mode = cli.serena;
 
-    // Fold in the journal before opening it for writing. The replay above
-    // rebuilt *which* symbols were read but stamped each with the hash it has
-    // now, so nothing looks drifted; only the journal knows what they looked
-    // like at the time. Skipped entirely when journaling is off, since then
-    // there is no journal to trust.
+    // Journal the session: fold the journal into the replayed ledger, then
+    // open it for appending. The replay above rebuilt *which* symbols were
+    // read but stamped each with the hash it has now, so nothing looks
+    // drifted; only the journal knows what they looked like at the time. And
+    // `Journal::open` seeds its dedup map from what is on disk, so the sync
+    // appends only genuinely new reads — which keeps relaunching idempotent.
+    // CLI flags win over the `[cache]` stanza in tools.toml.
     if journal_enabled {
-        if let Some(stats) = app.rehydrate_from_journal() {
+        app.set_journal_settings(Some(ambits::app::JournalSettings {
+            backend: if serena_mode { "serena" } else { "tree-sitter" },
+            interval: std::time::Duration::from_millis(
+                cli.flush_interval_ms
+                    .or(cache_cfg.flush_interval_ms)
+                    .unwrap_or(ambits::journal::DEFAULT_FLUSH_INTERVAL_MS),
+            ),
+        }));
+        let attach = app.attach_journal();
+        if let Some(stats) = attach.rehydrated {
             if stats.drifted > 0 || stats.inserted > 0 || stats.moved > 0 {
                 ambits::try_eprintln!(
                     "[ambit] rehydrated from journal: {} corrected, {} recovered, {} moved, {} stale",
@@ -1278,22 +1289,7 @@ fn run() -> Result<()> {
                 );
             }
         }
-    }
-
-    // Open the coverage journal *after* the startup replay above. `Journal::open`
-    // seeds its dedup map from what is already on disk, so the immediate sync
-    // below appends only genuinely new reads — which is what keeps relaunching
-    // ambit idempotent instead of re-appending the whole session every time.
-    // CLI flags win over the `[cache]` stanza in tools.toml.
-    if journal_enabled {
-        let interval = std::time::Duration::from_millis(
-            cli.flush_interval_ms
-                .or(cache_cfg.flush_interval_ms)
-                .unwrap_or(ambits::journal::DEFAULT_FLUSH_INTERVAL_MS),
-        );
-        let backend = if serena_mode { "serena" } else { "tree-sitter" };
-        report_warnings(app.enable_journal(backend, interval));
-        app.sync_journal();
+        report_warnings(attach.warnings);
     }
 
     // Terminal setup, as late as possible. The guard restores it on every
@@ -1467,7 +1463,7 @@ fn run_tui(
             Ok(AppEvent::Tick) => {
                 session.handle_tick(log_dir, app, serena_mode, project_path);
             }
-            Ok(AppEvent::WriteRecorded(record)) => app.record_write(record),
+            Ok(AppEvent::WriteRecorded { session, record }) => app.record_write(&session, record),
             Err(flume::RecvTimeoutError::Timeout) => {}
             Err(flume::RecvTimeoutError::Disconnected) => break,
         }
@@ -1558,7 +1554,7 @@ fn suspend_for_editor(
             AppEvent::Tick => {
                 session.handle_tick(log_dir, app, serena_mode, project_path);
             }
-            AppEvent::WriteRecorded(record) => app.record_write(record),
+            AppEvent::WriteRecorded { session, record } => app.record_write(&session, record),
         }
     }
 

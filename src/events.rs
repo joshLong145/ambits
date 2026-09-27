@@ -22,8 +22,12 @@ pub enum AppEvent {
     FileRemoved(PathBuf),
     Tick,
     /// An agent write, attributed off the render thread by the worker that
-    /// `TuiSession` spawns (spec §1), ready to journal.
-    WriteRecorded(ambits::writes::WriteRecord),
+    /// `TuiSession` spawns (spec §1), ready to journal into `session` — the
+    /// session it happened in, which a switch may since have left.
+    WriteRecorded {
+        session: std::sync::Arc<str>,
+        record: ambits::writes::WriteRecord,
+    },
 }
 
 /// Spawn a thread that polls crossterm key events and sends them to the channel.

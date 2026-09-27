@@ -59,7 +59,7 @@ fn writes_flow_from_the_log_to_the_journal_without_file_contents() {
             }
             SessionEvent::Write(w) => {
                 let record = ambits::writes::build_record(&w, &root, &registry, true).expect("inside the project");
-                app.record_write(record);
+                app.record_write("sess", record);
             }
             _ => {}
         }

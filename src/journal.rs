@@ -603,6 +603,7 @@ pub fn read_journal_session(dir: &Path, session_id: &str) -> JournalContents {
 #[derive(Debug)]
 pub struct Journal {
     path: PathBuf,
+    session_id: String,
     file: Option<File>,
     /// What is already on disk, so a diff can skip unchanged entries.
     ///
@@ -681,6 +682,7 @@ impl Journal {
 
         let mut journal = Self {
             path: path.clone(),
+            session_id: session_id.to_string(),
             file: None,
             journaled: HashMap::new(),
             symbols: std::collections::HashSet::new(),
@@ -748,6 +750,11 @@ impl Journal {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The session this journal belongs to.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// Non-fatal complaints accumulated so far (corrupt lines, write failures).

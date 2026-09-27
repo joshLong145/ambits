@@ -66,6 +66,22 @@ pub enum FocusPanel {
     Activity,
 }
 
+/// How the TUI journals a session (see [`App::attach_journal`]).
+#[derive(Debug, Clone)]
+pub struct JournalSettings {
+    /// Symbol backend, recorded in the journal header.
+    pub backend: &'static str,
+    pub interval: std::time::Duration,
+}
+
+/// What attaching a session's journal found.
+#[derive(Debug, Default)]
+pub struct JournalAttach {
+    pub rehydrated: Option<crate::restore::RehydrateStats>,
+    /// Non-fatal complaints from opening the journal.
+    pub warnings: Vec<String>,
+}
+
 pub struct App {
     pub project_tree: ProjectTree,
     pub project_root: PathBuf,
@@ -133,11 +149,19 @@ pub struct App {
     /// known (the journal is keyed by session, and guessing a filename would
     /// silently merge unrelated sessions). See `crate::journal`.
     pub journal: Option<crate::journal::Journal>,
-    /// Write events awaiting attribution. Every source — startup replay, a
-    /// session switch, the tailer — queues here, and the TUI drains the queue
-    /// to its attribution worker each tick, so parsing never runs on the
-    /// render thread.
-    pending_writes: Vec<crate::ingest::WriteEvent>,
+    /// The previous session's journal, kept after a switch so a write still
+    /// in the attribution worker at that moment lands in the session it
+    /// happened in. Replaced at the next switch.
+    retired_journal: Option<crate::journal::Journal>,
+    /// How to open a session's journal; `None` when journaling is off. Set
+    /// once at startup, so a session switch can reopen without the caller
+    /// re-deriving the settings.
+    journal_settings: Option<JournalSettings>,
+    /// Write events awaiting attribution, each tagged with the session it
+    /// happened in. Every source — startup replay, a session switch, the
+    /// tailer — queues here, and the TUI drains the queue to its attribution
+    /// worker each tick, so parsing never runs on the render thread.
+    pending_writes: Vec<(Arc<str>, crate::ingest::WriteEvent)>,
 
     /// Path filter restricting which files are tracked, if any. Shared with
     /// the TUI re-parse paths (file watcher, Serena cache rescan) so that
@@ -188,6 +212,8 @@ impl App {
             agent_alignment: Vec::new(),
             depth_cache: crate::tracking::alignment::DepthOrdinalCache::new(),
             journal: None,
+            retired_journal: None,
+            journal_settings: None,
             pending_writes: Vec::new(),
             filter: None,
             editor_template: None,
@@ -238,6 +264,28 @@ impl App {
         let warnings = journal.warnings().to_vec();
         self.journal = Some(journal);
         warnings
+    }
+
+    /// Journal every session from now on with these settings (`None`: off).
+    pub fn set_journal_settings(&mut self, settings: Option<JournalSettings>) {
+        self.journal_settings = settings;
+    }
+
+    /// Adopt the current session's journal: fold it into the replayed
+    /// ledger, open it for appending, and sync what the replay found.
+    ///
+    /// The one way a session's journal is opened, at startup and on every
+    /// session switch, so both keep the order `rehydrate_from_journal`
+    /// requires: after the log replay, before opening for writing. A no-op
+    /// when journaling is off.
+    pub fn attach_journal(&mut self) -> JournalAttach {
+        let Some(settings) = self.journal_settings.clone() else {
+            return JournalAttach::default();
+        };
+        let rehydrated = self.rehydrate_from_journal();
+        let warnings = self.enable_journal(settings.backend, settings.interval);
+        self.sync_journal();
+        JournalAttach { rehydrated, warnings }
     }
 
     /// Fold this session's journal into the freshly replayed ledger.
@@ -334,6 +382,8 @@ impl App {
     /// the project tree and UI configuration. Called when a `/clear` is detected
     /// in the session log.
     pub fn reset_session(&mut self) {
+        // Journal what the ledger holds before it is discarded.
+        self.sync_journal();
         self.ledger = ContextLedger::new();
         self.activity.clear();
         self.agents_seen.clear();
@@ -364,7 +414,14 @@ impl App {
     /// Callers switching sessions must use this rather than `reset_session` +
     /// [`Self::set_session_id`]. A bare `reset_session` remains correct for a
     /// `/clear` *within* one session, where the identity does not change.
+    ///
+    /// The outgoing journal is synced before the reset discards the ledger it
+    /// syncs from, then retired rather than dropped: writes from the old
+    /// session may still be in the attribution worker. The caller replays the
+    /// new session and then calls [`Self::attach_journal`].
     pub fn switch_session(&mut self, session_id: Option<String>) {
+        self.sync_journal();
+        self.retired_journal = self.journal.take();
         self.session_id = session_id;
         self.reset_session();
     }
@@ -977,21 +1034,41 @@ impl App {
         });
     }
 
-    /// Queue a write for attribution (see `pending_writes`).
+    /// Queue a write for attribution, tagged with the current session (see
+    /// `pending_writes`). Without a session there is no journal to put it in.
     pub fn queue_write(&mut self, event: crate::ingest::WriteEvent) {
-        self.pending_writes.push(event);
+        if let Some(session) = &self.session_id {
+            self.pending_writes.push((Arc::from(session.as_str()), event));
+        }
     }
 
     /// Take every queued write, for handing to the attribution worker.
-    pub fn take_pending_writes(&mut self) -> Vec<crate::ingest::WriteEvent> {
+    pub fn take_pending_writes(&mut self) -> Vec<(Arc<str>, crate::ingest::WriteEvent)> {
         std::mem::take(&mut self.pending_writes)
     }
 
-    /// Journal an attributed write. A write grants no read credit (D9), so
-    /// the ledger is untouched; the activity feed already showed the call.
-    pub fn record_write(&mut self, record: crate::writes::WriteRecord) {
-        if let Some(journal) = self.journal.as_mut() {
-            journal.record_write(&record);
+    /// Journal an attributed write into the session it happened in — the
+    /// current one, or the one just switched away from. A write grants no
+    /// read credit (D9), so the ledger is untouched; the activity feed
+    /// already showed the call.
+    ///
+    /// Never opens a file: a write for any older session is dropped, which
+    /// takes two switches while one write is in the worker.
+    pub fn record_write(&mut self, session: &str, record: crate::writes::WriteRecord) {
+        let journal = [self.journal.as_mut(), self.retired_journal.as_mut()]
+            .into_iter()
+            .flatten()
+            .find(|j| j.session_id() == session);
+        match journal {
+            Some(journal) => {
+                journal.record_write(&record);
+            }
+            None if self.journal_settings.is_some() => log::warn!(
+                target: "ambits::journal",
+                session, op = record.op.as_str();
+                "write arrived after its session's journal was closed; not journaled"
+            ),
+            None => {}
         }
     }
 
@@ -2681,8 +2758,8 @@ mod write_tests {
         app.set_session_id(Some("sess".into()));
         app.enable_journal("tree-sitter", std::time::Duration::ZERO);
 
-        app.record_write(record("toolu_1"));
-        app.record_write(record("toolu_1"));
+        app.record_write("sess", record("toolu_1"));
+        app.record_write("sess", record("toolu_1"));
 
         let contents = crate::journal::read_journal_session(&crate::journal::journal_dir(dir.path()), "sess");
         assert_eq!(contents.writes.len(), 1, "journaled once");
@@ -2693,7 +2770,7 @@ mod write_tests {
     fn without_a_journal_a_write_is_simply_not_persisted() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::new(project(vec![]), dir.path().to_path_buf());
-        app.record_write(record("toolu_1"));
+        app.record_write("sess", record("toolu_1"));
         assert!(!crate::journal::journal_dir(dir.path()).exists());
     }
 
@@ -2706,6 +2783,112 @@ mod write_tests {
         app.process_agent_event(call);
         assert_eq!(app.activity.len(), 1);
         assert_eq!(app.ledger.depth_of("src/a.rs::f"), ReadDepth::Unseen, "no read credit");
+    }
+
+    fn journaled(dir: &Path, session: &str) -> crate::journal::JournalContents {
+        crate::journal::read_journal_session(&crate::journal::journal_dir(dir), session)
+    }
+
+    /// An app on session `a` with journaling on, as startup leaves it.
+    fn journaling_app(dir: &Path, interval: std::time::Duration) -> App {
+        let mut app = App::new(
+            project(vec![file("src/a.rs", vec![sym("src/a.rs::f", "f")])]),
+            dir.to_path_buf(),
+        );
+        app.set_session_id(Some("a".into()));
+        app.set_journal_settings(Some(JournalSettings { backend: "tree-sitter", interval }));
+        app.attach_journal();
+        app
+    }
+
+    fn switch(app: &mut App, session: &str) {
+        app.switch_session(Some(session.into()));
+        app.attach_journal();
+    }
+
+    /// The journal used to stay on the first session's file across a switch,
+    /// so the new session's reads and writes landed in the old one.
+    #[test]
+    fn switching_sessions_journals_the_new_session_into_its_own_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = journaling_app(dir.path(), std::time::Duration::ZERO);
+        switch(&mut app, "b");
+        app.process_agent_event(tool_call("Read", "src/a.rs", ReadDepth::FullBody));
+        app.sync_journal();
+        app.record_write("b", record("toolu_b"));
+
+        let (a, b) = (journaled(dir.path(), "a"), journaled(dir.path(), "b"));
+        assert!(a.reads.is_empty() && a.writes.is_empty(), "nothing leaked into a");
+        assert!(b.reads.contains_key("src/a.rs::f"));
+        assert!(b.writes.contains_key("toolu_b"));
+    }
+
+    /// The reset on a switch discards the ledger; what it held must reach
+    /// the outgoing journal first, even inside the flush interval.
+    #[test]
+    fn switching_flushes_the_outgoing_sessions_unsynced_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = journaling_app(dir.path(), std::time::Duration::from_secs(3600));
+        app.process_agent_event(tool_call("Read", "src/a.rs", ReadDepth::FullBody));
+        switch(&mut app, "b");
+        assert!(journaled(dir.path(), "a").reads.contains_key("src/a.rs::f"));
+    }
+
+    /// A write still in the attribution worker at a switch comes back after
+    /// it, and belongs to the session it happened in.
+    #[test]
+    fn a_late_write_lands_in_the_session_it_happened_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = journaling_app(dir.path(), std::time::Duration::ZERO);
+        switch(&mut app, "b");
+        app.record_write("a", record("toolu_a"));
+        assert!(journaled(dir.path(), "a").writes.contains_key("toolu_a"));
+        assert!(journaled(dir.path(), "b").writes.is_empty());
+    }
+
+    #[test]
+    fn a_write_two_switches_late_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = journaling_app(dir.path(), std::time::Duration::ZERO);
+        switch(&mut app, "b");
+        switch(&mut app, "c");
+        app.record_write("a", record("toolu_a"));
+        for session in ["a", "b", "c"] {
+            assert!(journaled(dir.path(), session).writes.is_empty(), "{session}");
+        }
+    }
+
+    /// Routing a late write must never open a journal of its own.
+    #[test]
+    fn with_journaling_off_a_late_write_creates_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(project(vec![]), dir.path().to_path_buf());
+        app.set_session_id(Some("a".into()));
+        app.switch_session(Some("b".into()));
+        app.attach_journal();
+        app.record_write("a", record("toolu_a"));
+        assert!(!crate::journal::journal_dir(dir.path()).exists());
+    }
+
+    #[test]
+    fn queued_writes_carry_their_session_and_need_one() {
+        let event = || crate::ingest::WriteEvent {
+            op: "toolu_1".into(),
+            agent_id: "main".into(),
+            tool_name: "Edit".into(),
+            path: "src/a.rs".into(),
+            timestamp: String::new(),
+            source: crate::ingest::WriteSource::Opaque,
+        };
+        let mut app = App::new(project(vec![]), "/p".into());
+        app.queue_write(event());
+        assert!(app.take_pending_writes().is_empty(), "no session, no journal");
+
+        app.set_session_id(Some("a".into()));
+        app.queue_write(event());
+        let queued = app.take_pending_writes();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(&*queued[0].0, "a");
     }
 
     fn write_call(mut call: AgentToolCall) -> AgentToolCall {
