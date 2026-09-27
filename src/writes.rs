@@ -157,19 +157,13 @@ pub fn build_record(
     } else {
         event.path.as_path()
     };
-    let file = rel
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/");
-    if file.is_empty() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-        return None;
-    }
+    // Normalized, and parsed under the normalized name, so the file and its
+    // symbol ids match what `touched`, snapshots and linkage look up.
+    let file = crate::objects::project_rel(rel)?;
+    let rel = Path::new(&file);
 
     let fh = match &event.source {
-        WriteSource::Write { content, .. } => Some(crate::journal::encode_hash(
-            blake3::hash(content.as_bytes()).as_bytes(),
-        )),
+        WriteSource::Write { content, .. } => Some(crate::objects::file_hash(content.as_bytes())),
         _ => None,
     };
 
@@ -813,6 +807,17 @@ mod record_tests {
         let source = WriteSource::Edit { original, old, new, replace_all, hunks: Some(vec![]), user_modified };
         let rec = build(&event("/proj/src/lib.rs", source)).unwrap();
         assert_eq!(rec.level, Level::File);
+    }
+
+    /// A decomposed (NFD) file name is recorded in NFC, symbol ids included,
+    /// so `touched`, snapshots and linkage — which all normalize — find it.
+    #[test]
+    fn paths_and_symbol_ids_are_recorded_normalized() {
+        let ev = event("/proj/src/cafe\u{301}.rs", edit(Some(BEFORE), false));
+        let rec = build(&ev).unwrap();
+        assert_eq!(rec.file, "src/caf\u{e9}.rs");
+        assert_eq!(rec.syms[0].0, "src/caf\u{e9}.rs::beta");
+        assert!(crate::objects::valid_record_path(&rec.file));
     }
 
     #[test]

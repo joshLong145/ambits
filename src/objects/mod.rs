@@ -127,6 +127,23 @@ pub fn normalize_path(path: &str) -> String {
     path.replace('\\', "/").nfc().collect()
 }
 
+/// A path inside the project in the one form every record carries:
+/// relative, `/`-separated, NFC (see [`normalize_path`]). `None` for the
+/// project root itself or anything that climbs out of it (`..`, a root or
+/// drive prefix). Relative to the project already — strip the root first.
+pub fn project_rel(path: &std::path::Path) -> Option<String> {
+    use std::path::Component;
+    let mut parts = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::Normal(p) => parts.push(p.to_string_lossy()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    (!parts.is_empty()).then(|| normalize_path(&parts.join("/")))
+}
+
 /// `b3:` hash of a file's raw bytes: the `fh` of a write, a dirty file's
 /// fingerprint, and what a committed blob is compared by.
 pub fn file_hash(bytes: &[u8]) -> String {
@@ -184,6 +201,15 @@ mod tests {
     fn paths_normalize_separators_and_unicode() {
         // "é" precomposed vs "e" + combining acute.
         assert_eq!(normalize_path("src\\caf\u{e9}.rs"), normalize_path("src/cafe\u{301}.rs"));
+    }
+
+    #[test]
+    fn project_rel_normalizes_and_refuses_escapes() {
+        use std::path::Path;
+        assert_eq!(project_rel(Path::new("./src/cafe\u{301}.rs")).as_deref(), Some("src/caf\u{e9}.rs"));
+        for bad in ["", ".", "../x", "/etc/passwd", "src/../../x"] {
+            assert_eq!(project_rel(Path::new(bad)), None, "{bad}");
+        }
     }
 
     #[test]

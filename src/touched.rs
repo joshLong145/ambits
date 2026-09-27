@@ -34,10 +34,11 @@ impl Target {
     /// A symbol id contains `::`; anything else is a path, taken as
     /// project-relative after trimming `./` and normalizing separators.
     pub fn parse(arg: &str) -> Self {
+        let arg = crate::objects::normalize_path(arg.trim_start_matches("./"));
         if arg.contains("::") {
-            Target::Symbol(arg.to_string())
+            Target::Symbol(arg)
         } else {
-            Target::File(arg.trim_start_matches("./").replace('\\', "/"))
+            Target::File(arg)
         }
     }
 
