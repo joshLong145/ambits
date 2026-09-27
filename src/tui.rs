@@ -35,6 +35,34 @@ pub struct TuiSession {
     _project_watcher: notify::RecommendedWatcher,
     /// Holds the log-directory watcher alive (None if no log dir configured).
     _log_watcher: Option<notify::RecommendedWatcher>,
+    /// Hands write events to the attribution worker (spec §1).
+    write_tx: flume::Sender<ambits::ingest::WriteEvent>,
+}
+
+/// Attribute writes on a worker thread, never the render thread (spec §1):
+/// each costs up to two parses, and a replay can queue hundreds. Results come
+/// back to the TUI loop as `AppEvent::WriteRecorded`. The worker owns its own
+/// `ParserRegistry`, so nothing is shared across threads.
+fn spawn_write_attributor(
+    project_root: PathBuf,
+    symbol_level: bool,
+    tx: flume::Sender<AppEvent>,
+) -> flume::Sender<ambits::ingest::WriteEvent> {
+    let (write_tx, write_rx) = flume::unbounded::<ambits::ingest::WriteEvent>();
+    std::thread::spawn(move || {
+        let registry = ambits::parser::ParserRegistry::new();
+        for event in write_rx.iter() {
+            let Some(record) =
+                ambits::writes::build_record(&event, &project_root, &registry, symbol_level)
+            else {
+                continue;
+            };
+            if tx.send(AppEvent::WriteRecorded(record)).is_err() {
+                break;
+            }
+        }
+    });
+    write_tx
 }
 
 impl TuiSession {
@@ -129,6 +157,10 @@ impl TuiSession {
             .map(|ld| existing_session_ids(ld))
             .unwrap_or_default();
 
+        // Serena mode's tree ids need not match a tree-sitter parse, so its
+        // writes are file-level (spec §2.5).
+        let write_tx = spawn_write_attributor(project_path.to_path_buf(), !serena_mode, tx.clone());
+
         Ok(Self {
             current_session_id: session_id,
             known_sessions,
@@ -137,6 +169,7 @@ impl TuiSession {
             pkl_mtimes,
             _project_watcher: project_watcher,
             _log_watcher: log_watcher,
+            write_tx,
         })
     }
 
@@ -185,8 +218,7 @@ impl TuiSession {
                                     app.process_compaction(summary, timestamp, agent_id, metadata);
                                 }
                                 ambits::ingest::SessionEvent::SessionCleared => app.reset_session(),
-                                // Journaled once write recording lands (spec phase 2, step 4).
-                                ambits::ingest::SessionEvent::Write(_) => {}
+                                ambits::ingest::SessionEvent::Write(w) => app.queue_write(w),
                             }
                         }
                     }
@@ -211,9 +243,19 @@ impl TuiSession {
             for event in output.events {
                 app.process_agent_event(event);
             }
+            for write in output.writes {
+                app.queue_write(write);
+            }
             for compaction in output.compactions {
                 app.process_compaction(compaction.summary, compaction.timestamp, compaction.agent_id, compaction.metadata);
             }
+        }
+
+        // Hand queued writes — from the tailer, a session switch, or startup
+        // replay — to the attribution worker. A send fails only if the worker
+        // died; the writes are then simply not journaled.
+        for write in app.take_pending_writes() {
+            let _ = self.write_tx.send(write);
         }
 
         // Bring the coverage journal up to date. Interval-gated internally, so
@@ -717,5 +759,45 @@ mod tests {
         save(dir.path(), &mut app, "beta.rs", "pub fn beta() {}\n");
 
         assert!(row(&app, "beta.rs").unwrap().is_expanded);
+    }
+
+    /// Writes queued from any source are attributed off the render thread
+    /// and come back as `AppEvent::WriteRecorded` (spec §1).
+    #[test]
+    fn a_queued_write_is_attributed_by_the_worker_and_returned() {
+        let project = tempfile::tempdir().unwrap();
+        let log_dir = tempfile::tempdir().unwrap();
+        let ingester = Arc::new(MockIngester { latest: Mutex::new(Some("s1".into())) });
+        let (mut session, rx) = session_with(project.path(), log_dir.path(), &["s1"], "s1", ingester);
+        let mut app = empty_app(project.path(), "s1");
+
+        app.queue_write(ambits::ingest::WriteEvent {
+            op: Arc::from("toolu_1"),
+            agent_id: Arc::from("agent-1"),
+            tool_name: Arc::from("Write"),
+            path: project.path().join("src/new.rs"),
+            timestamp: "2026-09-26T10:00:01Z".into(),
+            source: ambits::ingest::WriteSource::Write {
+                original: None,
+                content: "fn a() {}\n".into(),
+                create: true,
+                hunks: vec![],
+                user_modified: false,
+            },
+        });
+        session.handle_tick(&Some(log_dir.path().to_path_buf()), &mut app, false, project.path());
+        assert!(app.take_pending_writes().is_empty(), "drained to the worker");
+
+        let record = loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(AppEvent::WriteRecorded(r)) => break r,
+                Ok(_) => continue,
+                Err(e) => panic!("no WriteRecorded: {e:?}"),
+            }
+        };
+        assert_eq!(record.op, "toolu_1");
+        assert_eq!(record.file, "src/new.rs");
+        assert_eq!(record.level, ambits::writes::Level::Symbol);
+        assert_eq!(record.syms[0].0, "src/new.rs::a");
     }
 }

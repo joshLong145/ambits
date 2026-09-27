@@ -79,7 +79,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(Color::White),
                     ),
                     Span::styled(
-                        format!("  ({})", event.read_depth),
+                        match event.effect {
+                            ambits::ingest::Effect::Write => "  (write)".to_string(),
+                            ambits::ingest::Effect::Read => format!("  ({})", event.read_depth),
+                        },
                         Style::default().fg(Color::DarkGray),
                     ),
                 ])

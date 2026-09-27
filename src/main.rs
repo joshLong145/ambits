@@ -1231,8 +1231,7 @@ fn run() -> Result<()> {
                         app.process_compaction(summary, timestamp, agent_id, metadata);
                     }
                     ingest::SessionEvent::SessionCleared => app.reset_session(),
-                    // Journaled once write recording lands (spec phase 2, step 4).
-                    ingest::SessionEvent::Write(_) => {}
+                    ingest::SessionEvent::Write(w) => app.queue_write(w),
                 }
             }
         }
@@ -1443,6 +1442,7 @@ fn run_tui(
             Ok(AppEvent::Tick) => {
                 session.handle_tick(log_dir, app, serena_mode, project_path);
             }
+            Ok(AppEvent::WriteRecorded(record)) => app.record_write(record),
             Err(flume::RecvTimeoutError::Timeout) => {}
             Err(flume::RecvTimeoutError::Disconnected) => break,
         }
@@ -1533,6 +1533,7 @@ fn suspend_for_editor(
             AppEvent::Tick => {
                 session.handle_tick(log_dir, app, serena_mode, project_path);
             }
+            AppEvent::WriteRecorded(record) => app.record_write(record),
         }
     }
 

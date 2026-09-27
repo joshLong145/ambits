@@ -21,6 +21,9 @@ pub enum AppEvent {
     /// file tree only ever grew: a removed file kept its row until restart.
     FileRemoved(PathBuf),
     Tick,
+    /// An agent write, attributed off the render thread by the worker that
+    /// `TuiSession` spawns (spec §1), ready to journal.
+    WriteRecorded(ambits::writes::WriteRecord),
 }
 
 /// Spawn a thread that polls crossterm key events and sends them to the channel.

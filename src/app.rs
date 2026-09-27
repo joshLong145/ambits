@@ -133,6 +133,11 @@ pub struct App {
     /// known (the journal is keyed by session, and guessing a filename would
     /// silently merge unrelated sessions). See `crate::journal`.
     pub journal: Option<crate::journal::Journal>,
+    /// Write events awaiting attribution. Every source — startup replay, a
+    /// session switch, the tailer — queues here, and the TUI drains the queue
+    /// to its attribution worker each tick, so parsing never runs on the
+    /// render thread.
+    pending_writes: Vec<crate::ingest::WriteEvent>,
 
     /// Path filter restricting which files are tracked, if any. Shared with
     /// the TUI re-parse paths (file watcher, Serena cache rescan) so that
@@ -183,6 +188,7 @@ impl App {
             agent_alignment: Vec::new(),
             depth_cache: crate::tracking::alignment::DepthOrdinalCache::new(),
             journal: None,
+            pending_writes: Vec::new(),
             filter: None,
             editor_template: None,
             pending_editor_request: None,
@@ -971,6 +977,24 @@ impl App {
         });
     }
 
+    /// Queue a write for attribution (see `pending_writes`).
+    pub fn queue_write(&mut self, event: crate::ingest::WriteEvent) {
+        self.pending_writes.push(event);
+    }
+
+    /// Take every queued write, for handing to the attribution worker.
+    pub fn take_pending_writes(&mut self) -> Vec<crate::ingest::WriteEvent> {
+        std::mem::take(&mut self.pending_writes)
+    }
+
+    /// Journal an attributed write. A write grants no read credit (D9), so
+    /// the ledger is untouched; the activity feed already showed the call.
+    pub fn record_write(&mut self, record: crate::writes::WriteRecord) {
+        if let Some(journal) = self.journal.as_mut() {
+            journal.record_write(&record);
+        }
+    }
+
     /// Process an agent tool call event and update the ledger.
     pub fn process_agent_event(&mut self, event: AgentToolCall) {
         self.compaction_call_count += 1;
@@ -984,8 +1008,10 @@ impl App {
             &mut self.depth_cache,
         );
 
-        // Only push tracked events to the activity feed.
-        if event.read_depth != ReadDepth::Unseen {
+        // Only push tracked events to the activity feed: reads, and writes —
+        // which carry no read depth (D9) but are exactly what the feed should
+        // show.
+        if event.read_depth != ReadDepth::Unseen || event.effect == crate::ingest::Effect::Write {
             self.activity.push(event);
             self.activity_scroll_offset = 0; // Auto-scroll to latest
             if self.activity.len() > 200 {
@@ -2615,5 +2641,64 @@ mod tests {
         assert_eq!(app.agent_selection_index, 0);
         // Project tree is preserved.
         assert_eq!(app.project_tree.files.len(), original_files_count);
+    }
+}
+
+/// Writes in the app (spec phase 2): journaled on arrival, shown in the
+/// activity feed, never credited as reads (D9).
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use crate::helpers::*;
+    use crate::writes::{Level, WriteRecord};
+
+    fn record(op: &str) -> WriteRecord {
+        WriteRecord {
+            op: op.into(),
+            av: crate::writes::ATTRIBUTION_VERSION,
+            a: "agent-1".into(),
+            t: "2026-09-26T10:00:01Z".into(),
+            tool: "Edit".into(),
+            file: "src/a.rs".into(),
+            level: Level::File,
+            outside_symbols: false,
+            syms: vec![],
+            removed: vec![],
+            fh: None,
+        }
+    }
+
+    #[test]
+    fn a_recorded_write_is_journaled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(project(vec![]), dir.path().to_path_buf());
+        app.set_session_id(Some("sess".into()));
+        app.enable_journal("tree-sitter", std::time::Duration::ZERO);
+
+        app.record_write(record("toolu_1"));
+        app.record_write(record("toolu_1"));
+
+        let contents = crate::journal::read_journal_session(&crate::journal::journal_dir(dir.path()), "sess");
+        assert_eq!(contents.writes.len(), 1, "journaled once");
+        assert!(contents.writes.contains_key("toolu_1"));
+    }
+
+    #[test]
+    fn without_a_journal_a_write_is_simply_not_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(project(vec![]), dir.path().to_path_buf());
+        app.record_write(record("toolu_1"));
+        assert!(!crate::journal::journal_dir(dir.path()).exists());
+    }
+
+    /// A write call has no read depth, which used to keep it out of the feed.
+    #[test]
+    fn a_write_call_is_shown_in_the_activity_feed_without_read_credit() {
+        let mut app = App::new(project(vec![file("src/a.rs", vec![sym("src/a.rs::f", "f")])]), "/p".into());
+        let mut call = tool_call("Edit", "src/a.rs", ReadDepth::Unseen);
+        call.effect = crate::ingest::Effect::Write;
+        app.process_agent_event(call);
+        assert_eq!(app.activity.len(), 1);
+        assert_eq!(app.ledger.depth_of("src/a.rs::f"), ReadDepth::Unseen, "no read credit");
     }
 }
