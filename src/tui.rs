@@ -77,7 +77,7 @@ pub fn replay_session(
     project_root: &Path,
 ) -> ambits::ingest::Handoff {
     use ambits::ingest::SessionEvent;
-    let mut handoff = ambits::ingest::Handoff::default();
+    let mut handoff = ambits::ingest::Handoff { project_root: Some(project_root.to_path_buf()), ..Default::default() };
     for file in files {
         let replay = ingester.replay_log_file(&file, project_root);
         for event in replay.events {

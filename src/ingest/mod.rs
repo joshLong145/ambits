@@ -178,6 +178,9 @@ pub struct Handoff {
     /// Each log file, with the offset its replay stopped at.
     pub files: Vec<(PathBuf, u64)>,
     pub awaiting: Vec<AgentToolCall>,
+    /// The project, so the tailer maps a worktree session's paths to it
+    /// exactly as the replay did.
+    pub project_root: Option<PathBuf>,
 }
 
 /// Output from a single incremental poll of an event tailer.

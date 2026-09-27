@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -485,105 +485,79 @@ fn parse_log_file_with_mapper(
 /// Parse a whole log file, recording where it stopped and which write calls
 /// still await their results, so a tailer can take over exactly there.
 fn replay_log_file(path: &Path, mapper: &dyn ToolCallMapper, project_root: Option<&Path>) -> FileReplay {
-    let mut events: Vec<SessionEvent> = Vec::new();
-    let file = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return FileReplay::default(),
+    let Ok(file) = fs::File::open(path) else {
+        return FileReplay::default();
     };
-
-    let default_id = path
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-
     let mut reader = BufReader::new(file);
-
-    // Read the first line once to extract the agent label and worktree cwd.
-    // This avoids a second file open for extract_agent_label / extract_cwd.
-    let mut first_line = String::new();
-    let _ = reader.read_line(&mut first_line);
-    let first_trimmed = first_line.trim();
-
-    let first_parsed: Option<Value> = serde_json::from_str(first_trimmed).ok();
-    let label: Arc<str> = match first_parsed.as_ref() {
-        Some(obj) => {
-            let content = obj.pointer("/message/content").and_then(|v| v.as_str()).unwrap_or("");
-            if content.is_empty() {
-                Arc::from(default_label(path).as_str())
-            } else {
-                let line_content = content.lines().next().unwrap_or(content);
-                if line_content.len() <= 50 {
-                    Arc::from(line_content)
-                } else {
-                    Arc::from(format!("{}...", &line_content[..47]).as_str())
-                }
-            }
-        }
-        None => Arc::from(default_label(path).as_str()),
-    };
-
-    // Detect worktree: cwd in the first record differs from the project root.
-    let cwd_remap: Option<(PathBuf, PathBuf)> = project_root.and_then(|root| {
-        let obj = first_parsed.as_ref()?;
-        let cwd = PathBuf::from(obj.get("cwd")?.as_str()?);
-        if cwd != root { Some((cwd, root.to_path_buf())) } else { None }
-    });
-
-    // Seek back to start so all lines — including line 1 — are processed for events.
-    let _ = reader.seek(SeekFrom::Start(0));
-
-    // Buffer the most-recent compact_boundary record. Claude Code emits the
-    // boundary immediately before the corresponding `isCompactSummary` line, so
-    // we attach the buffered metadata to the next `Compacted` event we see.
-    let mut pending_metadata: Option<CompactionMetadata> = None;
+    let mut feed = LineFeed::for_file(path, project_root);
     let mut writes = WriteCorrelator::default();
+    let mut events: Vec<SessionEvent> = Vec::new();
     let mut offset = 0u64;
     let mut line = String::new();
-
     loop {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) | Err(_) => break,
             Ok(n) => offset += n as u64,
         }
-        match parse_jsonl_line(line.trim(), &default_id, mapper) {
-            ParsedLine::Events(mut line_events) => {
-                if let Some((ref worktree, ref project)) = cwd_remap {
-                    for ev in &mut line_events {
-                        if let Some(ref fp) = ev.file_path {
-                            ev.file_path = Some(remap_path(fp, worktree, project));
-                        }
+        feed.feed(&line, mapper, &mut writes, &mut events);
+    }
+    FileReplay { events, offset, awaiting: writes.into_pending() }
+}
+
+/// Turns one log file's lines into events. The one implementation behind
+/// both the batch replay and the live tailer, so a line means the same
+/// thing whichever reads it: same agent id and label, same worktree path
+/// remapping, same compaction pairing, same write correlation.
+struct LineFeed {
+    default_id: String,
+    label: Arc<str>,
+    /// `(worktree, project)` when the session ran in a worktree of the
+    /// project: tool paths are rewritten from one to the other.
+    remap: Option<(PathBuf, PathBuf)>,
+    /// The most recent `compact_boundary`. Claude Code writes it just before
+    /// its `isCompactSummary` line, and the two may arrive in different polls.
+    pending_metadata: Option<CompactionMetadata>,
+}
+
+impl LineFeed {
+    /// Set up for `path`, from its first line: the agent's label and, given
+    /// the project root, whether it ran in a worktree.
+    fn for_file(path: &Path, project_root: Option<&Path>) -> Self {
+        let default_id = path.file_stem().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+        let remap = project_root.and_then(|root| {
+            let cwd = extract_cwd(path)?;
+            (cwd != root).then(|| (cwd, root.to_path_buf()))
+        });
+        Self { default_id, label: Arc::from(extract_agent_label(path).as_str()), remap, pending_metadata: None }
+    }
+
+    /// Feed one line, appending whatever events it completes to `out`.
+    fn feed(&mut self, line: &str, mapper: &dyn ToolCallMapper, writes: &mut WriteCorrelator, out: &mut Vec<SessionEvent>) {
+        match parse_jsonl_line(line.trim(), &self.default_id, mapper) {
+            ParsedLine::Events(mut calls) => {
+                for call in &mut calls {
+                    if let (Some((worktree, project)), Some(fp)) = (&self.remap, &call.file_path) {
+                        call.file_path = Some(remap_path(fp, worktree, project));
                     }
+                    call.label = self.label.clone();
                 }
-                for ev in &mut line_events {
-                    ev.label = label.clone();
-                }
-                writes.note_calls(&line_events);
-                events.extend(line_events.into_iter().map(SessionEvent::ToolCall));
+                writes.note_calls(&calls);
+                out.extend(calls.into_iter().map(SessionEvent::ToolCall));
             }
-            ParsedLine::ToolResults(results) => {
-                events.extend(writes.resolve(results).into_iter().map(SessionEvent::Write));
-            }
-            ParsedLine::CompactBoundary { metadata, .. } => {
-                pending_metadata = Some(metadata);
-            }
-            ParsedLine::Compacted { summary, timestamp } => {
-                let agent_id: Arc<str> = Arc::from(default_id.as_str());
-                events.push(SessionEvent::Compacted {
-                    summary,
-                    timestamp,
-                    agent_id,
-                    metadata: pending_metadata.take(),
-                });
-            }
-            ParsedLine::SessionCleared => {
-                events.push(SessionEvent::SessionCleared);
-            }
+            // A write's path comes from its call, remapped above.
+            ParsedLine::ToolResults(results) => out.extend(writes.resolve(results).into_iter().map(SessionEvent::Write)),
+            ParsedLine::CompactBoundary { metadata, .. } => self.pending_metadata = Some(metadata),
+            ParsedLine::Compacted { summary, timestamp } => out.push(SessionEvent::Compacted {
+                summary,
+                timestamp,
+                agent_id: Arc::from(self.default_id.as_str()),
+                metadata: self.pending_metadata.take(),
+            }),
+            ParsedLine::SessionCleared => out.push(SessionEvent::SessionCleared),
             ParsedLine::Ignored => {}
         }
     }
-    FileReplay { events, offset, awaiting: writes.into_pending() }
 }
 
 /// Parse the `compactMetadata` block from a `compact_boundary` system record.
@@ -981,10 +955,11 @@ pub struct LogTailer {
     files: Vec<PathBuf>,
     positions: std::collections::HashMap<PathBuf, u64>,
     mapper: Arc<dyn ToolCallMapper>,
-    /// Most-recent `compact_boundary` metadata, held until the matching
-    /// `isCompactSummary` line arrives (usually within the same poll, but kept
-    /// across polls in case the writer flushes them separately).
-    pending_metadata: Option<CompactionMetadata>,
+    /// Per-file line state (label, worktree remap, pending compaction),
+    /// set up when a file is first read and kept across polls.
+    feeds: std::collections::HashMap<PathBuf, LineFeed>,
+    /// The project, for recognizing a session run in a worktree of it.
+    project_root: Option<PathBuf>,
     /// Write calls awaiting their results, kept across polls: a result can
     /// land in a later poll than its call.
     writes: WriteCorrelator,
@@ -1006,7 +981,7 @@ impl LogTailer {
             let start = fs::metadata(f).map(|m| m.len()).unwrap_or(0);
             positions.insert(f.clone(), start);
         }
-        Self { files, positions, mapper, pending_metadata: None, writes: WriteCorrelator::default() }
+        Self { files, positions, mapper, feeds: Default::default(), project_root: None, writes: WriteCorrelator::default() }
     }
 
     /// Continue exactly where a batch replay stopped: each file from its
@@ -1016,7 +991,7 @@ impl LogTailer {
         writes.note_calls(&handoff.awaiting);
         let files = handoff.files.iter().map(|(f, _)| f.clone()).collect();
         let positions = handoff.files.into_iter().collect();
-        Self { files, positions, mapper, pending_metadata: None, writes }
+        Self { files, positions, mapper, feeds: Default::default(), project_root: handoff.project_root, writes }
     }
 
 
@@ -1033,32 +1008,21 @@ impl LogTailer {
     /// Returns a `TailerOutput` with any new agent tool call events and a
     /// `session_cleared` flag set to `true` if a `/clear` command was detected.
     pub fn read_new_events(&mut self) -> TailerOutput {
-        let mut output = TailerOutput {
-            events: Vec::new(),
-            compactions: Vec::new(),
-            session_cleared: false,
-            writes: Vec::new(),
-        };
-
+        let mut events: Vec<SessionEvent> = Vec::new();
         // Index-based loop so we can update `positions` via `get_mut` without
         // cloning the `PathBuf` key on every iteration.
         for i in 0..self.files.len() {
-            let pos = self.positions.get(&self.files[i]).copied().unwrap_or(0);
-            let current_len = fs::metadata(&self.files[i])
-                .map(|m| m.len())
-                .unwrap_or(0);
-
+            let path = &self.files[i];
+            let pos = self.positions.get(path).copied().unwrap_or(0);
+            let current_len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             if current_len <= pos {
                 continue;
             }
-
-            let default_id = self.files[i]
-                .file_stem()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-
-            if let Ok(file) = fs::File::open(&self.files[i]) {
+            let feed = self
+                .feeds
+                .entry(path.clone())
+                .or_insert_with(|| LineFeed::for_file(path, self.project_root.as_deref()));
+            if let Ok(file) = fs::File::open(path) {
                 use std::io::{Seek, SeekFrom};
                 let mut reader = BufReader::new(file);
                 if reader.seek(SeekFrom::Start(pos)).is_ok() {
@@ -1066,40 +1030,28 @@ impl LogTailer {
                     loop {
                         line.clear();
                         match reader.read_line(&mut line) {
-                            Ok(0) => break,
-                            Ok(_) => match parse_jsonl_line(line.trim(), &default_id, &*self.mapper) {
-                                ParsedLine::Events(events) => {
-                                    self.writes.note_calls(&events);
-                                    output.events.extend(events);
-                                }
-                                ParsedLine::ToolResults(results) => {
-                                    output.writes.extend(self.writes.resolve(results));
-                                }
-                                ParsedLine::SessionCleared => output.session_cleared = true,
-                                ParsedLine::CompactBoundary { metadata, .. } => {
-                                    self.pending_metadata = Some(metadata);
-                                }
-                                ParsedLine::Compacted { summary, timestamp } => {
-                                    output.compactions.push(TailedCompaction {
-                                        summary,
-                                        timestamp,
-                                        agent_id: Arc::from(default_id.as_str()),
-                                        metadata: self.pending_metadata.take(),
-                                    });
-                                }
-                                ParsedLine::Ignored => {}
-                            },
-                            Err(_) => break,
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => feed.feed(&line, &*self.mapper, &mut self.writes, &mut events),
                         }
                     }
                 }
             }
-
             // Insert rather than `get_mut`: an absent key must start tracking
             // from here, not silently keep re-reading from 0.
             self.positions.insert(self.files[i].clone(), current_len);
         }
 
+        let mut output = TailerOutput { events: Vec::new(), compactions: Vec::new(), session_cleared: false, writes: Vec::new() };
+        for event in events {
+            match event {
+                SessionEvent::ToolCall(call) => output.events.push(call),
+                SessionEvent::Write(write) => output.writes.push(write),
+                SessionEvent::Compacted { summary, timestamp, agent_id, metadata } => {
+                    output.compactions.push(TailedCompaction { summary, timestamp, agent_id, metadata })
+                }
+                SessionEvent::SessionCleared => output.session_cleared = true,
+            }
+        }
         output
     }
 }
@@ -2243,7 +2195,7 @@ mod write_tests {
         std::fs::write(&path, lines.join("\n") + "\n").unwrap();
         let config: Arc<dyn ToolCallMapper> = Arc::new(write_config());
         let replay = replay_log_file(&path, &*config, None);
-        let handoff = Handoff { files: vec![(path.clone(), replay.offset)], awaiting: replay.awaiting.clone() };
+        let handoff = Handoff { files: vec![(path.clone(), replay.offset)], awaiting: replay.awaiting.clone(), project_root: None };
         let tailer = LogTailer::resume(handoff, config);
         (path, replay, tailer)
     }
@@ -2335,6 +2287,32 @@ mod write_tests {
         let mut c = WriteCorrelator::default();
         c.note_calls(&[write_call("t1"), write_call("t1")]);
         assert_eq!(pending_ids(c), vec!["t1"]);
+    }
+
+    /// Live tailing maps a worktree session's paths to the project exactly
+    /// as the startup replay does: a write made live in a worktree used to
+    /// keep its worktree path and be dropped as outside the project.
+    #[test]
+    fn the_tailer_remaps_a_worktree_session_like_the_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.jsonl");
+        let first = serde_json::json!({"type": "user", "cwd": "/work/tree", "message": {"content": "task"}}).to_string();
+        std::fs::write(&path, format!("{first}\n")).unwrap();
+        let config: Arc<dyn ToolCallMapper> = Arc::new(write_config());
+        let replay = replay_log_file(&path, &*config, Some(Path::new("/proj")));
+        let handoff = Handoff {
+            files: vec![(path.clone(), replay.offset)],
+            awaiting: replay.awaiting,
+            project_root: Some(PathBuf::from("/proj")),
+        };
+        let mut tailer = LogTailer::resume(handoff, config);
+
+        append(&path, call("toolu_1", "Edit", "/work/tree/src/a.rs"));
+        append(&path, result("toolu_1", edit_detail(None), false));
+        let polled = tailer.read_new_events();
+        assert_eq!(polled.events[0].file_path.as_deref(), Some(Path::new("/proj/src/a.rs")));
+        assert_eq!(polled.writes[0].path, PathBuf::from("/proj/src/a.rs"));
+        assert_eq!(&*polled.events[0].label, "task", "labelled like the replay too");
     }
 
     /// A partial patch would under-report the change, so any defect makes
