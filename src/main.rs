@@ -192,6 +192,13 @@ enum Commands {
     },
 
     /// Delete snapshot objects that no ref or recent reflog entry reaches.
+    /// Maintain the links index (which commit agent writes landed in).
+    #[command(hide = true)]
+    Links {
+        #[command(subcommand)]
+        command: LinksCommands,
+    },
+
     Gc {
         /// Keep unreachable objects younger than this many days.
         #[arg(long, default_value_t = 14)]
@@ -687,6 +694,33 @@ enum HookCommands {
         /// Project directory to install for (defaults to the current directory).
         #[arg(long, short)]
         project: Option<PathBuf>,
+
+        /// Instead, install this repository's git post-commit hook, which
+        /// records which commit recent agent writes landed in.
+        #[arg(long, conflicts_with = "global")]
+        git: bool,
+    },
+
+    /// Remove the git post-commit hook, restoring any hook it chained to.
+    Uninstall {
+        /// Required: the git hook is the only one `uninstall` removes.
+        #[arg(long, required = true)]
+        git: bool,
+
+        /// Repository directory (defaults to the current directory).
+        #[arg(long, short)]
+        project: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum LinksCommands {
+    /// Resolve where recent agent writes landed and record it in the links
+    /// index. Run by the git post-commit hook.
+    Refresh {
+        /// Look at writes from this many days back.
+        #[arg(long, default_value_t = 14)]
+        days: u64,
     },
 }
 
@@ -1078,8 +1112,21 @@ fn run() -> Result<()> {
         }
         Some(Commands::Hook { command }) => {
             return match command {
-                HookCommands::Install { global, project } => {
+                HookCommands::Install { git: true, project, .. } => {
+                    let dir = project.clone().unwrap_or(std::env::current_dir()?);
+                    let exe = std::env::current_exe()?.canonicalize()?;
+                    let path = ambits::git_hook::install(&dir, &exe)?;
+                    writeln!(io::stdout().lock(), "installed {}", path.display())?;
+                    Ok(())
+                }
+                HookCommands::Install { global, project, .. } => {
                     hook::install(*global, project.clone())
+                }
+                HookCommands::Uninstall { project, .. } => {
+                    let dir = project.clone().unwrap_or(std::env::current_dir()?);
+                    let removed = ambits::git_hook::uninstall(&dir)?;
+                    writeln!(io::stdout().lock(), "{}", if removed { "removed the git hook" } else { "no ambits git hook installed" })?;
+                    Ok(())
                 }
             };
         }
@@ -1167,6 +1214,23 @@ fn run() -> Result<()> {
     });
 
     ambits::logging::init(cli.log_output.as_deref(), session_id.as_deref());
+
+    if let Some(Commands::Links { command: LinksCommands::Refresh { days } }) = &command {
+        let window = days
+            .checked_mul(24 * 60 * 60)
+            .map(Duration::from_secs)
+            .ok_or_else(|| color_eyre::eyre::eyre!("--days {days} is too large"))?;
+        // Bounded, so a hook never leaves a process running for long.
+        let stats = ambits::linkage::refresh(&project_path, window, Duration::from_secs(30))?;
+        writeln!(
+            io::stdout().lock(),
+            "links: {} landed, {} uncommitted{}",
+            stats.landed,
+            stats.uncommitted,
+            if stats.stopped_early { " (stopped at the time limit)" } else { "" }
+        )?;
+        return Ok(());
+    }
 
     // Snapshot history and gc read only the store; no scan needed.
     if let Some(Commands::Log { reference }) = &command {

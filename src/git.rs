@@ -80,6 +80,11 @@ impl Repo {
         Some(Self { prefix, top, head, dir: dir.to_path_buf() })
     }
 
+    /// The directory the repository was discovered from.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Changed paths under `dir`, relative to it: tracked files modified,
     /// added or deleted, and untracked files not ignored — from
     /// `git status --porcelain=v1 -z` (§7). Renames are reported as a

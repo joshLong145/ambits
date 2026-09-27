@@ -279,7 +279,13 @@ time only. A symbol the write removed is *removed* while it stays absent, and
 Resolved lazily, per `(op, symbol, hash)` — one write's symbols can land in
 different commits (`git add -p`):
 
-1. `git log --branches --full-history -M --name-status --format=%H --reverse --since=<t − 1 day> -- <path>`.
+1. `git log --branches HEAD --full-history -M --name-status -z --format='commit %H %ct' --reverse --since=<t − 1 day>`.
+   **Amended in implementation:** no `-- <path>` pathspec. With one, a
+   rename after the write shows as a deletion and later commits under the
+   new name never appear. The whole (time-bounded) log is walked instead,
+   following the path forward through renames. A rename git does not detect
+   (too much of the file changed) shows as a deletion plus additions; the
+   unit is then looked for among the files that commit added.
 2. For each commit C: `git cat-file blob C:<path-at-C>`; for a symbol write,
    parse and compare the symbol's hash; for a file-level `Write`, compare
    BLAKE3 of the blob with `fh`.
@@ -298,7 +304,14 @@ so amends and rebases re-resolve.
 - **Pushed as hints** (D18). The ignore filter (§4) is applied **at push
   time** — links are written after snapshots, by `touched` or the hook.
   Fetched links are re-verified locally before display (§9.4).
-- The **never-landed** cache (per `HEAD`) is **local-only**, never pushed.
+- The **never-landed** cache is **local-only**, never pushed. It is keyed by
+  a digest of every branch tip and `HEAD`, not `HEAD` alone, since
+  resolution searches all branches (`.ambits/cache/never-landed/`).
+- Entries are files named by `BLAKE3(op, target, hash)`, so no journal
+  string becomes a path.
+- **Known edge:** the search starts a day before the write, for clock skew.
+  A commit in that window that already held the exact symbol the write
+  produced (the write reverted a recent change) is taken as where it landed.
 - Links are not objects and not gc roots.
 
 **Optional prewarm:** `ambits hook install --git` (§9.3).
@@ -725,7 +738,7 @@ Merges into the **same session id** locally.
 | 1 | Spec | This document | — |
 | 2 | Writes, locally | §1; §2 on a worker thread; journal v3 (`write`, `history`); shards; tool stanzas and validation; `touched` without commits; TUI shows writes | only changed lines attribute; pure deletion; create touches every symbol; `userModified` ⇒ file; null `originalFile` ⇒ file; `outside_symbols`; outside-project dropped; errors skipped; replay twice ⇒ idempotent; higher `av` replaces; no read credit; **canary** |
 | 3 | Objects + snapshots | §5–§8 locally: objects, D17 ids, no-op rule, `log`, reflog, gc; a writes-only scan for `touched`. **Delivered.** Pending merge tips join a snapshot's parents once phase 6 writes `merge` records | snapshot twice ⇒ same id; `touch` ⇒ same id; whitespace or same-length dirty edit ⇒ new; **revert ⇒ new snapshot, parent = tip**; journal append ⇒ new; torn line ignored; schema upgrade ⇒ one new id; `SYMBOL_SCHEMA` ⇒ new; `\`/`/`, NFC/NFD, shuffled dirty ⇒ same; ignore covers every record type; user-global ignore not negatable; **gc: crash → gc → re-snapshot never loses an object; parents-first deletion; age refresh** |
-| 4 | Git linkage | §3: lazy resolution, links index, verified/unverified, reachability re-check, optional hook | write → commit → link; `add -p` across two commits; file-level `Write` via `fh`; later edit ⇒ changed since; amend and rebase ⇒ re-resolved; other branch; rename; never-landed cached locally; hook chains and never fails a commit |
+| 4 | Git linkage | §3: lazy resolution, links index, verified/unverified, reachability re-check, optional hook. **Delivered** (`links refresh`, hidden, is what the hook runs) | write → commit → link; `add -p` across two commits; file-level `Write` via `fh`; later edit ⇒ changed since; amend and rebase ⇒ re-resolved; other branch; rename; never-landed cached locally; hook chains and never fails a commit |
 | 5 | Restore (same machine) | §12.1 | into a new session; restore twice ⇒ no change; ref set ⇒ next snapshot descends; moved symbols; drifted; different commit ⇒ warning |
 | 6 | Dumb remote | §9, §12.2, §12.3; cross-machine restore; origin in `touched` | two clones converge both ways; **repeated pull/snapshot/push with no new reads ⇒ no new snapshots after one round**; **diverged pull with nothing to append ⇒ two-parent snapshot ⇒ fast-forward**; **after B's force-with-lease, A's fetch and pull still work**; pulled reads the fold already has are not re-appended; stale remote read ⇒ history; concurrent push rejected; force-with-lease; **crash → gc → fetch recovers**; push verifies skipped closure; colliding id refused; hostile names, symlinks, oversized and cyclic objects rejected; interrupted push leaves no dangling ref; break-lock rules |
 | 7 | Network transports | SSH / object storage; packs with an index and zstd | — |

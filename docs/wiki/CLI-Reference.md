@@ -94,9 +94,12 @@ default budget 3000 tokens, default format `markdown`.
 
 `ambits -p . touched [--format text|json] <file|symbol-id>` — the latest agent
 write across every session's journal, and whether it is `current`, `changed`,
-`removed`, or `unknown` (a file-level edit, no hash to compare). A symbol
-covers everything nested under it, and counts only symbol-level writes. Exits
-0 whether or not a write was found (JSON: `"last_write": null`).
+`removed`, or `unknown` (a file-level edit, no hash to compare), and the
+[commit it landed in](Agent-Writes#which-commit-it-landed-in) (JSON:
+`last_write.landed.state` is `verified`, `unverified`, `partial`,
+`uncommitted` or `no_repository`, with `commits`). A symbol covers everything
+nested under it, and counts only symbol-level writes. Exits 0 whether or not
+a write was found (JSON: `"last_write": null`).
 
 ## `ambits snapshot`
 
@@ -127,6 +130,10 @@ and 90 days.
 |---|---|
 | `-p`, `--project <DIR>` | Project to install for (default: current directory) |
 | `-g`, `--global` | Install to `~/.claude/settings.json` instead |
+| `--git` | Install the repository's [git post-commit hook](Agent-Writes#which-commit-it-landed-in) instead |
+
+`ambits hook uninstall --git [-p DIR]` removes the git hook and restores any
+hook it chained to.
 
 ## `ambits skill install`
 

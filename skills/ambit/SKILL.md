@@ -333,7 +333,8 @@ editing a symbol does not mark it read. Mentioning a file in conversation
 without reading it via a tool does not count.
 
 **When was this last changed by an agent?** — `ambits touched <file|symbol-id>`
-shows the latest agent write and whether that version is still on disk. For a
+shows the latest agent write, whether that version is still on disk, and which
+commit it landed in. For a
 symbol it counts only writes attributed to that symbol or one nested in it
 (`App` covers `App/handle_key`). A write the log could attribute only to the
 whole file is not counted, so "no writes" for a symbol means none that ambits

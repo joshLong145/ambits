@@ -50,6 +50,7 @@ ambits -p . touched --format json src/app.rs
 src/app.rs::App/handle_key — last written 2026-09-27T10:00:01Z by agent-3f9c (Edit)
   session 9a1c…, write toolu_01…
   unchanged since the agent wrote it
+  landed in 3054724 (verified)
 ```
 
 For a symbol, only writes attributed to that symbol count — or to one nested
@@ -60,8 +61,36 @@ reported. Ask about the file to see it.
 It searches every session's journal and reports whether the agent's version
 is still on disk: `current`, `changed`, `removed` (still absent — a symbol
 that came back after the agent deleted it is `changed`), or `unknown` for a
-file-level edit with no hash to compare. Which git commit a write landed in is
-planned.
+file-level edit with no hash to compare.
+
+## Which commit it landed in
+
+`touched` also finds the commit the agent's write landed in, on any local
+branch:
+
+| Result | Meaning |
+|---|---|
+| `landed in <commit> (verified)` | That commit contains the symbol exactly as the agent wrote it (or, for a whole-file `Write`, the file byte for byte) |
+| `landed in <commit> (unverified: …)` | The write left nothing to compare — a file-level `Edit` — so this is only the first commit to touch the file after it |
+| `partly landed in …` | A write's symbols were committed separately (`git add -p`) and some are not committed yet |
+| `uncommitted` | In no commit on any branch |
+
+A write that touched several symbols can land in several commits; all are
+listed. The file is followed through renames. Answers are cached in
+`.ambits/links/`, and a cached commit that was amended or rebased away is
+looked up again. Symbol hashes ignore whitespace, so a commit that differs
+from the agent's version only in whitespace still counts as verified.
+
+To keep the cache warm, install the optional git hook:
+
+```bash
+ambits hook install --git      # remove with: ambits hook uninstall --git
+```
+
+After each commit it records where recent writes landed, in the background.
+It keeps any `post-commit` hook you already have (and runs it first), acts
+only in repositories with an `.ambits/` directory at the top, and can never
+fail or delay a commit.
 
 Writes are journaled by the [TUI](TUI), like reads — see
 [Configuration → The read journal](Configuration#the-read-journal).

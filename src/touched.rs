@@ -180,6 +180,8 @@ struct WriteDto<'a> {
     tool: &'a str,
     level: Level,
     status: Status,
+    /// Which commit the write landed in (§3.2).
+    landed: crate::linkage::Landed,
 }
 
 /// Print the answer for `arg`, as text or JSON.
@@ -188,13 +190,25 @@ pub fn run(project_root: &Path, arg: &str, json: bool) -> Result<()> {
     let found = latest(project_root, &target);
     let registry = ParserRegistry::new();
     let status = found.as_ref().map(|(_, w)| status(project_root, &registry, &target, w));
+    // Only the parts of the write that are about the target: a symbol and
+    // what is nested in it, or the whole file.
+    let landed = match &found {
+        Some((_, w)) => {
+            let keep = |u: &crate::linkage::Unit| match &target {
+                Target::Symbol(id) => within(&u.target, id),
+                Target::File(_) => true,
+            };
+            Some(crate::linkage::landed(crate::linkage::Resolver::new(project_root).as_mut(), w, &keep)?)
+        }
+        None => None,
+    };
     let mut out = std::io::stdout().lock();
 
     if json {
         let dto = TouchedDto {
             schema_version: SCHEMA_VERSION,
             target: arg,
-            last_write: found.as_ref().zip(status).map(|((session, w), status)| WriteDto {
+            last_write: found.as_ref().zip(status).zip(landed).map(|(((session, w), status), landed)| WriteDto {
                 session,
                 op: &w.op,
                 agent: &w.a,
@@ -202,6 +216,7 @@ pub fn run(project_root: &Path, arg: &str, json: bool) -> Result<()> {
                 tool: &w.tool,
                 level: w.level,
                 status,
+                landed,
             }),
         };
         writeln!(out, "{}", serde_json::to_string(&dto)?)?;
@@ -221,7 +236,24 @@ pub fn run(project_root: &Path, arg: &str, json: bool) -> Result<()> {
         Status::Unknown => "unknown: a file-level write carries no hash to compare",
     };
     writeln!(out, "  {status_line}")?;
+    if let Some(landed) = &landed {
+        writeln!(out, "  {}", landed_line(landed))?;
+    }
     Ok(())
+}
+
+fn landed_line(landed: &crate::linkage::Landed) -> String {
+    use crate::linkage::Landed;
+    let short = |commits: &[String]| commits.iter().map(|c| c.get(..7).unwrap_or(c)).collect::<Vec<_>>().join(", ");
+    match landed {
+        Landed::Verified { commits } => format!("landed in {} (verified)", short(commits)),
+        Landed::Unverified { commits } => {
+            format!("landed in {} (unverified: the first commit to touch the file after the write)", short(commits))
+        }
+        Landed::Partial { commits } => format!("partly landed in {}; the rest is uncommitted", short(commits)),
+        Landed::Uncommitted => "uncommitted".to_string(),
+        Landed::NoRepository => "not in a git repository with commits".to_string(),
+    }
 }
 
 #[cfg(test)]
