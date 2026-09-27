@@ -183,6 +183,23 @@ enum Commands {
         require_clean: bool,
     },
 
+    /// Restore a snapshot's coverage and writes into a session on this
+    /// machine.
+    ///
+    /// Reads still valid against the project as it is now are restored (moved
+    /// symbols followed); drifted ones are not. Writes are restored as history.
+    /// The session's ref is set to the snapshot, so its next snapshot descends
+    /// from it. Restoring twice changes nothing. Not `restore-context`, which
+    /// prints what this session has read.
+    Restore {
+        /// A session id, a snapshot id, or a unique prefix of one.
+        reference: String,
+
+        /// The session to restore into. Without it a new session id is minted.
+        #[arg(long)]
+        into: Option<String>,
+    },
+
     /// Show snapshot history: time, git commit, dirty files, reads, writes,
     /// parents and message.
     Log {
@@ -1328,6 +1345,20 @@ fn run() -> Result<()> {
     }
 
     let project_tree = scan_tree(cli.serena, &registry, &project_path, filter.as_ref())?;
+
+    if let Some(Commands::Restore { reference, into }) = &command {
+        report_warnings(&config_warnings);
+        let report = ambits::objects::restore::restore(&ambits::objects::restore::Request {
+            project_root: &project_path,
+            reference,
+            into: into.as_deref(),
+            tree: &project_tree,
+            backend: if cli.serena { "serena" } else { "tree-sitter" },
+            filter: filter.as_ref().map(|f| f.display()),
+        })?;
+        ambits::objects::restore::print_report(&mut io::stdout().lock(), &report)?;
+        return Ok(());
+    }
 
     if let Some(Commands::Snapshot { message, require_clean }) = &command {
         report_warnings(&config_warnings);

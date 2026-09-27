@@ -337,15 +337,6 @@ pub fn reads_from_ledger(
         .collect()
 }
 
-/// Split `"<relative-path>::<Name/Path>"` into its two halves.
-///
-/// Symbol ids are built as `{path_prefix}::{name_path}` by every parser, with
-/// `/` separating nesting levels inside the name path — so the first `::` is
-/// unambiguously the boundary.
-pub fn split_symbol_id(id: &str) -> Option<(&str, &str)> {
-    id.split_once("::")
-}
-
 /// Recursively index every symbol in the tree by id, including nested children.
 /// Build an id → symbols index over the whole project tree.
 ///
@@ -555,10 +546,8 @@ fn follow_moves(
 /// Owned `(file_path, name_path)` for a symbol id. A malformed id degrades to
 /// an empty path and the whole id as the name, rather than losing the record.
 fn split_id(id: &str) -> (PathBuf, String) {
-    match split_symbol_id(id) {
-        Some((path, name)) => (PathBuf::from(path), name.to_string()),
-        None => (PathBuf::new(), id.to_string()),
-    }
+    let (path, name) = crate::symbols::split_id(id);
+    (PathBuf::from(path), name.to_string())
 }
 
 /// What a cold-start rehydrate changed about the ledger.
@@ -923,18 +912,6 @@ mod tests {
         let out = classify(&HashMap::new(), &tree);
         assert_eq!(out.total(), 0);
         assert!(out.omitted_files().is_empty());
-    }
-
-    #[test]
-    fn split_symbol_id_handles_both_shapes() {
-        assert_eq!(split_symbol_id("src/a.rs::App/run"), Some(("src/a.rs", "App/run")));
-        assert_eq!(split_symbol_id("no-separator"), None);
-        // A malformed id degrades to using the whole thing as the name rather
-        // than losing the record.
-        assert_eq!(
-            split_id("no-separator"),
-            (PathBuf::new(), "no-separator".to_string())
-        );
     }
 
     /// Nested symbols must report the file they live in. Paths are derived

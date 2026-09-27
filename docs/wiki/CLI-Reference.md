@@ -16,6 +16,7 @@ collects them in one place.
 | `ambits -p <path> touched <file\|symbol-id>` | [When an agent last wrote it](Agent-Writes), and whether that version is still on disk |
 | `ambits -p <path> snapshot` | [Record a snapshot](Snapshots) of this session |
 | `ambits -p <path> log [ref]` | [Snapshot history](Snapshots#history) |
+| `ambits -p <path> restore <ref> [--into <session>]` | [Restore a snapshot](Snapshots#restoring) into a session |
 | `ambits -p <path> gc` | Delete [unreachable snapshot objects](Snapshots#garbage-collection) |
 | `ambits -p <path> --coverage` | [Coverage report](Coverage-and-Multi-Agent) |
 | `ambits -p <path> --dump` | Print the symbol tree |
@@ -110,6 +111,12 @@ snapshot, or `nothing changed: <id>` when nothing did. See [Snapshots](Snapshots
 
 `ambits -p . log [REF]` — `REF` is a session id, a snapshot id or a unique
 prefix (7+ hex digits); the current session by default.
+
+## `ambits restore`
+
+`ambits -p . restore REF [--into SESSION]` — `REF` as for `log`. Without
+`--into`, a new session id is minted and printed. Distinct from
+`restore-context`, which prints what the current session has read.
 
 ## `ambits gc`
 

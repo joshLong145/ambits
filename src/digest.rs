@@ -109,12 +109,10 @@ fn symbol_label(sym: &RestoredSymbol) -> String {
     let Some(ref old_id) = sym.moved_from else {
         return base;
     };
-    match crate::restore::split_symbol_id(old_id) {
-        Some((old_file, _)) if Path::new(old_file) != sym.file_path => {
-            format!("{base} (was {old_file})")
-        }
-        Some((_, old_name)) => format!("{base} (was {old_name})"),
-        None => format!("{base} (was {old_id})"),
+    match crate::symbols::split_id(old_id) {
+        ("", _) => format!("{base} (was {old_id})"),
+        (old_file, _) if Path::new(old_file) != sym.file_path => format!("{base} (was {old_file})"),
+        (_, old_name) => format!("{base} (was {old_name})"),
     }
 }
 

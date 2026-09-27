@@ -246,7 +246,15 @@ impl ProjectTree {
 #[cfg(test)]
 mod tests {
     use crate::helpers::{file, sym_with_bytes, sym_with_children};
-    use crate::symbols::FileSymbols;
+    use crate::symbols::{nested_in, split_id, FileSymbols};
+
+    #[test]
+    fn ids_split_at_the_first_separator() {
+        assert_eq!(split_id("src/a.rs::App/run"), ("src/a.rs", "App/run"));
+        assert_eq!(split_id("src/a.rs::impl fmt::Display for X"), ("src/a.rs", "impl fmt::Display for X"));
+        assert_eq!(split_id("no-separator"), ("", "no-separator"));
+        assert!(nested_in("App/run", "App") && nested_in("App", "App") && !nested_in("Application", "App"));
+    }
 
     /// `sym_with_children` leaves the parent spanning 0..100, so the child's
     /// 40..60 is genuinely nested inside it.

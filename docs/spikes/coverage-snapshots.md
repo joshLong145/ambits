@@ -685,6 +685,15 @@ is minted.
 
 Cross-machine restore is the same operation after a `fetch` (phase 6).
 
+**Implementation notes.** `classify` takes one hash per symbol, and a
+coverage object can hold two for one symbol (two agents read two versions).
+Reads are therefore classified in layers with at most one hash per symbol,
+almost always just one. "Unverifiable here" is a read that did not verify in
+a file listed dirty in the snapshot. A read that fails in a clean file is
+*drifted* (or removed). Writes are restored as `history{of:"write"}` whole,
+and their `op`s are folded (`JournalContents::history_writes`) so a second
+restore skips them. Moved symbols are appended under their new id.
+
 ### 12.2 Push and fetch (dumb remote over a filesystem path)
 
 - **push**: copy missing objects children first, fsync each, snapshot object
@@ -760,7 +769,7 @@ Merges into the **same session id** locally.
 | 2 | Writes, locally | §1; §2 on a worker thread; journal v3 (`write`, `history`); shards; tool stanzas and validation; `touched` without commits; TUI shows writes | only changed lines attribute; pure deletion; create touches every symbol; `userModified` ⇒ file; null `originalFile` ⇒ file; `outside_symbols`; outside-project dropped; errors skipped; replay twice ⇒ idempotent; higher `av` replaces; no read credit; **canary** |
 | 3 | Objects + snapshots | §5–§8 locally: objects, D17 ids, no-op rule, `log`, reflog, gc; a writes-only scan for `touched`. **Delivered.** Pending merge tips join a snapshot's parents once phase 6 writes `merge` records | snapshot twice ⇒ same id; `touch` ⇒ same id; whitespace or same-length dirty edit ⇒ new; **revert ⇒ new snapshot, parent = tip**; journal append ⇒ new; torn line ignored; schema upgrade ⇒ one new id; `SYMBOL_SCHEMA` ⇒ new; `\`/`/`, NFC/NFD, shuffled dirty ⇒ same; ignore covers every record type; user-global ignore not negatable; **gc: crash → gc → re-snapshot never loses an object; parents-first deletion; age refresh** |
 | 4 | Git linkage | §3: lazy resolution, links index, verified/unverified, reachability re-check, optional hook. **Delivered** (`links refresh`, hidden, is what the hook runs) | write → commit → link; `add -p` across two commits; file-level `Write` via `fh`; later edit ⇒ changed since; amend and rebase ⇒ re-resolved; other branch; rename; never-landed cached locally; hook chains and never fails a commit |
-| 5 | Restore (same machine) | §12.1 | into a new session; restore twice ⇒ no change; ref set ⇒ next snapshot descends; moved symbols; drifted; different commit ⇒ warning |
+| 5 | Restore (same machine) | §12.1. **Delivered** | into a new session; restore twice ⇒ no change; ref set ⇒ next snapshot descends; moved symbols; drifted; different commit ⇒ warning |
 | 6 | Dumb remote | §9, §12.2, §12.3; cross-machine restore; origin in `touched` | two clones converge both ways; **repeated pull/snapshot/push with no new reads ⇒ no new snapshots after one round**; **diverged pull with nothing to append ⇒ two-parent snapshot ⇒ fast-forward**; **after B's force-with-lease, A's fetch and pull still work**; pulled reads the fold already has are not re-appended; stale remote read ⇒ history; concurrent push rejected; force-with-lease; **crash → gc → fetch recovers**; push verifies skipped closure; colliding id refused; hostile names, symlinks, oversized and cyclic objects rejected; interrupted push leaves no dangling ref; break-lock rules |
 | 7 | Network transports | SSH / object storage; packs with an index and zstd | — |
 | — | *(later)* | Smart `ambits serve`; signed snapshots; `blame`; `share_provenance`; Serena symbol writes (`replace_symbol_body` and friends name their symbol in the log, so they could be definite symbol-level touches under D15) | — |

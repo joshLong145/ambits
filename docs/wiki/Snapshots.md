@@ -18,9 +18,8 @@ snapshot 871171228aa7  2026-09-27T16:36:33Z
   before the refactor
 ```
 
-Snapshots are manual. They are the groundwork for restoring a session and
-syncing coverage to a remote, both of which are planned. For now they are
-local history.
+Snapshots are manual. A snapshot can be [restored](#restoring) into another
+session on this machine; syncing to a remote is planned.
 
 ## Taking a snapshot
 
@@ -59,6 +58,41 @@ defaults to the current session.
 
 Snapshots made with `--serena` are marked **non-reproducible**: they depend
 on Serena's cache, not just the commit.
+
+## Restoring
+
+```bash
+ambits -p . restore <ref>                    # into a new session (id printed)
+ambits -p . restore <ref> --into <session>   # into an existing one
+```
+
+```
+restored snapshot 89ad0e4badaa into session 3f1c…
+  warning: the snapshot is pinned to 6d8c21f, but HEAD is 1f32c0b; nothing was checked out
+  src/app.rs: 41 verified, 2 drifted
+  src/linkage.rs: 12 verified, 1 moved
+  src/time.rs: 0 verified, 3 unverifiable here (dirty when snapshotted)
+  56 read(s) and 4 write(s) appended
+```
+
+Each read in the snapshot is checked against the project as it is now,
+exactly as [`restore-context`](Restoring-Context) checks a journal:
+
+| Per file | Meaning |
+|---|---|
+| verified | Still what was read: restored. A symbol that moved to another file since is restored at its new address (`moved`) |
+| drifted | Changed since it was read: not restored |
+| unverifiable here | The file had uncommitted changes when snapshotted, and what was read is not on this machine any more: not restored |
+
+The snapshot's writes are restored as *history* — a record of what an agent
+did, not writes of the new session, so `touched` does not report them as
+its own. Everything goes to the session's `<session>.restore.ndjson`
+journal, which the [TUI](TUI) and `restore-context` read with the rest. The
+session's ref is set to the snapshot, so its next snapshot descends from
+it. Restoring twice changes nothing. A snapshot pinned to another commit is
+restored with a warning; nothing is ever checked out.
+
+Restoring from another machine arrives with syncing.
 
 ## Leaving things out
 

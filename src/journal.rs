@@ -398,6 +398,10 @@ pub struct JournalContents {
     /// Agent writes by `op`, keeping the record with the highest `av`
     /// (spec §2.6). Empty before v3.
     pub writes: std::collections::BTreeMap<String, crate::writes::WriteRecord>,
+    /// `op` of every write kept as history (`history{of:"write"}`, from a
+    /// restore). Not folded into `writes` — history never is — but known, so
+    /// restoring again appends nothing.
+    pub history_writes: std::collections::BTreeSet<String>,
     pub warnings: Vec<String>,
 }
 
@@ -523,7 +527,11 @@ fn fold_lines(path: &Path, content: &str, records: Records) -> JournalContents {
                 )),
             },
             Record::Write(record) => fold_write(&mut out.writes, *record),
-            Record::History { .. } => {}
+            Record::History { of, rest } => {
+                if let (true, Some(op)) = (of == "write", rest.get("op").and_then(|v| v.as_str())) {
+                    out.history_writes.insert(op.to_string());
+                }
+            }
         }
     }
 
@@ -631,6 +639,7 @@ pub fn merge_shard(out: &mut JournalContents, shard: JournalContents) {
     for record in shard.writes.into_values() {
         fold_write(&mut out.writes, record);
     }
+    out.history_writes.extend(shard.history_writes);
 }
 
 // ---------------------------------------------------------------------------
@@ -891,6 +900,13 @@ impl Journal {
 
     /// Serialize and append one record. Returns `false` once journaling has
     /// been disabled by an error.
+    /// Append `record` as it is. For writers of their own shard (`restore`)
+    /// that decide what is new themselves; `false` if it could not be
+    /// written.
+    pub fn append(&mut self, record: &Record) -> bool {
+        self.error.is_none() && self.write(record)
+    }
+
     fn write(&mut self, record: &Record) -> bool {
         let Some(file) = self.file.as_mut() else {
             return false;

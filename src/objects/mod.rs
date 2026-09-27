@@ -8,6 +8,7 @@
 //! - [`inputs`] — what a snapshot's id is derived from (D17).
 //! - [`refs`] — session refs, their lock, and the reflog.
 //! - [`snapshot`] — `ambits snapshot` and `ambits log`.
+//! - [`restore`] — `ambits restore`: a snapshot back into a session.
 //! - [`gc`] — reclaiming unreachable objects.
 
 pub mod canonical;
@@ -15,6 +16,7 @@ pub mod gc;
 pub mod inputs;
 pub mod record;
 pub mod refs;
+pub mod restore;
 pub mod snapshot;
 pub mod store;
 pub mod sync_ignore;

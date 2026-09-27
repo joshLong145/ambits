@@ -32,6 +32,9 @@ A symbol that moved between files is annotated `(was <old path>)`. ambits
 identifies symbols by content as well as by path, so hoisting a helper into a
 shared module does not lose it.
 
+Not to be confused with [`ambits restore`](Snapshots#restoring), which puts
+a *snapshot's* coverage into a session.
+
 ## Options
 
 | Flag | Effect |
