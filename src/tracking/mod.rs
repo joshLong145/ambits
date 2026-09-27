@@ -116,6 +116,12 @@ impl ContextLedger {
         agent_id: String,
         token_count: usize,
     ) {
+        // Recording nothing seen must not re-establish provenance below: that
+        // would clear `stale` and adopt the current hash for a symbol nobody
+        // looked at (spec §2.7).
+        if !depth.is_seen() {
+            return;
+        }
         let entry = self.entries.entry(symbol_id.clone()).or_insert_with(|| ContextEntry {
             symbol_id: symbol_id.clone(),
             depth: ReadDepth::Unseen,

@@ -233,6 +233,12 @@ Tree ids come from the LSP cache and may not match a tree-sitter parse, so
   (`App::process_agent_event`); it must render writes explicitly.
 - Coverage: a symbol edited but never read drops out — release notes. Rejected
   edits, which today still grant `FullBody`, no longer do.
+- A write call leaves existing read state untouched: no stale-clear, no
+  provenance or hash refresh. The same holds for a read that resolves to
+  `Unseen`. Both are guarded in `apply_tool_call` (the one path every replay
+  shares) and in `ContextLedger::record`, which ignores `Unseen`. Otherwise
+  editing a drifted symbol makes the stale read look current, and the journal
+  records it as a fresh read at the post-edit hash.
 
 ---
 

@@ -11,6 +11,11 @@ has not necessarily read it, and usually reads the file again afterwards. So a
 symbol an agent edited but never read does not count toward coverage, and an
 edit that was rejected counts for nothing at all.
 
+Nor does a write refresh an earlier read. If an agent read a function, the
+function then changed, and the agent edited it without reading it again, the
+old read stays marked as out of date — `restore-context` will not hand it back
+as current.
+
 ## What is recorded
 
 For each successful write, from the tool's result in the session log:

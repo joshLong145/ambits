@@ -1123,6 +1123,12 @@ pub fn apply_tool_call(
         "tool call"
     );
 
+    // Only a read that saw something changes read state: a write is not a
+    // read (D9), and an Unseen read saw nothing.
+    if event.effect == crate::ingest::Effect::Write || !event.read_depth.is_seen() {
+        return;
+    }
+
     if !event.target_selectors.is_empty() {
         mark_selected_symbols(tree, event, ledger, depth_cache);
     }
@@ -2700,5 +2706,92 @@ mod write_tests {
         app.process_agent_event(call);
         assert_eq!(app.activity.len(), 1);
         assert_eq!(app.ledger.depth_of("src/a.rs::f"), ReadDepth::Unseen, "no read credit");
+    }
+
+    fn write_call(mut call: AgentToolCall) -> AgentToolCall {
+        call.effect = crate::ingest::Effect::Write;
+        call
+    }
+
+    /// Read `f`, then let it drift on disk: the entry is stale at its
+    /// original hash, which is what every case below must preserve.
+    fn app_with_a_stale_read() -> (App, [u8; 32]) {
+        let mut app = App::new(project(vec![file("src/a.rs", vec![sym("src/a.rs::f", "f")])]), "/p".into());
+        app.process_agent_event(tool_call("Read", "src/a.rs", ReadDepth::FullBody));
+        let read_at = app.ledger.entries["src/a.rs::f"].content_hash_at_read;
+        app.ledger.mark_stale_if_changed("src/a.rs::f", [7u8; 32]);
+        assert!(app.ledger.entries["src/a.rs::f"].stale);
+        (app, read_at)
+    }
+
+    fn assert_still_stale(app: &App, read_at: [u8; 32], case: &str) {
+        let entry = &app.ledger.entries["src/a.rs::f"];
+        assert!(entry.stale, "{case}: stale read refreshed");
+        assert_eq!(entry.content_hash_at_read, read_at, "{case}: hash replaced");
+        assert_eq!(entry.provenance, crate::tracking::Provenance::Live, "{case}");
+        assert_eq!(entry.depth, ReadDepth::FullBody, "{case}");
+    }
+
+    /// D9: a write refreshes nothing. It used to reach `ledger.record` at
+    /// Unseen, which cleared `stale` and adopted the post-edit hash — so an
+    /// edit made a stale read look current. One case per marking branch.
+    #[test]
+    fn a_write_call_leaves_a_stale_read_stale() {
+        let cases = [
+            ("whole file", write_call(tool_call("Edit", "src/a.rs", ReadDepth::Unseen))),
+            ("target symbol", write_call(tool_call_targeted("replace_symbol_body", "src/a.rs", ReadDepth::Unseen, "f"))),
+            ("selectors", {
+                let mut c = write_call(tool_call("Bash", "src/a.rs", ReadDepth::Unseen));
+                c.target_selectors = vec![("src/a.rs::f".into(), ReadDepth::Unseen)];
+                c
+            }),
+        ];
+        for (case, call) in cases {
+            let (mut app, read_at) = app_with_a_stale_read();
+            app.process_agent_event(call);
+            assert_still_stale(&app, read_at, case);
+        }
+    }
+
+    /// The same hole through a *read* stanza whose depth resolves to Unseen.
+    #[test]
+    fn an_unseen_read_leaves_a_stale_read_stale() {
+        let (mut app, read_at) = app_with_a_stale_read();
+        app.process_agent_event(tool_call("Glob", "src/a.rs", ReadDepth::Unseen));
+        assert_still_stale(&app, read_at, "unseen read");
+    }
+
+    #[test]
+    fn a_write_call_on_an_unread_file_creates_no_entries() {
+        let mut app = App::new(project(vec![file("src/a.rs", vec![sym("src/a.rs::f", "f")])]), "/p".into());
+        app.process_agent_event(write_call(tool_call("Edit", "src/a.rs", ReadDepth::Unseen)));
+        assert!(app.ledger.entries.is_empty());
+    }
+
+    /// End to end through the journal: after an edit to a drifted symbol, the
+    /// journal must still hold only the read's original hash. Before the fix
+    /// the edit re-established the read and `sync` journaled the new hash as
+    /// a fresh FullBody read.
+    #[test]
+    fn a_write_does_not_journal_a_fresh_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            project(vec![file("src/a.rs", vec![sym("src/a.rs::f", "f")])]),
+            dir.path().to_path_buf(),
+        );
+        app.set_session_id(Some("sess".into()));
+        app.enable_journal("tree-sitter", std::time::Duration::ZERO);
+        app.process_agent_event(tool_call("Read", "src/a.rs", ReadDepth::FullBody));
+        app.sync_journal();
+        let read_at = app.ledger.entries["src/a.rs::f"].content_hash_at_read;
+
+        let drifted = [7u8; 32];
+        app.project_tree.files[0].symbols[0].content_hash = drifted;
+        app.ledger.mark_stale_if_changed("src/a.rs::f", drifted);
+        app.process_agent_event(write_call(tool_call("Edit", "src/a.rs", ReadDepth::Unseen)));
+        app.sync_journal();
+
+        let contents = crate::journal::read_journal_session(&crate::journal::journal_dir(dir.path()), "sess");
+        assert_eq!(contents.reads["src/a.rs::f"], (read_at, ReadDepth::FullBody));
     }
 }
