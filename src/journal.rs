@@ -578,6 +578,39 @@ pub fn read_journal_session(dir: &Path, session_id: &str) -> JournalContents {
     out
 }
 
+/// Only the write records of `session_id`'s journal, folded by `op` (highest
+/// `av` wins) — for `ambits touched`, which needs nothing else. Read records,
+/// which outnumber writes several times over, are skipped by their prefix
+/// without being parsed. A shard with an unreadable schema contributes
+/// nothing, as in [`read_journal`].
+pub fn read_session_writes(dir: &Path, session_id: &str) -> std::collections::BTreeMap<String, crate::writes::WriteRecord> {
+    let mut out = std::collections::BTreeMap::new();
+    for path in session_shard_paths(dir, session_id) {
+        let Ok(content) = std::fs::read_to_string(&path) else { continue };
+        let mut shard = std::collections::BTreeMap::new();
+        let mut readable = true;
+        for line in content.lines() {
+            let line = line.trim();
+            if !(line.starts_with(r#"{"kind":"write""#) || line.starts_with(r#"{"kind":"header""#)) {
+                continue;
+            }
+            match serde_json::from_str::<Record>(line) {
+                Ok(Record::Header(h)) => {
+                    readable = (MIN_READABLE_SCHEMA_VERSION..=SUPPORTED_SCHEMA_VERSION).contains(&h.schema_version);
+                }
+                Ok(Record::Write(w)) => fold_write(&mut shard, *w),
+                _ => {}
+            }
+        }
+        if readable {
+            for record in shard.into_values() {
+                fold_write(&mut out, record);
+            }
+        }
+    }
+    out
+}
+
 /// Fold one shard's contents into a session's, with the same rules
 /// [`fold`] applies within a file.
 pub fn merge_shard(out: &mut JournalContents, shard: JournalContents) {
@@ -1409,6 +1442,43 @@ mod write_record_tests {
 
     fn open(root: &Path, shard: Option<&str>) -> Journal {
         Journal::open_at(root, "sess", shard, Duration::ZERO, manifest)
+    }
+
+    /// `touched`'s writes-only scan must agree with the full fold, across
+    /// shards and attribution versions, without parsing a single read.
+    #[test]
+    fn the_writes_only_scan_agrees_with_the_full_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut main = open(dir.path(), None);
+        main.record_write(&record("toolu_1", 1, "src/lib.rs::a"));
+        main.record_write(&record("toolu_2", 1, "src/lib.rs::b"));
+        let mut shard = open(dir.path(), Some("find"));
+        shard.record_write(&record("toolu_1", 2, "src/lib.rs::c"));
+        drop((main, shard));
+        let path = journal_dir(dir.path()).join("sess.ndjson");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("{\"kind\":\"read\",\"sym\":\"src/lib.rs::a\",\"h\":\"b3:00\",\"d\":\"full_body\"}\n");
+        std::fs::write(&path, text).unwrap();
+
+        let jdir = journal_dir(dir.path());
+        let fast = read_session_writes(&jdir, "sess");
+        assert_eq!(fast, read_journal_session(&jdir, "sess").writes);
+        assert_eq!(fast["toolu_1"].av, 2);
+        assert_eq!(fast.len(), 2);
+    }
+
+    #[test]
+    fn the_writes_only_scan_skips_an_unreadable_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let jdir = journal_dir(dir.path());
+        std::fs::create_dir_all(&jdir).unwrap();
+        let future = format!(
+            "{{\"kind\":\"header\",\"schema_version\":{},\"created_at\":\"0\",\"session_id\":\"sess\",\"project_root\":\"/p\",\"tree_fingerprint\":\"b3:00\",\"ambit_version\":\"0\",\"backend\":\"x\",\"os\":\"x\",\"arch\":\"x\"}}\n{}\n",
+            SUPPORTED_SCHEMA_VERSION + 1,
+            serde_json::to_string(&Record::Write(Box::new(record("toolu_1", 2, "src/lib.rs::a")))).unwrap()
+        );
+        std::fs::write(jdir.join("sess.ndjson"), future).unwrap();
+        assert!(read_session_writes(&jdir, "sess").is_empty());
     }
 
     #[test]

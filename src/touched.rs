@@ -13,7 +13,7 @@ use color_eyre::eyre::Result;
 use serde::Serialize;
 
 use crate::cache::{journal_dir, session_ids};
-use crate::journal::{encode_hash, read_journal_session};
+use crate::journal::{encode_hash, read_session_writes};
 use crate::parser::ParserRegistry;
 use crate::symbols::SymbolNode;
 use crate::writes::{Level, WriteRecord};
@@ -94,8 +94,7 @@ pub fn latest(project_root: &Path, target: &Target) -> Option<(String, WriteReco
     session_ids(&dir)
         .into_iter()
         .flat_map(|session| {
-            read_journal_session(&dir, &session)
-                .writes
+            read_session_writes(&dir, &session)
                 .into_values()
                 .filter(|w| target.is_touched_by(w))
                 .map(move |w| (session.clone(), w))
