@@ -310,15 +310,28 @@ pub struct ToolResult {
 /// walk a log in order — the batch parser, and the tailer across polls —
 /// feed calls in with [`note_calls`](Self::note_calls) and results with
 /// [`resolve`](Self::resolve).
+///
+/// Bounded: a call whose result never comes (an interrupted session) would
+/// otherwise stay for the tailer's whole life. Past [`Self::MAX_PENDING`]
+/// the oldest call is forgotten, and its write, if it ever completes, is
+/// not journaled.
 #[derive(Debug, Default)]
 pub struct WriteCorrelator {
-    pending: std::collections::HashMap<Arc<str>, AgentToolCall>,
+    /// Each pending call with the order it was noted in.
+    pending: std::collections::HashMap<Arc<str>, (u64, AgentToolCall)>,
+    next_seq: u64,
 }
 
 impl WriteCorrelator {
-    /// The write calls still awaiting results, for handing to a tailer.
+    /// Far above the handful of writes that can be in flight at once.
+    pub const MAX_PENDING: usize = 1024;
+
+    /// The write calls still awaiting results, oldest first, for handing to
+    /// a tailer.
     pub fn into_pending(self) -> Vec<AgentToolCall> {
-        self.pending.into_values().collect()
+        let mut pending: Vec<_> = self.pending.into_values().collect();
+        pending.sort_by_key(|(seq, _)| *seq);
+        pending.into_iter().map(|(_, call)| call).collect()
     }
 
     /// Remember write calls until their results arrive.
@@ -327,8 +340,15 @@ impl WriteCorrelator {
             if call.effect != Effect::Write || call.file_path.is_none() {
                 continue;
             }
-            if let Some(id) = &call.tool_use_id {
-                self.pending.insert(id.clone(), call.clone());
+            let Some(id) = &call.tool_use_id else { continue };
+            self.pending.insert(id.clone(), (self.next_seq, call.clone()));
+            self.next_seq += 1;
+            if self.pending.len() > Self::MAX_PENDING {
+                // O(n) at the cap, which only a stream of unanswered calls reaches.
+                let oldest = self.pending.iter().min_by_key(|(_, (seq, _))| *seq).map(|(id, _)| id.clone());
+                if let Some(oldest) = oldest {
+                    self.pending.remove(&oldest);
+                }
             }
         }
     }
@@ -338,7 +358,7 @@ impl WriteCorrelator {
     pub fn resolve(&mut self, results: Vec<ToolResult>) -> Vec<WriteEvent> {
         let mut out = Vec::new();
         for result in results {
-            let Some(call) = self.pending.remove(&result.tool_use_id) else {
+            let Some((_, call)) = self.pending.remove(&result.tool_use_id) else {
                 continue;
             };
             if result.is_error {
@@ -417,7 +437,11 @@ fn parse_hunks(patch: Option<&Value>) -> Option<Vec<Hunk>> {
 }
 
 /// Every `tool_result` block on a `type:"user"` line.
-fn parse_tool_results(obj: &Value) -> Vec<ToolResult> {
+///
+/// Takes `toolUseResult` out of `obj` rather than cloning it: for a `Read`
+/// or `Bash` it holds the whole output, and most results are dropped unpaired.
+fn parse_tool_results(obj: &mut Value) -> Vec<ToolResult> {
+    let mut detail = obj.get_mut("toolUseResult").map(Value::take);
     let Some(Value::Array(blocks)) = obj.pointer("/message/content") else {
         return Vec::new();
     };
@@ -428,18 +452,17 @@ fn parse_tool_results(obj: &Value) -> Vec<ToolResult> {
         .collect();
     // `toolUseResult` is one per line; it can only be attributed to a block
     // when there is exactly one.
-    let detail = obj.get("toolUseResult");
     let single = results.len() == 1;
+    let string_result = detail.as_ref().is_some_and(|d| d.is_string());
     results
         .into_iter()
         .filter_map(|b| {
             let id = b.get("tool_use_id")?.as_str()?;
-            let string_result = detail.is_some_and(|d| d.is_string());
             Some(ToolResult {
                 tool_use_id: Arc::from(id),
                 is_error: b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false)
                     || (single && string_result),
-                detail: detail.filter(|d| single && d.is_object()).cloned(),
+                detail: detail.take().filter(|d| single && d.is_object()),
                 timestamp: timestamp.clone(),
             })
         })
@@ -579,7 +602,7 @@ fn parse_compact_metadata(meta: &Value) -> Option<CompactionMetadata> {
 /// Parse a single JSONL line from a Claude Code session log.
 /// Returns a `ParsedLine` indicating tool call events, a session clear signal, or nothing.
 pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCallMapper) -> ParsedLine {
-    let obj: Value = match serde_json::from_str(line) {
+    let mut obj: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return ParsedLine::Ignored,
     };
@@ -626,7 +649,7 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
         if content.contains("<command-name>/clear</command-name>") {
             return ParsedLine::SessionCleared;
         }
-        let results = parse_tool_results(&obj);
+        let results = parse_tool_results(&mut obj);
         return if results.is_empty() {
             ParsedLine::Ignored
         } else {
@@ -2269,6 +2292,49 @@ mod write_tests {
         );
         assert!(replay.awaiting.is_empty());
         assert!(writes(&replay.events).is_empty());
+    }
+
+    fn write_call(id: &str) -> AgentToolCall {
+        match parse_jsonl_line(&call(id, "Edit", "/p/src/a.rs"), "d", &write_config()) {
+            ParsedLine::Events(mut evs) => evs.remove(0),
+            _ => unreachable!(),
+        }
+    }
+
+    fn pending_ids(c: WriteCorrelator) -> Vec<String> {
+        c.into_pending().into_iter().map(|c| c.tool_use_id.unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn the_correlator_forgets_the_oldest_call_past_its_cap() {
+        let mut c = WriteCorrelator::default();
+        let calls: Vec<_> = (0..=WriteCorrelator::MAX_PENDING).map(|i| write_call(&format!("t{i}"))).collect();
+        c.note_calls(&calls);
+        let ids = pending_ids(c);
+        assert_eq!(ids.len(), WriteCorrelator::MAX_PENDING);
+        assert_eq!(ids[0], "t1", "t0 was the oldest");
+    }
+
+    /// Resolved calls free their slot: a long run of answered writes never
+    /// evicts anything.
+    #[test]
+    fn resolved_calls_do_not_count_toward_the_cap() {
+        let mut c = WriteCorrelator::default();
+        for i in 0..3 * WriteCorrelator::MAX_PENDING {
+            let id = format!("t{i}");
+            c.note_calls(&[write_call(&id)]);
+            let done = ToolResult { tool_use_id: Arc::from(id.as_str()), is_error: false, detail: None, timestamp: String::new() };
+            assert_eq!(c.resolve(vec![done]).len(), 1);
+        }
+        c.note_calls(&[write_call("last")]);
+        assert_eq!(pending_ids(c), vec!["last"]);
+    }
+
+    #[test]
+    fn a_call_noted_twice_is_pending_once() {
+        let mut c = WriteCorrelator::default();
+        c.note_calls(&[write_call("t1"), write_call("t1")]);
+        assert_eq!(pending_ids(c), vec!["t1"]);
     }
 
     /// A partial patch would under-report the change, so any defect makes
