@@ -11,6 +11,7 @@ pub fn days(n: u64) -> Option<Duration> {
     n.checked_mul(SECS_PER_DAY).map(Duration::from_secs)
 }
 
+/// Seconds since the Unix epoch, or 0 if the clock reads before it.
 pub fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
