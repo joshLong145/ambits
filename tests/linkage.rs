@@ -130,7 +130,7 @@ fn one_writes_symbols_can_land_in_different_commits() {
     );
     repo.write_file("src/a.rs", "fn alpha() { 1; }\nfn beta() {}\n");
     let first = repo.commit_all("alpha only");
-    assert!(matches!(repo.landed(&w), Landed::Partial { commits } if commits == vec![first.clone()]));
+    assert!(matches!(repo.landed(&w), Landed::Partial { commits, unverified: false } if commits == vec![first.clone()]));
 
     repo.write_file("src/a.rs", both);
     let second = repo.commit_all("then beta");
@@ -287,4 +287,108 @@ fn the_git_hook_chains_and_never_fails_a_commit() {
     assert!(ambits::git_hook::uninstall(&repo.root).unwrap());
     let restored = std::fs::read_to_string(&existing).unwrap();
     assert!(restored.contains("chained-ran"), "the original hook is back");
+}
+
+/// A file long enough that git detects the rename, carrying the edit with it.
+#[test]
+fn a_write_committed_through_a_detected_rename_is_found() {
+    let repo = Repo::new();
+    let long: String = (0..40).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    repo.write_file("src/a.rs", &long);
+    repo.commit_all("long file");
+    let edited = long.replace("fn f0() {}", "fn f0() { 1; }");
+    repo.write_file("src/a.rs", &edited);
+    let w = write("toolu_1", Level::Symbol, vec![("src/a.rs::f0", hash_of(&edited, "f0"))], None);
+    git(&repo.root, &["mv", "src/a.rs", "src/b.rs"]);
+    let commit = repo.commit_all("rename with the edit");
+    let log = git(&repo.root, &["show", "--name-status", "--format=", "HEAD"]);
+    assert!(log.starts_with('R'), "git saw a rename: {log}");
+    assert_eq!(repo.landed(&w), Landed::Verified { commits: vec![commit] });
+}
+
+/// A rename on one branch must not stop the search following the file on
+/// another: the log mixes branches.
+#[test]
+fn a_rename_on_another_branch_does_not_hide_this_one() {
+    let repo = Repo::new();
+    repo.write_file("src/a.rs", EDITED);
+    let w = write("toolu_1", Level::Symbol, vec![("src/a.rs::alpha", hash_of(EDITED, "alpha"))], None);
+    git(&repo.root, &["stash", "-q"]);
+    git(&repo.root, &["checkout", "-q", "-b", "feature"]);
+    git(&repo.root, &["mv", "src/a.rs", "src/b.rs"]);
+    repo.commit_all("rename on feature");
+    git(&repo.root, &["checkout", "-q", "main"]);
+    git(&repo.root, &["stash", "pop", "-q"]);
+    let commit = repo.commit_all("the write, on main");
+    assert_eq!(repo.landed(&w), Landed::Verified { commits: vec![commit] });
+}
+
+/// A project in a subdirectory of its repository, with `diff.relative` set:
+/// git would print project-relative paths unless told not to.
+#[test]
+fn a_subdirectory_project_resolves_despite_diff_relative() {
+    let dir = tempfile::tempdir().unwrap();
+    let top = dir.path().canonicalize().unwrap();
+    let root = top.join("proj");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
+    git(&top, &["init", "-q"]);
+    git(&top, &["config", "diff.relative", "true"]);
+    git(&top, &["add", "."]);
+    git(&top, &["commit", "-qm", "init"]);
+    std::fs::write(root.join("src/a.rs"), EDITED).unwrap();
+    let w = write("toolu_1", Level::Symbol, vec![("src/a.rs::alpha", hash_of(EDITED, "alpha"))], None);
+    git(&top, &["commit", "-qam", "edit"]);
+    let commit = git(&top, &["rev-parse", "HEAD"]);
+    let result = landed(Resolver::new(&root).as_mut(), &w, &|_| true).unwrap();
+    assert_eq!(result, Landed::Verified { commits: vec![commit] });
+}
+
+fn hooks_dir(root: &Path) -> PathBuf {
+    let hooks = PathBuf::from(git(root, &["rev-parse", "--git-path", "hooks"]));
+    if hooks.is_absolute() { hooks } else { root.join(hooks) }
+}
+
+/// A commit whose output is captured (`$(git commit)`, an IDE, an agent's
+/// shell tool) must not wait for the hook's background work.
+#[test]
+fn the_git_hook_never_delays_a_captured_commit() {
+    let repo = Repo::new();
+    std::fs::create_dir_all(repo.root.join(".ambits")).unwrap();
+    let slow = repo.root.join("slow-ambits");
+    std::fs::write(&slow, "#!/bin/sh\nsleep 5\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    ambits::git_hook::install(&repo.root, &slow).unwrap();
+    repo.write_file("src/a.rs", EDITED);
+    git(&repo.root, &["add", "-A"]);
+    let started = std::time::Instant::now();
+    git(&repo.root, &["commit", "-qm", "captured"]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(3), "commit waited {:?}", started.elapsed());
+}
+
+/// Installed for real, the hook records the landing commit in the links
+/// index without being asked.
+#[test]
+fn the_git_hook_records_links() {
+    let repo = Repo::new();
+    repo.write_file("src/a.rs", EDITED);
+    let w = write("toolu_1", Level::Symbol, vec![("src/a.rs::alpha", hash_of(EDITED, "alpha"))], None);
+    let dir = repo.root.join(".ambits/coverage");
+    std::fs::create_dir_all(&dir).unwrap();
+    let line = serde_json::to_string(&ambits::journal::Record::Write(Box::new(w))).unwrap();
+    std::fs::write(dir.join(format!("{SESSION}.ndjson")), format!("{line}\n")).unwrap();
+    ambits::git_hook::install(&repo.root, Path::new(env!("CARGO_BIN_EXE_ambits"))).unwrap();
+    assert!(hooks_dir(&repo.root).join("post-commit").exists());
+
+    repo.commit_all("edit alpha");
+    let links = repo.root.join(".ambits/links");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::fs::read_dir(&links).map_or(0, |d| d.count()) == 0 {
+        assert!(std::time::Instant::now() < deadline, "the hook wrote no link");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }

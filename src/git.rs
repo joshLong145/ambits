@@ -38,6 +38,22 @@ fn command(dir: &Path) -> Command {
     command
 }
 
+/// `git config <scope> --get <key>` — `scope` is `--global` or `--system` —
+/// with the system config visible, unlike every other call here. `Ok(None)`
+/// when the key is unset; an error when git could not answer (too old for
+/// the scope flag, or missing), so callers never mistake "unknown" for
+/// "unset".
+pub fn config_get(dir: &Path, scope: &str, key: &str) -> color_eyre::Result<Option<String>> {
+    let mut cmd = command(dir);
+    cmd.env_remove("GIT_CONFIG_NOSYSTEM");
+    let out = cmd.args(["config", scope, "--get", key]).output()?;
+    match out.status.code() {
+        Some(0) => Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_string())),
+        Some(1) => Ok(None),
+        _ => Err(color_eyre::eyre::eyre!("git config {scope} --get {key} failed: {}", String::from_utf8_lossy(&out.stderr).trim())),
+    }
+}
+
 /// Run `git <args>` in `dir`; `None` if git is missing or the command fails.
 pub fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let output = command(dir).args(args).output().ok()?;

@@ -88,9 +88,15 @@ ambits hook install --git      # remove with: ambits hook uninstall --git
 ```
 
 After each commit it records where recent writes landed, in the background.
-It keeps any `post-commit` hook you already have (and runs it first), acts
-only in repositories with an `.ambits/` directory at the top, and can never
-fail or delay a commit.
+It keeps any `post-commit` hook you already have (and runs it first), and can
+never fail or delay a commit. It acts only when `.ambits/` is at the
+repository's top level, so a project in a subdirectory of its repository is
+not refreshed by it; `touched` still resolves on demand. It refuses to
+install when `core.hooksPath` is set in your global or system git config,
+since the hook would then run for every repository.
+
+Not seen: changes made while resolving a merge conflict (merge commits list
+none), and files whose names contain `:` or `\`.
 
 Writes are journaled by the [TUI](TUI), like reads — see
 [Configuration → The read journal](Configuration#the-read-journal).

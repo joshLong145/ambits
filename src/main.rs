@@ -191,7 +191,6 @@ enum Commands {
         reference: Option<String>,
     },
 
-    /// Delete snapshot objects that no ref or recent reflog entry reaches.
     /// Maintain the links index (which commit agent writes landed in).
     #[command(hide = true)]
     Links {
@@ -199,6 +198,7 @@ enum Commands {
         command: LinksCommands,
     },
 
+    /// Delete snapshot objects that no ref or recent reflog entry reaches.
     Gc {
         /// Keep unreachable objects younger than this many days.
         #[arg(long, default_value_t = 14)]
@@ -1115,8 +1115,13 @@ fn run() -> Result<()> {
                 HookCommands::Install { git: true, project, .. } => {
                     let dir = project.clone().unwrap_or(std::env::current_dir()?);
                     let exe = std::env::current_exe()?.canonicalize()?;
-                    let path = ambits::git_hook::install(&dir, &exe)?;
-                    writeln!(io::stdout().lock(), "installed {}", path.display())?;
+                    let installed = ambits::git_hook::install(&dir, &exe)?;
+                    writeln!(io::stdout().lock(), "installed {}", installed.path.display())?;
+                    if installed.in_work_tree {
+                        ambits::try_eprintln!(
+                            "[ambit] note: this hooks directory is inside the work tree and may be tracked; the hook names this machine's ambits path"
+                        );
+                    }
                     Ok(())
                 }
                 HookCommands::Install { global, project, .. } => {

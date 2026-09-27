@@ -17,7 +17,7 @@ use color_eyre::eyre::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::git::{git, is_commit_id, Repo};
-use crate::objects::store::{create_private_dir, write_atomic};
+use crate::objects::store::create_private_dir;
 use crate::objects::{b3, valid_record_path};
 use crate::parser::ParserRegistry;
 use crate::writes::{Level, WriteRecord};
@@ -101,6 +101,10 @@ pub enum Landing {
     Uncommitted,
 }
 
+/// Clock skew allowed between the session log's timestamps and commit times
+/// on the same machine: commits this long before a write are still searched.
+pub const SKEW_SECS: u64 = 10 * 60;
+
 /// One commit of the log, with the paths it touched (repo-relative).
 #[derive(Debug, Clone)]
 struct Commit {
@@ -111,19 +115,32 @@ struct Commit {
 
 #[derive(Debug, Clone)]
 enum Change {
-    /// Added, modified or type-changed.
-    Touched(String),
+    Added(String),
+    /// Modified or type-changed.
+    Modified(String),
     Deleted(String),
     Renamed { from: String, to: String },
 }
 
-/// Resolves units against one repository, caching the log per start time.
+/// The never-landed cache entry: the branch tips a unit was last searched
+/// up to, and the names its file had by then.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NeverLanded {
+    tips: Vec<String>,
+    names: Vec<String>,
+}
+
+/// Resolves units against one repository.
 pub struct Resolver {
     repo: Repo,
     state: PathBuf,
     registry: ParserRegistry,
-    logs: HashMap<u64, Vec<Commit>>,
-    tips: String,
+    /// The log from `log_since` on, oldest first: one search serves every
+    /// write that starts at or after it.
+    log: Vec<Commit>,
+    log_since: Option<u64>,
+    /// Every branch tip and `HEAD`, sorted and deduplicated.
+    tips: Vec<String>,
     /// What each `(commit, path)` contains, computed once: many units share
     /// a file, and a refresh walks the same commits for all of them.
     contents: HashMap<(String, String), Contents>,
@@ -137,16 +154,26 @@ struct Contents {
     symbols: std::collections::HashSet<(String, String)>,
 }
 
+/// Arguments every `git log` here runs with, overriding user config that
+/// would change its output: signatures printed before each commit
+/// (`log.showSignature`), paths relative to the current directory
+/// (`diff.relative`), colour, external diff drivers.
+const LOG_ARGS: &[&str] = &[
+    "log", "--no-show-signature", "--no-relative", "--no-color", "--no-ext-diff", "-M", "--name-status", "-z",
+    "--format=commit %H %ct", "--reverse",
+];
+
 impl Resolver {
     /// `None` outside a git repository or before its first commit.
     pub fn new(project_root: &Path) -> Option<Self> {
         let repo = Repo::discover(project_root).filter(|r| r.head.is_some())?;
-        let tips = tips_digest(project_root);
+        let tips = tips(project_root);
         Some(Self {
             repo,
             state: project_root.join(crate::state_dir::STATE_DIR),
             registry: ParserRegistry::new(),
-            logs: HashMap::new(),
+            log: Vec::new(),
+            log_since: None,
             tips,
             contents: HashMap::new(),
         })
@@ -156,9 +183,23 @@ impl Resolver {
         self.repo.dir()
     }
 
+    /// Load the log from `since` on, if what is loaded starts later.
+    /// [`refresh`] calls it once with its earliest write, so every write
+    /// shares one search.
+    pub fn prime(&mut self, since: u64) {
+        if self.log_since.is_some_and(|s| s <= since) {
+            return;
+        }
+        let since_arg = format!("--since={}", crate::objects::refs::rfc3339(since));
+        let mut args: Vec<&str> = LOG_ARGS.to_vec();
+        args.extend(["--branches", "HEAD", &since_arg]);
+        self.log = parse_log(&git(self.dir(), &args).unwrap_or_default());
+        self.log_since = Some(since);
+    }
+
     /// Where `unit` of `write` landed: from the links index when the commit
-    /// is still reachable, from the never-landed cache while no branch has
-    /// moved, else resolved now and cached.
+    /// is still reachable, else resolved and cached. Caching is best-effort:
+    /// a store that cannot be written costs speed, never the answer.
     pub fn landing(&mut self, write: &WriteRecord, unit: &Unit) -> Result<Landing> {
         let key = link_key(&write.op, &unit.target, unit.hash());
         let link_path = self.state.join("links").join(format!("{key}.json"));
@@ -171,90 +212,113 @@ impl Resolver {
             // Amended or rebased away: resolve again.
             let _ = std::fs::remove_file(&link_path);
         }
-        if std::fs::read_to_string(&never_path).is_ok_and(|tips| tips.trim() == self.tips) {
-            return Ok(Landing::Uncommitted);
-        }
 
-        let landing = self.resolve(write, unit);
+        let cached: Option<NeverLanded> = std::fs::read_to_string(&never_path).ok().and_then(|s| serde_json::from_str(&s).ok());
+        let (landing, names) = match cached {
+            // Nothing has moved since it was last searched.
+            Some(c) if c.tips == self.tips => return Ok(Landing::Uncommitted),
+            // Search only what is new since then, from the names the file
+            // had by then.
+            Some(c) => match self.new_commits(&c.tips) {
+                Some(commits) => self.search(write, unit, &commits, c.names),
+                None => self.resolve(write, unit),
+            },
+            None => self.resolve(write, unit),
+        };
         match &landing {
             Landing::Landed(link) => {
-                create_private_dir(link_path.parent().expect("has parent"))?;
-                write_atomic(&link_path, serde_json::to_string(link)?.as_bytes())?;
+                let _ = write_cache(&link_path, &serde_json::to_vec(link)?);
                 let _ = std::fs::remove_file(&never_path);
             }
             Landing::Uncommitted => {
-                create_private_dir(never_path.parent().expect("has parent"))?;
-                write_atomic(&never_path, format!("{}\n", self.tips).as_bytes())?;
+                let entry = NeverLanded { tips: self.tips.clone(), names };
+                let _ = write_cache(&never_path, &serde_json::to_vec(&entry)?);
             }
         }
         Ok(landing)
     }
 
-    /// Resolve without caches (§3.2): walk the commits since a day before
-    /// the write, oldest first, following the file through renames, and
-    /// take the first whose version of it contains the unit.
-    fn resolve(&mut self, write: &WriteRecord, unit: &Unit) -> Landing {
+    /// Resolve from scratch (§3.2): the commits since just before the write.
+    fn resolve(&mut self, write: &WriteRecord, unit: &Unit) -> (Landing, Vec<String>) {
         let Some(written_at) = crate::objects::refs::parse_rfc3339(&write.t) else {
-            return Landing::Uncommitted;
+            return (Landing::Uncommitted, Vec::new());
         };
-        if !valid_record_path(&write.file) {
-            return Landing::Uncommitted;
+        let since = written_at.saturating_sub(SKEW_SECS);
+        self.prime(since);
+        let commits: Vec<Commit> = self.log.iter().filter(|c| c.time >= since).cloned().collect();
+        let names = vec![format!("{}{}", self.repo.prefix, write.file)];
+        self.search(write, unit, &commits, names)
+    }
+
+    /// Commits reachable from the current tips but not from `old`, oldest
+    /// first; `None` when an old tip no longer exists.
+    fn new_commits(&self, old: &[String]) -> Option<Vec<Commit>> {
+        if old.iter().any(|t| !is_commit_id(t)) {
+            return None;
         }
-        let since = written_at.saturating_sub(24 * 60 * 60);
-        let commits = self.log(since);
+        let mut args: Vec<&str> = LOG_ARGS.to_vec();
+        args.extend(self.tips.iter().map(String::as_str));
+        args.push("--not");
+        args.extend(old.iter().map(String::as_str));
+        git(self.dir(), &args).map(|out| parse_log(&out))
+    }
+
+    /// Walk `commits` oldest first and take the first whose version of the
+    /// file contains `unit`. `names` are every name the file is known by
+    /// (repo-relative); a rename adds its new name and keeps the old, since
+    /// the log mixes branches and a rename on one says nothing about the
+    /// others. Returns the names as they stand at the end, for the cache.
+    fn search(&mut self, write: &WriteRecord, unit: &Unit, commits: &[Commit], mut names: Vec<String>) -> (Landing, Vec<String>) {
+        let written_at = crate::objects::refs::parse_rfc3339(&write.t).unwrap_or(0);
+        if !valid_record_path(&write.file) {
+            return (Landing::Uncommitted, names);
+        }
         let prefix = self.repo.prefix.clone();
-        let mut path = format!("{prefix}{}", write.file);
+        // With nothing to compare, following renames could only guess:
+        // unverified results stay on the file's own name.
+        let follow = !matches!(unit.proof, Proof::None);
 
         for commit in commits {
-            let mut touched = false;
+            let mut candidates: Vec<String> = Vec::new();
             let mut deleted = false;
             for change in &commit.changes {
                 match change {
-                    Change::Touched(p) if *p == path => touched = true,
-                    Change::Renamed { from, to } if *from == path => {
-                        path = to.clone();
-                        touched = true;
+                    Change::Added(p) | Change::Modified(p) if names.contains(p) => candidates.push(p.clone()),
+                    Change::Renamed { from, to } if names.contains(from) || names.contains(to) => {
+                        if follow && !names.contains(to) {
+                            names.push(to.clone());
+                        }
+                        candidates.push(to.clone());
                     }
-                    Change::Deleted(p) if *p == path => deleted = true,
+                    Change::Deleted(p) if names.contains(p) => deleted = true,
                     _ => {}
                 }
             }
             // A rename that also changed most of the file is no rename to
-            // git: it reports a deletion and an addition. Look for the unit
-            // in what the commit added, and follow it there.
-            if deleted && !touched && !matches!(unit.proof, Proof::None) {
-                let added: Vec<String> = commit
-                    .changes
-                    .iter()
-                    .filter_map(|c| match c {
-                        Change::Touched(p) => Some(p.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                for candidate in added {
-                    let Some(rel) = candidate.strip_prefix(&prefix).map(str::to_string) else { continue };
-                    if self.contains(&commit.sha, &candidate, &rel, unit) {
-                        return Landing::Landed(self.link(write, unit, &commit.sha, rel));
+            // git: it reports a deletion and an addition. The unit may be in
+            // what the commit added — only added files, never modified ones.
+            if follow && deleted && candidates.is_empty() {
+                for change in &commit.changes {
+                    if let Change::Added(p) = change {
+                        if !names.contains(p) {
+                            names.push(p.clone());
+                        }
+                        candidates.push(p.clone());
                     }
                 }
-                continue;
             }
-            if !touched {
-                continue;
-            }
-            let Some(rel) = path.strip_prefix(&prefix).map(str::to_string) else {
-                // Renamed out of the project: nothing further to find.
-                return Landing::Uncommitted;
-            };
-            let found = match &unit.proof {
-                Proof::None => commit.time >= written_at,
-                _ => self.contains(&commit.sha, &path, &rel, unit),
-            };
-            if found {
-                return Landing::Landed(self.link(write, unit, &commit.sha, rel));
+            for path in candidates {
+                let Some(rel) = path.strip_prefix(&prefix).map(str::to_string) else { continue };
+                let found = match &unit.proof {
+                    Proof::None => commit.time >= written_at,
+                    _ => self.contains(&commit.sha, &path, &rel, unit),
+                };
+                if found {
+                    return (Landing::Landed(self.link(write, unit, &commit.sha, rel)), names);
+                }
             }
         }
-        Landing::Uncommitted
+        (Landing::Uncommitted, names)
     }
 
     /// Whether commit `sha`'s version of `path` (repo-relative; `rel` is
@@ -320,56 +384,40 @@ impl Resolver {
             .is_some_and(|out| !out.is_empty());
         on_branch || git(self.dir(), &["merge-base", "--is-ancestor", "--end-of-options", sha, "HEAD"]).is_some()
     }
-
-    /// Commits reachable from any branch or `HEAD` since `since`, oldest
-    /// first, with the paths each touched and renames detected. Not limited
-    /// to the write's path: a pathspec would hide the rename that moved it
-    /// (spec §3.2, amended).
-    fn log(&mut self, since: u64) -> Vec<Commit> {
-        if let Some(cached) = self.logs.get(&since) {
-            return cached.clone();
-        }
-        let since_arg = format!("--since={}", crate::objects::refs::rfc3339(since));
-        let out = git(
-            self.dir(),
-            &[
-                "log", "--branches", "HEAD", "--full-history", "-M", "--name-status", "-z",
-                "--format=commit %H %ct", "--reverse", &since_arg,
-            ],
-        )
-        .unwrap_or_default();
-        let commits = parse_log(&out);
-        self.logs.insert(since, commits.clone());
-        commits
-    }
 }
 
 /// Parse `git log --name-status -z --format='commit %H %ct'`.
+///
+/// Tokens are NUL-separated. A commit header is the *last line* of its
+/// token, so text git prints before it (a signature, should config ask for
+/// one anyway) cannot hide the commit. Paths are taken exactly as given:
+/// only the status tokens carry the newline that separates a commit's
+/// header from its changes.
 fn parse_log(out: &[u8]) -> Vec<Commit> {
     let mut commits: Vec<Commit> = Vec::new();
-    let mut tokens = out.split(|&b| b == 0).map(|t| String::from_utf8_lossy(t).trim_start_matches('\n').to_string());
+    let mut tokens = out.split(|&b| b == 0).map(|t| String::from_utf8_lossy(t).into_owned());
     while let Some(token) = tokens.next() {
-        if let Some(rest) = token.strip_prefix("commit ") {
+        let token = token.strip_prefix('\n').unwrap_or(&token).to_string();
+        if let Some(rest) = token.rsplit('\n').next().and_then(|line| line.strip_prefix("commit ")) {
             let mut parts = rest.split(' ');
             let sha = parts.next().unwrap_or_default().to_string();
-            let time = parts.next().and_then(|t| t.parse().ok()).unwrap_or(0);
-            if is_commit_id(&sha) {
+            let time = parts.next().and_then(|t| t.parse().ok());
+            if let (true, Some(time)) = (is_commit_id(&sha), time) {
                 commits.push(Commit { sha, time, changes: Vec::new() });
+                continue;
             }
-            continue;
         }
         let Some(commit) = commits.last_mut() else { continue };
+        let mut path = || tokens.next().unwrap_or_default();
         let change = match token.as_bytes().first() {
-            Some(b'R') | Some(b'C') => {
-                let (from, to) = (tokens.next().unwrap_or_default(), tokens.next().unwrap_or_default());
-                if token.starts_with('R') {
-                    Change::Renamed { from, to }
-                } else {
-                    Change::Touched(to)
-                }
+            Some(b'R') => Change::Renamed { from: path(), to: path() },
+            Some(b'C') => {
+                let _source = path();
+                Change::Added(path())
             }
-            Some(b'D') => Change::Deleted(tokens.next().unwrap_or_default()),
-            Some(b'A' | b'M' | b'T') => Change::Touched(tokens.next().unwrap_or_default()),
+            Some(b'D') => Change::Deleted(path()),
+            Some(b'A') => Change::Added(path()),
+            Some(b'M' | b'T') => Change::Modified(path()),
             _ => continue,
         };
         commit.changes.push(change);
@@ -377,16 +425,35 @@ fn parse_log(out: &[u8]) -> Vec<Commit> {
     commits
 }
 
-/// Identifies the state of every branch and `HEAD`: the never-landed cache
-/// is valid only while this is unchanged.
-fn tips_digest(dir: &Path) -> String {
-    let heads = git(dir, &["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"]).unwrap_or_default();
+/// Every local branch tip and `HEAD`, sorted and deduplicated. The
+/// never-landed cache is exact while these are unchanged, and otherwise
+/// only commits not reachable from the old tips need searching.
+fn tips(dir: &Path) -> Vec<String> {
+    let heads = git(dir, &["for-each-ref", "--format=%(objectname)", "refs/heads"]).unwrap_or_default();
     let head = git(dir, &["rev-parse", "--verify", "--quiet", "HEAD"]).unwrap_or_default();
-    let mut h = blake3::Hasher::new();
-    h.update(&heads);
-    h.update(b"\0");
-    h.update(&head);
-    h.finalize().to_hex().to_string()
+    let mut tips: Vec<String> = String::from_utf8_lossy(&heads)
+        .lines()
+        .chain(String::from_utf8_lossy(&head).lines())
+        .map(str::trim)
+        .filter(|t| is_commit_id(t))
+        .map(String::from)
+        .collect();
+    tips.sort();
+    tips.dedup();
+    tips
+}
+
+/// Write a cache file: atomic by rename, but not fsynced — losing one to a
+/// crash only means resolving it again.
+fn write_cache(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path.parent().expect("cache files live in a directory");
+    create_private_dir(dir)?;
+    let tmp = dir.join(format!(".tmp-{}", crate::objects::store::random_token()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    Ok(())
 }
 
 /// The file name of a unit's entry: a hash of `(op, target, hash)`, so
@@ -418,20 +485,30 @@ pub fn refresh(project_root: &Path, window: std::time::Duration, budget: std::ti
     let Some(mut resolver) = Resolver::new(project_root) else { return Ok(stats) };
     let cutoff = crate::objects::refs::now_secs().saturating_sub(window.as_secs());
     let dir = crate::journal::journal_dir(project_root);
-    for session in crate::cache::session_ids(&dir) {
-        for write in crate::journal::read_session_writes(&dir, &session).into_values() {
-            if crate::objects::refs::parse_rfc3339(&write.t).is_none_or(|t| t < cutoff) {
-                continue;
+
+    // Newest first: if the budget runs out, what goes unresolved is the
+    // oldest, least likely to be asked about — and not the same tail
+    // starved on every run in session order.
+    let mut writes: Vec<(u64, WriteRecord)> = crate::cache::session_ids(&dir)
+        .into_iter()
+        .flat_map(|session| crate::journal::read_session_writes(&dir, &session).into_values())
+        .filter_map(|w| Some((crate::objects::refs::parse_rfc3339(&w.t).filter(|t| *t >= cutoff)?, w)))
+        .collect();
+    writes.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.op.cmp(&b.1.op)));
+    // One history search for all of them.
+    if let Some(earliest) = writes.iter().map(|(t, _)| *t).min() {
+        resolver.prime(earliest.saturating_sub(SKEW_SECS));
+    }
+
+    for (_, write) in &writes {
+        for unit in units(write) {
+            if started.elapsed() > budget {
+                stats.stopped_early = true;
+                return Ok(stats);
             }
-            for unit in units(&write) {
-                if started.elapsed() > budget {
-                    stats.stopped_early = true;
-                    return Ok(stats);
-                }
-                match resolver.landing(&write, &unit)? {
-                    Landing::Landed(_) => stats.landed += 1,
-                    Landing::Uncommitted => stats.uncommitted += 1,
-                }
+            match resolver.landing(write, &unit)? {
+                Landing::Landed(_) => stats.landed += 1,
+                Landing::Uncommitted => stats.uncommitted += 1,
             }
         }
     }
@@ -447,8 +524,9 @@ pub enum Landed {
     /// The first commit touching the file after the write; nothing could be
     /// compared (a file-level `Edit`).
     Unverified { commits: Vec<String> },
-    /// Some units landed, others are in no commit yet.
-    Partial { commits: Vec<String> },
+    /// Some units landed, others are in no commit yet. `unverified` when
+    /// any that landed could not be compared.
+    Partial { commits: Vec<String>, unverified: bool },
     Uncommitted,
     /// Not a git repository, or no commits yet.
     NoRepository,
@@ -472,7 +550,7 @@ pub fn landed(resolver: Option<&mut Resolver>, write: &WriteRecord, keep: &dyn F
     }
     Ok(match (commits.is_empty(), missing > 0, unverified) {
         (true, _, _) => Landed::Uncommitted,
-        (false, true, _) => Landed::Partial { commits },
+        (false, true, unverified) => Landed::Partial { commits, unverified },
         (false, false, true) => Landed::Unverified { commits },
         (false, false, false) => Landed::Verified { commits },
     })
@@ -486,7 +564,7 @@ mod tests {
     fn the_log_parses_changes_and_renames() {
         let sha = |c: char| c.to_string().repeat(40);
         let out = format!(
-            "commit {} 100\0\0\nA\0a.rs\0commit {} 200\0\0\nR100\0a.rs\0b.rs\0M\0c.rs\0commit {} 300\0\0\nD\0b.rs\0",
+            "commit {} 100\0\0\nA\0a.rs\0No signature\ncommit {} 200\0\0\nR100\0a.rs\0b.rs\0M\0c.rs\0commit {} 300\0\0\nD\0\nodd.rs\0",
             sha('a'),
             sha('b'),
             sha('c')
@@ -495,8 +573,57 @@ mod tests {
         assert_eq!(commits.len(), 3);
         assert_eq!(commits[1].time, 200);
         assert!(matches!(&commits[1].changes[0], Change::Renamed { from, to } if from == "a.rs" && to == "b.rs"));
-        assert!(matches!(&commits[1].changes[1], Change::Touched(p) if p == "c.rs"));
-        assert!(matches!(&commits[2].changes[0], Change::Deleted(p) if p == "b.rs"));
+        assert!(matches!(&commits[1].changes[1], Change::Modified(p) if p == "c.rs"));
+        assert!(matches!(&commits[0].changes[0], Change::Added(p) if p == "a.rs"));
+        // A path may begin with a newline; only status tokens lose theirs.
+        assert!(matches!(&commits[2].changes[0], Change::Deleted(p) if p == "\nodd.rs"));
+    }
+
+    /// The never-landed cache is *read*: seeded with the current tips, it
+    /// answers "uncommitted" even for a unit that is committed.
+    #[test]
+    fn the_never_landed_cache_is_consulted_while_the_tips_stand() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        run(&["init", "-q"]);
+        run(&["add", "."]);
+        run(&["commit", "-qm", "c"]);
+
+        let write = WriteRecord {
+            op: "toolu_1".into(),
+            av: 2,
+            a: "a".into(),
+            t: crate::objects::refs::rfc3339(crate::objects::refs::now_secs() - 60),
+            tool: "Edit".into(),
+            file: "a.txt".into(),
+            level: Level::File,
+            outside_symbols: false,
+            syms: vec![],
+            removed: vec![],
+            fh: Some(b3(blake3::hash(b"x").as_bytes())),
+        };
+        let unit = &units(&write)[0];
+        let mut resolver = Resolver::new(&root).unwrap();
+        let key = link_key(&write.op, &unit.target, unit.hash());
+        let entry = NeverLanded { tips: resolver.tips.clone(), names: vec!["a.txt".into()] };
+        write_cache(&root.join(".ambits/cache/never-landed").join(format!("{key}.json")), &serde_json::to_vec(&entry).unwrap()).unwrap();
+        assert_eq!(resolver.landing(&write, unit).unwrap(), Landing::Uncommitted);
     }
 
     #[test]

@@ -19,21 +19,28 @@ use crate::git::git;
 const MARKER: &str = "# Installed by `ambits hook install --git`";
 const CHAINED: &str = "post-commit.ambits-chained";
 
-fn hooks_dir(repo_dir: &Path) -> Result<PathBuf> {
-    if crate::git::Repo::discover(repo_dir).is_none() {
+/// Where git runs this repository's hooks, and whether that is inside the
+/// work tree (a tracked `.husky/`, say).
+fn hooks_dir(repo_dir: &Path) -> Result<(PathBuf, bool)> {
+    let Some(repo) = crate::git::Repo::discover(repo_dir) else {
         bail!("{} is not inside a git repository", repo_dir.display());
-    }
-    // A hooksPath set in global or system config would make the hook apply
-    // to every repository (§9.3: never global).
-    if let Some(scope) = git(repo_dir, &["config", "--show-scope", "--get", "core.hooksPath"]) {
-        let scope = String::from_utf8_lossy(&scope);
-        if !scope.starts_with("local") && !scope.starts_with("worktree") {
-            bail!("core.hooksPath is set outside this repository ({}); not installing a hook every repository would run", scope.trim());
+    };
+    // A hooksPath from global or system config would make the hook apply to
+    // every repository (§9.3: never global). Asked per scope, with system
+    // config visible, and a git too old to answer is an error, not a pass.
+    for scope in ["--global", "--system"] {
+        if let Some(path) = crate::git::config_get(repo_dir, scope, "core.hooksPath")? {
+            bail!("core.hooksPath is set in {} config ({path}); not installing a hook every repository would run", &scope[2..]);
         }
     }
     let out = git(repo_dir, &["rev-parse", "--git-path", "hooks"]).ok_or_else(|| eyre!("git could not locate the hooks directory"))?;
     let path = PathBuf::from(String::from_utf8_lossy(&out).trim());
-    Ok(if path.is_absolute() { path } else { repo_dir.join(path) })
+    let path = if path.is_absolute() { path } else { repo_dir.join(path) };
+    let git_dir = git(repo_dir, &["rev-parse", "--absolute-git-dir"]).map(|o| PathBuf::from(String::from_utf8_lossy(&o).trim()));
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let (hooks, top) = (canonical(&path), canonical(&repo.top));
+    let in_work_tree = hooks.starts_with(&top) && !git_dir.as_deref().is_some_and(|g| hooks.starts_with(canonical(g)));
+    Ok((path, in_work_tree))
 }
 
 /// Quote `s` for a POSIX shell.
@@ -55,7 +62,7 @@ if [ -x "$chained" ]; then
 fi
 top=$(git rev-parse --show-toplevel 2>/dev/null) || exit "$status"
 if [ -d "$top/.ambits" ]; then
-  ( {ambits} -p "$top" links refresh >/dev/null 2>&1 || true ) &
+  ( {ambits} -p "$top" links refresh || true ) </dev/null >/dev/null 2>&1 &
 fi
 exit "$status"
 "#,
@@ -63,34 +70,57 @@ exit "$status"
     )
 }
 
+/// What [`install`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installed {
+    pub path: PathBuf,
+    /// The hooks directory is inside the work tree, where it may be tracked
+    /// and shared.
+    pub in_work_tree: bool,
+}
+
 /// Install the hook for the repository containing `repo_dir`, running
-/// `ambits` (an absolute path to this binary). Returns the hook's path.
-pub fn install(repo_dir: &Path, ambits: &Path) -> Result<PathBuf> {
-    let dir = hooks_dir(repo_dir)?;
+/// `ambits` (an absolute path to this binary).
+pub fn install(repo_dir: &Path, ambits: &Path) -> Result<Installed> {
+    let Some(ambits) = ambits.to_str() else {
+        bail!("the ambits path {} is not UTF-8, so a hook cannot name it reliably", ambits.display());
+    };
+    let (dir, in_work_tree) = hooks_dir(repo_dir)?;
     std::fs::create_dir_all(&dir)?;
     let hook = dir.join("post-commit");
+    let chained = dir.join(CHAINED);
+    let mut moved = false;
     if let Ok(existing) = std::fs::read_to_string(&hook) {
         if !existing.contains(MARKER) {
-            let chained = dir.join(CHAINED);
             if chained.exists() {
                 bail!("{} already exists; resolve it by hand before installing", chained.display());
             }
             std::fs::rename(&hook, &chained).wrap_err("keeping the existing post-commit hook")?;
+            moved = true;
         }
     }
-    std::fs::write(&hook, script(ambits))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+    let written = std::fs::write(&hook, script(Path::new(ambits))).and_then(|()| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(())
+    });
+    if let Err(e) = written {
+        // Never leave the repository without the hook it had.
+        if moved {
+            let _ = std::fs::rename(&chained, &hook);
+        }
+        return Err(e).wrap_err("writing the post-commit hook");
     }
-    Ok(hook)
+    Ok(Installed { path: hook, in_work_tree })
 }
 
 /// Remove the hook, putting back any hook it chained to. Returns whether
 /// there was one to remove.
 pub fn uninstall(repo_dir: &Path) -> Result<bool> {
-    let dir = hooks_dir(repo_dir)?;
+    let (dir, _) = hooks_dir(repo_dir)?;
     let hook = dir.join("post-commit");
     let ours = std::fs::read_to_string(&hook).is_ok_and(|s| s.contains(MARKER));
     if !ours {

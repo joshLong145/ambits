@@ -279,13 +279,25 @@ time only. A symbol the write removed is *removed* while it stays absent, and
 Resolved lazily, per `(op, symbol, hash)` — one write's symbols can land in
 different commits (`git add -p`):
 
-1. `git log --branches HEAD --full-history -M --name-status -z --format='commit %H %ct' --reverse --since=<t − 1 day>`.
-   **Amended in implementation:** no `-- <path>` pathspec. With one, a
-   rename after the write shows as a deletion and later commits under the
-   new name never appear. The whole (time-bounded) log is walked instead,
-   following the path forward through renames. A rename git does not detect
-   (too much of the file changed) shows as a deletion plus additions; the
-   unit is then looked for among the files that commit added.
+1. `git log --no-show-signature --no-relative --no-color --no-ext-diff --branches HEAD -M --name-status -z --format='commit %H %ct' --reverse --since=<t − 10 min>`.
+   **Amended in implementation and review:**
+   - No `-- <path>` pathspec: with one, a rename after the write shows as
+     a deletion, and later commits under the new name never appear. The
+     time-bounded log is walked instead, once per refresh and shared by
+     every write.
+   - The file is known by a *set* of names. A rename adds its new name and
+     keeps the old, since the log mixes branches and a rename on one says
+     nothing about the others. A rename git does not detect (too much of the
+     file changed) shows as a deletion plus additions: the unit is then
+     looked for among the files that commit *added*, never ones it only
+     modified. Unverified units stay on the file's own name.
+   - The window starts **10 minutes** before the write (`SKEW_SECS`), not a
+     day. The margin is for clock skew between the session log and commits
+     on one machine; a day let an identical change ported from another
+     branch, or a pre-existing identical symbol, count as the landing.
+   - The `--no-*` flags override user config that changes the output:
+     `log.showSignature` (text before each commit), `diff.relative` (paths
+     relative to a subdirectory), colour, external diff drivers.
 2. For each commit C: `git cat-file blob C:<path-at-C>`; for a symbol write,
    parse and compare the symbol's hash; for a file-level `Write`, compare
    BLAKE3 of the blob with `fh`.
@@ -309,9 +321,18 @@ so amends and rebases re-resolve.
   resolution searches all branches (`.ambits/cache/never-landed/`).
 - Entries are files named by `BLAKE3(op, target, hash)`, so no journal
   string becomes a path.
-- **Known edge:** the search starts a day before the write, for clock skew.
-  A commit in that window that already held the exact symbol the write
-  produced (the write reverted a recent change) is taken as where it landed.
+- A never-landed entry records the branch tips it was searched up to and
+  the names the file had. While the tips are unchanged it answers directly;
+  after they move, only `git log <tips> --not <old tips>` is searched, so a
+  post-commit refresh costs one commit's worth, not the whole window.
+- Caching is best-effort (never fails `touched`), and cache files are
+  renamed into place without fsync: losing one only means resolving again.
+- **Known limits:** content introduced while resolving a merge conflict
+  never lands, since merge commits list no changes; files whose names have
+  `:`, `\` or control characters never match; a history whose commit clocks
+  run backwards can hide commits from `--since`; a commit within 10 minutes
+  before the write that already held the exact symbol it produced (the write
+  reverted a very recent change) counts as its landing.
 - Links are not objects and not gc roots.
 
 **Optional prewarm:** `ambits hook install --git` (§9.3).
