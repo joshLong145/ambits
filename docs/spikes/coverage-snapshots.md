@@ -348,14 +348,18 @@ ignore = ["secrets/**", "vendor/"]
 
 | Type | Payload | Id |
 |---|---|---|
-| `symbol` | name, category, label, `line_range`, `byte_range`, `content_hash`, child symbol ids | content |
-| `file` | top-level symbol ids, `total_lines`, parser identity | content |
+| `symbol` | `name`, `name_path`, `category`, `label`, `lines`, `bytes`, `hash` (`content_hash`), `children` (symbol object ids) | content |
+| `file` | `symbols` (top-level symbol object ids), `lines` (`total_lines`), `parser` (identity) | content |
 | `dir` | sorted entries `{name, kind: file\|dir, id}` | content |
 | `coverage` | sorted reads `(symbol id, hash at read, depth, agent)` — the fold's result, **no `history`, no origin** | content (D14) |
 | `writes` | write records (§2.6), sorted by canonical bytes — no `history`, no origin | content (D14) |
 | `snapshot` | §6.3 | derived (D17) |
 
 `estimated_tokens` is excluded from `symbol` payloads (recomputed on restore).
+`name_path` is the symbol id without its file (`App/handle_key`). It is
+needed because a child's id cannot be rebuilt from its parent's: an inherent
+impl is `impl App`, but its methods are `App/…`. Leaving the file out keeps
+the object shared when a file is renamed. (Found in implementation.)
 
 ### 5.2 Canonical JSON and object ids
 
@@ -394,10 +398,11 @@ snapshot_id = BLAKE3("ambits-snapshot v1\0" ‖ inputs_digest ‖ sorted parents
 | `parents` | history (§6.4) |
 
 - **`parsers`**: backend, grammar versions **generated from `Cargo.lock` at
-  build time** (today's list in `EnvironmentManifest::capture` is
-  hand-maintained), and a per-language **`SYMBOL_SCHEMA`** constant bumped
+  build time** (`build.rs`; the manifest's once hand-maintained list uses the
+  same source), and a per-language **`SYMBOL_SCHEMA`** constant bumped
   whenever ambits' own extraction changes (#33 changed spans with no grammar
-  change).
+  change). One string per parser, `rust:tree-sitter-rust@0.23.3:schema=1`,
+  plus `tree-sitter@<version>`; a `file` object records its parser's string.
 - **`scan_inputs`**: everything the walker honours that is not in the commit —
   `--filter`/`--filter-regex`, `.git/info/exclude`, global git excludes,
   untracked `.ignore` files, and walker flags. `snapshot` records its own
@@ -701,7 +706,7 @@ Merges into the **same session id** locally.
 |---|---|---|---|
 | 1 | Spec | This document | — |
 | 2 | Writes, locally | §1; §2 on a worker thread; journal v3 (`write`, `history`); shards; tool stanzas and validation; `touched` without commits; TUI shows writes | only changed lines attribute; pure deletion; create touches every symbol; `userModified` ⇒ file; null `originalFile` ⇒ file; `outside_symbols`; outside-project dropped; errors skipped; replay twice ⇒ idempotent; higher `av` replaces; no read credit; **canary** |
-| 3 | Objects + snapshots | §5–§8 locally: objects, D17 ids, no-op rule, `log`, reflog, gc; a writes-only scan for `touched` (today it folds every read of every session to find the writes) | snapshot twice ⇒ same id; `touch` ⇒ same id; whitespace or same-length dirty edit ⇒ new; **revert ⇒ new snapshot, parent = tip**; journal append ⇒ new; torn line ignored; schema upgrade ⇒ one new id; `SYMBOL_SCHEMA` ⇒ new; `\`/`/`, NFC/NFD, shuffled dirty ⇒ same; ignore covers every record type; user-global ignore not negatable; **gc: crash → gc → re-snapshot never loses an object; parents-first deletion; age refresh** |
+| 3 | Objects + snapshots | §5–§8 locally: objects, D17 ids, no-op rule, `log`, reflog, gc; a writes-only scan for `touched`. **Delivered.** Pending merge tips join a snapshot's parents once phase 6 writes `merge` records | snapshot twice ⇒ same id; `touch` ⇒ same id; whitespace or same-length dirty edit ⇒ new; **revert ⇒ new snapshot, parent = tip**; journal append ⇒ new; torn line ignored; schema upgrade ⇒ one new id; `SYMBOL_SCHEMA` ⇒ new; `\`/`/`, NFC/NFD, shuffled dirty ⇒ same; ignore covers every record type; user-global ignore not negatable; **gc: crash → gc → re-snapshot never loses an object; parents-first deletion; age refresh** |
 | 4 | Git linkage | §3: lazy resolution, links index, verified/unverified, reachability re-check, optional hook | write → commit → link; `add -p` across two commits; file-level `Write` via `fh`; later edit ⇒ changed since; amend and rebase ⇒ re-resolved; other branch; rename; never-landed cached locally; hook chains and never fails a commit |
 | 5 | Restore (same machine) | §12.1 | into a new session; restore twice ⇒ no change; ref set ⇒ next snapshot descends; moved symbols; drifted; different commit ⇒ warning |
 | 6 | Dumb remote | §9, §12.2, §12.3; cross-machine restore; origin in `touched` | two clones converge both ways; **repeated pull/snapshot/push with no new reads ⇒ no new snapshots after one round**; **diverged pull with nothing to append ⇒ two-parent snapshot ⇒ fast-forward**; **after B's force-with-lease, A's fetch and pull still work**; pulled reads the fold already has are not re-appended; stale remote read ⇒ history; concurrent push rejected; force-with-lease; **crash → gc → fetch recovers**; push verifies skipped closure; colliding id refused; hostile names, symlinks, oversized and cyclic objects rejected; interrupted push leaves no dangling ref; break-lock rules |
@@ -718,6 +723,12 @@ Merges into the **same session id** locally.
   cached, prewarmable.
 - **Parser determinism** assumed by D8; guarded by phase 3 tests and
   `SYMBOL_SCHEMA`.
+- **First-snapshot cost.** Every object is fsynced (§8). On macOS that is
+  `F_FULLFSYNC`, which the disk serializes: this repository's first
+  snapshot (~2,500 objects) takes ~11 s even with files written in parallel.
+  Later snapshots write only new objects (~0.4 s; ~0.2 s for a no-op). If
+  it matters, batch the fsyncs (write every object, fsync each once, then
+  the snapshot) rather than drop them.
 - **`--break-lock`** can lose a slow live push; conservative defaults only.
 - **`--force-with-lease` after a fetch** passes the lease even if the fetched
   tip was never merged (git's known gap). Consider git's `--force-if-includes`

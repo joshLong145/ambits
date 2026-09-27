@@ -14,6 +14,9 @@ collects them in one place.
 | `ambits -p <path> show <selector>…` | [Symbol definitions](Reading-by-Symbol) as JSON |
 | `ambits -p <path> restore-context` | [This session's read history](Restoring-Context) |
 | `ambits -p <path> touched <file\|symbol-id>` | [When an agent last wrote it](Agent-Writes), and whether that version is still on disk |
+| `ambits -p <path> snapshot` | [Record a snapshot](Snapshots) of this session |
+| `ambits -p <path> log [ref]` | [Snapshot history](Snapshots#history) |
+| `ambits -p <path> gc` | Delete [unreachable snapshot objects](Snapshots#garbage-collection) |
 | `ambits -p <path> --coverage` | [Coverage report](Coverage-and-Multi-Agent) |
 | `ambits -p <path> --dump` | Print the symbol tree |
 | `ambits -p <path> cache status\|clear` | Inspect or remove [read journals](Configuration#the-read-journal) |
@@ -94,6 +97,20 @@ write across every session's journal, and whether it is `current`, `changed`,
 `removed`, or `unknown` (a file-level edit, no hash to compare). A symbol
 covers everything nested under it, and counts only symbol-level writes. Exits
 0 whether or not a write was found (JSON: `"last_write": null`).
+
+## `ambits snapshot`
+
+`ambits -p . snapshot [-m MESSAGE] [--require-clean]` — prints the new
+snapshot, or `nothing changed: <id>` when nothing did. See [Snapshots](Snapshots).
+
+## `ambits log`
+
+`ambits -p . log [REF]` — `REF` is a session id, a snapshot id or a unique
+prefix (7+ hex digits); the current session by default.
+
+## `ambits gc`
+
+`ambits -p . gc [--grace-days N]` — default grace period 14 days.
 
 ## `ambits cache`
 

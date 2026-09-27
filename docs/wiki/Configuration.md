@@ -149,6 +149,17 @@ enabled           = true    # default
 flush_interval_ms = 5000    # default
 ```
 
+### Sync
+
+```toml
+[sync]
+ignore = ["secrets/**", "vendor/"]      # .gitignore syntax
+```
+
+Paths [snapshots](Snapshots#leaving-things-out) leave out entirely. A project's
+list replaces an earlier layer's, except that patterns in the user-global
+`~/.config/ambit/tools.toml` always apply and cannot be negated.
+
 ## Parsing backends
 
 | Backend | Languages |
