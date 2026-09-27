@@ -1,6 +1,8 @@
 //! Process-level test for `ambits touched`: dispatch, text and JSON output.
 
-use std::process::Command;
+mod common;
+
+use common::run_ambits;
 
 #[test]
 fn touched_reports_the_last_write_as_text_and_json() {
@@ -17,16 +19,7 @@ fn touched_reports_the_last_write_as_text_and_json() {
     )
     .unwrap();
 
-    let run = |args: &[&str]| {
-        let out = Command::new(env!("CARGO_BIN_EXE_ambits"))
-            .current_dir(root)
-            .env("HOME", root)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        String::from_utf8(out.stdout).unwrap()
-    };
+    let run = |args: &[&str]| run_ambits(root, args);
 
     let text = run(&["touched", "src/lib.rs"]);
     assert!(text.contains("last written 2026-09-26T10:00:00Z by agent-1 (Edit)"), "{text}");

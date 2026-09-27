@@ -54,6 +54,24 @@ pub fn config_get(dir: &Path, scope: &str, key: &str) -> color_eyre::Result<Opti
     }
 }
 
+/// `git <args>` in `dir` for tests: the same hardened command as production
+/// (so a test run inside a git hook still targets `dir`), a fixed identity,
+/// any extra `env`, and a panic with git's stderr on failure. Returns
+/// trimmed stdout.
+#[doc(hidden)]
+pub fn test_git(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> String {
+    let mut cmd = command(dir);
+    for (k, v) in [("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")]
+        .into_iter()
+        .chain(env.iter().copied())
+    {
+        cmd.env(k, v);
+    }
+    let out = cmd.args(args).output().expect("git runs");
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 /// Run `git <args>` in `dir`; `None` if git is missing or the command fails.
 pub fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let output = command(dir).args(args).output().ok()?;
@@ -150,12 +168,7 @@ mod tests {
     use super::*;
 
     fn sh(dir: &Path, args: &[&str]) {
-        let ok = Command::new("git").arg("-C").arg(dir).args(args)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
-            .status().unwrap().success();
-        assert!(ok, "git {args:?}");
+        test_git(dir, args, &[]);
     }
 
     #[test]

@@ -2,29 +2,15 @@
 //! which commit an agent's write landed in.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+mod common;
 
 use ambits::linkage::{landed, Landed, Resolver};
+use common::{git, git_env, run_ambits};
 use ambits::parser::ParserRegistry;
 use ambits::writes::{Level, WriteRecord};
 
 const SESSION: &str = "0b7e9d3a-1c2f-4e5a-9b8c-7d6e5f4a3b2c";
-
-fn git(root: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8(out.stdout).unwrap().trim().to_string()
-}
 
 struct Repo {
     _dir: tempfile::TempDir,
@@ -43,21 +29,7 @@ impl Repo {
         git(&root, &["add", "."]);
         // Two hours back, well before any write a test makes.
         let past = format!("@{} +0000", ambits::time::now_secs() - 7200);
-        let ok = Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(["commit", "-qm", "init"])
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .env("GIT_AUTHOR_DATE", &past)
-            .env("GIT_COMMITTER_DATE", &past)
-            .status()
-            .unwrap()
-            .success();
-        assert!(ok);
+        git_env(&root, &["commit", "-qm", "init"], &[("GIT_AUTHOR_DATE", &past), ("GIT_COMMITTER_DATE", &past)]);
         Self { _dir: dir, root }
     }
 
@@ -248,11 +220,7 @@ fn touched_shows_the_landing_commit() {
     std::fs::write(dir.join(format!("{SESSION}.ndjson")), format!("{line}\n")).unwrap();
     let commit = repo.commit_all("edit alpha");
 
-    let run = |args: &[&str]| {
-        let out = Command::new(env!("CARGO_BIN_EXE_ambits")).current_dir(&repo.root).env("HOME", &repo.root).args(args).output().unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        String::from_utf8(out.stdout).unwrap()
-    };
+    let run = |args: &[&str]| run_ambits(&repo.root, args);
     let text = run(&["touched", "src/a.rs::alpha"]);
     assert!(text.contains(&format!("landed in {} (verified)", &commit[..7])), "{text}");
     let json: serde_json::Value = serde_json::from_str(&run(&["touched", "--format", "json", "src/a.rs::alpha"])).unwrap();

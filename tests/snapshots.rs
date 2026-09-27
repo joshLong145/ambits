@@ -1,11 +1,13 @@
 //! Snapshots end to end (spec §6–§8; the phase-3 key tests of §14), against
 //! a real git repository in a temp directory.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
+mod common;
+
 use ambits::ingest::tool_config::SyncConfig;
+use common::{git, run_ambits};
 use ambits::objects::gc;
 use ambits::objects::inputs::Backend;
 use ambits::objects::snapshot::{snapshot, Outcome, Request, Snapshot};
@@ -20,22 +22,6 @@ struct Project {
     _dir: tempfile::TempDir,
     root: PathBuf,
     registry: ParserRegistry,
-}
-
-fn git(root: &Path, args: &[&str]) {
-    let ok = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .status()
-        .unwrap()
-        .success();
-    assert!(ok, "git {args:?}");
 }
 
 impl Project {
@@ -334,17 +320,7 @@ fn reusing_an_object_refreshes_its_age() {
 #[test]
 fn the_cli_snapshots_and_logs() {
     let p = Project::new();
-    let run = |args: &[&str]| {
-        let out = Command::new(env!("CARGO_BIN_EXE_ambits"))
-            .current_dir(&p.root)
-            .env("HOME", &p.root)
-            .args(["--session", SESSION])
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
-        String::from_utf8(out.stdout).unwrap()
-    };
+    let run = |args: &[&str]| run_ambits(&p.root, &[&["--session", SESSION], args].concat());
     let made = run(&["snapshot", "-m", "first"]);
     assert!(made.starts_with("snapshot "), "{made}");
     assert!(run(&["snapshot"]).starts_with("nothing changed: "));

@@ -563,19 +563,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let run = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&root)
-                .args(args)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@t")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@t")
-                .status()
-                .unwrap()
-                .success();
-            assert!(ok, "git {args:?}");
+            crate::git::test_git(&root, args, &[]);
         };
         std::fs::write(root.join("a.txt"), "x").unwrap();
         run(&["init", "-q"]);
