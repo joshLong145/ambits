@@ -144,6 +144,8 @@ pub struct Resolver {
     /// What each `(commit, path)` contains, computed once: many units share
     /// a file, and a refresh walks the same commits for all of them.
     contents: HashMap<(String, String), Contents>,
+    /// Whether each commit is reachable, asked once: many links share one.
+    reachable: HashMap<String, bool>,
 }
 
 /// A committed file's identity, as units are matched against it.
@@ -176,6 +178,7 @@ impl Resolver {
             log_since: None,
             tips,
             contents: HashMap::new(),
+            reachable: HashMap::new(),
         })
     }
 
@@ -379,7 +382,16 @@ impl Resolver {
     }
 
     /// Whether `sha` is reachable from any local branch or `HEAD`.
-    fn reachable(&self, sha: &str) -> bool {
+    fn reachable(&mut self, sha: &str) -> bool {
+        if let Some(&known) = self.reachable.get(sha) {
+            return known;
+        }
+        let answer = self.ask_reachable(sha);
+        self.reachable.insert(sha.to_string(), answer);
+        answer
+    }
+
+    fn ask_reachable(&self, sha: &str) -> bool {
         let on_branch = git(self.dir(), &["for-each-ref", "--count=1", "--format=%(refname)", "--contains", sha, "refs/heads"])
             .is_some_and(|out| !out.is_empty());
         on_branch || git(self.dir(), &["merge-base", "--is-ancestor", "--end-of-options", sha, "HEAD"]).is_some()
