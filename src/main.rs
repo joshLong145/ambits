@@ -166,6 +166,38 @@ enum Commands {
         format: DigestFormat,
     },
 
+    /// Record a snapshot of this session: its symbols, coverage and writes,
+    /// pinned to the current git commit and working-tree state.
+    ///
+    /// Snapshots are content-addressed objects under `.ambits/objects/`, and
+    /// the session's ref points at the latest. Running it again with nothing
+    /// changed writes nothing. Not to be confused with `restore-context`,
+    /// which prints what an agent has read.
+    Snapshot {
+        /// A message stored with the snapshot (in its local note).
+        #[arg(short, long)]
+        message: Option<String>,
+
+        /// Refuse when the working tree has uncommitted changes.
+        #[arg(long)]
+        require_clean: bool,
+    },
+
+    /// Show snapshot history: time, git commit, dirty files, reads, writes,
+    /// parents and message.
+    Log {
+        /// A session id, a snapshot id, or a unique prefix of one (7+ hex
+        /// digits). Defaults to the current session.
+        reference: Option<String>,
+    },
+
+    /// Delete snapshot objects that no ref or recent reflog entry reaches.
+    Gc {
+        /// Keep unreachable objects younger than this many days.
+        #[arg(long, default_value_t = 14)]
+        grace_days: u64,
+    },
+
     /// Print a symbol's definition as JSON, looked up by content hash or id.
     ///
     /// Intended as the follow-up to `restore-context`: that names what is
@@ -954,6 +986,32 @@ fn execute(
     ambits::search::run(registry, &targets, &request.options, coverage)
 }
 
+/// `ambits log`: the history of `reference`, or of the current session.
+fn run_log(project_path: &Path, reference: Option<&str>) -> Result<()> {
+    use ambits::objects::snapshot;
+    let Some(reference) = reference else {
+        color_eyre::eyre::bail!("no session: pass a session or snapshot id, or --session");
+    };
+    let store = ambits::objects::store::Store::at(project_path);
+    let start = snapshot::resolve(&store, reference)?;
+    let entries = snapshot::history(&store, start)?;
+    snapshot::print_log(&mut io::stdout().lock(), &entries)?;
+    Ok(())
+}
+
+/// Identifies the Serena caches a snapshot was built from: BLAKE3 over each
+/// cache file's name and bytes. Serena snapshots are not reproducible from
+/// the commit alone (spec §6.4), and this is what they depend on instead.
+fn serena_fingerprint(project_path: &Path) -> String {
+    let mut h = blake3::Hasher::new();
+    for path in serena::find_serena_caches(project_path) {
+        let rel = path.strip_prefix(project_path).unwrap_or(&path);
+        h.update(rel.to_string_lossy().replace('\\', "/").as_bytes());
+        h.update(&std::fs::read(&path).unwrap_or_default());
+    }
+    h.finalize().to_hex()[..16].to_string()
+}
+
 /// Build the project symbol tree with whichever backend was selected.
 ///
 /// Named because two call sites need it and they must not drift: `find`
@@ -1028,10 +1086,11 @@ fn run() -> Result<()> {
     let (tool_config, config_warnings) =
         ToolMappingConfig::resolve(cli.tools_config.as_deref(), &project_path);
 
-    // Capture the `[cache]`/`[editor]` stanzas before `tool_config` is
-    // coerced into the mapper trait object below and its concrete type is no
-    // longer reachable.
+    // Capture the `[cache]`/`[editor]`/`[sync]` stanzas before `tool_config`
+    // is coerced into the mapper trait object below and its concrete type is
+    // no longer reachable.
     let cache_cfg = tool_config.cache.clone();
+    let sync_cfg = tool_config.sync.clone();
     let editor_template = ambits::editor::resolve_editor_template(
         cli.editor.as_deref(),
         tool_config.editor.command.as_deref(),
@@ -1095,6 +1154,26 @@ fn run() -> Result<()> {
     });
 
     ambits::logging::init(cli.log_output.as_deref(), session_id.as_deref());
+
+    // Snapshot history and gc read only the store; no scan needed.
+    if let Some(Commands::Log { reference }) = &command {
+        return run_log(&project_path, reference.as_deref().or(session_id.as_deref()));
+    }
+    if let Some(Commands::Gc { grace_days }) = &command {
+        let store = ambits::objects::store::Store::at(&project_path);
+        let stats = ambits::objects::gc::gc(&store, Duration::from_secs(grace_days * 24 * 60 * 60))?;
+        let mut out = io::stdout().lock();
+        writeln!(
+            out,
+            "gc: {} reachable, {} deleted, {} unreachable kept, {} reflog entries expired, {} notes removed",
+            stats.reachable,
+            stats.deleted.len(),
+            stats.kept,
+            stats.reflog_entries_expired,
+            stats.notes_removed
+        )?;
+        return Ok(());
+    }
 
     // Coverage context for `find` and `show`. Loaded once, from the journal
     // the TUI maintains, so both can report whether a symbol has already been
@@ -1164,6 +1243,30 @@ fn run() -> Result<()> {
     }
 
     let project_tree = scan_tree(cli.serena, &registry, &project_path, filter.as_ref())?;
+
+    if let Some(Commands::Snapshot { message, require_clean }) = &command {
+        report_warnings(&config_warnings);
+        let Some(session) = session_id.as_deref() else {
+            color_eyre::eyre::bail!("no session to snapshot: pass --session, or run inside a project with Claude Code logs");
+        };
+        let backend = if cli.serena {
+            ambits::objects::inputs::Backend::Serena { fingerprint: serena_fingerprint(&project_path) }
+        } else {
+            ambits::objects::inputs::Backend::TreeSitter(&registry)
+        };
+        let outcome = ambits::objects::snapshot::snapshot(&ambits::objects::snapshot::Request {
+            project_root: &project_path,
+            session,
+            tree: &project_tree,
+            backend,
+            filter: filter.as_ref().map(|f| f.display()),
+            sync: &sync_cfg,
+            message: message.as_deref(),
+            require_clean: *require_clean,
+        })?;
+        ambits::objects::snapshot::print_outcome(&mut io::stdout().lock(), &outcome)?;
+        return Ok(());
+    }
 
     if cli.dump {
         report_warnings(&config_warnings);

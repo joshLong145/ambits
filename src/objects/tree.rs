@@ -31,16 +31,47 @@ pub fn write_tree(
     parser_of: &dyn Fn(&FileSymbols) -> String,
     ignore: &SyncIgnore,
 ) -> Result<TreeStats> {
+    let included: Vec<(String, &FileSymbols, String)> = tree
+        .files
+        .iter()
+        .map(|f| (normalize_path(&f.file_path.to_string_lossy()), f))
+        .filter(|(path, _)| !ignore.is_ignored(path))
+        .map(|(path, f)| (path, f, parser_of(f)))
+        .collect();
+
+    // Files are independent, and each object write ends in an fsync, so a
+    // first snapshot of a large project is dominated by waiting on the disk:
+    // spread the files across threads. Directories follow once every file
+    // is stored.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, included.len().max(1));
+    let chunk = included.len().div_ceil(threads).max(1);
+    let written: Vec<Result<Vec<(String, ObjectId, usize)>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = included
+            .chunks(chunk)
+            .map(|batch| {
+                scope.spawn(move || {
+                    batch
+                        .iter()
+                        .map(|(path, file, parser)| {
+                            let mut count = 0;
+                            let id = write_file(store, file, path, parser, &mut count)?;
+                            Ok((path.clone(), id, count))
+                        })
+                        .collect()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(eyre!("a writer thread panicked")))).collect()
+    });
+
     let mut root = Dir::default();
     let (mut files, mut symbols) = (0, 0);
-    for file in &tree.files {
-        let path = normalize_path(&file.file_path.to_string_lossy());
-        if ignore.is_ignored(&path) {
-            continue;
+    for batch in written {
+        for (path, id, count) in batch? {
+            root.insert(&path, id)?;
+            files += 1;
+            symbols += count;
         }
-        let id = write_file(store, file, &path, &parser_of(file), &mut symbols)?;
-        root.insert(&path, id)?;
-        files += 1;
     }
     Ok(TreeStats { root: root.write(store)?, files, symbols })
 }
