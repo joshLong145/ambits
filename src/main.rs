@@ -196,6 +196,11 @@ enum Commands {
         /// Keep unreachable objects younger than this many days.
         #[arg(long, default_value_t = 14)]
         grace_days: u64,
+
+        /// Reflog entries older than this many days stop protecting the
+        /// snapshots they name.
+        #[arg(long, default_value_t = 90)]
+        reflog_expiry_days: u64,
     },
 
     /// Print a symbol's definition as JSON, looked up by content hash or id.
@@ -1167,13 +1172,18 @@ fn run() -> Result<()> {
     if let Some(Commands::Log { reference }) = &command {
         return run_log(&project_path, reference.as_deref().or(session_id.as_deref()));
     }
-    if let Some(Commands::Gc { grace_days }) = &command {
+    if let Some(Commands::Gc { grace_days, reflog_expiry_days }) = &command {
         let store = ambits::objects::store::Store::at(&project_path);
-        let grace = grace_days
-            .checked_mul(24 * 60 * 60)
-            .map(Duration::from_secs)
-            .ok_or_else(|| color_eyre::eyre::eyre!("--grace-days {grace_days} is too large"))?;
-        let stats = ambits::objects::gc::gc(&store, grace)?;
+        let days = |n: u64, flag: &str| {
+            n.checked_mul(24 * 60 * 60)
+                .map(Duration::from_secs)
+                .ok_or_else(|| color_eyre::eyre::eyre!("{flag} {n} is too large"))
+        };
+        let stats = ambits::objects::gc::gc(
+            &store,
+            days(*grace_days, "--grace-days")?,
+            days(*reflog_expiry_days, "--reflog-expiry-days")?,
+        )?;
         let mut out = io::stdout().lock();
         writeln!(
             out,
@@ -1278,6 +1288,11 @@ fn run() -> Result<()> {
             require_clean: *require_clean,
         })?;
         ambits::objects::snapshot::print_outcome(&mut io::stdout().lock(), &outcome)?;
+        if let ambits::objects::snapshot::Outcome::Created { skipped, .. } = &outcome {
+            for path in skipped {
+                ambits::try_eprintln!("[ambit] left out of the snapshot: {path} (invalid name, or collides with another path by case)");
+            }
+        }
         return Ok(());
     }
 

@@ -72,10 +72,11 @@ pub struct GcStats {
     pub temp_files_removed: usize,
 }
 
-/// Collect `store`'s unreachable objects older than `grace`.
-pub fn gc(store: &Store, grace: Duration) -> Result<GcStats> {
+/// Collect `store`'s unreachable objects older than `grace`, after dropping
+/// reflog entries older than `reflog_expiry` (§8; 90 days by default).
+pub fn gc(store: &Store, grace: Duration, reflog_expiry: Duration) -> Result<GcStats> {
     let _lock = GcLock::exclusive(store)?;
-    let mut stats = GcStats { reflog_entries_expired: refs::expire_reflogs(store, refs::REFLOG_EXPIRY)?, ..Default::default() };
+    let mut stats = GcStats { reflog_entries_expired: refs::expire_reflogs(store, reflog_expiry)?, ..Default::default() };
 
     let reachable = mark(store)?;
     stats.reachable = reachable.len();

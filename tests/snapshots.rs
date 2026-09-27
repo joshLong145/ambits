@@ -266,11 +266,11 @@ fn crash_then_gc_then_snapshot_never_loses_an_object() {
     let _ = std::fs::remove_dir_all(p.root.join(".ambits/logs"));
 
     // Within the grace period nothing unreachable goes.
-    let young = gc::gc(&p.store(), gc::DEFAULT_GRACE).unwrap();
+    let young = gc::gc(&p.store(), gc::DEFAULT_GRACE, ambits::objects::refs::REFLOG_EXPIRY).unwrap();
     assert!(young.deleted.is_empty());
     assert!(p.store().contains(&orphan));
 
-    let collected = gc::gc(&p.store(), Duration::ZERO).unwrap();
+    let collected = gc::gc(&p.store(), Duration::ZERO, ambits::objects::refs::REFLOG_EXPIRY).unwrap();
     assert!(collected.deleted.contains(&orphan));
     assert_closed(&p.store());
     assert!(Snapshot::load(&p.store(), kept).is_ok());
@@ -302,7 +302,7 @@ fn gc_deletes_parents_before_children() {
             .collect();
         references.push((id, refs));
     }
-    let stats = gc::gc(&p.store(), Duration::ZERO).unwrap();
+    let stats = gc::gc(&p.store(), Duration::ZERO, ambits::objects::refs::REFLOG_EXPIRY).unwrap();
     assert!(p.store().list().is_empty(), "everything was unreachable");
     let position = |id: &ObjectId| stats.deleted.iter().position(|d| d == id).unwrap();
     for (parent, children) in &references {
@@ -480,7 +480,7 @@ fn gc_collects_leftover_temp_files() {
     let stray = p.root.join(".ambits/refs/sessions/.tmp-deadbeef");
     std::fs::write(&stray, format!("{}\n", "0".repeat(64))).unwrap();
     assert!(ambits::objects::refs::all(&p.store()).iter().all(|(name, _)| !name.contains(".tmp-")));
-    let stats = gc::gc(&p.store(), Duration::ZERO).unwrap();
+    let stats = gc::gc(&p.store(), Duration::ZERO, ambits::objects::refs::REFLOG_EXPIRY).unwrap();
     assert_eq!(stats.temp_files_removed, 1);
     assert!(!stray.exists());
 }

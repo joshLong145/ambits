@@ -39,6 +39,9 @@ local history.
   log), fingerprinted by their raw bytes. `--require-clean` refuses a dirty
   working tree instead.
 - `-m` stores a message in the snapshot's local note.
+- A file whose path cannot be stored — a name with `:` or a control
+  character, or two paths differing only in case — is left out with a
+  warning; the rest of the snapshot goes ahead.
 - **What git does not report is not seen.** Changes inside a submodule, and
   to files marked `skip-worktree` or `assume-unchanged`, do not make a new
   snapshot.
@@ -75,7 +78,7 @@ Tightening `ignore` does not rewrite earlier snapshots.
 ## Garbage collection
 
 `ambits gc` deletes objects that no session ref, and no reflog entry from the
-last 90 days, can reach. Unreachable objects younger than the grace period
+last 90 days (`--reflog-expiry-days`), can reach. Unreachable objects younger than the grace period
 (`--grace-days`, default 14) are kept, so a snapshot in progress is never
 disturbed. It is always safe to interrupt.
 

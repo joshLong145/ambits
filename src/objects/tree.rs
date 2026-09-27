@@ -15,11 +15,16 @@ use super::{b3, normalize_path, valid_entry_name, Kind, ObjectId};
 use crate::symbols::{FileSymbols, ProjectTree, SymbolNode};
 
 /// What [`write_tree`] stored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeStats {
     pub root: ObjectId,
     pub files: usize,
     pub symbols: usize,
+    /// Files left out because their path cannot be stored (§9.1): a name
+    /// that is not one plain component, or one that collides with another
+    /// file's after case folding. One odd file costs itself, not the
+    /// snapshot.
+    pub skipped: Vec<String>,
 }
 
 /// Store `tree` and return its root `dir`. `parser_of` names the parser
@@ -31,13 +36,51 @@ pub fn write_tree(
     parser_of: &dyn Fn(&FileSymbols) -> String,
     ignore: &SyncIgnore,
 ) -> Result<TreeStats> {
-    let included: Vec<(String, &FileSymbols, String)> = tree
+    let mut candidates: Vec<(String, &FileSymbols)> = tree
         .files
         .iter()
         .map(|f| (normalize_path(&f.file_path.to_string_lossy()), f))
         .filter(|(path, _)| !ignore.is_ignored(path))
-        .map(|(path, f)| (path, f, parser_of(f)))
         .collect();
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Refuse, in path order so the choice is deterministic: invalid names,
+    // and any path — file or directory — equal to an earlier one after case
+    // folding but spelled differently (one file on a case-insensitive
+    // system; readers refuse such trees).
+    let mut skipped = Vec::new();
+    let mut spelling: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut included: Vec<(String, &FileSymbols, String)> = Vec::with_capacity(candidates.len());
+    'files: for (path, f) in candidates {
+        if !path.split('/').all(valid_entry_name) {
+            skipped.push(path);
+            continue;
+        }
+        let mut prefix = String::new();
+        for component in path.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            match spelling.get(&prefix.to_lowercase()) {
+                Some(seen) if *seen != prefix => {
+                    skipped.push(path);
+                    continue 'files;
+                }
+                _ => {}
+            }
+        }
+        let mut prefix = String::new();
+        for component in path.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            spelling.entry(prefix.to_lowercase()).or_insert_with(|| prefix.clone());
+        }
+        let parser = parser_of(f);
+        included.push((path, f, parser));
+    }
 
     // Files are independent, and each object write ends in an fsync, so a
     // first snapshot of a large project is dominated by waiting on the disk:
@@ -68,12 +111,17 @@ pub fn write_tree(
     let (mut files, mut symbols) = (0, 0);
     for batch in written {
         for (path, id, count) in batch? {
-            root.insert(&path, id)?;
+            // A file that is also a directory's name: keep the first.
+            if root.insert(&path, id).is_err() {
+                skipped.push(path);
+                continue;
+            }
             files += 1;
             symbols += count;
         }
     }
-    Ok(TreeStats { root: root.write(store)?, files, symbols })
+    skipped.sort();
+    Ok(TreeStats { root: root.write(store)?, files, symbols, skipped })
 }
 
 fn write_file(store: &Store, file: &FileSymbols, parser: &str, count: &mut usize) -> Result<ObjectId> {
@@ -173,20 +221,26 @@ impl Dir {
 /// references, and the kind of each. Iterative, with a visited set, so a
 /// hostile or corrupt store cannot recurse without bound (§9.5).
 pub fn walk(store: &Store, root: ObjectId, visit: &mut dyn FnMut(ObjectId, Kind)) -> Result<()> {
-    let mut stack = vec![(root, Kind::Dir)];
+    let mut stack = vec![(root, Kind::Dir, 0usize)];
     let mut seen = std::collections::HashSet::new();
-    while let Some((id, kind)) = stack.pop() {
+    while let Some((id, kind, depth)) = stack.pop() {
         if !seen.insert(id) {
             continue;
+        }
+        if depth > MAX_DEPTH {
+            bail!("tree under {} is nested over {MAX_DEPTH} levels deep", root.short());
         }
         visit(id, kind);
         let payload = store.get(&id, kind)?;
         for (child, child_kind) in references(kind, &payload)? {
-            stack.push((child, child_kind));
+            stack.push((child, child_kind, depth + 1));
         }
     }
     Ok(())
 }
+
+/// Deepest nesting of directories and symbols a walk accepts (§9.5).
+pub const MAX_DEPTH: usize = 4096;
 
 /// The objects a tree object references directly.
 pub fn references(kind: Kind, payload: &Value) -> Result<Vec<(ObjectId, Kind)>> {
@@ -285,11 +339,20 @@ mod tests {
         assert_eq!(stats.root, write_tree(&store, &without, &parser, &SyncIgnore::none()).unwrap().root);
     }
 
+    /// Case collisions and invalid names cost the file, not the snapshot,
+    /// and which file goes is decided by path order, not scan order.
     #[test]
-    fn names_differing_only_in_case_are_refused() {
+    fn unstorable_paths_are_skipped_deterministically() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
-        let t = tree(vec![file("src/A.rs", vec![]), file("src/a.rs", vec![])]);
-        assert!(write_tree(&store, &t, &parser, &SyncIgnore::none()).is_err());
+        let files = || vec![file("src/a.rs", vec![]), file("src/A.rs", vec![]), file("SRC/b.rs", vec![]), file("c:d.rs", vec![])];
+        let forward = write_tree(&store, &tree(files()), &parser, &SyncIgnore::none()).unwrap();
+        let mut reversed = files();
+        reversed.reverse();
+        let backward = write_tree(&store, &tree(reversed), &parser, &SyncIgnore::none()).unwrap();
+        assert_eq!(forward, backward);
+        assert_eq!(forward.files, 1);
+        // Byte order puts `SRC/b.rs` first, so both `src/…` collide with it.
+        assert_eq!(forward.skipped, vec!["c:d.rs", "src/A.rs", "src/a.rs"]);
     }
 }

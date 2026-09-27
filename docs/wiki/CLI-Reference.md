@@ -110,7 +110,8 @@ prefix (7+ hex digits); the current session by default.
 
 ## `ambits gc`
 
-`ambits -p . gc [--grace-days N]` — default grace period 14 days.
+`ambits -p . gc [--grace-days N] [--reflog-expiry-days N]` — defaults 14
+and 90 days.
 
 ## `ambits cache`
 

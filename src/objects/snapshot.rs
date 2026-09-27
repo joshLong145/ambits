@@ -138,7 +138,16 @@ pub struct Request<'a> {
 pub enum Outcome {
     /// Inputs equal the tip's and nothing is pending: nothing written (§6.4).
     NothingChanged(ObjectId),
-    Created { id: ObjectId, parents: Vec<ObjectId>, files: usize, reads: usize, writes: usize, dirty: usize },
+    Created {
+        id: ObjectId,
+        parents: Vec<ObjectId>,
+        files: usize,
+        reads: usize,
+        writes: usize,
+        dirty: usize,
+        /// Files whose path could not be stored (see [`tree::TreeStats::skipped`]).
+        skipped: Vec<String>,
+    },
 }
 
 /// Make a snapshot of `req.session` (§6.4).
@@ -232,7 +241,15 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
     refs::write_note(&store, &id, req.message)?;
     refs::update(&store, &name, tip, id, "snapshot")?;
 
-    Ok(Outcome::Created { id, parents, files: tree.files, reads: records.reads, writes: records.write_count, dirty })
+    Ok(Outcome::Created {
+        id,
+        parents,
+        files: tree.files,
+        reads: records.reads,
+        writes: records.write_count,
+        dirty,
+        skipped: tree.skipped,
+    })
 }
 
 /// `tree` with every dirty file parsed again from the bytes its fingerprint
@@ -362,7 +379,7 @@ pub fn print_log(out: &mut impl std::io::Write, entries: &[LogEntry]) -> std::io
 pub fn print_outcome(out: &mut impl std::io::Write, outcome: &Outcome) -> std::io::Result<()> {
     match outcome {
         Outcome::NothingChanged(tip) => writeln!(out, "nothing changed: {}", tip.short()),
-        Outcome::Created { id, parents, files, reads, writes, dirty } => {
+        Outcome::Created { id, parents, files, reads, writes, dirty, .. } => {
             let parent = parents.first().map_or("none".to_string(), ObjectId::short);
             writeln!(
                 out,

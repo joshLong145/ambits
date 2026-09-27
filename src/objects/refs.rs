@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use super::store::{create_private_dir, random_token, write_atomic, Store};
 use super::ObjectId;
 
-/// Reflog entries older than this stop protecting objects from gc (§8).
+/// Default age after which reflog entries stop protecting objects from gc
+/// (§8); `ambits gc --reflog-expiry-days` overrides it.
 pub const REFLOG_EXPIRY: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
 /// A validated ref name, relative to `.ambits/`, e.g. `refs/sessions/<id>`.

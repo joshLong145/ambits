@@ -19,6 +19,10 @@ use super::{canonical, content_id, Kind, ObjectId};
 /// Largest object a reader will load (§9.5), checked before reading.
 pub const MAX_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Most entries any one list in an object may hold (§9.5): directory
+/// entries, a symbol's children, a coverage object's reads.
+pub const MAX_ENTRIES: usize = 1_000_000;
+
 /// The object store of one project.
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -115,6 +119,9 @@ impl Store {
             bail!("object {} is not a {} object", id.short(), kind.name());
         }
         let payload = envelope.get("payload").cloned().ok_or_else(|| eyre!("object {} has no payload", id.short()))?;
+        if payload.as_object().is_some_and(|o| o.values().any(|v| v.as_array().is_some_and(|a| a.len() > MAX_ENTRIES))) {
+            bail!("object {} has a list of over {MAX_ENTRIES} entries", id.short());
+        }
         if kind != Kind::Snapshot && content_id(kind, &canonical::to_bytes(&payload)?) != *id {
             bail!("object {} does not match its id", id.short());
         }

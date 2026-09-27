@@ -527,7 +527,7 @@ flagged **non-reproducible**.
 - **Ref updates**: create `<ref>.lock` exclusively containing **pid, start time
   and a random token** (no host, D16); re-read the ref after locking; write;
   rename; append to the reflog.
-- **Reflog** entries expire after 90 days (configurable).
+- **Reflog** entries expire after 90 days (`gc --reflog-expiry-days`).
 - **gc** (found necessary by the model, §16):
   - `gc` holds `.ambits/gc.lock` **exclusively**; `snapshot`, `fetch` and
     `pull` hold it **shared** for their duration. It is an OS advisory lock
