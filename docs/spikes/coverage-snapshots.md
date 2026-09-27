@@ -126,6 +126,11 @@ Add:
 - Attribution (§2) runs in **core** (the ingester holds no
   `ParserRegistry`) on a **worker thread**, never the render thread: tailing
   and replay run synchronously in `handle_tick`.
+- **Replay → tailer handoff.** A call and its result can straddle the moment
+  the startup or session-switch replay hands over to the tailer (a permission
+  prompt). The replay returns each file's byte offset and its still-pending
+  write calls (`Handoff`), and the tailer resumes from exactly there. No line
+  is read twice or skipped, and a late result still pairs.
 
 ## 2. Writes
 

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use crate::tracking::ReadDepth;
-use super::{AgentToolCall, CompactionMetadata, Effect, EventTailer, Hunk, SessionEvent, SessionIngester, TailedCompaction, TailerOutput, ToolCallMapper, WriteEvent, WriteSource};
+use super::{AgentToolCall, CompactionMetadata, Effect, EventTailer, FileReplay, Handoff, Hunk, SessionEvent, SessionIngester, TailedCompaction, TailerOutput, ToolCallMapper, WriteEvent, WriteSource};
 use super::tool_config::ToolMappingConfig;
 
 /// Derive the Claude Code log directory for a given project path.
@@ -316,6 +316,11 @@ pub struct WriteCorrelator {
 }
 
 impl WriteCorrelator {
+    /// The write calls still awaiting results, for handing to a tailer.
+    pub fn into_pending(self) -> Vec<AgentToolCall> {
+        self.pending.into_values().collect()
+    }
+
     /// Remember write calls until their results arrive.
     pub fn note_calls(&mut self, calls: &[AgentToolCall]) {
         for call in calls {
@@ -451,10 +456,16 @@ fn parse_log_file_with_mapper(
     mapper: &dyn ToolCallMapper,
     project_root: Option<&Path>,
 ) -> Vec<SessionEvent> {
+    replay_log_file(path, mapper, project_root).events
+}
+
+/// Parse a whole log file, recording where it stopped and which write calls
+/// still await their results, so a tailer can take over exactly there.
+fn replay_log_file(path: &Path, mapper: &dyn ToolCallMapper, project_root: Option<&Path>) -> FileReplay {
     let mut events: Vec<SessionEvent> = Vec::new();
     let file = match fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return events,
+        Err(_) => return FileReplay::default(),
     };
 
     let default_id = path
@@ -504,8 +515,15 @@ fn parse_log_file_with_mapper(
     // we attach the buffered metadata to the next `Compacted` event we see.
     let mut pending_metadata: Option<CompactionMetadata> = None;
     let mut writes = WriteCorrelator::default();
+    let mut offset = 0u64;
+    let mut line = String::new();
 
-    for line in reader.lines().map_while(Result::ok) {
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => offset += n as u64,
+        }
         match parse_jsonl_line(line.trim(), &default_id, mapper) {
             ParsedLine::Events(mut line_events) => {
                 if let Some((ref worktree, ref project)) = cwd_remap {
@@ -542,7 +560,7 @@ fn parse_log_file_with_mapper(
             ParsedLine::Ignored => {}
         }
     }
-    events
+    FileReplay { events, offset, awaiting: writes.into_pending() }
 }
 
 /// Parse the `compactMetadata` block from a `compact_boundary` system record.
@@ -968,6 +986,16 @@ impl LogTailer {
         Self { files, positions, mapper, pending_metadata: None, writes: WriteCorrelator::default() }
     }
 
+    /// Continue exactly where a batch replay stopped: each file from its
+    /// replay offset, still awaiting the replay's unresolved write calls.
+    pub fn resume(handoff: Handoff, mapper: Arc<dyn ToolCallMapper>) -> Self {
+        let mut writes = WriteCorrelator::default();
+        writes.note_calls(&handoff.awaiting);
+        let files = handoff.files.iter().map(|(f, _)| f.clone()).collect();
+        let positions = handoff.files.into_iter().collect();
+        Self { files, positions, mapper, pending_metadata: None, writes }
+    }
+
 
 
     /// Add a new file to tail (e.g., a newly created agent log).
@@ -1090,6 +1118,12 @@ impl SessionIngester for ClaudeIngester {
     }
     fn new_tailer(&self, files: Vec<PathBuf>) -> Box<dyn EventTailer> {
         Box::new(LogTailer::new(files, Arc::clone(&self.mapper)))
+    }
+    fn replay_log_file(&self, path: &Path, project_root: &Path) -> FileReplay {
+        replay_log_file(path, &*self.mapper, Some(project_root))
+    }
+    fn resume_tailer(&self, handoff: Handoff) -> Box<dyn EventTailer> {
+        Box::new(LogTailer::resume(handoff, Arc::clone(&self.mapper)))
     }
 }
 
@@ -2178,6 +2212,63 @@ mod write_tests {
         let second = tailer.read_new_events();
         assert_eq!(second.writes.len(), 1);
         assert_eq!(&*second.writes[0].op, "toolu_1");
+    }
+
+    /// Replay `lines`, then resume a tailer from the replay's handoff.
+    fn replay_then_tail(dir: &Path, lines: &[String]) -> (PathBuf, FileReplay, LogTailer) {
+        let path = dir.join("s1.jsonl");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let config: Arc<dyn ToolCallMapper> = Arc::new(write_config());
+        let replay = replay_log_file(&path, &*config, None);
+        let handoff = Handoff { files: vec![(path.clone(), replay.offset)], awaiting: replay.awaiting.clone() };
+        let tailer = LogTailer::resume(handoff, config);
+        (path, replay, tailer)
+    }
+
+    fn append(path: &Path, line: String) {
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(f, "{line}").unwrap();
+    }
+
+    /// A write whose call the replay saw but whose result lands later — a
+    /// permission prompt at startup — is still paired, by the tailer.
+    #[test]
+    fn a_result_after_the_replay_pairs_with_the_replayed_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, replay, mut tailer) = replay_then_tail(dir.path(), &[call("toolu_1", "Edit", "/p/src/a.rs")]);
+        assert_eq!(replay.awaiting.len(), 1);
+
+        append(&path, result("toolu_1", edit_detail(Some("x\n")), false));
+        let polled = tailer.read_new_events();
+        assert_eq!(polled.writes.len(), 1);
+        assert_eq!(&*polled.writes[0].op, "toolu_1");
+    }
+
+    /// The tailer starts where the replay stopped: a line landing between
+    /// the two is read once, not skipped and not repeated.
+    #[test]
+    fn the_tailer_continues_exactly_where_the_replay_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, replay, mut tailer) = replay_then_tail(dir.path(), &[call("toolu_1", "Edit", "/p/src/a.rs")]);
+        assert_eq!(replay.offset, std::fs::metadata(&path).unwrap().len());
+
+        append(&path, call("toolu_2", "Edit", "/p/src/b.rs"));
+        let polled = tailer.read_new_events();
+        let ids: Vec<_> = polled.events.iter().map(|e| e.tool_use_id.as_deref()).collect();
+        assert_eq!(ids, vec![Some("toolu_2")]);
+    }
+
+    /// A rejected write resolved in the replay emits nothing and must not be
+    /// left awaiting a result that already came.
+    #[test]
+    fn a_rejected_write_is_not_awaited() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, replay, _) = replay_then_tail(
+            dir.path(),
+            &[call("toolu_1", "Edit", "/p/src/a.rs"), result("toolu_1", serde_json::json!("rejected"), true)],
+        );
+        assert!(replay.awaiting.is_empty());
+        assert!(writes(&replay.events).is_empty());
     }
 
     /// A partial patch would under-report the change, so any defect makes

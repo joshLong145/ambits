@@ -1245,21 +1245,12 @@ fn run() -> Result<()> {
         .zip(session_id.as_ref())
         .and_then(|(ld, sid)| ingester.session_slug(ld, sid));
 
-    // Pre-populate the ledger from existing session logs.
+    // Pre-populate the ledger from existing session logs. The tailer the TUI
+    // starts later continues exactly where this stops.
+    let mut handoff = ingest::Handoff::default();
     if let (Some(ref log_dir), Some(ref session_id)) = (&log_dir, &session_id) {
         let log_files = ingester.session_log_files(log_dir, session_id);
-        for log_file in &log_files {
-            for event in ingester.parse_log_file_with_root(log_file, &project_path) {
-                match event {
-                    ingest::SessionEvent::ToolCall(tc) => app.process_agent_event(tc),
-                    ingest::SessionEvent::Compacted { summary, timestamp, agent_id, metadata } => {
-                        app.process_compaction(summary, timestamp, agent_id, metadata);
-                    }
-                    ingest::SessionEvent::SessionCleared => app.reset_session(),
-                    ingest::SessionEvent::Write(w) => app.queue_write(w),
-                }
-            }
-        }
+        handoff = tui::replay_session(&mut app, &*ingester, log_files, &project_path);
     }
 
     let serena_mode = cli.serena;
@@ -1303,7 +1294,8 @@ fn run() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_tui(&mut terminal, &mut app, &project_path, &log_dir, session_id, &registry, serena_mode, &ingester);
+    let starting = tui::StartingSession { id: session_id, handoff };
+    let result = run_tui(&mut terminal, &mut app, &project_path, &log_dir, starting, &registry, serena_mode, &ingester);
 
     // Capture the tail of the session. Records are written unbuffered, so this
     // is not a buffer flush — it is a final diff of anything read since the
@@ -1428,7 +1420,7 @@ fn run_tui(
     app: &mut App,
     project_path: &Path,
     log_dir: &Option<PathBuf>,
-    session_id: Option<String>,
+    starting: tui::StartingSession,
     registry: &ParserRegistry,
     serena_mode: bool,
     ingester: &Arc<dyn SessionIngester>,
@@ -1441,7 +1433,7 @@ fn run_tui(
     let mut session = tui::TuiSession::new(
         project_path,
         log_dir,
-        session_id,
+        starting,
         registry.supported_extensions(),
         Arc::clone(ingester),
         serena_mode,

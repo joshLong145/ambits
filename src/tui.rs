@@ -66,12 +66,49 @@ fn spawn_write_attributor(
     write_tx
 }
 
+/// Replay a session's logs into `app` — every tool call, compaction, clear
+/// and write already on disk — and return where its tailer continues.
+///
+/// The one replay loop, shared by startup and session switches.
+pub fn replay_session(
+    app: &mut App,
+    ingester: &dyn SessionIngester,
+    files: Vec<PathBuf>,
+    project_root: &Path,
+) -> ambits::ingest::Handoff {
+    use ambits::ingest::SessionEvent;
+    let mut handoff = ambits::ingest::Handoff::default();
+    for file in files {
+        let replay = ingester.replay_log_file(&file, project_root);
+        for event in replay.events {
+            match event {
+                SessionEvent::ToolCall(tc) => app.process_agent_event(tc),
+                SessionEvent::Compacted { summary, timestamp, agent_id, metadata } => {
+                    app.process_compaction(summary, timestamp, agent_id, metadata);
+                }
+                SessionEvent::SessionCleared => app.reset_session(),
+                SessionEvent::Write(w) => app.queue_write(w),
+            }
+        }
+        handoff.files.push((file, replay.offset));
+        handoff.awaiting.extend(replay.awaiting);
+    }
+    handoff
+}
+
+/// The session the TUI starts on, as replayed before it opened.
+pub struct StartingSession {
+    pub id: Option<String>,
+    /// Where the startup replay stopped; the tailer continues from here.
+    pub handoff: ambits::ingest::Handoff,
+}
+
 impl TuiSession {
     /// Create a new session, setting up both filesystem watchers and the log tailer.
     pub fn new(
         project_path: &Path,
         log_dir: &Option<PathBuf>,
-        session_id: Option<String>,
+        starting: StartingSession,
         watched_extensions: std::collections::HashSet<String>,
         ingester: Arc<dyn SessionIngester>,
         serena_mode: bool,
@@ -108,14 +145,13 @@ impl TuiSession {
             })?;
         project_watcher.watch(project_path, RecursiveMode::Recursive)?;
 
-        // Log tailer — follows the current session's .jsonl files.
-        let log_tailer: Option<Box<dyn EventTailer>> =
-            if let (Some(ref ld), Some(ref sid)) = (log_dir, &session_id) {
-                let files = ingester.session_log_files(ld, sid);
-                Some(ingester.new_tailer(files))
-            } else {
-                None
-            };
+        // Log tailer — follows the current session's .jsonl files from where
+        // the startup replay stopped.
+        let StartingSession { id: session_id, handoff } = starting;
+        let log_tailer: Option<Box<dyn EventTailer>> = match (log_dir, &session_id) {
+            (Some(_), Some(_)) => Some(ingester.resume_tailer(handoff)),
+            _ => None,
+        };
 
         // Log directory watcher — fires Tick when .jsonl files appear or change.
         let log_watcher = if let Some(ref ld) = log_dir {
@@ -234,23 +270,11 @@ impl TuiSession {
                         .zip(self.current_session_id.as_ref())
                         .and_then(|(ld2, sid)| self.ingester.session_slug(ld2, sid));
 
-                    // Pre-populate from lines already written before this tick.
+                    // Pre-populate from lines already written before this
+                    // tick, then tail from exactly where that stopped.
                     let new_files = self.ingester.session_log_files(ld, &latest);
-                    for log_file in &new_files {
-                        for event in self.ingester.parse_log_file_with_root(log_file, project_path) {
-                            match event {
-                                ambits::ingest::SessionEvent::ToolCall(tc) => app.process_agent_event(tc),
-                                ambits::ingest::SessionEvent::Compacted { summary, timestamp, agent_id, metadata } => {
-                                    app.process_compaction(summary, timestamp, agent_id, metadata);
-                                }
-                                ambits::ingest::SessionEvent::SessionCleared => app.reset_session(),
-                                ambits::ingest::SessionEvent::Write(w) => app.queue_write(w),
-                            }
-                        }
-                    }
-
-                    // Replace the tailer.
-                    self.log_tailer = Some(self.ingester.new_tailer(new_files));
+                    let handoff = replay_session(app, &*self.ingester, new_files, project_path);
+                    self.log_tailer = Some(self.ingester.resume_tailer(handoff));
 
                     // Same order as startup: journal after the replay.
                     let attach = app.attach_journal();
@@ -492,7 +516,7 @@ mod tests {
         let session = TuiSession::new(
             project,
             &Some(log_dir.to_path_buf()),
-            Some(current.to_string()),
+            StartingSession { id: Some(current.to_string()), handoff: Default::default() },
             HashSet::new(),
             ingester,
             false,

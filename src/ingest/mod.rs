@@ -160,6 +160,26 @@ pub struct TailedCompaction {
     pub metadata: Option<CompactionMetadata>,
 }
 
+/// A batch replay of one log file: its events, and where a tailer should
+/// continue so that nothing is read twice or missed.
+#[derive(Default)]
+pub struct FileReplay {
+    pub events: Vec<SessionEvent>,
+    /// Byte offset the replay read up to.
+    pub offset: u64,
+    /// Write calls whose results the replay had not reached (spec §1): a
+    /// permission prompt or a long write can straddle the handoff.
+    pub awaiting: Vec<AgentToolCall>,
+}
+
+/// What a session's replay hands to the tailer that follows it.
+#[derive(Default)]
+pub struct Handoff {
+    /// Each log file, with the offset its replay stopped at.
+    pub files: Vec<(PathBuf, u64)>,
+    pub awaiting: Vec<AgentToolCall>,
+}
+
 /// Output from a single incremental poll of an event tailer.
 pub struct TailerOutput {
     pub events: Vec<AgentToolCall>,
@@ -208,6 +228,22 @@ pub trait SessionIngester: Send + Sync {
     fn parse_log_file_with_root(&self, path: &Path, project_root: &Path) -> Vec<SessionEvent> {
         let _ = project_root;
         self.parse_log_file(path)
+    }
+
+    /// Replay a log file for a tailer to continue from ([`Self::resume_tailer`]).
+    /// Default: parse it, and hand over the file's end afterwards with
+    /// nothing awaited — lines landing in between are missed, which is what
+    /// implementations override this to avoid.
+    fn replay_log_file(&self, path: &Path, project_root: &Path) -> FileReplay {
+        let events = self.parse_log_file_with_root(path, project_root);
+        let offset = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        FileReplay { events, offset, awaiting: Vec::new() }
+    }
+
+    /// A tailer that continues exactly where a replay stopped. Default: a
+    /// fresh tailer from each file's current end.
+    fn resume_tailer(&self, handoff: Handoff) -> Box<dyn EventTailer> {
+        self.new_tailer(handoff.files.into_iter().map(|(file, _)| file).collect())
     }
 }
 
