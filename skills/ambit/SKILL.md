@@ -327,9 +327,13 @@ If coverage on files you need is insufficient:
 slug is your project path with `/` replaced by `-`. The latest `.jsonl` file is
 the current session.
 
-**Coverage shows 0% for a file you've read** — Coverage tracks tool calls only
-(Read, Edit, find_symbol, etc.). Mentioning a file in conversation without reading
-it via a tool does not count.
+**Coverage shows 0% for a file you've read** — Coverage tracks read tool calls
+only (Read, grep, find_symbol, etc.). Edits are recorded as writes, not reads —
+editing a symbol does not mark it read. Mentioning a file in conversation
+without reading it via a tool does not count.
+
+**When was this last changed by an agent?** — `ambits touched <file|symbol-id>`
+shows the latest agent write and whether that version is still on disk.
 
 **File not in the coverage report** — The file may not have parseable symbols
 (empty file, non-code file, or unsupported language without `--serena`).

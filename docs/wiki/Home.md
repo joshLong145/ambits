@@ -23,6 +23,7 @@ addresses both halves of that:
 - [Finding Callers](Finding-Callers) — call sites from the grammar, not from text
 - [Reading by Symbol](Reading-by-Symbol) — `show`: definitions as JSON, by id or hash
 - [Restoring Context](Restoring-Context) — `restore-context` and the post-compaction hook
+- [Agent Writes](Agent-Writes) — which files and symbols agents changed; `touched`
 - [Portability](Portability) — the formats, and where the provider-specific seams are
 
 **For you**

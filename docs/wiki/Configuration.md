@@ -89,9 +89,24 @@ description   = "MyCustomReader {path}"
 | `pattern_keys` | Input keys that may hold a search pattern |
 | `path_required` | Default `true`; set `false` for tools where the path is an optional filter (Glob, Grep, Bash) |
 | `depth` | How deeply a call reads the symbols it touches (below) |
+| `effect` | `"read"` (default) or `"write"`. A stanza has **exactly one** of a `depth` or `effect = "write"`: writes grant no read credit. See [Agent Writes](Agent-Writes) |
 | `description` | Activity-feed line; `{key}` interpolates an input value |
 | `extends` | Name of a built-in stanza to inherit unset fields from |
 | `target_symbol`, `target_lines`, `target_selectors` | Narrow the read to specific symbols rather than the whole file; see the built-ins |
+
+A tool that **changes** files is declared a write instead of given a depth:
+
+```toml
+[[tool]]
+names       = ["MyEditor"]
+path_keys   = ["path"]
+effect      = "write"
+description = "MyEditor {path}"
+```
+
+The built-in writes are `Edit`, `Write`, `MultiEdit`, `NotebookEdit` and
+Serena's editing tools. `extends` inherits an unset `effect`, and a stanza
+that turns a read tool into a write does not inherit its depth.
 
 Depths are `Unseen`, `NameOnly`, `Overview`, `Signature`, `FullBody`. A
 `depth` is one of:

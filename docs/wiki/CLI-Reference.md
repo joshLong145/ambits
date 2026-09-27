@@ -13,6 +13,7 @@ collects them in one place.
 | `ambits -p <path> callers <name>…` | [Call sites](Finding-Callers) and their enclosing symbol |
 | `ambits -p <path> show <selector>…` | [Symbol definitions](Reading-by-Symbol) as JSON |
 | `ambits -p <path> restore-context` | [This session's read history](Restoring-Context) |
+| `ambits -p <path> touched <file\|symbol-id>` | [When an agent last wrote it](Agent-Writes), and whether that version is still on disk |
 | `ambits -p <path> --coverage` | [Coverage report](Coverage-and-Multi-Agent) |
 | `ambits -p <path> --dump` | Print the symbol tree |
 | `ambits -p <path> cache status\|clear` | Inspect or remove [read journals](Configuration#the-read-journal) |
@@ -85,6 +86,12 @@ hex characters).
 
 `ambits -p . restore-context [--max-tokens N] [--format markdown|json|hook]` —
 default budget 3000 tokens, default format `markdown`.
+
+## `ambits touched`
+
+`ambits -p . touched [--format text|json] <file|symbol-id>` — the latest agent
+write across every session's journal, and whether it is `current`, `changed`,
+`removed`, or `unknown` (a file-level edit, no hash to compare).
 
 ## `ambits cache`
 

@@ -8,6 +8,7 @@
 - [Finding Callers](Finding-Callers)
 - [Reading by Symbol](Reading-by-Symbol)
 - [Restoring Context](Restoring-Context)
+- [Agent Writes](Agent-Writes)
 - [Portability](Portability)
 
 **For you**

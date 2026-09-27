@@ -7,7 +7,8 @@ ambits -p .
 ![screenshot](https://raw.githubusercontent.com/joshLong145/ambits/main/images/screenshot.png)
 
 Tails the session log and updates live. Three panels — symbol tree, coverage
-stats, activity feed — cycled with `Tab`.
+stats, activity feed — cycled with `Tab`. Edits appear in the activity feed
+marked `(write)`; they are journaled as [writes](Agent-Writes), not reads.
 
 Files start collapsed, including ones created while the TUI is running;
 expanding a file shows its full outline. A file you expanded stays expanded

@@ -3,6 +3,8 @@
 Every read is tracked per symbol and per agent, at the depth the tool implies —
 a `Read` gives full body, a grep match gives overview, a glob gives name only
 (the full mapping is data; see [Configuration](Configuration#tool-mappings)).
+Edits are not reads: an agent that changed a symbol has not necessarily read
+it, so edits are recorded separately as [writes](Agent-Writes).
 `restore-context` reports that history:
 
 ```bash
