@@ -1114,6 +1114,7 @@ fn run() -> Result<()> {
             return match command {
                 HookCommands::Install { git: true, project, .. } => {
                     let dir = project.clone().unwrap_or(std::env::current_dir()?);
+                    let dir = dir.canonicalize().unwrap_or(dir);
                     let exe = std::env::current_exe()?.canonicalize()?;
                     let installed = ambits::git_hook::install(&dir, &exe)?;
                     writeln!(io::stdout().lock(), "installed {}", installed.path.display())?;

@@ -232,7 +232,10 @@ fn landed_line(landed: &crate::linkage::Landed) -> String {
             format!("landed in {} (unverified: the first commit to touch the file after the write)", short(commits))
         }
         Landed::Partial { commits, unverified } => format!(
-            "partly landed in {}{}; the rest is uncommitted",
+            // "In no commit" rather than "uncommitted": the rest may have
+            // been changed again before committing, and so never land as
+            // the agent wrote it.
+            "partly landed in {}{}; the rest is in no commit",
             short(commits),
             if *unverified { " (unverified)" } else { "" }
         ),

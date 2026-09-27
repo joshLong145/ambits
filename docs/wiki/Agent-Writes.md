@@ -72,7 +72,7 @@ branch:
 |---|---|
 | `landed in <commit> (verified)` | That commit contains the symbol exactly as the agent wrote it (or, for a whole-file `Write`, the file byte for byte) |
 | `landed in <commit> (unverified: …)` | The write left nothing to compare — a file-level `Edit` — so this is only the first commit to touch the file after it |
-| `partly landed in …` | A write's symbols were committed separately (`git add -p`) and some are not committed yet |
+| `partly landed in … ; the rest is in no commit` | Some of a write's symbols are committed (perhaps separately, `git add -p`); the rest are in no commit — not committed yet, or changed again before committing |
 | `uncommitted` | In no commit on any branch |
 
 A write that touched several symbols can land in several commits; all are
