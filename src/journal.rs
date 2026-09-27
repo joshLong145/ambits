@@ -441,6 +441,23 @@ pub fn read_journal(path: &Path) -> JournalContents {
 /// Snapshots fold exactly the bytes they digest (spec §6.2), so they read a
 /// shard once and pass its text here.
 pub fn fold_journal_text(path: &Path, content: &str) -> JournalContents {
+    fold_lines(path, content, Records::All)
+}
+
+/// Which records a fold parses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Records {
+    All,
+    /// Headers and writes only: reads, which outnumber writes several times
+    /// over, are counted but skipped unparsed, by their `{"kind":"read"`
+    /// prefix (serde writes the tag first; `the_record_tag_is_serialized_first`
+    /// holds it to that).
+    Writes,
+}
+
+/// The one journal fold, with one schema rule: a header outside the
+/// readable range discards the whole shard.
+fn fold_lines(path: &Path, content: &str, records: Records) -> JournalContents {
     let mut out = JournalContents::default();
 
     let lines: Vec<&str> = content.lines().collect();
@@ -453,6 +470,9 @@ pub fn fold_journal_text(path: &Path, content: &str) -> JournalContents {
             continue;
         }
         out.records += 1;
+        if records == Records::Writes && line.trim_start().starts_with(r#"{"kind":"read""#) {
+            continue;
+        }
         let record: Record = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(e) => {
@@ -587,25 +607,8 @@ pub fn read_session_writes(dir: &Path, session_id: &str) -> std::collections::BT
     let mut out = std::collections::BTreeMap::new();
     for path in session_shard_paths(dir, session_id) {
         let Ok(content) = std::fs::read_to_string(&path) else { continue };
-        let mut shard = std::collections::BTreeMap::new();
-        let mut readable = true;
-        for line in content.lines() {
-            let line = line.trim();
-            if !(line.starts_with(r#"{"kind":"write""#) || line.starts_with(r#"{"kind":"header""#)) {
-                continue;
-            }
-            match serde_json::from_str::<Record>(line) {
-                Ok(Record::Header(h)) => {
-                    readable = (MIN_READABLE_SCHEMA_VERSION..=SUPPORTED_SCHEMA_VERSION).contains(&h.schema_version);
-                }
-                Ok(Record::Write(w)) => fold_write(&mut shard, *w),
-                _ => {}
-            }
-        }
-        if readable {
-            for record in shard.into_values() {
-                fold_write(&mut out, record);
-            }
+        for record in fold_lines(&path, &content, Records::Writes).writes.into_values() {
+            fold_write(&mut out, record);
         }
     }
     out
@@ -1465,6 +1468,35 @@ mod write_record_tests {
         assert_eq!(fast, read_journal_session(&jdir, "sess").writes);
         assert_eq!(fast["toolu_1"].av, 2);
         assert_eq!(fast.len(), 2);
+    }
+
+    /// The writes-only fold skips reads by their serialized prefix; that
+    /// holds only while serde writes the `kind` tag first.
+    #[test]
+    fn the_record_tag_is_serialized_first() {
+        let read = Record::Read { symbol_id: "a::b".into(), hash: "b3:00".into(), depth: DepthDto::FullBody, agent: None };
+        assert!(serde_json::to_string(&read).unwrap().starts_with(r#"{"kind":"read""#));
+        let write = Record::Write(Box::new(record("toolu_1", 2, "src/lib.rs::a")));
+        assert!(serde_json::to_string(&write).unwrap().starts_with(r#"{"kind":"write""#));
+    }
+
+    /// A later header does not revive a shard an unreadable one discarded:
+    /// the writes-only fold follows the full fold's rule exactly.
+    #[test]
+    fn both_folds_agree_on_a_shard_with_a_bad_then_good_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let jdir = journal_dir(dir.path());
+        std::fs::create_dir_all(&jdir).unwrap();
+        let header = |v: u32| format!(
+            "{{\"kind\":\"header\",\"schema_version\":{v},\"created_at\":\"0\",\"session_id\":\"sess\",\"project_root\":\"/p\",\"tree_fingerprint\":\"b3:00\",\"ambit_version\":\"0\",\"backend\":\"x\",\"os\":\"x\",\"arch\":\"x\"}}"
+        );
+        let write = serde_json::to_string(&Record::Write(Box::new(record("toolu_1", 2, "src/lib.rs::a")))).unwrap();
+        std::fs::write(
+            jdir.join("sess.ndjson"),
+            format!("{}\n{}\n{write}\n", header(SUPPORTED_SCHEMA_VERSION + 1), header(SUPPORTED_SCHEMA_VERSION)),
+        )
+        .unwrap();
+        assert_eq!(read_session_writes(&jdir, "sess"), read_journal_session(&jdir, "sess").writes);
     }
 
     #[test]
