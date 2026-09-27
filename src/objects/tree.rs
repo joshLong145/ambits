@@ -54,7 +54,7 @@ pub fn write_tree(
                         .iter()
                         .map(|(path, file, parser)| {
                             let mut count = 0;
-                            let id = write_file(store, file, path, parser, &mut count)?;
+                            let id = write_file(store, file, parser, &mut count)?;
                             Ok((path.clone(), id, count))
                         })
                         .collect()
@@ -76,8 +76,11 @@ pub fn write_tree(
     Ok(TreeStats { root: root.write(store)?, files, symbols })
 }
 
-fn write_file(store: &Store, file: &FileSymbols, path: &str, parser: &str, count: &mut usize) -> Result<ObjectId> {
-    let prefix = format!("{path}::");
+fn write_file(store: &Store, file: &FileSymbols, parser: &str, count: &mut usize) -> Result<ObjectId> {
+    // Ids are built from the path as the parser saw it — separators and
+    // Unicode form untouched — so that is the prefix to strip; `name_path`
+    // is normalized afterwards.
+    let prefix = format!("{}::", file.file_path.to_string_lossy());
     let mut ids = Vec::with_capacity(file.symbols.len());
     for sym in &file.symbols {
         ids.push(write_symbol(store, sym, &prefix, count)?);
@@ -250,13 +253,16 @@ mod tests {
         assert_eq!(store.list().len(), 8, "nothing stored that the root does not reach");
     }
 
-    /// `\\` and `/`, and composed vs decomposed accents, name the same file.
+    /// `\\` and `/`, and composed vs decomposed accents, name the same file
+    /// — and its symbols, whose ids carry the path in whichever form the
+    /// parser was given it.
     #[test]
     fn separators_and_unicode_forms_do_not_change_the_tree() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
-        let a = tree(vec![file("src\\caf\u{e9}.rs", vec![])]);
-        let b = tree(vec![file("src/cafe\u{301}.rs", vec![])]);
+        let (win, nfd) = ("src\\caf\u{e9}.rs", "src/cafe\u{301}.rs");
+        let a = tree(vec![file(win, vec![sym(&format!("{win}::A"), "A")])]);
+        let b = tree(vec![file(nfd, vec![sym(&format!("{nfd}::A"), "A")])]);
         assert_eq!(
             write_tree(&store, &a, &parser, &SyncIgnore::none()).unwrap().root,
             write_tree(&store, &b, &parser, &SyncIgnore::none()).unwrap().root

@@ -22,18 +22,25 @@ pub enum Backend<'a> {
     Serena { fingerprint: String },
 }
 
+/// Version of the object encodings (`tree`, `record`). Part of every
+/// snapshot's `parsers` input, so a change to how objects are written makes
+/// new snapshots rather than colliding with ids made under the old encoding.
+pub const OBJECT_FORMAT: &str = "ambits-objects@1";
+
 impl Backend<'_> {
-    /// The `parsers` input: backend, grammar versions and symbol schemas.
+    /// The `parsers` input: object format, backend, grammar versions and
+    /// symbol schemas.
     pub fn parsers(&self) -> Vec<String> {
+        let mut out = vec![OBJECT_FORMAT.to_string()];
         match self {
             Backend::TreeSitter(registry) => {
-                let mut out = vec![format!("tree-sitter@{}", crate::parser::grammar_version("tree-sitter"))];
+                out.push(format!("tree-sitter@{}", crate::parser::grammar_version("tree-sitter")));
                 out.extend(registry.identities());
-                out.sort();
-                out
             }
-            Backend::Serena { fingerprint } => vec![format!("serena@{fingerprint}")],
+            Backend::Serena { fingerprint } => out.push(format!("serena@{fingerprint}")),
         }
+        out.sort();
+        out
     }
 }
 
@@ -92,7 +99,13 @@ pub fn snapshot_id(inputs_digest: &[u8; 32], parents: &[ObjectId]) -> ObjectId {
 pub struct Environment {
     pub git: Option<String>,
     pub scan: [u8; 32],
+    /// `(normalized path, BLAKE3 of raw bytes)`, sorted: the `dirty` input.
     pub dirty: Vec<(String, String)>,
+    /// The bytes each dirty file was fingerprinted from, by its raw
+    /// project-relative path (`None` when it is gone or not a regular file).
+    /// A snapshot parses dirty files from exactly these bytes, so the tree
+    /// and the fingerprints cannot describe two different moments.
+    pub contents: Vec<(std::path::PathBuf, Option<Vec<u8>>)>,
 }
 
 /// Inspect the working tree of `project_root`, whose scan produced `tree`.
@@ -100,52 +113,77 @@ pub struct Environment {
 /// In a repository, the dirty files are the tracked files git reports
 /// changed plus the untracked files the scan picked up. Outside one — or
 /// before the first commit — every scanned file is dirty (§7).
+///
+/// Call it *after* the scan: a file changed during the scan then shows up
+/// dirty here, and its symbols are re-parsed from the bytes read now.
 pub fn environment(project_root: &Path, tree: &ProjectTree, filter: Option<&str>, ignore: &SyncIgnore) -> Result<Environment> {
-    let scanned: std::collections::HashSet<String> =
-        tree.files.iter().map(|f| normalize_path(&f.file_path.to_string_lossy())).collect();
+    // Scanned files by normalized path, keeping the raw path to open them by
+    // (git on Linux hands back names in whatever form they were created).
+    let scanned: std::collections::HashMap<String, std::path::PathBuf> = tree
+        .files
+        .iter()
+        .map(|f| (normalize_path(&f.file_path.to_string_lossy()), f.file_path.clone()))
+        .collect();
     let repo = Repo::discover(project_root);
     let status = repo.as_ref().filter(|r| r.head.is_some()).and_then(Repo::status);
 
-    let mut dirty_paths: Vec<String> = Vec::new();
-    let mut untracked_ignores: Vec<(String, String)> = Vec::new();
+    let mut candidates: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut untracked_ignores: Vec<(String, Value)> = Vec::new();
     match &status {
         Some(entries) => {
             for entry in entries {
                 let path = normalize_path(&entry.path);
                 let name = path.rsplit('/').next().unwrap_or(&path);
                 if entry.untracked && matches!(name, ".ignore" | ".gitignore") {
-                    untracked_ignores.push((path.clone(), fingerprint(&project_root.join(&entry.path))));
+                    untracked_ignores.push((path.clone(), stream_hash(&project_root.join(&entry.path))));
                 }
-                if !entry.untracked || scanned.contains(&path) {
-                    dirty_paths.push(path);
+                if !entry.untracked || scanned.contains_key(&path) {
+                    candidates.push((path, std::path::PathBuf::from(&entry.path)));
                 }
             }
         }
-        None => dirty_paths.extend(scanned.iter().cloned()),
+        None => candidates.extend(scanned.iter().map(|(n, raw)| (n.clone(), raw.clone()))),
+    }
+    candidates.retain(|(path, _)| !ignore.is_ignored(path));
+    candidates.sort();
+    candidates.dedup_by(|a, b| a.0 == b.0);
+
+    let mut dirty = Vec::with_capacity(candidates.len());
+    let mut contents = Vec::with_capacity(candidates.len());
+    for (path, raw) in candidates {
+        let bytes = read_regular(&project_root.join(&raw));
+        let hash = match (&bytes, std::fs::symlink_metadata(project_root.join(&raw))) {
+            (Some(b), _) => b3(blake3::hash(b).as_bytes()),
+            (None, Ok(m)) if !m.is_file() => "not-a-file".into(),
+            (None, Ok(_)) => "unreadable".into(),
+            (None, Err(_)) => "deleted".into(),
+        };
+        dirty.push((path, hash));
+        contents.push((raw, bytes));
+    }
+    untracked_ignores.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Ignore files the walker also reads above a project that is a
+    // subdirectory of its repository: `git status -- .` does not see them.
+    let mut parent_ignores: Vec<Value> = Vec::new();
+    if let Some(repo) = repo.as_ref().filter(|r| !r.prefix.is_empty()) {
+        let top = repo.top.canonicalize().unwrap_or_else(|_| repo.top.clone());
+        for dir in project_root.ancestors().skip(1) {
+            let rel = dir.strip_prefix(&top).map(|p| normalize_path(&p.to_string_lossy())).unwrap_or_default();
+            for name in [".gitignore", ".ignore"] {
+                parent_ignores.push(json!([format!("{rel}/{name}"), stream_hash(&dir.join(name))]));
+            }
+            if dir == top {
+                break;
+            }
+        }
     }
 
-    let mut dirty: Vec<(String, String)> = dirty_paths
-        .into_iter()
-        .filter(|p| !ignore.is_ignored(p))
-        .map(|p| {
-            let hash = fingerprint(&project_root.join(&p));
-            (p, hash)
-        })
-        .collect();
-    dirty.sort();
-    dirty.dedup();
-    untracked_ignores.sort();
-
-    let file_hash = |p: Option<std::path::PathBuf>| -> Value {
-        match p.and_then(|p| std::fs::read(p).ok()) {
-            Some(bytes) => json!(b3(blake3::hash(&bytes).as_bytes())),
-            None => Value::Null,
-        }
-    };
     let scan_value = json!({
         "filter": filter,
-        "global_excludes": file_hash(repo.as_ref().and_then(Repo::global_excludes)),
-        "info_exclude": file_hash(repo.as_ref().and_then(|r| r.git_path("info/exclude"))),
+        "global_excludes": repo.as_ref().and_then(Repo::global_excludes).map_or(Value::Null, |p| stream_hash(&p)),
+        "info_exclude": repo.as_ref().and_then(|r| r.git_path("info/exclude")).map_or(Value::Null, |p| stream_hash(&p)),
+        "parent_ignores": parent_ignores,
         "untracked_ignores": untracked_ignores.iter().map(|(p, h)| json!([p, h])).collect::<Vec<_>>(),
         // The walker's own settings (`parser::walk_files` defaults).
         "walker": "hidden=skip ignore=on git_ignore=on git_global=on git_exclude=on",
@@ -158,19 +196,30 @@ pub fn environment(project_root: &Path, tree: &ProjectTree, filter: Option<&str>
         git: repo.and_then(|r| r.head),
         scan: *h.finalize().as_bytes(),
         dirty,
+        contents,
     })
 }
 
-/// BLAKE3 of a file's raw bytes (§7): `"deleted"` when it is gone, and for
-/// anything that is not a regular file, which is never followed (§9.1).
-fn fingerprint(path: &Path) -> String {
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if m.is_file() => match std::fs::read(path) {
-            Ok(bytes) => b3(blake3::hash(&bytes).as_bytes()),
-            Err(_) => "unreadable".into(),
-        },
-        Ok(_) => "not-a-file".into(),
-        Err(_) => "deleted".into(),
+/// A regular file's bytes; `None` for anything else, which is never
+/// followed (§9.1), or when it is gone.
+fn read_regular(path: &Path) -> Option<Vec<u8>> {
+    std::fs::symlink_metadata(path).ok().filter(|m| m.is_file())?;
+    std::fs::read(path).ok()
+}
+
+/// `b3:` hash of a regular file, streamed, or `null` when there is none.
+fn stream_hash(path: &Path) -> Value {
+    let Some(file) = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|m| m.is_file())
+        .and_then(|_| std::fs::File::open(path).ok())
+    else {
+        return Value::Null;
+    };
+    let mut h = blake3::Hasher::new();
+    match h.update_reader(file) {
+        Ok(_) => json!(b3(h.finalize().as_bytes())),
+        Err(_) => Value::Null,
     }
 }
 

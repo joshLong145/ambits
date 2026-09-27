@@ -2,7 +2,7 @@
 //! and the `coverage` and `writes` objects folded from the same bytes
 //! (§5.1, D14).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::Result;
 use serde_json::{json, Value};
@@ -28,22 +28,33 @@ pub struct JournalPrefix {
 /// after), several shards, and older schema versions (§6.2).
 pub fn read_prefix(project_root: &Path, session: &str) -> Result<JournalPrefix> {
     let dir = journal::journal_dir(project_root);
-    let mut shards = journal::session_shard_paths(&dir, session);
-    shards.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    // Each shard read once, keeping only complete lines.
+    let mut shards: Vec<(PathBuf, String, Vec<u8>)> = Vec::new();
+    for path in journal::session_shard_paths(&dir, session) {
+        let mut bytes = std::fs::read(&path)?;
+        bytes.truncate(bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1));
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        shards.push((path, name, bytes));
+    }
 
+    // Fold in the order `read_journal_session` uses (primary shard first),
+    // so a snapshot's coverage is what the TUI and `restore` see: the fold
+    // is last-hash-wins, so order matters.
+    let mut contents = JournalContents::default();
+    for (path, _, bytes) in &shards {
+        journal::merge_shard(&mut contents, journal::fold_journal_text(path, &String::from_utf8_lossy(bytes)));
+    }
+
+    // Digest in name order, the order §6.2 specifies.
+    shards.sort_by(|a, b| a.1.cmp(&b.1));
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"ambits-journal v1\0");
-    let mut contents = JournalContents::default();
-    for path in shards {
-        let bytes = std::fs::read(&path)?;
-        let prefix = &bytes[..bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1)];
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        for part in [name.as_bytes(), prefix] {
+    for (_, name, bytes) in &shards {
+        for part in [name.as_bytes(), bytes.as_slice()] {
             hasher.update(part.len().to_string().as_bytes());
             hasher.update(b"\0");
             hasher.update(part);
         }
-        journal::merge_shard(&mut contents, journal::fold_journal_text(&path, &String::from_utf8_lossy(prefix)));
     }
     Ok(JournalPrefix { digest: *hasher.finalize().as_bytes(), contents })
 }
@@ -70,16 +81,18 @@ pub fn write_records(store: &Store, session: &str, contents: &JournalContents, i
         contents.agent_reads.iter().map(|((id, agent), (h, d))| (id.as_str(), agent.as_str(), h, *d)).collect()
     };
     for (id, agent, hash, depth) in attributed {
-        if !depth.is_seen() || ignore.ignores_symbol(id) {
+        // Normalized before matching, or `secret\k.rs` escapes `secret/`.
+        let id = super::normalize_path(id);
+        if !depth.is_seen() || ignore.ignores_symbol(&id) {
             continue;
         }
-        reads.push(json!([super::normalize_path(id), b3(hash), DepthDto::from(depth), agent]));
+        reads.push(json!([id, b3(hash), DepthDto::from(depth), agent]));
     }
     sort_canonically(&mut reads)?;
 
     let mut writes: Vec<Value> = Vec::new();
     for record in contents.writes.values() {
-        if !ignore.is_ignored(&record.file) {
+        if !ignore.is_ignored(&super::normalize_path(&record.file)) {
             writes.push(serde_json::to_value(record)?);
         }
     }
@@ -146,6 +159,35 @@ mod tests {
         let two = read_prefix(dir.path(), "s").unwrap();
         assert_ne!(one, two.digest);
         assert_eq!(two.contents.reads.len(), 2);
+    }
+
+    /// A read recorded with Windows separators is still matched by a `/`
+    /// pattern.
+    #[test]
+    fn ignore_matching_sees_normalized_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        journal(dir.path(), "s.ndjson", &format!("{}\n", READ_B.replace("secret/k.rs", "secret\\\\k.rs")));
+        let prefix = read_prefix(dir.path(), "s").unwrap();
+        let ignore = SyncIgnore::new(&crate::ingest::tool_config::SyncConfig {
+            ignore: Some(vec!["secret/".into()]),
+            global_ignore: vec![],
+        })
+        .unwrap();
+        let stats = write_records(&Store::at(dir.path()), "s", &prefix.contents, &ignore).unwrap();
+        assert_eq!(stats.reads, 0);
+    }
+
+    /// Coverage folds shards in the TUI's order (primary first), which can
+    /// differ from name order: the fold is last-hash-wins.
+    #[test]
+    fn shards_fold_primary_first_like_the_tui() {
+        let dir = tempfile::tempdir().unwrap();
+        let newer = READ_A.replace("\"h\":\"b3:0000000000000000000000000000000000000000000000000000000000000000\"", "\"h\":\"b3:1111111111111111111111111111111111111111111111111111111111111111\"");
+        journal(dir.path(), "s.ndjson", &format!("{READ_A}\n"));
+        journal(dir.path(), "s.find.ndjson", &format!("{newer}\n"));
+        let prefix = read_prefix(dir.path(), "s").unwrap();
+        let tui = journal::read_journal_session(&journal::journal_dir(dir.path()), "s");
+        assert_eq!(prefix.contents.reads, tui.reads);
     }
 
     /// Ignored paths leave no read and no write behind (§4).

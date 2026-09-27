@@ -403,6 +403,9 @@ snapshot_id = BLAKE3("ambits-snapshot v1\0" ‖ inputs_digest ‖ sorted parents
   whenever ambits' own extraction changes (#33 changed spans with no grammar
   change). One string per parser, `rust:tree-sitter-rust@0.23.3:schema=1`,
   plus `tree-sitter@<version>`; a `file` object records its parser's string.
+  Also `ambits-objects@1`, the object encoding version, so a change to how
+  objects are written makes new snapshots instead of colliding with ids from
+  the old encoding.
 - **`scan_inputs`**: everything the walker honours that is not in the commit —
   `--filter`/`--filter-regex`, `.git/info/exclude`, global git excludes,
   untracked `.ignore` files, and walker flags. `snapshot` records its own
@@ -477,6 +480,16 @@ flagged **non-reproducible**.
   `file` object ids miss same-length edits outside symbols and whitespace-only
   edits inside them (`content_hash` is normalized).
 - `ambits snapshot --require-clean` refuses dirty trees.
+- **Taken after the scan, and authoritative.** The environment is read after
+  the tree is scanned. Each dirty file is read **once**, and its symbols are
+  re-parsed from the bytes its fingerprint was taken from. A file saved
+  mid-scan therefore cannot leave a tree of the old bytes under an id of the
+  new ones (found in review).
+- A project in a **subdirectory** of its repository: `git status -- .`
+  covers only the project, so the `.gitignore`/`.ignore` files between the
+  repository top and the project are hashed into `scan_inputs`.
+- **Not detected** (git does not report them): changes inside submodules, and
+  files marked `skip-worktree` or `assume-unchanged`.
 - `log` shows `a1b2c3d (dirty: 4 files)`.
 
 | Implication | Why acceptable |
@@ -505,7 +518,12 @@ flagged **non-reproducible**.
 
 - Store mode `0700`, files `0600`.
 - **Object writes**: temp, fsync, rename; **children before parents**,
-  snapshot object last. Loose objects uncompressed (zstd with packs, phase 7).
+  snapshot object last. The directories that received new objects are
+  fsynced before the snapshot object is written, and the snapshot's before
+  the ref moves, so after a power loss a present parent always has its
+  children. A tip whose objects are missing anyway is rebuilt from the
+  unchanged state by the next `snapshot` (the no-op check verifies `root`,
+  `coverage` and `writes` exist). Loose objects uncompressed (zstd with packs, phase 7).
 - **Ref updates**: create `<ref>.lock` exclusively containing **pid, start time
   and a random token** (no host, D16); re-read the ref after locking; write;
   rename; append to the reflog.

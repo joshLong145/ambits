@@ -8,18 +8,39 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Run `git <args>` in `dir`; `None` if git is missing or the command fails.
-pub fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = Command::new("git")
+/// Variables that would point git at another repository, index or object
+/// store than the one at `-C` — set, for instance, when running inside a git
+/// hook. Always cleared.
+const REPOSITORY_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+];
+
+/// The hardened `git -C <dir>` every call starts from.
+fn command(dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    for var in REPOSITORY_VARS {
+        command.env_remove(var);
+    }
+    command
         .arg("-C")
         .arg(dir)
         .args(["-c", "core.fsmonitor=false", "-c", "diff.external=", "--no-pager"])
-        .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .ok()?;
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    command
+}
+
+/// Run `git <args>` in `dir`; `None` if git is missing or the command fails.
+pub fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let output = command(dir).args(args).output().ok()?;
     output.status.success().then_some(output.stdout)
 }
 
@@ -39,6 +60,8 @@ pub fn is_commit_id(s: &str) -> bool {
 pub struct Repo {
     /// `dir` relative to the work tree's top, `/`-terminated or empty.
     pub prefix: String,
+    /// The work tree's top directory.
+    pub top: PathBuf,
     /// `HEAD`, or `None` before the first commit.
     pub head: Option<String>,
     dir: PathBuf,
@@ -51,9 +74,10 @@ impl Repo {
             return None;
         }
         let prefix = git_line(dir, &["rev-parse", "--show-prefix"]).unwrap_or_default();
+        let top = PathBuf::from(git_line(dir, &["rev-parse", "--show-toplevel"])?);
         let head = git_line(dir, &["rev-parse", "--verify", "--quiet", "--end-of-options", "HEAD^{commit}"])
             .filter(|h| is_commit_id(h));
-        Some(Self { prefix, head, dir: dir.to_path_buf() })
+        Some(Self { prefix, top, head, dir: dir.to_path_buf() })
     }
 
     /// Changed paths under `dir`, relative to it: tracked files modified,
@@ -61,7 +85,8 @@ impl Repo {
     /// `git status --porcelain=v1 -z` (§7). Renames are reported as a
     /// deletion plus an addition.
     pub fn status(&self) -> Option<Vec<StatusEntry>> {
-        let out = git(&self.dir, &["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"])?;
+        // `-- .` keeps git from walking the rest of a larger repository.
+        let out = git(&self.dir, &["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--", "."])?;
         let mut entries = Vec::new();
         for record in out.split(|&b| b == 0).filter(|r| r.len() > 3) {
             let code = &record[..2];
@@ -147,6 +172,17 @@ mod tests {
                 StatusEntry { path: "src/new.rs".into(), untracked: true },
             ]
         );
+    }
+
+    /// Variables that would point git at another repository (set inside a
+    /// git hook, for one) are cleared on every call.
+    #[test]
+    fn inherited_repository_variables_are_cleared() {
+        let cmd = command(Path::new("."));
+        let cleared: Vec<_> = cmd.get_envs().filter(|(_, v)| v.is_none()).map(|(k, _)| k.to_owned()).collect();
+        for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
+            assert!(cleared.iter().any(|k| k == var), "{var} not cleared");
+        }
     }
 
     #[test]

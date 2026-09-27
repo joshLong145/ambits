@@ -71,7 +71,10 @@ pub fn all(store: &Store) -> Vec<(String, ObjectId)> {
             let Ok(meta) = fs::symlink_metadata(&path) else { continue };
             if meta.is_dir() {
                 stack.push(path);
-            } else if meta.is_file() && path.extension().is_none_or(|e| e != "lock") {
+            } else if meta.is_file()
+                && path.extension().is_none_or(|e| e != "lock")
+                && !entry.file_name().to_string_lossy().starts_with('.')
+            {
                 if let Some(id) = fs::read_to_string(&path).ok().and_then(|s| ObjectId::parse(s.trim()).ok()) {
                     let name = path.strip_prefix(store.root()).unwrap_or(&path).to_string_lossy().replace('\\', "/");
                     out.push((name, id));
@@ -131,6 +134,7 @@ pub fn update(store: &Store, name: &RefName, expected: Option<ObjectId>, new: Ob
         bail!("{} moved while this snapshot was being made; run it again", name.as_str());
     }
     write_atomic(&path, format!("{new}\n").as_bytes())?;
+    super::store::fsync_dir(path.parent().unwrap_or(&path))?;
     append_reflog(store, name, &ReflogEntry { old: current.map(|c| c.hex()), new: new.hex(), secs: now_secs(), time: now_rfc3339(), action: action.to_string() })
 }
 
@@ -170,7 +174,7 @@ pub fn reflogs(store: &Store) -> Vec<(PathBuf, Vec<ReflogEntry>)> {
             let path = entry.path();
             match fs::symlink_metadata(&path) {
                 Ok(m) if m.is_dir() => stack.push(path),
-                Ok(m) if m.is_file() => {
+                Ok(m) if m.is_file() && !entry.file_name().to_string_lossy().starts_with('.') => {
                     let entries = fs::read_to_string(&path)
                         .unwrap_or_default()
                         .lines()

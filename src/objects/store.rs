@@ -24,13 +24,29 @@ pub const MAX_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
 pub struct Store {
     /// `.ambits/`
     root: PathBuf,
+    /// Directories that gained an entry since the last [`Store::sync_dirs`].
+    /// A rename is durable only once its directory is synced, so these are
+    /// flushed before anything that references the new objects is written.
+    written_dirs: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<PathBuf>>>,
 }
 
 impl Store {
     /// The store of `project_root`. Nothing is created until something is
     /// written.
     pub fn at(project_root: &Path) -> Self {
-        Self { root: project_root.join(crate::state_dir::STATE_DIR) }
+        Self { root: project_root.join(crate::state_dir::STATE_DIR), written_dirs: Default::default() }
+    }
+
+    /// Make every object written so far durable: fsync each directory that
+    /// gained one (§8). Called before writing what references them — the
+    /// snapshot object, then the ref — so a power loss can never keep a
+    /// parent whose children's renames were lost.
+    pub fn sync_dirs(&self) -> Result<()> {
+        let dirs = std::mem::take(&mut *self.written_dirs.lock().expect("not poisoned"));
+        for dir in dirs.iter().chain(std::iter::once(&self.objects())) {
+            fsync_dir(dir)?;
+        }
+        Ok(())
     }
 
     /// `.ambits/`, under which refs, logs and notes also live.
@@ -75,7 +91,11 @@ impl Store {
             return Ok(());
         }
         let envelope = canonical::to_bytes(&json!({"payload": payload, "type": kind.name()}))?;
-        write_atomic(&path, &envelope)
+        write_atomic(&path, &envelope)?;
+        if let Some(dir) = path.parent() {
+            self.written_dirs.lock().expect("not poisoned").insert(dir.to_path_buf());
+        }
+        Ok(())
     }
 
     /// Load and verify object `id`, which must be of type `kind`.
@@ -158,6 +178,20 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result.wrap_err_with(|| format!("writing {}", path.display()))
+}
+
+/// Flush a directory's entries to disk, so renames into it survive a power
+/// loss. A no-op where directories cannot be opened as files (Windows).
+pub fn fsync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .wrap_err_with(|| format!("syncing {}", dir.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 /// Mark `path` as recently used, for gc's grace period (§8). Best-effort: a

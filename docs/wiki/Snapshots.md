@@ -39,6 +39,9 @@ local history.
   log), fingerprinted by their raw bytes. `--require-clean` refuses a dirty
   working tree instead.
 - `-m` stores a message in the snapshot's local note.
+- **What git does not report is not seen.** Changes inside a submodule, and
+  to files marked `skip-worktree` or `assume-unchanged`, do not make a new
+  snapshot.
 
 A project's first snapshot writes every symbol and can take a few seconds.
 Each object is flushed to disk so a crash can never leave one half-written.

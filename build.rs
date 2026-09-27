@@ -6,7 +6,13 @@ use std::fmt::Write as _;
 
 fn main() {
     println!("cargo:rerun-if-changed=Cargo.lock");
-    let lock = std::fs::read_to_string("Cargo.lock").unwrap_or_default();
+    let lock = match std::fs::read_to_string("Cargo.lock") {
+        Ok(lock) => lock,
+        Err(_) => {
+            println!("cargo:warning=no Cargo.lock: grammar versions will be recorded as \"unknown\" in snapshot inputs");
+            String::new()
+        }
+    };
 
     // `[[package]]` stanzas: `name = "…"` followed by `version = "…"`.
     let mut grammars = Vec::new();
@@ -21,6 +27,14 @@ fn main() {
         }
     }
     grammars.sort();
+    for pair in grammars.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            println!(
+                "cargo:warning=Cargo.lock has two versions of {} ({} and {}); snapshots record the first",
+                pair[0].0, pair[0].1, pair[1].1
+            );
+        }
+    }
 
     let mut out = String::from("/// `(crate, version)` for every tree-sitter crate in `Cargo.lock`.\n");
     out.push_str("pub const GRAMMARS: &[(&str, &str)] = &[\n");

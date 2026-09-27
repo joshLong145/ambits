@@ -89,6 +89,17 @@ impl Snapshot {
             inputs,
             parents,
         };
+        // Fields are validated as untrusted input (§9.1), and the payload
+        // must be exactly what these values encode to: an extra key would
+        // ride along covered by no digest.
+        let git_ok = snapshot.inputs.git.as_deref().is_none_or(crate::git::is_commit_id);
+        let dirty_ok = snapshot.inputs.dirty.iter().all(|(p, _)| super::valid_record_path(p));
+        if !git_ok || !dirty_ok || !crate::ingest::claude::is_uuid(&snapshot.inputs.session) {
+            bail!("snapshot {}: malformed fields", id.short());
+        }
+        if super::canonical::to_bytes(&snapshot.to_value())? != super::canonical::to_bytes(&v)? {
+            bail!("snapshot {}: unexpected or malformed fields", id.short());
+        }
         if snapshot.inputs.digest()? != snapshot.inputs_digest {
             bail!("snapshot {}: its inputs do not match its inputs digest", id.short());
         }
@@ -139,7 +150,13 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
     let _gc = gc::GcLock::shared(&store)?;
 
     let prefix = record::read_prefix(req.project_root, req.session)?;
+    // After the scan (§7): see `inputs::environment`.
     let env = inputs::environment(req.project_root, req.tree, req.filter.as_deref(), &ignore)?;
+    let scanned = match &req.backend {
+        Backend::TreeSitter(registry) => reparse_dirty(req.tree, &env.contents, registry),
+        // Serena's symbols come from its cache, not from the files.
+        Backend::Serena { .. } => req.tree.clone(),
+    };
     if req.require_clean && !env.dirty.is_empty() {
         bail!("working tree has {} dirty file(s); commit or stash them, or drop --require-clean", env.dirty.len());
     }
@@ -157,9 +174,16 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
     // Parents: the session's tip. Pending merge tips join them once `pull`
     // records merges (phase 6); until then there are none.
     let tip = refs::read(&store, &name)?;
+    let mut repair: Option<Snapshot> = None;
     if let Some(tip) = tip {
-        if Snapshot::load(&store, tip)?.inputs_digest == inputs_digest {
-            return Ok(Outcome::NothingChanged(tip));
+        let current = Snapshot::load(&store, tip)?;
+        if current.inputs_digest == inputs_digest {
+            if [current.root, current.coverage, current.writes].iter().all(|id| store.contains(id)) {
+                return Ok(Outcome::NothingChanged(tip));
+            }
+            // The tip survived a crash its objects did not. Same inputs,
+            // same objects: rebuild them below and leave the tip as it is.
+            repair = Some(current);
         }
     }
     let parents: Vec<ObjectId> = tip.into_iter().collect();
@@ -172,8 +196,15 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
             Backend::Serena { .. } => req.backend.parsers().join(","),
         }
     };
-    let tree = tree::write_tree(&store, req.tree, &parser_of, &ignore)?;
+    let tree = tree::write_tree(&store, &scanned, &parser_of, &ignore)?;
     let records = record::write_records(&store, req.session, &prefix.contents, &ignore)?;
+    if let Some(tip) = repair {
+        if (tip.root, tip.coverage, tip.writes) != (tree.root, records.coverage, records.writes) {
+            bail!("snapshot {} is missing objects that cannot be rebuilt from the current state", tip.id.short());
+        }
+        store.sync_dirs()?;
+        return Ok(Outcome::NothingChanged(tip.id));
+    }
     let dirty = inputs.dirty.len();
     let snapshot = Snapshot {
         id,
@@ -193,11 +224,46 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
             bail!("snapshot {} already exists with different contents; the store may be corrupt", id.short());
         }
     }
+    // Every object durable before the snapshot that references them, and
+    // the snapshot before the ref (§8).
+    store.sync_dirs()?;
     store.put_at(&id, Kind::Snapshot, &snapshot.to_value())?;
+    store.sync_dirs()?;
     refs::write_note(&store, &id, req.message)?;
     refs::update(&store, &name, tip, id, "snapshot")?;
 
     Ok(Outcome::Created { id, parents, files: tree.files, reads: records.reads, writes: records.write_count, dirty })
+}
+
+/// `tree` with every dirty file parsed again from the bytes its fingerprint
+/// was taken from — or dropped when it is gone or no longer parses — so the
+/// tree and the `dirty` input describe the same moment even if a file
+/// changed while the project was being scanned (§7).
+fn reparse_dirty(
+    tree: &ProjectTree,
+    contents: &[(std::path::PathBuf, Option<Vec<u8>>)],
+    registry: &crate::parser::ParserRegistry,
+) -> ProjectTree {
+    let mut tree = tree.clone();
+    for (raw, bytes) in contents {
+        let key = super::normalize_path(&raw.to_string_lossy());
+        let Some(pos) = tree.files.iter().position(|f| super::normalize_path(&f.file_path.to_string_lossy()) == key) else {
+            continue;
+        };
+        let path = tree.files[pos].file_path.clone();
+        let parsed = bytes
+            .as_deref()
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .zip(registry.parser_for(&path))
+            .and_then(|(source, parser)| parser.parse_file(&path, source).ok());
+        match parsed {
+            Some(file) => tree.files[pos] = file,
+            None => {
+                tree.files.remove(pos);
+            }
+        }
+    }
+    tree
 }
 
 /// Resolve what `ambits log` was given: a session id (its ref), a full
@@ -272,7 +338,7 @@ pub fn print_log(out: &mut impl std::io::Write, entries: &[LogEntry]) -> std::io
         let s = &e.snapshot;
         let time = e.note.as_ref().map_or("unknown time", |n| n.time.as_str());
         writeln!(out, "snapshot {}  {time}", s.id.short())?;
-        let git = s.inputs.git.as_deref().map_or("none".to_string(), |g| g[..7].to_string());
+        let git = s.inputs.git.as_deref().map_or("none", |g| g.get(..7).unwrap_or(g));
         let dirty = match s.inputs.dirty.len() {
             0 => String::new(),
             n => format!(" (dirty: {n} file{})", if n == 1 { "" } else { "s" }),

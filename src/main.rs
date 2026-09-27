@@ -1003,11 +1003,19 @@ fn run_log(project_path: &Path, reference: Option<&str>) -> Result<()> {
 /// cache file's name and bytes. Serena snapshots are not reproducible from
 /// the commit alone (spec §6.4), and this is what they depend on instead.
 fn serena_fingerprint(project_path: &Path) -> String {
+    let mut caches: Vec<(String, PathBuf)> = serena::find_serena_caches(project_path)
+        .into_iter()
+        .map(|p| (p.strip_prefix(project_path).unwrap_or(&p).to_string_lossy().replace('\\', "/"), p))
+        .collect();
+    caches.sort();
     let mut h = blake3::Hasher::new();
-    for path in serena::find_serena_caches(project_path) {
-        let rel = path.strip_prefix(project_path).unwrap_or(&path);
-        h.update(rel.to_string_lossy().replace('\\', "/").as_bytes());
-        h.update(&std::fs::read(&path).unwrap_or_default());
+    for (name, path) in caches {
+        let bytes = std::fs::read(&path).unwrap_or_default();
+        // Length-prefixed, so no name/content split can collide with another.
+        for part in [name.as_bytes(), bytes.as_slice()] {
+            h.update(&(part.len() as u64).to_le_bytes());
+            h.update(part);
+        }
     }
     h.finalize().to_hex()[..16].to_string()
 }
@@ -1161,16 +1169,21 @@ fn run() -> Result<()> {
     }
     if let Some(Commands::Gc { grace_days }) = &command {
         let store = ambits::objects::store::Store::at(&project_path);
-        let stats = ambits::objects::gc::gc(&store, Duration::from_secs(grace_days * 24 * 60 * 60))?;
+        let grace = grace_days
+            .checked_mul(24 * 60 * 60)
+            .map(Duration::from_secs)
+            .ok_or_else(|| color_eyre::eyre::eyre!("--grace-days {grace_days} is too large"))?;
+        let stats = ambits::objects::gc::gc(&store, grace)?;
         let mut out = io::stdout().lock();
         writeln!(
             out,
-            "gc: {} reachable, {} deleted, {} unreachable kept, {} reflog entries expired, {} notes removed",
+            "gc: {} reachable, {} deleted, {} unreachable kept, {} reflog entries expired, {} notes and {} temp files removed",
             stats.reachable,
             stats.deleted.len(),
             stats.kept,
             stats.reflog_entries_expired,
-            stats.notes_removed
+            stats.notes_removed,
+            stats.temp_files_removed
         )?;
         return Ok(());
     }

@@ -69,6 +69,7 @@ pub struct GcStats {
     pub kept: usize,
     pub reflog_entries_expired: usize,
     pub notes_removed: usize,
+    pub temp_files_removed: usize,
 }
 
 /// Collect `store`'s unreachable objects older than `grace`.
@@ -114,7 +115,7 @@ pub fn gc(store: &Store, grace: Duration) -> Result<GcStats> {
     }
     stats.kept = unreachable.len() - stats.deleted.len();
 
-    // Notes of snapshots that no longer exist, and temp files a crash left.
+    // Notes of snapshots that no longer exist.
     for entry in fs::read_dir(store.root().join("notes")).into_iter().flatten().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let orphan = name.strip_suffix(".json").and_then(|n| ObjectId::parse(n).ok()).is_some_and(|id| !store.contains(&id));
@@ -122,11 +123,19 @@ pub fn gc(store: &Store, grace: Duration) -> Result<GcStats> {
             stats.notes_removed += 1;
         }
     }
-    for (_, path) in store.list() {
-        if let Some(dir) = path.parent() {
-            for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
-                if entry.file_name().to_string_lossy().starts_with(".tmp-") && older_than(&entry.path(), grace) {
-                    let _ = fs::remove_file(entry.path());
+    // Temp files a crash left, anywhere a writer makes them: each directory
+    // visited once.
+    for dir in ["objects", "refs", "logs", "notes"] {
+        let mut stack = vec![store.root().join(dir)];
+        while let Some(d) = stack.pop() {
+            for entry in fs::read_dir(&d).into_iter().flatten().flatten() {
+                let path = entry.path();
+                match fs::symlink_metadata(&path) {
+                    Ok(m) if m.is_dir() => stack.push(path),
+                    Ok(m) if m.is_file() && entry.file_name().to_string_lossy().starts_with(".tmp-") && older_than(&path, grace) => {
+                        stats.temp_files_removed += usize::from(fs::remove_file(&path).is_ok());
+                    }
+                    _ => {}
                 }
             }
         }

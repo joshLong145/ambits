@@ -380,3 +380,107 @@ fn file_contents_never_reach_objects_or_notes() {
         assert!(!text.contains(CANARY), "{} leaks file contents", f.display());
     }
 }
+
+/// The root the project's current files produce, written the way a
+/// snapshot writes it.
+fn fresh_root(p: &Project) -> ObjectId {
+    let tree = p.registry.scan_project(&p.root, None).unwrap();
+    let parser_of = |f: &ambits::symbols::FileSymbols| p.registry.parser_for(&f.file_path).unwrap().identity();
+    ambits::objects::tree::write_tree(&p.store(), &tree, &parser_of, &ambits::objects::sync_ignore::SyncIgnore::none()).unwrap().root
+}
+
+/// A file saved between the scan and the fingerprint must not leave a tree
+/// of the old bytes under an id of the new ones: dirty files are parsed
+/// from the very bytes they are fingerprinted from.
+#[test]
+fn a_file_changed_after_the_scan_is_snapshotted_as_fingerprinted() {
+    let p = Project::new();
+    let stale = p.registry.scan_project(&p.root, None).unwrap();
+    std::fs::write(p.root.join("src/a.rs"), "fn alpha() {}\nfn gamma() {}\n").unwrap();
+    let sync = SyncConfig::default();
+    let id = created(
+        snapshot(&Request {
+            project_root: &p.root,
+            session: SESSION,
+            tree: &stale,
+            backend: Backend::TreeSitter(&p.registry),
+            filter: None,
+            sync: &sync,
+            message: None,
+            require_clean: false,
+        })
+        .unwrap(),
+    );
+    assert_eq!(Snapshot::load(&p.store(), id).unwrap().root, fresh_root(&p));
+}
+
+/// A tip whose objects were lost (a power cut after the ref moved) is
+/// repaired from the unchanged state rather than reported as fine.
+#[test]
+fn a_tip_with_missing_objects_is_repaired() {
+    let p = Project::new();
+    let id = created(p.snap());
+    let root = Snapshot::load(&p.store(), id).unwrap().root;
+    std::fs::remove_file(p.store().path_of(&root)).unwrap();
+    assert_eq!(unchanged(p.snap()), id);
+    assert!(p.store().contains(&root));
+}
+
+/// A field no digest covers — a forged `host`, say — makes the snapshot
+/// unreadable rather than silently carried.
+#[test]
+fn an_extra_field_in_a_snapshot_is_refused() {
+    let p = Project::new();
+    let id = created(p.snap());
+    let path = p.store().path_of(&id);
+    let mut envelope: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    envelope["payload"]["host"] = serde_json::json!("laptop");
+    std::fs::write(&path, ambits::objects::canonical::to_bytes(&envelope).unwrap()).unwrap();
+    assert!(Snapshot::load(&p.store(), id).is_err());
+}
+
+/// A project in a subdirectory of its repository: the walker reads ignore
+/// files above it, so changing one changes the snapshot.
+#[test]
+fn an_ignore_file_above_a_subdirectory_project_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let top = dir.path().canonicalize().unwrap();
+    let root = top.join("proj");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), "fn alpha() {}\n").unwrap();
+    std::fs::write(top.join(".gitignore"), ".ambits/\n").unwrap();
+    git(&top, &["init", "-q"]);
+    git(&top, &["add", "."]);
+    git(&top, &["commit", "-qm", "init"]);
+    let p = Project { _dir: dir, root, registry: ParserRegistry::new() };
+    p.append_journal(&format!("{READ}\n"));
+
+    let first = created(p.snap());
+    assert_eq!(unchanged(p.snap()), first);
+    std::fs::write(top.join(".gitignore"), ".ambits/\nsrc/generated/\n").unwrap();
+    created(p.snap());
+}
+
+/// Parser identity names the symbol schema, and every snapshot records
+/// the object format: either changing makes a new snapshot.
+#[test]
+fn parser_inputs_carry_the_schema_and_the_object_format() {
+    let registry = ParserRegistry::new();
+    let parsers = Backend::TreeSitter(&registry).parsers();
+    assert!(parsers.iter().any(|p| p == ambits::objects::inputs::OBJECT_FORMAT));
+    assert!(parsers.iter().any(|p| p.starts_with("rust:") && p.contains(":schema=")), "{parsers:?}");
+}
+
+/// Temp files a crash left are collected, and a leftover one in `refs/`
+/// is never mistaken for a ref.
+#[test]
+fn gc_collects_leftover_temp_files() {
+    let p = Project::new();
+    created(p.snap());
+    let stray = p.root.join(".ambits/refs/sessions/.tmp-deadbeef");
+    std::fs::write(&stray, format!("{}\n", "0".repeat(64))).unwrap();
+    assert!(ambits::objects::refs::all(&p.store()).iter().all(|(name, _)| !name.contains(".tmp-")));
+    let stats = gc::gc(&p.store(), Duration::ZERO).unwrap();
+    assert_eq!(stats.temp_files_removed, 1);
+    assert!(!stray.exists());
+}
