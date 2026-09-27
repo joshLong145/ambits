@@ -103,11 +103,13 @@ use crate::tracking::{ContextLedger, ReadDepth};
 ///
 /// - **v1** — one record per symbol, no agent attribution.
 /// - **v2** — one record per `(symbol, agent)`, plus `host` in the manifest.
+/// - **v3** — adds `write` records (agent writes, spec §2.6) and `history`
+///   records (kept, ignored by the fold). Reads are unchanged.
 ///
 /// Older versions stay readable: `a` is optional and the manifest fields are
 /// `#[serde(default)]`, so a v1 file folds into the same symbol-level view and
 /// only loses per-agent detail. See [`MIN_READABLE_SCHEMA_VERSION`].
-pub const SUPPORTED_SCHEMA_VERSION: u32 = 2;
+pub const SUPPORTED_SCHEMA_VERSION: u32 = 3;
 
 /// Oldest on-disk version this build can still fold. Reading an older journal
 /// is always preferable to discarding it — the symbol-level read set, which is
@@ -302,6 +304,16 @@ pub enum Record {
         #[serde(rename = "a", default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
     },
+    /// An agent write (v3). One per `(session, op)`; the highest `av` wins.
+    Write(Box<crate::writes::WriteRecord>),
+    /// A fact kept for the record but not folded into current state (v3):
+    /// stale remote reads, restored writes, merge conflicts (spec §2.6).
+    /// Local-only, never copied into snapshot objects.
+    History {
+        of: String,
+        #[serde(flatten)]
+        rest: serde_json::Map<String, serde_json::Value>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +400,9 @@ pub struct JournalContents {
     /// Per-`(symbol, agent)` view, for restoring agent-filtered coverage.
     /// Empty for v1 journals, which carried no attribution.
     pub agent_reads: HashMap<AgentReadKey, ([u8; 32], ReadDepth)>,
+    /// Agent writes by `op`, keeping the record with the highest `av`
+    /// (spec §2.6). Empty before v3.
+    pub writes: std::collections::BTreeMap<String, crate::writes::WriteRecord>,
     pub warnings: Vec<String>,
 }
 
@@ -490,10 +505,26 @@ pub fn read_journal(path: &Path) -> JournalContents {
                     i + 1
                 )),
             },
+            Record::Write(record) => fold_write(&mut out.writes, *record),
+            Record::History { .. } => {}
         }
     }
 
     out
+}
+
+/// Keep one write per `op`: the highest attribution version wins, so a write
+/// re-attributed under newer rules replaces its older record (spec §2.6).
+fn fold_write(
+    writes: &mut std::collections::BTreeMap<String, crate::writes::WriteRecord>,
+    record: crate::writes::WriteRecord,
+) {
+    match writes.get(&record.op) {
+        Some(existing) if existing.av >= record.av => {}
+        _ => {
+            writes.insert(record.op.clone(), record);
+        }
+    }
 }
 
 /// Every on-disk shard of `session_id`'s journal under `dir` (the
@@ -557,6 +588,9 @@ pub fn read_journal_session(dir: &Path, session_id: &str) -> JournalContents {
         for (key, (hash, depth)) in shard.agent_reads {
             fold(out.agent_reads.entry(key), hash, depth);
         }
+        for record in shard.writes.into_values() {
+            fold_write(&mut out.writes, record);
+        }
     }
     out
 }
@@ -579,6 +613,9 @@ pub struct Journal {
     /// Distinct symbols on disk, for [`Journal::len`]. Tracked separately so
     /// the count stays a symbol count rather than a record count.
     symbols: std::collections::HashSet<String>,
+    /// `op` → attribution version of every write already journaled, in any of
+    /// the session's shards — so replaying a log never duplicates a write.
+    written_ops: HashMap<String, u32>,
     interval: Duration,
     last_sync: Instant,
     /// Set when writing fails. Journaling then stops for the rest of the run
@@ -647,6 +684,7 @@ impl Journal {
             file: None,
             journaled: HashMap::new(),
             symbols: std::collections::HashSet::new(),
+            written_ops: HashMap::new(),
             interval,
             last_sync: Instant::now(),
             error: None,
@@ -667,6 +705,13 @@ impl Journal {
         // one-time cost that upgrades the file in place rather than stranding
         // its history behind a version gate.
         journal.journaled = existing.agent_reads;
+        // Writes dedupe across every shard of the session (spec §2.6), not
+        // just this file: the TUI replays the whole log at startup.
+        journal.written_ops = read_journal_session(&dir, session_id)
+            .writes
+            .into_values()
+            .map(|w| (w.op, w.av))
+            .collect();
 
         let file = match OpenOptions::new().create(true).append(true).open(&path) {
             Ok(f) => f,
@@ -725,6 +770,23 @@ impl Journal {
             return 0;
         }
         self.sync(ledger)
+    }
+
+    /// Append an agent write, unless the session already holds that `op` at
+    /// the same or a newer attribution version. Returns whether it was
+    /// written.
+    pub fn record_write(&mut self, record: &crate::writes::WriteRecord) -> bool {
+        if self.error.is_some() {
+            return false;
+        }
+        if self.written_ops.get(&record.op).is_some_and(|&av| av >= record.av) {
+            return false;
+        }
+        if !self.write(&Record::Write(Box::new(record.clone()))) {
+            return false;
+        }
+        self.written_ops.insert(record.op.clone(), record.av);
+        true
     }
 
     /// Append a record for every ledger entry whose read-state has changed
@@ -1296,5 +1358,126 @@ mod tests {
         let mut j = Journal::open(dir.path(), "sess", Duration::from_secs(3600), manifest);
         assert_eq!(j.maybe_sync(&ledger), 0, "interval has not elapsed");
         assert_eq!(j.sync(&ledger), 1, "explicit sync ignores the interval");
+    }
+}
+
+/// Journal v3 write records (spec §2.6).
+#[cfg(test)]
+mod write_record_tests {
+    use super::*;
+    use crate::writes::{Level, WriteRecord};
+
+    fn record(op: &str, av: u32, sym: &str) -> WriteRecord {
+        WriteRecord {
+            op: op.into(),
+            av,
+            a: "agent-1".into(),
+            t: "2026-09-26T10:00:01Z".into(),
+            tool: "Edit".into(),
+            file: "src/lib.rs".into(),
+            level: Level::Symbol,
+            outside_symbols: false,
+            syms: vec![(sym.into(), "b3:00".into())],
+            removed: vec![],
+            fh: None,
+        }
+    }
+
+    fn manifest() -> EnvironmentManifest {
+        EnvironmentManifest {
+            project_root: "/p".into(),
+            tree_fingerprint: "b3:00".into(),
+            ambit_version: "test".into(),
+            backend: "tree-sitter".into(),
+            parsers: vec![],
+            tool_config_version: None,
+            filter: None,
+            os: "test".into(),
+            arch: "test".into(),
+            host: "test".into(),
+        }
+    }
+
+    fn open(root: &Path, shard: Option<&str>) -> Journal {
+        Journal::open_at(root, "sess", shard, Duration::ZERO, manifest)
+    }
+
+    #[test]
+    fn writes_round_trip_and_are_read_back_by_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut j = open(dir.path(), None);
+        assert!(j.record_write(&record("toolu_1", 1, "src/lib.rs::a")));
+        let contents = read_journal_session(&journal_dir(dir.path()), "sess");
+        assert_eq!(contents.writes.len(), 1);
+        assert_eq!(contents.writes["toolu_1"], record("toolu_1", 1, "src/lib.rs::a"));
+        assert_eq!(contents.header.as_ref().map(|h| h.0), Some(SUPPORTED_SCHEMA_VERSION));
+    }
+
+    /// The TUI replays the whole log at startup; an op already on disk —
+    /// in any shard — is not written again.
+    #[test]
+    fn a_write_is_journaled_once_across_reopens_and_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(open(dir.path(), Some("pull")).record_write(&record("toolu_1", 1, "src/lib.rs::a")));
+
+        let mut primary = open(dir.path(), None);
+        assert!(!primary.record_write(&record("toolu_1", 1, "src/lib.rs::a")), "already in the pull shard");
+        assert!(primary.record_write(&record("toolu_2", 1, "src/lib.rs::b")));
+        drop(primary);
+        assert!(!open(dir.path(), None).record_write(&record("toolu_2", 1, "src/lib.rs::b")));
+
+        let contents = read_journal_session(&journal_dir(dir.path()), "sess");
+        assert_eq!(contents.writes.len(), 2);
+    }
+
+    /// Re-attribution under newer rules replaces the old record.
+    #[test]
+    fn the_highest_attribution_version_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut j = open(dir.path(), None);
+        assert!(j.record_write(&record("toolu_1", 1, "src/lib.rs::old")));
+        assert!(j.record_write(&record("toolu_1", 2, "src/lib.rs::new")));
+        assert!(!j.record_write(&record("toolu_1", 1, "src/lib.rs::old")), "an older version never wins");
+        let contents = read_journal_session(&journal_dir(dir.path()), "sess");
+        assert_eq!(contents.writes["toolu_1"].av, 2);
+        assert_eq!(contents.writes["toolu_1"].syms[0].0, "src/lib.rs::new");
+    }
+
+    /// History records are kept but never folded into current state.
+    #[test]
+    fn history_records_are_ignored_by_the_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = journal_dir(dir.path()).join("sess.ndjson");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "{\"kind\":\"history\",\"of\":\"read\",\"sym\":\"src/a.rs::x\",\"h\":\"b3:00\",\"d\":\"full_body\"}\n",
+        )
+        .unwrap();
+        let contents = read_journal(&path);
+        assert!(contents.warnings.is_empty(), "{:?}", contents.warnings);
+        assert!(contents.reads.is_empty() && contents.writes.is_empty());
+    }
+
+    /// A v2 journal keeps working: its reads load, and the first v3 writer
+    /// appends a v3 header (the one-time change spec §6.2 documents).
+    #[test]
+    fn a_v2_journal_is_read_and_upgraded_by_appending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = journal_dir(dir.path()).join("sess.ndjson");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let header = Record::Header(Box::new(HeaderRecord {
+            schema_version: 2,
+            created_at: "t".into(),
+            session_id: "sess".into(),
+            environment: manifest(),
+        }));
+        let read = Record::Read { symbol_id: "src/a.rs::x".into(), hash: encode_hash(&[0; 32]), depth: DepthDto::FullBody, agent: Some("ag".into()) };
+        std::fs::write(&path, format!("{}\n{}\n", serde_json::to_string(&header).unwrap(), serde_json::to_string(&read).unwrap())).unwrap();
+
+        drop(open(dir.path(), None));
+        let contents = read_journal(&path);
+        assert_eq!(contents.reads.len(), 1);
+        assert_eq!(contents.header.map(|h| h.0), Some(SUPPORTED_SCHEMA_VERSION));
     }
 }

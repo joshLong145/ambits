@@ -1,9 +1,11 @@
 //! Which symbols an agent's write touched.
 //!
-//! Spec: `docs/spikes/coverage-snapshots.md` §2. This module is the pure core
-//! of write attribution — no I/O, no ingestion, no journal. Given the file
-//! before and after a write, the write's diff hunks, and the file's parser,
-//! it answers which symbols the write changed or removed.
+//! Spec: `docs/spikes/coverage-snapshots.md` §2. Two layers, both free of
+//! I/O: [`attribute`] is the core — given the file before and after a write,
+//! the write's diff hunks, and the file's parser, it answers which symbols
+//! the write changed or removed; [`build_record`] turns an ingested
+//! [`WriteEvent`] into the [`WriteRecord`] the journal stores, choosing
+//! symbol- or file-level attribution per spec §2.2.
 //!
 //! ## Changed lines, not hunk ranges
 //!
@@ -33,8 +35,137 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::parser::LanguageParser;
+use serde::{Deserialize, Serialize};
+
+use crate::ingest::{WriteEvent, WriteSource};
+use crate::parser::{LanguageParser, ParserRegistry};
 use crate::symbols::{SymbolId, SymbolNode};
+
+/// Version of the attribution rules. Recorded on every write (`av`) so a
+/// write re-attributed after the rules change replaces the old record rather
+/// than duplicating it (spec §2.6).
+pub const ATTRIBUTION_VERSION: u32 = 1;
+
+/// How precisely a write was attributed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Level {
+    /// Changed symbols named, from the session log (spec D15).
+    Symbol,
+    /// Only the file is known: the log lacked the text to attribute, the
+    /// file has no parser, or the reconstruction did not verify.
+    File,
+}
+
+/// One agent write, as journaled (spec §2.6). One record per `(session,
+/// op)`; the fold keeps the highest `av`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteRecord {
+    /// The tool call's `tool_use_id`.
+    pub op: String,
+    /// [`ATTRIBUTION_VERSION`] that produced this record.
+    pub av: u32,
+    /// Agent id.
+    pub a: String,
+    /// Timestamp of the tool result.
+    pub t: String,
+    pub tool: String,
+    /// Project-relative, `/`-separated.
+    pub file: String,
+    pub level: Level,
+    /// Some changed line fell inside no symbol.
+    #[serde(default)]
+    pub outside_symbols: bool,
+    /// Innermost touched symbols with their post-write hash (`b3:…`). Hashes
+    /// travel with ids because ids are not unique.
+    #[serde(default)]
+    pub syms: Vec<(String, String)>,
+    /// Innermost symbols the write deleted.
+    #[serde(default)]
+    pub removed: Vec<String>,
+    /// For a `Write`, BLAKE3 of the new content, so even a file-level `Write`
+    /// can later be matched to the commit it landed in. Hashing is allowed;
+    /// storing contents is not (spec §9.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fh: Option<String>,
+}
+
+/// Turn a write event into its journal record (spec §2.2).
+///
+/// `None` for a write outside `project_root` (spec §2.6): neither portable
+/// nor the project's. `symbol_level` is `false` in Serena mode, whose tree
+/// ids need not match a tree-sitter parse (spec §2.5).
+pub fn build_record(
+    event: &WriteEvent,
+    project_root: &Path,
+    registry: &ParserRegistry,
+    symbol_level: bool,
+) -> Option<WriteRecord> {
+    let rel = if event.path.is_absolute() {
+        event.path.strip_prefix(project_root).ok()?
+    } else {
+        event.path.as_path()
+    };
+    let file = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    if file.is_empty() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return None;
+    }
+
+    let fh = match &event.source {
+        WriteSource::Write { content, .. } => Some(crate::journal::encode_hash(
+            blake3::hash(content.as_bytes()).as_bytes(),
+        )),
+        _ => None,
+    };
+
+    let attribution = symbol_level
+        .then(|| registry.parser_for(rel))
+        .flatten()
+        .and_then(|parser| match &event.source {
+            WriteSource::Edit { original: Some(before), old, new, replace_all, hunks, user_modified: false } => {
+                let after = apply_edit(before, old, new, *replace_all)?;
+                attribute(parser, rel, before, &after, Some(hunks))
+            }
+            WriteSource::Write { create: true, content, user_modified: false, .. } => {
+                attribute(parser, rel, "", content, None)
+            }
+            WriteSource::Write { original: Some(before), content, hunks, user_modified: false, .. } => {
+                attribute(parser, rel, before, content, Some(hunks))
+            }
+            _ => None,
+        });
+
+    let (level, outside_symbols, syms, removed) = match attribution {
+        Some(a) => (
+            Level::Symbol,
+            a.outside_symbols,
+            a.touched
+                .iter()
+                .map(|(id, h)| (id.clone(), crate::journal::encode_hash(h)))
+                .collect(),
+            a.removed,
+        ),
+        None => (Level::File, false, Vec::new(), Vec::new()),
+    };
+
+    Some(WriteRecord {
+        op: event.op.to_string(),
+        av: ATTRIBUTION_VERSION,
+        a: event.agent_id.to_string(),
+        t: event.timestamp.clone(),
+        tool: event.tool_name.to_string(),
+        file,
+        level,
+        outside_symbols,
+        syms,
+        removed,
+        fh,
+    })
+}
 
 /// One diff hunk, as Claude Code records it in `structuredPatch`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -432,5 +563,132 @@ fn gamma() {
         assert_eq!(apply_edit("a b a", "a", "x", true).as_deref(), Some("x b x"));
         assert_eq!(apply_edit("a b a", "zz", "x", false), None);
         assert_eq!(apply_edit("a b a", "", "x", false), None);
+    }
+}
+
+/// Journal records from ingested writes (spec §2.2, §2.6, §9.6).
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+    use crate::ingest::{Hunk, WriteEvent, WriteSource};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    const ROOT: &str = "/proj";
+    const CANARY: &str = "CANARY_7f3c_never_persist";
+
+    fn event(path: &str, source: WriteSource) -> WriteEvent {
+        WriteEvent {
+            op: Arc::from("toolu_01abc"),
+            agent_id: Arc::from("agent-1"),
+            tool_name: Arc::from("Edit"),
+            path: PathBuf::from(path),
+            timestamp: "2026-09-26T10:00:01Z".into(),
+            source,
+        }
+    }
+
+    fn edit(original: Option<&str>, user_modified: bool) -> WriteSource {
+        WriteSource::Edit {
+            original: original.map(String::from),
+            old: format!("let b = 2; // {CANARY}"),
+            new: "let b = 20;".into(),
+            replace_all: false,
+            hunks: vec![Hunk {
+                old_start: 2,
+                new_start: 2,
+                lines: vec![format!("-    let b = 2; // {CANARY}"), "+    let b = 20;".into()],
+            }],
+            user_modified,
+        }
+    }
+
+    const BEFORE: &str = "fn beta() {\n    let b = 2; // CANARY_7f3c_never_persist\n}\n";
+
+    fn build(ev: &WriteEvent) -> Option<WriteRecord> {
+        build_record(ev, Path::new(ROOT), &ParserRegistry::new(), true)
+    }
+
+    #[test]
+    fn an_edit_with_original_file_is_symbol_level() {
+        let rec = build(&event("/proj/src/lib.rs", edit(Some(BEFORE), false))).unwrap();
+        assert_eq!(rec.level, Level::Symbol);
+        assert_eq!(rec.file, "src/lib.rs");
+        assert_eq!(rec.syms.len(), 1);
+        assert_eq!(rec.syms[0].0, "src/lib.rs::beta");
+        assert!(rec.syms[0].1.starts_with("b3:"));
+        assert_eq!((rec.op.as_str(), rec.av, rec.a.as_str()), ("toolu_01abc", ATTRIBUTION_VERSION, "agent-1"));
+        assert_eq!(rec.fh, None, "only a Write carries a file hash");
+    }
+
+    #[test]
+    fn missing_original_file_or_user_modified_is_file_level() {
+        for source in [edit(None, false), edit(Some(BEFORE), true)] {
+            let rec = build(&event("/proj/src/lib.rs", source)).unwrap();
+            assert_eq!(rec.level, Level::File);
+            assert!(rec.syms.is_empty() && rec.removed.is_empty());
+        }
+    }
+
+    #[test]
+    fn serena_mode_is_file_level() {
+        let ev = event("/proj/src/lib.rs", edit(Some(BEFORE), false));
+        let rec = build_record(&ev, Path::new(ROOT), &ParserRegistry::new(), false).unwrap();
+        assert_eq!(rec.level, Level::File);
+    }
+
+    #[test]
+    fn a_create_is_symbol_level_with_a_file_hash() {
+        let ev = event("/proj/src/new.rs", WriteSource::Write {
+            original: None,
+            content: "fn a() {}\nfn b() {}\n".into(),
+            create: true,
+            hunks: vec![],
+            user_modified: false,
+        });
+        let rec = build(&ev).unwrap();
+        assert_eq!(rec.level, Level::Symbol);
+        let ids: Vec<&str> = rec.syms.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["src/new.rs::a", "src/new.rs::b"]);
+        assert_eq!(
+            rec.fh.as_deref(),
+            Some(crate::journal::encode_hash(blake3::hash(b"fn a() {}\nfn b() {}\n").as_bytes()).as_str())
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_parser_is_file_level() {
+        let ev = event("/proj/notes.txt", WriteSource::Write {
+            original: None, content: "hello".into(), create: true, hunks: vec![], user_modified: false,
+        });
+        let rec = build(&ev).unwrap();
+        assert_eq!((rec.level, rec.file.as_str()), (Level::File, "notes.txt"));
+        assert!(rec.fh.is_some());
+    }
+
+    /// Writes outside the project are neither portable nor the project's.
+    #[test]
+    fn a_write_outside_the_project_is_dropped() {
+        assert!(build(&event("/elsewhere/.aws/config", WriteSource::Opaque)).is_none());
+        assert!(build(&event("../escape.rs", WriteSource::Opaque)).is_none());
+        assert!(build(&event("/proj", WriteSource::Opaque)).is_none(), "the root itself is not a file");
+    }
+
+    /// File contents never reach a record (spec §9.6): not the original, not
+    /// the edit strings, not written content.
+    #[test]
+    fn file_contents_never_reach_the_record() {
+        let write = WriteSource::Write {
+            original: Some(BEFORE.into()),
+            content: format!("fn beta() {{ /* {CANARY} */ }}\n"),
+            create: false,
+            hunks: vec![],
+            user_modified: false,
+        };
+        for source in [edit(Some(BEFORE), false), edit(None, false), write] {
+            let rec = build(&event("/proj/src/lib.rs", source)).unwrap();
+            let json = serde_json::to_string(&rec).unwrap();
+            assert!(!json.contains(CANARY), "leaked into {json}");
+        }
     }
 }
