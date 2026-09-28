@@ -180,9 +180,51 @@ pub fn valid_record_path(path: &str) -> bool {
         && unicode_normalization::is_nfc(path)
 }
 
+/// A tool-use id, as Claude Code mints them: `toolu_` then letters and
+/// digits (§9.1).
+pub fn valid_op(op: &str) -> bool {
+    op.strip_prefix("toolu_").is_some_and(|rest| !rest.is_empty() && rest.len() <= 128 && rest.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// A symbol id: a record path, `::`, and a name path of printable text.
+pub fn valid_symbol_id(id: &str) -> bool {
+    let (file, name) = crate::symbols::split_id(id);
+    id.contains("::") && valid_record_path(file) && !name.is_empty() && id.len() <= 4096 && !id.chars().any(char::is_control)
+}
+
+/// A content hash as records carry one: `b3:` and 64 lowercase hex digits.
+pub fn valid_hash(h: &str) -> bool {
+    h.strip_prefix("b3:").is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// Short free text from elsewhere (an agent id, a tool name): printable and
+/// bounded, so it can be shown without escapes reaching the terminal.
+pub fn valid_label(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control)
+}
+
+/// `s` with control characters (terminal escapes among them) replaced, for
+/// printing text that came from another machine.
+pub fn printable(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { '\u{fffd}' } else { c }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_fields_are_validated() {
+        assert!(valid_op("toolu_01Lt2aWQ"));
+        for bad in ["toolu_", "toolu_a-b", "x_1", "toolu_\n"] {
+            assert!(!valid_op(bad), "{bad:?}");
+        }
+        assert!(valid_symbol_id("src/a.rs::App/run"));
+        assert!(!valid_symbol_id("../a.rs::x") && !valid_symbol_id("src/a.rs") && !valid_symbol_id("a.rs::\u{1b}[2J"));
+        assert!(valid_hash(&format!("b3:{}", "0".repeat(64))));
+        assert!(!valid_hash("b3:XYZ") && !valid_hash(&"0".repeat(64)));
+        assert_eq!(printable("ok\u{1b}[31m"), "ok\u{fffd}[31m");
+    }
 
     #[test]
     fn ids_round_trip_and_reject_junk() {

@@ -781,6 +781,34 @@ Merges into the **same session id** locally.
   reference is taken (`log`, `restore`): cross-machine restore is `fetch`
   then `restore origin/<session>`.
 
+**After review (phase 6).**
+
+- **Single-user remotes.** Remote files keep the store's `0600`/`0700`
+  modes; a remote owned by another uid is refused. Shared (group) remotes
+  are future work.
+- **Links from a remote are proven, not trusted** (§9.2, §9.4): kept only
+  when well-formed, their commit reachable here, and that commit's blob
+  holding the unit; keys are recomputed. Unverified (hash-less) links are
+  dropped. A push sends only the links of the writes it pushes.
+- **Fetch is per session**: each session's history is verified and its
+  tracking ref moved on its own; a failure is reported, the rest proceed,
+  the command exits non-zero.
+- **Every store file is opened `O_NOFOLLOW|O_NONBLOCK` and checked regular**
+  on the handle; flat files are capped at 256 MiB, objects at 16 MiB.
+- **Transfer repairs**: an object present but no longer verifying is
+  rewritten from the verified source; a same-id snapshot with another
+  `state_digest` is still refused.
+- **Pulled records are validated** (`op`, record paths, symbol ids, hashes,
+  labels); malformed ones are left out and counted. Remote text is printed
+  with control characters replaced.
+- **A merge is recorded whenever a pull writes anything** (history
+  included), once per remote tip, so history alone while behind cannot
+  leave a push non-fast-forward. Pending merge tips are gc roots.
+- **"Up to date" leaves the lease alone**; notes and links reach the remote
+  under its lock; `--break-lock` moves the lock aside and re-checks its
+  token before deleting; a pid is alive if signalling it is merely
+  forbidden (`EPERM`).
+
 ---
 
 ## 13. Compatibility and migration

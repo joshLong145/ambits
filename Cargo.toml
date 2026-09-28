@@ -45,6 +45,10 @@ fs4 = { version = "1.1.0", features = ["sync"] }
 [features]
 dhat-heap = ["dep:dhat"]
 
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW and O_NONBLOCK, so a store file is never a symlink or a FIFO (§9.1).
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 divan = "0.1.21"

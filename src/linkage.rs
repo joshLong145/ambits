@@ -261,8 +261,8 @@ impl Resolver {
             return;
         }
         self.caches.loaded = true;
-        fold_links(self.links_file().read(), &mut self.caches.links);
-        let lines = self.never_file().read();
+        fold_links(self.links_file().read().unwrap_or_default(), &mut self.caches.links);
+        let lines = self.never_file().read().unwrap_or_default();
         fold_never(lines, &mut self.caches.never, &mut self.caches.tip_lists);
     }
 
@@ -277,7 +277,7 @@ impl Resolver {
         if !new_links.is_empty() {
             let file = self.links_file();
             let lock = file.lock()?;
-            let on_disk: Vec<LinkLine> = file.read();
+            let on_disk: Vec<LinkLine> = file.read()?;
             let lines = file.line_count() + new_links.len();
             let mut folded = HashMap::new();
             fold_links(on_disk, &mut folded);
@@ -295,7 +295,7 @@ impl Resolver {
             let lock = file.lock()?;
             let lines = file.line_count() + new_never.len();
             let (mut never, mut lists) = (HashMap::new(), HashMap::new());
-            fold_never(file.read(), &mut never, &mut lists);
+            fold_never(file.read()?, &mut never, &mut lists);
             fold_never(new_never.clone(), &mut never, &mut lists);
             let live: Vec<(String, (String, Vec<String>))> = never.into_iter().filter_map(|(k, v)| Some((k, v?))).collect();
             let used: std::collections::HashSet<&String> = live.iter().map(|(_, (d, _))| d).collect();
@@ -583,26 +583,59 @@ impl Drop for Resolver {
 
 /// The links index of the store at `root` (a project's `.ambits`, or a
 /// remote): every unit's live link, by key.
-pub fn links_of(root: &Path) -> Vec<(String, Link)> {
+pub fn links_of(root: &Path) -> Result<Vec<(String, Link)>> {
     let mut folded = HashMap::new();
-    fold_links(crate::objects::flat::FlatLog::at(root.join(crate::state_dir::LINKS)).read(), &mut folded);
+    fold_links(crate::objects::flat::FlatLog::at(root.join(crate::state_dir::LINKS)).read()?, &mut folded);
     let mut out: Vec<(String, Link)> = folded.into_iter().filter_map(|(k, l)| Some((k, l?))).collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+    Ok(out)
 }
 
-/// Add to the links index at `root` whichever of `links` it lacks, as
-/// hints: a link is re-checked for reachability before use (§9.4). How
-/// many were added.
-pub fn add_links(root: &Path, links: Vec<(String, Link)>) -> Result<usize> {
+/// Add to the links index at `root` whichever of `links` it lacks — not
+/// overriding a tombstone's key with an older link. How many were added.
+pub fn add_links(root: &Path, links: Vec<(String, Link)>, durability: crate::objects::store::Durability) -> Result<usize> {
     let file = crate::objects::flat::FlatLog::at(root.join(crate::state_dir::LINKS));
     let lock = file.lock()?;
     let mut have = HashMap::new();
-    fold_links(file.read(), &mut have);
+    fold_links(file.read()?, &mut have);
     let new: Vec<LinkLine> =
-        links.into_iter().filter(|(k, _)| !matches!(have.get(k), Some(Some(_)))).map(|(k, link)| LinkLine { k, link: Some(link) }).collect();
-    file.append(&lock, &new, crate::objects::store::Durability::NoSync)?;
+        links.into_iter().filter(|(k, _)| !have.contains_key(k)).map(|(k, link)| LinkLine { k, link: Some(link) }).collect();
+    file.append(&lock, &new, durability)?;
     Ok(new.len())
+}
+
+/// Take `links` a remote offered into this project's links index, but only
+/// those this machine can prove (§9.2, §9.4): well-formed, their commit
+/// reachable here, and its blob holding the unit — the same check a local
+/// resolution makes. A link with nothing to compare (unverified) proves
+/// nothing and is dropped. Keys are recomputed, never taken from the
+/// remote. How many were added; none outside a repository.
+pub fn import_links(project_root: &Path, links: Vec<Link>) -> Result<usize> {
+    let Some(mut resolver) = Resolver::new(project_root) else { return Ok(0) };
+    let mut proven = Vec::new();
+    for link in links {
+        let Some(hash) = link.hash.clone() else { continue };
+        let well_formed = crate::objects::valid_op(&link.op)
+            && is_commit_id(&link.commit)
+            && valid_record_path(&link.path)
+            && crate::objects::valid_hash(&hash)
+            && (valid_record_path(&link.target) || crate::objects::valid_symbol_id(&link.target));
+        if !well_formed || !resolver.reachable(&link.commit) {
+            continue;
+        }
+        let proof = if link.target.contains("::") {
+            Proof::Symbol { name_path: crate::symbols::split_id(&link.target).1.to_string(), hash: hash.clone() }
+        } else {
+            Proof::FileHash(hash.clone())
+        };
+        let unit = Unit { target: link.target.clone(), proof };
+        let path = format!("{}{}", resolver.repo.prefix, link.path);
+        if resolver.contains(&link.commit, &path, &link.path, &unit) {
+            proven.push((link_key(&link.op, &link.target, Some(&hash)), Link { verified: true, ..link }));
+        }
+    }
+    drop(resolver);
+    add_links(&project_root.join(crate::state_dir::STATE_DIR), proven, crate::objects::store::Durability::NoSync)
 }
 
 /// A unit's key in both caches: a hash of `(op, target, hash)`.
@@ -800,7 +833,7 @@ mod tests {
             }
         }
         let file = crate::objects::flat::FlatLog::at(root.join(".ambits/cache/never-landed.ndjson"));
-        let lines: Vec<NeverLine> = file.read();
+        let lines: Vec<NeverLine> = file.read().unwrap();
         assert_eq!(lines.iter().filter(|l| l.list.is_some()).count(), 1, "one tip list");
         assert_eq!(lines.iter().filter(|l| l.k.is_some()).count(), 3);
         assert_eq!(std::fs::read_dir(root.join(".ambits/cache")).unwrap().count(), 2, "the file and its lock");

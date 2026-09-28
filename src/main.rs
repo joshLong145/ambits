@@ -1163,26 +1163,39 @@ fn print_push(out: &mut impl Write, outcome: &ambits::remote::PushOutcome) -> io
     use ambits::remote::PushOutcome;
     match outcome {
         PushOutcome::UpToDate { remote, tip } => writeln!(out, "{remote} is up to date ({})", tip.short()),
-        PushOutcome::Pushed { remote, from, to, objects, links, forced } => writeln!(
-            out,
-            "{remote}: {} → {}{}; {objects} object(s), {links} link(s) sent",
-            short(from.as_ref()),
-            to.short(),
-            if *forced { " (forced)" } else { "" }
-        ),
-        PushOutcome::DryRun { remote, from, to, objects, links } => writeln!(
-            out,
-            "would push to {remote}: {} → {}; {objects} object(s), {links} link(s)",
-            short(from.as_ref()),
-            to.short()
-        ),
+        PushOutcome::Pushed { remote, from, to, objects, links, forced, other_ignore } => {
+            writeln!(
+                out,
+                "{remote}: {} → {}{}; {objects} object(s), {links} link(s) sent",
+                short(from.as_ref()),
+                to.short(),
+                if *forced { " (forced)" } else { "" }
+            )?;
+            warn_ignore(*other_ignore)
+        }
+        PushOutcome::DryRun { remote, from, to, objects, links, other_ignore } => {
+            writeln!(out, "would push to {remote}: {} → {}; {objects} object(s), {links} link(s)", short(from.as_ref()), to.short())?;
+            warn_ignore(*other_ignore)
+        }
     }
+}
+
+/// Snapshots are filtered when made: one made under other `[sync] ignore`
+/// rules holds what those let in.
+fn warn_ignore(n: usize) -> io::Result<()> {
+    if n > 0 {
+        eprintln!("warning: {n} snapshot(s) were made under different [sync] ignore rules than today's, and are sent as they were made");
+    }
+    Ok(())
 }
 
 fn print_fetch(out: &mut impl Write, report: &ambits::remote::FetchReport) -> io::Result<()> {
     for m in &report.moved {
         let forced = if m.forced { "  (forced: the remote was overwritten; the old tip stays in the reflog)" } else { "" };
         writeln!(out, "{}/{}: {} → {}{forced}", report.remote, m.session, short(m.from.as_ref()), m.to.short())?;
+    }
+    for (session, why) in &report.failed {
+        writeln!(out, "{}/{session}: not fetched — {}", report.remote, ambits::objects::printable(why))?;
     }
     writeln!(out, "fetched from {}: {} session(s) moved, {} object(s), {} link(s)", report.remote, report.moved.len(), report.objects, report.links)
 }
@@ -1195,16 +1208,16 @@ fn print_pull(out: &mut impl Write, session: &str, report: &ambits::remote::Pull
         PullOutcome::NotOnRemote => writeln!(out, "{remote} has no snapshots of session {session}"),
         PullOutcome::UpToDate => writeln!(out, "already up to date with {remote}"),
         PullOutcome::Behind => writeln!(out, "{remote} is ahead but adds nothing this session lacks; nothing merged"),
-        PullOutcome::Merged { tip, reads, stale, writes, conflicts, merged } => {
+        PullOutcome::Merged { tip, reads, stale, writes, conflicts, rejected } => {
             writeln!(
                 out,
                 "merged {remote}/{} into {session}: {reads} read(s), {writes} write(s); {stale} stale read(s) and {conflicts} conflicting write(s) kept as history",
                 tip.short()
             )?;
-            if *merged {
-                writeln!(out, "the next `ambits snapshot` descends from both")?;
+            if *rejected > 0 {
+                writeln!(out, "{rejected} malformed remote record(s) left out")?;
             }
-            Ok(())
+            writeln!(out, "the next `ambits snapshot` descends from {remote}/{}", tip.short())
         }
     }
 }
@@ -1449,6 +1462,9 @@ fn run() -> Result<()> {
     if let Some(Commands::Fetch { remote }) = &command {
         let report = ambits::remote::fetch(&project_path, remote.as_deref())?;
         print_fetch(&mut io::stdout().lock(), &report)?;
+        if !report.failed.is_empty() {
+            color_eyre::eyre::bail!("{} session(s) from {} did not verify and were not fetched", report.failed.len(), report.remote);
+        }
         return Ok(());
     }
 

@@ -108,17 +108,24 @@ impl Store {
         Ok(())
     }
 
+    /// Store `payload` under `id` even if a file is there: to repair an
+    /// object that no longer verifies, from a copy that does.
+    pub fn replace_at(&self, id: &ObjectId, kind: Kind, payload: &Value) -> Result<()> {
+        let path = self.path_of(id);
+        let envelope = canonical::to_bytes(&json!({"payload": payload, "type": kind.name()}))?;
+        write_atomic(&path, &envelope)?;
+        if let Some(dir) = path.parent() {
+            self.written_dirs.lock().expect("not poisoned").insert(dir.to_path_buf());
+        }
+        Ok(())
+    }
+
     /// Load and verify object `id`, which must be of type `kind`.
     pub fn get(&self, id: &ObjectId, kind: Kind) -> Result<Value> {
         let path = self.path_of(id);
-        let meta = fs::symlink_metadata(&path).wrap_err_with(|| format!("object {} is missing", id.short()))?;
-        if !meta.is_file() {
-            bail!("object {} is not a regular file", id.short());
-        }
-        if meta.len() > MAX_OBJECT_BYTES {
-            bail!("object {} is {} bytes, over the {MAX_OBJECT_BYTES}-byte limit", id.short(), meta.len());
-        }
-        let bytes = fs::read(&path)?;
+        // One open, then everything checked on what was opened: no window
+        // for a swap to a symlink or a FIFO.
+        let bytes = read_capped(&path, MAX_OBJECT_BYTES).wrap_err_with(|| format!("object {}", id.short()))?;
         let envelope = canonical::from_bytes(&bytes).wrap_err_with(|| format!("object {}", id.short()))?;
         let found = envelope.get("type").and_then(Value::as_str).and_then(Kind::from_name);
         if found != Some(kind) {
@@ -252,10 +259,42 @@ pub fn fsync_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Open `path` with `options`, never through a symlink and never blocking
+/// on a FIFO, and only if it is a regular file (§9.1): a store may be a
+/// shared directory where someone else plants either.
+pub fn open_regular(path: &Path, options: &mut fs::OpenOptions) -> std::io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    if fs::symlink_metadata(path).is_ok_and(|m| !m.is_file()) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"));
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{} is not a regular file", path.display())));
+    }
+    Ok(file)
+}
+
+/// Read at most `max` bytes of the regular file `path`; an error past that.
+pub fn read_capped(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let file = open_regular(path, fs::OpenOptions::new().read(true))?;
+    let mut bytes = Vec::new();
+    file.take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{} is over the {max}-byte limit", path.display())));
+    }
+    Ok(bytes)
+}
+
 /// Mark `path` as recently used, for gc's grace period (§8). Best-effort: a
 /// failure only makes the object look older than it is.
 pub fn refresh_age(path: &Path) {
-    if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
+    if let Ok(file) = open_regular(path, fs::OpenOptions::new().write(true)) {
         let _ = file.set_modified(std::time::SystemTime::now());
     }
 }

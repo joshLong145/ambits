@@ -18,7 +18,11 @@ use color_eyre::eyre::{Result, WrapErr};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use super::store::{create_private_dir, private_options, write_atomic_with, Durability};
+use super::store::{create_private_dir, fsync_dir, open_regular, private_options, read_capped, write_atomic_with, Durability};
+
+/// The most a flat file may hold before reading it is refused (§9.5): far
+/// past any real store, short of one that would exhaust memory.
+pub const MAX_FLAT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// An append-only NDJSON file.
 #[derive(Debug, Clone)]
@@ -39,15 +43,23 @@ impl FlatLog {
     }
 
     /// Every record that parses as `T`, in file order. A missing file is
-    /// empty; unparseable or cut-short lines are skipped.
-    pub fn read<T: DeserializeOwned>(&self) -> Vec<T> {
-        let Ok(text) = fs::read_to_string(&self.path) else { return Vec::new() };
-        text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+    /// empty; unparseable or cut-short lines are skipped. An error for a file
+    /// that is not a regular file or is over [`MAX_FLAT_BYTES`].
+    pub fn read<T: DeserializeOwned>(&self) -> Result<Vec<T>> {
+        Ok(self.text()?.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+    }
+
+    fn text(&self) -> Result<String> {
+        match read_capped(&self.path, MAX_FLAT_BYTES) {
+            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(e).wrap_err_with(|| format!("reading {}", self.path.display())),
+        }
     }
 
     /// How many lines the file holds, parseable or not.
     pub fn line_count(&self) -> usize {
-        fs::read_to_string(&self.path).map_or(0, |t| t.lines().count())
+        self.text().map_or(0, |t| t.lines().count())
     }
 
     /// Take the write lock, waiting for another writer to finish.
@@ -57,10 +69,7 @@ impl FlatLog {
         let mut name = self.path.file_name().unwrap_or_default().to_os_string();
         name.push(".lock");
         let lock = dir.join(name);
-        let file = private_options()
-            .create(true)
-            .truncate(false)
-            .open(&lock)
+        let file = open_regular(&lock, private_options().create(true).truncate(false))
             .wrap_err_with(|| format!("opening {}", lock.display()))?;
         fs4::FileExt::lock(&file).wrap_err_with(|| format!("waiting for {}", lock.display()))?;
         Ok(FlatLock(file))
@@ -72,12 +81,10 @@ impl FlatLog {
         if records.is_empty() {
             return Ok(());
         }
-        create_private_dir(self.path.parent().unwrap_or(Path::new(".")))?;
-        let mut file = private_options()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&self.path)
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        create_private_dir(dir)?;
+        let created = !self.path.exists();
+        let mut file = open_regular(&self.path, private_options().create(true).read(true).append(true))
             .wrap_err_with(|| format!("opening {}", self.path.display()))?;
         // A line a crash cut short must not swallow the first new one.
         let mut body = String::new();
@@ -96,6 +103,10 @@ impl FlatLog {
         file.write_all(body.as_bytes()).wrap_err_with(|| format!("appending to {}", self.path.display()))?;
         if durability == Durability::Fsync {
             file.sync_all()?;
+            // A new file is durable only once its directory entry is.
+            if created {
+                fsync_dir(dir)?;
+            }
         }
         Ok(())
     }
@@ -132,13 +143,13 @@ mod tests {
     fn appends_read_back_in_order_and_a_rewrite_replaces() {
         let dir = tempfile::tempdir().unwrap();
         let log = FlatLog::at(dir.path().join("sub/x.ndjson"));
-        assert!(log.read::<R>().is_empty());
+        assert!(log.read::<R>().unwrap().is_empty());
         let lock = log.lock().unwrap();
         log.append(&lock, &[R { k: 1 }, R { k: 2 }], Durability::NoSync).unwrap();
         log.append(&lock, &[R { k: 3 }], Durability::Fsync).unwrap();
-        assert_eq!(log.read::<R>(), vec![R { k: 1 }, R { k: 2 }, R { k: 3 }]);
+        assert_eq!(log.read::<R>().unwrap(), vec![R { k: 1 }, R { k: 2 }, R { k: 3 }]);
         log.rewrite(&lock, &[R { k: 9 }], Durability::NoSync).unwrap();
-        assert_eq!(log.read::<R>(), vec![R { k: 9 }]);
+        assert_eq!(log.read::<R>().unwrap(), vec![R { k: 9 }]);
         assert_eq!(log.line_count(), 1);
         #[cfg(unix)]
         {
@@ -158,7 +169,22 @@ mod tests {
         std::fs::write(log.path(), "{\"k\":1}\n{\"k\":").unwrap();
         let lock = log.lock().unwrap();
         log.append(&lock, &[R { k: 2 }], Durability::NoSync).unwrap();
-        assert_eq!(log.read::<R>(), vec![R { k: 1 }, R { k: 2 }]);
+        assert_eq!(log.read::<R>().unwrap(), vec![R { k: 1 }, R { k: 2 }]);
+    }
+
+    /// A planted symlink is never written through, nor read.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_neither_read_nor_appended_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "precious\n").unwrap();
+        let log = FlatLog::at(dir.path().join("x.ndjson"));
+        std::os::unix::fs::symlink(&victim, log.path()).unwrap();
+        assert!(log.read::<R>().is_err());
+        let lock = log.lock().unwrap();
+        assert!(log.append(&lock, &[R { k: 1 }], Durability::NoSync).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious\n");
     }
 
     /// Writers wait for each other: many threads appending lose nothing.
@@ -180,7 +206,7 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
-        assert_eq!(FlatLog::at(path).read::<R>().len(), 200);
+        assert_eq!(FlatLog::at(path).read::<R>().unwrap().len(), 200);
     }
 
     #[test]

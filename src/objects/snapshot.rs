@@ -311,7 +311,7 @@ pub fn history(store: &Store, start: ObjectId) -> Result<Vec<LogEntry>> {
     let count = |id: &ObjectId, kind: Kind, key: &str| -> Result<usize> {
         Ok(store.get(id, kind)?.get(key).and_then(Value::as_array).map_or(0, Vec::len))
     };
-    let mut notes = refs::notes(store);
+    let mut notes = refs::notes(store)?;
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![start];
@@ -342,7 +342,7 @@ pub fn print_log(out: &mut impl std::io::Write, entries: &[LogEntry]) -> std::io
             writeln!(out)?;
         }
         let s = &e.snapshot;
-        let time = e.note.as_ref().map_or("unknown time", |n| n.time.as_str());
+        let time = e.note.as_ref().map_or("unknown time".to_string(), |n| super::printable(&n.time));
         writeln!(out, "snapshot {}  {time}", s.id.short())?;
         let git = s.inputs.git.as_deref().map_or("none", |g| g.get(..7).unwrap_or(g));
         let dirty = match s.inputs.dirty.len() {
@@ -355,7 +355,8 @@ pub fn print_log(out: &mut impl std::io::Write, entries: &[LogEntry]) -> std::io
             writeln!(out, "  parents {}", parents.join(" "))?;
         }
         if let Some(message) = e.note.as_ref().and_then(|n| n.message.as_deref()) {
-            writeln!(out, "  {message}")?;
+            // A note may come from another machine: no terminal escapes.
+            writeln!(out, "  {}", super::printable(message))?;
         }
     }
     Ok(())

@@ -158,8 +158,10 @@ pub fn run(project_root: &Path, arg: &str, json: bool) -> Result<()> {
         writeln!(out, "{arg} — no agent writes recorded")?;
         return Ok(());
     };
-    let origin = w.origin.as_deref().map(|o| format!(", pulled from {o}")).unwrap_or_default();
-    writeln!(out, "{arg} — last written {} by {} ({}){origin}", w.t, w.a, w.tool)?;
+    // Agent, tool and origin may come from another machine: printed plain.
+    use crate::objects::printable;
+    let origin = w.origin.as_deref().map(|o| format!(", pulled from {}", printable(o))).unwrap_or_default();
+    writeln!(out, "{arg} — last written {} by {} ({}){origin}", printable(&w.t), printable(&w.a), printable(&w.tool))?;
     writeln!(out, "  session {session}, write {}", w.op)?;
     writeln!(out, "  {}", status.phrase())?;
     if let Some(landed) = &landed {

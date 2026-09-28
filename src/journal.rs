@@ -405,6 +405,9 @@ pub struct JournalContents {
     /// restore). Not folded into `writes` — history never is — but known, so
     /// restoring again appends nothing.
     pub history_writes: std::collections::BTreeSet<String>,
+    /// `op` of every write kept as a pull conflict (`history{of:"write",
+    /// conflict:true}`), so pulling again keeps it once.
+    pub conflict_writes: std::collections::BTreeSet<String>,
     /// `(symbol, hash)` of every read kept as history (`history{of:"read"}`,
     /// a stale remote read), so pulling again appends nothing.
     pub history_reads: std::collections::BTreeSet<(String, String)>,
@@ -538,7 +541,9 @@ fn fold_lines(path: &Path, content: &str, records: Records) -> JournalContents {
             Record::Write(record) => fold_write(&mut out.writes, *record),
             Record::History { of, rest } => {
                 let field = |k: &str| rest.get(k).and_then(|v| v.as_str()).map(String::from);
+                let conflict = rest.get("conflict").and_then(|v| v.as_bool()) == Some(true);
                 match of.as_str() {
+                    "write" if conflict => out.conflict_writes.extend(field("op")),
                     "write" => out.history_writes.extend(field("op")),
                     "read" => out.history_reads.extend(field("sym").zip(field("h"))),
                     _ => {}
@@ -656,6 +661,7 @@ pub fn merge_shard(out: &mut JournalContents, shard: JournalContents) {
     }
     out.history_writes.extend(shard.history_writes);
     out.history_reads.extend(shard.history_reads);
+    out.conflict_writes.extend(shard.conflict_writes);
     out.merges.extend(shard.merges);
 }
 

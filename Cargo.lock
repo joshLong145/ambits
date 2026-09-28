@@ -46,6 +46,7 @@ dependencies = [
  "flume",
  "fs4",
  "ignore",
+ "libc",
  "log",
  "notify",
  "ratatui",

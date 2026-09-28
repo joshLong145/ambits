@@ -41,19 +41,28 @@ fn lock_path(remote: &Store) -> PathBuf {
 }
 
 impl RemoteLock {
+    /// Take the lock, retrying briefly: a push holds it only to move a ref.
     pub fn acquire(remote: &Store, store_id: &str) -> Result<Self> {
+        Self::acquire_within(remote, store_id, std::time::Duration::from_secs(3))
+    }
+
+    pub fn acquire_within(remote: &Store, store_id: &str, patience: std::time::Duration) -> Result<Self> {
         create_private_dir(remote.root())?;
         let path = lock_path(remote);
         let holder = Holder { store: store_id.to_string(), pid: std::process::id(), start: now_secs(), token: random_token() };
-        let mut file = match private_options().create_new(true).open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let age = read_holder(remote).map(|h| format!("taken {}s ago", now_secs().saturating_sub(h.start))).unwrap_or_default();
-                bail!(
-                    "the remote is locked by another push ({age}); if none is running, retry with --break-lock"
-                );
+        let deadline = std::time::Instant::now() + patience;
+        let mut file = loop {
+            match private_options().create_new(true).open(&path) {
+                Ok(f) => break f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let age = read_holder(remote).map(|h| format!("taken {}s ago", now_secs().saturating_sub(h.start))).unwrap_or_default();
+                    bail!("the remote is locked by another push ({age}); if none is running, retry with --break-lock");
+                }
+                Err(e) => return Err(e).wrap_err_with(|| format!("locking {}", path.display())),
             }
-            Err(e) => return Err(e).wrap_err_with(|| format!("locking {}", path.display())),
         };
         file.write_all(serde_json::to_string(&holder)?.as_bytes())?;
         file.sync_all()?;
@@ -75,7 +84,12 @@ impl Drop for RemoteLock {
 }
 
 pub fn read_holder(remote: &Store) -> Option<Holder> {
-    serde_json::from_str(&std::fs::read_to_string(lock_path(remote)).ok()?).ok()
+    read_holder_at(&lock_path(remote))
+}
+
+fn read_holder_at(path: &std::path::Path) -> Option<Holder> {
+    let bytes = crate::objects::store::read_capped(path, 4096).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Whether process `pid` is alive on this machine; `None` when that cannot
@@ -83,12 +97,17 @@ pub fn read_holder(remote: &Store) -> Option<Holder> {
 fn pid_alive(pid: u32) -> Option<bool> {
     #[cfg(unix)]
     {
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .ok()
-            .map(|s| s.success())
+        let pid = i32::try_from(pid).ok()?;
+        // SAFETY: signal 0 checks for existence; nothing is sent.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return Some(true);
+        }
+        // Another user's process is alive, just not ours to signal.
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EPERM) => Some(true),
+            Some(libc::ESRCH) => Some(false),
+            _ => None,
+        }
     }
     #[cfg(not(unix))]
     {
@@ -129,8 +148,19 @@ pub fn break_lock(remote: &Store, store_id: &str, confirm: impl FnOnce(&str) -> 
             bail!("the remote lock was left in place");
         }
     }
-    std::fs::remove_file(lock_path(remote))?;
-    Ok(Broken::Broken(holder))
+    // Move it aside and look again before deleting: if the lock was released
+    // and retaken meanwhile, what was moved is someone else's live lock.
+    let path = lock_path(remote);
+    let aside = remote.root().join(format!("refs.lock.breaking-{}", random_token()));
+    std::fs::rename(&path, &aside)?;
+    if read_holder_at(&aside).is_some_and(|h| h.token == holder.token) {
+        std::fs::remove_file(&aside)?;
+        return Ok(Broken::Broken(holder));
+    }
+    if !path.exists() {
+        std::fs::rename(&aside, &path)?;
+    }
+    Err(color_eyre::eyre::eyre!("the remote lock changed hands while it was being broken; nothing was removed"))
 }
 
 #[cfg(test)]
@@ -148,7 +178,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let remote = Store::at_root(dir.path());
         let held = RemoteLock::acquire(&remote, "me").unwrap();
-        assert!(RemoteLock::acquire(&remote, "you").unwrap_err().to_string().contains("--break-lock"));
+        let err = RemoteLock::acquire_within(&remote, "you", std::time::Duration::ZERO).unwrap_err();
+        assert!(err.to_string().contains("--break-lock"));
         drop(held);
         RemoteLock::acquire(&remote, "you").unwrap();
     }

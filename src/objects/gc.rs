@@ -135,10 +135,19 @@ pub fn gc(store: &Store, grace: Duration, reflog_expiry: Duration) -> Result<GcS
 /// Every object reachable from a root: every ref (local and
 /// remote-tracking) and every unexpired reflog entry (§8).
 fn mark(store: &Store) -> Result<HashSet<ObjectId>> {
-    let mut roots: Vec<ObjectId> = refs::all(store).into_iter().map(|(_, id)| id).collect();
-    for e in refs::reflog(store) {
+    let mut roots: Vec<ObjectId> = refs::all(store)?.into_iter().map(|(_, id)| id).collect();
+    for e in refs::reflog(store)? {
         roots.extend(ObjectId::parse(&e.new));
         roots.extend(e.old.as_deref().and_then(|o| ObjectId::parse(o).ok()));
+    }
+    // Remote tips a pull merged in and no snapshot has taken yet: the next
+    // snapshot's parents (§12.3).
+    if let Some(project) = store.root().parent() {
+        let dir = crate::journal::journal_dir(project);
+        for session in crate::cache::session_ids(&dir) {
+            let merges = crate::journal::read_journal_session(&dir, &session).merges;
+            roots.extend(merges.iter().filter_map(|m| ObjectId::parse(m).ok()));
+        }
     }
 
     let mut reachable = HashSet::new();

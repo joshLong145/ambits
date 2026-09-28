@@ -114,17 +114,17 @@ fn tips(entries: &[ReflogEntry]) -> HashMap<&str, &str> {
 /// The snapshot `name` points at, if any.
 pub fn read(store: &Store, name: &RefName) -> Result<Option<ObjectId>> {
     check_layout(store)?;
-    let entries = reflog(store);
+    let entries = reflog(store)?;
     tips(&entries).get(name.as_str()).map(|t| ObjectId::parse(t)).transpose()
 }
 
 /// Every ref, local and remote-tracking, with its tip.
-pub fn all(store: &Store) -> Vec<(String, ObjectId)> {
-    let entries = reflog(store);
+pub fn all(store: &Store) -> Result<Vec<(String, ObjectId)>> {
+    let entries = reflog(store)?;
     let mut out: Vec<(String, ObjectId)> =
         tips(&entries).into_iter().filter_map(|(name, tip)| Some((name.to_string(), ObjectId::parse(tip).ok()?))).collect();
     out.sort();
-    out
+    Ok(out)
 }
 
 /// Move `name` from `expected` to `new`: one reflog entry, appended under
@@ -134,10 +134,10 @@ pub fn update(store: &Store, name: &RefName, expected: Option<ObjectId>, new: Ob
     check_layout(store)?;
     let file = reflog_file(store);
     let lock = file.lock()?;
-    let entries = reflog(store);
+    let entries = reflog(store)?;
     let current = tips(&entries).get(name.as_str()).and_then(|t| ObjectId::parse(t).ok());
     if current != expected {
-        bail!("{} moved while this snapshot was being made; run it again", name.as_str());
+        bail!("{} moved meanwhile (another snapshot, restore or push); run it again", name.as_str());
     }
     let entry = ReflogEntry {
         name: name.as_str().to_string(),
@@ -151,7 +151,7 @@ pub fn update(store: &Store, name: &RefName, expected: Option<ObjectId>, new: Ob
 }
 
 /// Every reflog entry, oldest first. Unparseable lines are skipped.
-pub fn reflog(store: &Store) -> Vec<ReflogEntry> {
+pub fn reflog(store: &Store) -> Result<Vec<ReflogEntry>> {
     reflog_file(store).read()
 }
 
@@ -164,7 +164,7 @@ pub fn expire_reflogs(store: &Store, expiry: Duration) -> Result<usize> {
     let cutoff = now_secs().saturating_sub(expiry.as_secs());
     let file = reflog_file(store);
     let lock = file.lock()?;
-    let entries = reflog(store);
+    let entries = reflog(store)?;
     let last: HashMap<&str, usize> = entries.iter().enumerate().map(|(i, e)| (e.name.as_str(), i)).collect();
     let kept: Vec<&ReflogEntry> = entries.iter().enumerate().filter(|(i, e)| e.secs >= cutoff || last[e.name.as_str()] == *i).map(|(_, e)| e).collect();
     let dropped = entries.len() - kept.len();
@@ -201,18 +201,18 @@ pub fn write_note(store: &Store, id: &ObjectId, message: Option<&str>) -> Result
 }
 
 /// Every snapshot's note; the last written wins.
-pub fn notes(store: &Store) -> HashMap<ObjectId, Note> {
-    notes_file(store).read::<NoteLine>().into_iter().filter_map(|l| Some((ObjectId::parse(&l.id).ok()?, l.note))).collect()
+pub fn notes(store: &Store) -> Result<HashMap<ObjectId, Note>> {
+    Ok(notes_file(store).read::<NoteLine>()?.into_iter().filter_map(|l| Some((ObjectId::parse(&l.id).ok()?, l.note))).collect())
 }
 
 pub fn read_note(store: &Store, id: &ObjectId) -> Option<Note> {
-    notes(store).remove(id)
+    notes(store).ok()?.remove(id)
 }
 
 /// Copy `from`'s notes for `ids` that `to` lacks; how many.
 pub fn copy_notes(from: &Store, to: &Store, ids: &std::collections::HashSet<ObjectId>) -> Result<usize> {
-    let have = notes(to);
-    let missing: Vec<NoteLine> = notes(from)
+    let have = notes(to)?;
+    let missing: Vec<NoteLine> = notes(from)?
         .into_iter()
         .filter(|(id, _)| ids.contains(id) && !have.contains_key(id))
         .map(|(id, note)| NoteLine { id: id.hex(), note })
@@ -232,7 +232,7 @@ pub fn prune_notes(store: &Store, keep: impl Fn(&ObjectId) -> bool) -> Result<us
         return Ok(0);
     }
     let lock = file.lock()?;
-    let lines: Vec<NoteLine> = file.read();
+    let lines: Vec<NoteLine> = file.read()?;
     let kept: Vec<&NoteLine> = lines.iter().filter(|l| ObjectId::parse(&l.id).is_ok_and(|id| keep(&id))).collect();
     let dropped = lines.len() - kept.len();
     if dropped > 0 {
@@ -266,9 +266,9 @@ mod tests {
         assert!(update(&store, &name, None, b, "snapshot").is_err(), "stale expectation");
         update(&store, &name, Some(a), b, "snapshot").unwrap();
         assert_eq!(read(&store, &name).unwrap(), Some(b));
-        assert_eq!(all(&store), vec![(name.as_str().to_string(), b)]);
+        assert_eq!(all(&store).unwrap(), vec![(name.as_str().to_string(), b)]);
 
-        let news: Vec<String> = reflog(&store).into_iter().map(|e| e.new).collect();
+        let news: Vec<String> = reflog(&store).unwrap().into_iter().map(|e| e.new).collect();
         assert_eq!(news, vec![a.hex(), b.hex()]);
         assert_eq!(std::fs::read_dir(dir.path().join(".ambits")).unwrap().count(), 2, "one reflog and its lock");
     }
@@ -291,7 +291,7 @@ mod tests {
             .map(|t| usize::from(t.join().unwrap()))
             .sum();
         assert_eq!(wins, 1);
-        assert_eq!(reflog(&Store::at(&root)).len(), 1);
+        assert_eq!(reflog(&Store::at(&root)).unwrap().len(), 1);
     }
 
     /// Expiry drops old moves but never where a ref points.

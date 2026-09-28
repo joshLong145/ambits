@@ -1,13 +1,18 @@
 # Sharing
 
 A session's [snapshots](Snapshots) can be shared through a **remote**: a
-plain directory — on a local disk, a shared mount, anything with atomic
-rename and exclusive create — laid out as `.ambits/` is. There is no server.
-Another clone of the project fetches from it, pulls a session's history into
-its own session of the same id, or restores it into a new one.
+plain directory — on a local disk, a mount, anything with atomic rename and
+exclusive create — laid out as `.ambits/` is. There is no server. Another
+clone of the project fetches from it, pulls a session's history into its own
+session of the same id, or restores it into a new one.
+
+**A remote serves one user for now**: its files are private to whoever
+created it, as `.ambits/` is, and ambits refuses a remote another user owns.
+It is for moving your own sessions between your machines or clones — a
+synced or mounted directory of yours — not yet for a team.
 
 ```bash
-ambits -p . remote add origin /mnt/team/ambits   # once per clone
+ambits -p . remote add origin /mnt/me/ambits     # once per clone
 ambits -p . snapshot
 ambits -p . push                                  # this session's history to origin
 
@@ -32,7 +37,10 @@ ambits -p . --session <session> pull              # or merge into the same sessi
   them instead, but only if the remote still holds what you last fetched.
 - `--dry-run` says how many objects and links would go, and sends nothing.
 - Links (which commit a write [landed in](Agent-Writes#which-commit-it-landed-in))
-  go with it, filtered by `[sync] ignore`, as hints the other side re-checks.
+  go with it: only those of the writes being pushed, filtered by
+  `[sync] ignore`.
+- Snapshots are filtered when they are made. A push warns when it sends
+  snapshots made under different `[sync] ignore` rules than today's.
 
 The remote's ref is guarded by `refs.lock`, a file naming the store that
 took it (a random id from `.ambits/config`, never a host name), a pid and a
@@ -46,8 +54,14 @@ confirmation, since breaking a live push's lock can lose that push.
 `ambits fetch [remote]` copies every session's history from the remote and
 records where each points, as `<remote>/<session>`. Nothing is trusted:
 every object is re-hashed, every snapshot's id and contents recomputed,
-symlinks and oversized files refused. A fetch that fails verification
-records nothing.
+symlinks, FIFOs and oversized files refused, malformed ref names ignored.
+Each session is fetched on its own: one that fails verification records
+nothing and is reported, the others still come, and the command exits
+non-zero.
+
+The remote's links are kept only when this machine can prove them — the
+commit is reachable here and its version of the file holds the write — so
+a remote cannot make `touched` report a landing that did not happen.
 
 A remote session that was overwritten (someone used `--force-with-lease`) is
 still followed, and reported as forced; the old tip stays in the reflog. A
@@ -63,12 +77,13 @@ current session into the same session here, writing to its
 |---|---|
 | A read of code that is the same here | Added, unless already known at that depth |
 | A read of code that differs here | Kept as history, once: it never lowers what this session knows |
+| A malformed record | Left out, and counted |
 | A write with a newer attribution | Added, marked with where it came from |
 | The same write, attributed differently | Yours kept; theirs kept as history (a conflict) |
 
-When anything was added, or the two histories diverged, the pull records a
-merge: the next `ambits snapshot` has both tips as parents, and pushes as a
-fast-forward. When you are merely behind and the remote adds nothing, a pull
+When anything was written, or the two histories diverged, the pull records a
+merge (once per remote tip): the next `ambits snapshot` descends from the
+remote's, and pushes as a fast-forward. When you are merely behind and the remote adds nothing, a pull
 writes nothing — so pull, snapshot, push rounds settle instead of minting
 snapshots back and forth.
 
@@ -93,8 +108,8 @@ path = "/mnt/team/ambits"
 
 `ambits remote add <name> <path>`, `remote list`, `remote remove <name>`. A
 world-writable remote is warned about: anyone who can write it can rewrite
-the history everyone pulls. A dumb remote proves nothing about who wrote
-what; signatures are future work.
+the history you pull. A dumb remote proves nothing about who wrote what;
+signatures are future work.
 
 ## What leaves the machine
 
