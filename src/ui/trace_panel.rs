@@ -10,10 +10,10 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use ambits::app::{App, FocusPanel, PanelSubject};
-use ambits::trace::summary::{self, Row, TraceDetail};
+use ambits::trace::summary::{self, FileActivity, Row, TraceDetail};
 use ambits::trace::view;
 use ambits::trace::SpanKind;
-use ambits::writes::Status;
+use ambits::writes::{Status, WriteRecord};
 
 use super::inspector::{depth_spans, fact, text};
 use super::trace_view::{instant_glyph, span_color, span_name, TraceFrame};
@@ -37,20 +37,20 @@ pub(super) fn render(f: &mut Frame, app: &App, area: Rect, frame: &TraceFrame<'_
     f.render_widget(block, area);
     let width = inner.width as usize;
     let selected = focused.then_some(app.panel_index);
+    // The line the selected row is on, to keep in view.
+    let mut at = None;
+    let mut with_rows = |mut out: Vec<Line<'static>>, rows: &[Row<'_>]| {
+        let (lines, picked) = rows_lines(app, frame, rows, selected, width);
+        at = picked.map(|p| p + out.len());
+        out.extend(lines);
+        out
+    };
     let lines = match subject {
         PanelSubject::Trace(root) => match summary::detail(&app.trace, &frame.index, root) {
-            Some(d) => {
-                let mut out = trace_lines(app, &d, width);
-                out.extend(rows_lines(app, frame, &d.rows(), selected, width));
-                out
-            }
+            Some(d) => with_rows(trace_lines(app, &d, width), &d.rows()),
             None => vec![Line::from(text(" nothing here", Color::DarkGray))],
         },
-        PanelSubject::Call(i) => {
-            let mut out = call_lines(app, i, frame, width);
-            out.extend(rows_lines(app, frame, &summary::call_rows(&app.trace, &frame.index, i), selected, width));
-            out
-        }
+        PanelSubject::Call(i) => with_rows(call_lines(app, i, frame, width), &summary::call_rows(&app.trace, &frame.index, i)),
         PanelSubject::Instant(i) => {
             let x = &app.trace.instants()[i];
             let (glyph, color) = instant_glyph(&x.kind);
@@ -61,7 +61,11 @@ pub(super) fn render(f: &mut Frame, app: &App, area: Rect, frame: &TraceFrame<'_
         }
         PanelSubject::Nothing => vec![Line::from(text(" No traces yet.", Color::DarkGray))],
     };
-    f.render_widget(Paragraph::new(lines), inner);
+    let height = inner.height as usize;
+    // Scroll only as far as the selected row needs, with a line of what
+    // follows it in view.
+    let scroll = at.map_or(0, |at| (at + 2).saturating_sub(height)).min(lines.len().saturating_sub(height));
+    f.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), inner);
 }
 
 /// A fact whose value wraps under its label, up to `max` lines.
@@ -148,14 +152,12 @@ fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, width: usize) -> Vec<
             Some((w, status)) => {
                 let level = if w.syms.is_empty() { "file-level".to_string() } else { format!("{} symbol(s)", w.syms.len()) };
                 out.push(fact("wrote", vec![text(level, Color::White), text("  ", Color::Gray), write_word(*status)]));
-                let now = app.project_tree.file(&w.file).map(ambits::writes::FileContents::from_symbols);
-                for (id, _) in w.syms.iter().take(8) {
-                    let status = now.as_ref().map_or(Status::Removed, |n| n.symbol_status(id, w));
-                    let name = ambits::symbols::split_id(id).1.to_string();
-                    out.push(fact("", vec![text(fit(&name, width.saturating_sub(26).max(8)), Color::White), text("  ", Color::Gray), write_word(status)]));
+                let syms = if w.syms.is_empty() { Vec::new() } else { symbols_written(app, w, *status) };
+                for (name, status) in syms.iter().take(8) {
+                    out.push(fact("", vec![text(fit(name, width.saturating_sub(26).max(8)), Color::White), text("  ", Color::Gray), write_word(*status)]));
                 }
-                if w.syms.len() > 8 {
-                    out.push(fact("", vec![text(format!("… {} more", w.syms.len() - 8), Color::DarkGray)]));
+                if syms.len() > 8 {
+                    out.push(fact("", vec![text(format!("… {} more", syms.len() - 8), Color::DarkGray)]));
                 }
             }
             None => out.push(fact("wrote", vec![text("not attributed (no journal entry)", Color::DarkGray)])),
@@ -181,16 +183,85 @@ fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, width: usize) -> Vec<
     out
 }
 
+/// What write `w` left and whether each still stands: its symbols by name
+/// path, or — a file-level write — the whole file, at `status`.
+fn symbols_written(app: &App, w: &WriteRecord, status: Status) -> Vec<(String, Status)> {
+    if w.syms.is_empty() {
+        return vec![(WHOLE_FILE.to_string(), status)];
+    }
+    let now = app.project_tree.file(&w.file).map(ambits::writes::FileContents::from_symbols);
+    w.syms
+        .iter()
+        .map(|(id, _)| (ambits::symbols::split_id(id).1.to_string(), now.as_ref().map_or(Status::Removed, |n| n.symbol_status(id, w))))
+        .collect()
+}
+
+/// How a read or write of a whole file is named among symbols.
+const WHOLE_FILE: &str = "(whole file)";
+
+/// Detail lines a file gets under its row, at most.
+const FILE_DETAIL: usize = 6;
+
+/// Under a trace's file row: what it read of the file, each symbol at its
+/// deepest, then what it wrote, each symbol as its latest write left it.
+fn file_details(app: &App, frame: &TraceFrame<'_>, file: &FileActivity, width: usize) -> Vec<Line<'static>> {
+    let mut wrote: Vec<(String, Status)> = Vec::new();
+    for &i in &file.writes {
+        let Some((w, status)) = app.trace.spans()[i].id.as_deref().and_then(|op| frame.statuses.get(op)) else { continue };
+        for (name, status) in symbols_written(app, w, *status) {
+            match wrote.iter_mut().find(|(n, _)| *n == name) {
+                Some(slot) => slot.1 = status,
+                None => wrote.push((name, status)),
+            }
+        }
+    }
+    let name_w = width.saturating_sub(5 + 6 + 14).max(8);
+    let read = file.symbols_read(&app.trace).into_iter().map(|(name, depth)| {
+        let mut cells = vec![text("read  ", Color::DarkGray)];
+        let mut word = depth_spans(depth);
+        if let Some(last) = word.last_mut() {
+            *last = text(format!("{:<11}", last.content), Color::Gray);
+        }
+        cells.extend(word);
+        cells.push(text(fit(name.as_deref().unwrap_or(WHOLE_FILE), name_w), Color::White));
+        cells
+    });
+    let written = wrote.into_iter().map(|(name, status)| {
+        vec![
+            text("wrote ", Color::DarkGray),
+            text(format!("✎ {:<11}", status.word()), tree_view::write_color(status)),
+            text(fit(&name, name_w), Color::White),
+        ]
+    });
+    let all: Vec<Vec<Span<'static>>> = read.chain(written).collect();
+    let more = all.len().saturating_sub(FILE_DETAIL);
+    let mut out: Vec<Line<'static>> = all
+        .into_iter()
+        .take(FILE_DETAIL)
+        .map(|cells| {
+            let mut line = vec![text("     ", Color::Reset)];
+            line.extend(cells);
+            Line::from(line)
+        })
+        .collect();
+    if more > 0 {
+        out.push(Line::from(text(format!("     … {more} more"), Color::DarkGray)));
+    }
+    out
+}
+
 /// The width of a files row's name column: what the counts leave.
 fn file_name_width(width: usize) -> usize {
     width.saturating_sub(3 + 12 + 14).max(8)
 }
 
 /// The panel's selectable rows, under a heading per section, the selected
-/// one marked: the same list, in the same order, that `Enter` opens.
-fn rows_lines(app: &App, frame: &TraceFrame<'_>, rows: &[Row<'_>], selected: Option<usize>, width: usize) -> Vec<Line<'static>> {
+/// one marked: the same list, in the same order, that `Enter` opens. With
+/// the line the selected row is on.
+fn rows_lines(app: &App, frame: &TraceFrame<'_>, rows: &[Row<'_>], selected: Option<usize>, width: usize) -> (Vec<Line<'static>>, Option<usize>) {
     let spans = app.trace.spans();
     let picked = selected.map(|s| s.min(rows.len().saturating_sub(1)));
+    let mut at = None;
     let mut out = Vec::new();
     let mut heading = None;
     for (n, row) in rows.iter().enumerate() {
@@ -205,13 +276,13 @@ fn rows_lines(app: &App, frame: &TraceFrame<'_>, rows: &[Row<'_>], selected: Opt
         }
         let cells = match *row {
             Row::File(file) => {
-                let status = file.write_spans.last().and_then(|&i| spans[i].id.as_deref()).and_then(|op| frame.statuses.get(op)).map(|(_, s)| *s);
+                let status = file.writes.last().and_then(|&i| spans[i].id.as_deref()).and_then(|op| frame.statuses.get(op)).map(|(_, s)| *s);
                 let name_w = file_name_width(width);
                 let name = fit(&file.file, name_w);
                 let pad = name_w.saturating_sub(super::width(&name));
                 let mut cells = vec![
                     text(format!("{name}{}", " ".repeat(pad)), Color::White),
-                    text(format!(" {:>4} {:>5}  ", file.reads, file.writes), Color::Gray),
+                    text(format!(" {:>4} {:>5}  ", file.reads.len(), file.writes.len()), Color::Gray),
                 ];
                 cells.extend(status.map(write_word));
                 cells
@@ -236,12 +307,18 @@ fn rows_lines(app: &App, frame: &TraceFrame<'_>, rows: &[Row<'_>], selected: Opt
             ],
         };
         let pick = picked == Some(n);
+        if pick {
+            at = Some(out.len());
+        }
         let mut line = vec![Span::styled(if pick { " › " } else { "   " }, Style::default().fg(colors::HIGHLIGHT_FG))];
         line.extend(cells);
         let line = Line::from(line);
         out.push(if pick { line.style(Style::default().bg(colors::HIGHLIGHT_BG).add_modifier(Modifier::BOLD)) } else { line });
+        if let Row::File(file) = row {
+            out.extend(file_details(app, frame, file, width));
+        }
     }
-    out
+    (out, at)
 }
 
 #[cfg(test)]
@@ -295,6 +372,38 @@ mod tests {
         for want in ["make it better", "3 calls", "Edit 2 · Read 1", "1 failed", "src/a.rs", "src/b.rs", "✗ Edit src/b.rs — String to replace not found"] {
             assert!(text.contains(want), "{want}: {text}");
         }
+    }
+
+    /// Under each file: what was read of it, and what was written and
+    /// whether that stands (here the tree is empty, so it is gone).
+    #[test]
+    fn a_files_reads_and_writes_are_listed_under_it() {
+        let mut app = app();
+        app.record_write("sess", ambits::writes::WriteRecord {
+            op: "e1".into(), a: "sess".into(), t: "2026-09-27T10:00:04Z".into(), tool: "Edit".into(), file: "src/a.rs".into(),
+            level: ambits::writes::Level::Symbol, syms: vec![("src/a.rs::App/run".into(), "b3:x".into())],
+            ..Default::default()
+        });
+        let text = screen(&app);
+        for want in ["read  ● full body  (whole file)", "wrote ✎ gone       App/run"] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let a = lines.iter().position(|l| l.contains("src/a.rs")).unwrap();
+        assert!(lines[a + 1].contains("read") && lines[a + 2].contains("wrote"), "under src/a.rs: {text}");
+    }
+
+    /// With more rows than room, the panel scrolls to the selected one.
+    #[test]
+    fn the_selected_row_stays_in_view() {
+        let mut app = app();
+        for n in 0..20 {
+            call(&mut app, &format!("m{n}"), "Read", &format!("src/m{n:02}.rs"), "2026-09-27T10:00:07Z", "2026-09-27T10:00:08Z", None);
+        }
+        app.focus = FocusPanel::Right;
+        app.panel_index = 21;
+        let text = screen(&app);
+        assert!(text.contains(" › "), "the selected row is drawn: {text}");
     }
 
     #[test]

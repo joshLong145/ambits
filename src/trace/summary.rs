@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use super::view::{effective_ends, subtree};
 use super::{InstantKind, Node, SpanKind, Trace};
+use crate::tracking::ReadDepth;
 
 /// A trace's structure, worked out once and asked many times (a frame asks
 /// dozens of questions of it): the span tree, which trace each span belongs
@@ -72,12 +73,30 @@ impl TraceIndex {
 pub struct FileActivity {
     /// Project-relative.
     pub file: String,
-    pub reads: usize,
-    pub writes: usize,
+    /// Its read calls, in time order.
+    pub reads: Vec<usize>,
     /// Its write calls, latest last: their ops name their write records.
-    pub write_spans: Vec<usize>,
+    pub writes: Vec<usize>,
     /// Its first call in the trace.
     pub first: usize,
+}
+
+impl FileActivity {
+    /// What its reads saw: each symbol once, at the deepest it was read,
+    /// in the order first read. `None` is the whole file.
+    pub fn symbols_read(&self, trace: &Trace) -> Vec<(Option<String>, ReadDepth)> {
+        let mut out: Vec<(Option<String>, ReadDepth)> = Vec::new();
+        for &i in &self.reads {
+            let s = &trace.spans()[i];
+            let SpanKind::Read(depth) = s.kind else { continue };
+            let name = s.symbol_name();
+            match out.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, d)) => *d = (*d).max(depth),
+                None => out.push((name, depth)),
+            }
+        }
+        out
+    }
 }
 
 /// A subagent a trace started.
@@ -134,16 +153,13 @@ pub fn detail(trace: &Trace, index: &TraceIndex, root: usize) -> Option<TraceDet
             let at = match files.iter().position(|f| &f.file == file) {
                 Some(at) => at,
                 None => {
-                    files.push(FileActivity { file: file.clone(), reads: 0, writes: 0, write_spans: Vec::new(), first: i });
+                    files.push(FileActivity { file: file.clone(), reads: Vec::new(), writes: Vec::new(), first: i });
                     files.len() - 1
                 }
             };
             match s.kind {
-                SpanKind::Read(_) => files[at].reads += 1,
-                SpanKind::Write => {
-                    files[at].writes += 1;
-                    files[at].write_spans.push(i);
-                }
+                SpanKind::Read(_) => files[at].reads.push(i),
+                SpanKind::Write => files[at].writes.push(i),
                 _ => {}
             }
         }
@@ -162,7 +178,7 @@ pub fn detail(trace: &Trace, index: &TraceIndex, root: usize) -> Option<TraceDet
     }
     let mut by_tool: Vec<(Arc<str>, usize)> = by_tool.into_iter().collect();
     by_tool.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    files.sort_by(|a, b| (b.reads + b.writes).cmp(&(a.reads + a.writes)).then_with(|| a.first.cmp(&b.first)));
+    files.sort_by(|a, b| (b.reads.len() + b.writes.len()).cmp(&(a.reads.len() + a.writes.len())).then_with(|| a.first.cmp(&b.first)));
 
     let (start, end) = (spans[root].start, node.end);
     let mut commits: Vec<usize> = (0..trace.instants().len())
@@ -308,7 +324,8 @@ mod tests {
         assert_eq!(d.calls, 7);
         assert_eq!(d.by_tool.iter().map(|(t, n)| (t.as_ref(), *n)).collect::<Vec<_>>(), vec![("Read", 4), ("Edit", 2), ("Agent", 1)]);
         let a = &d.files[0];
-        assert_eq!((a.file.as_str(), a.reads, a.writes, a.write_spans.clone()), ("src/a.rs", 4, 1, vec![3]));
+        assert_eq!((a.file.as_str(), a.reads.clone(), a.writes.clone()), ("src/a.rs", vec![1, 2, 6, 7], vec![3]));
+        assert_eq!(a.symbols_read(&t), vec![(None, ReadDepth::FullBody)], "four whole-file reads, once");
         assert_eq!(d.files[1].file, "src/b.rs");
         assert_eq!(d.failed, vec![4]);
         assert_eq!(d.agents.len(), 1);
@@ -316,6 +333,22 @@ mod tests {
         assert_eq!((&*run.agent, run.calls, run.failed, run.duration), ("x", 2, 0, 11_000));
         assert_eq!(d.commits, vec![0]);
         assert!(detail(&t, &TraceIndex::new(&t), 1).is_none(), "not a root");
+    }
+
+    #[test]
+    fn a_files_reads_are_each_symbol_once_at_its_deepest() {
+        let mut t = Trace::default();
+        t.prompt(&Prompt { agent_id: Arc::from("main"), timestamp: "2026-09-27T10:00:00Z".into(), text: "go".into() });
+        for (id, symbol, depth) in [("r1", Some("impl App/fn run"), ReadDepth::Signature), ("r2", None, ReadDepth::Overview), ("r3", Some("App/run"), ReadDepth::FullBody)] {
+            let mut c = crate::helpers::tool_call("Read", "/p/src/a.rs", depth);
+            c.agent_id = Arc::from("main");
+            c.tool_use_id = Some(Arc::from(id));
+            c.timestamp_str = "2026-09-27T10:00:01Z".into();
+            c.target_symbol = symbol.map(String::from);
+            t.start(&c, Path::new("/p"));
+        }
+        let d = detail(&t, &TraceIndex::new(&t), 0).unwrap();
+        assert_eq!(d.files[0].symbols_read(&t), vec![(Some("App/run".into()), ReadDepth::FullBody), (None, ReadDepth::Overview)]);
     }
 
     #[test]

@@ -200,6 +200,11 @@ In the trace view the right-hand panel follows the selection.
 
  files                          read wrote
  › src/trace/view.rs               4     3  ✎ still there
+     read  ● full body  (whole file)
+     read  ◐ signature  TraceView/zoom
+     wrote ✎ still there TraceView/fit
+     wrote ✎ changed     Viewport
+     … 3 more
    src/app.rs                      6     2  ✎ changed
  agents
    Expert review of phase 3  7m57s · 17 calls
@@ -212,6 +217,11 @@ In the trace view the right-hand panel follows the selection.
 The prompt in full, when and how long, calls by tool, the files it read and
 wrote — and whether its writes are still there, changed or gone — its
 agents, its failed calls with the reason, and the commits made meanwhile.
+
+Under each file, what the trace read of it — each symbol once, at the
+deepest it was read, `(whole file)` for a read of all of it — then what it
+wrote, each symbol as its latest write in the trace left it. Up to six
+lines a file; the panel scrolls to keep the selected row in view.
 
 **A call**: who made it, when and for how long, in which trace; why it
 failed (the error's own line: a traceback's last, a compiler's first
