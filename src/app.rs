@@ -723,21 +723,32 @@ impl App {
         }
     }
 
-    /// The right-hand panel's keys: its rows, and what `Enter` opens.
+    /// The right-hand panel's keys, by what it shows.
     fn handle_right_key(&mut self, key: KeyEvent) {
-        let rows = if self.trace_view.open { self.trace_panel_targets().len() } else { usize::MAX };
-        match (self.trace_view.open, self.right_pane, key.code) {
-            (true, RightPane::Inspector, KeyCode::Enter) => self.open_panel_target(),
-            (_, _, KeyCode::Char('j') | KeyCode::Down) if self.trace_view.open || self.right_pane == RightPane::Inspector => {
-                self.panel_index = (self.panel_index + 1).min(rows.saturating_sub(1));
-            }
-            (_, _, KeyCode::Char('k') | KeyCode::Up) if self.trace_view.open || self.right_pane == RightPane::Inspector => {
-                self.panel_index = self.panel_index.saturating_sub(1)
-            }
-            (false, RightPane::Inspector, KeyCode::Enter) => self.open_inspected_trace(),
-            (false, RightPane::Session, KeyCode::Char('j') | KeyCode::Down) => self.move_agent_selection(1),
-            (false, RightPane::Session, KeyCode::Char('k') | KeyCode::Up) => self.move_agent_selection(-1),
-            (false, RightPane::Session, KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter) => self.apply_agent_selection(),
+        match (self.right_pane, self.trace_view.open) {
+            (RightPane::Session, _) => self.handle_session_key(key),
+            (RightPane::Inspector, true) => self.handle_panel_rows_key(key, self.trace_panel_targets().len(), Self::open_panel_target),
+            (RightPane::Inspector, false) => self.handle_panel_rows_key(key, usize::MAX, Self::open_inspected_trace),
+        }
+    }
+
+    /// A panel of rows — the trace panel's, or the inspector's traces —
+    /// moved through with `j`/`k` and opened with `Enter`.
+    fn handle_panel_rows_key(&mut self, key: KeyEvent, rows: usize, open: fn(&mut Self)) {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.panel_index = (self.panel_index + 1).min(rows.saturating_sub(1)),
+            KeyCode::Char('k') | KeyCode::Up => self.panel_index = self.panel_index.saturating_sub(1),
+            KeyCode::Enter => open(self),
+            _ => {}
+        }
+    }
+
+    /// The session pane's keys: pick an agent to filter by.
+    fn handle_session_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.move_agent_selection(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_agent_selection(-1),
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => self.apply_agent_selection(),
             _ => {}
         }
     }
@@ -771,32 +782,18 @@ impl App {
             Target::Span(i) => Item::Span(i),
             Target::Instant(i) => Item::Instant(i),
         };
+        let index = crate::trace::summary::TraceIndex::new(&self.trace);
         if self.trace_view.focus.is_none() {
             let root = match item {
-                Item::Span(i) => crate::trace::summary::TraceIndex::new(&self.trace).root_of(i),
+                Item::Span(i) => index.root_of(i),
                 Item::Instant(_) => self.trace_view.list,
             };
             let Some(root) = root.or_else(|| self.trace_view.list_index(&self.trace_list()).map(|i| self.trace_list()[i].root)) else { return };
             self.trace_view.open_trace(root);
         }
         if let Item::Span(i) = item {
-            // Unfold what hides it.
-            let tree = self.trace.tree();
-            let mut path = Vec::new();
-            fn find(nodes: &[crate::trace::Node], want: usize, path: &mut Vec<usize>) -> bool {
-                nodes.iter().any(|n| {
-                    path.push(n.span);
-                    let found = n.span == want || find(&n.children, want, path);
-                    if !found {
-                        path.pop();
-                    }
-                    found
-                })
-            }
-            if find(&tree, i, &mut path) {
-                for ancestor in path {
-                    self.trace_view.collapsed_spans.remove(&ancestor);
-                }
+            for ancestor in index.ancestors(i) {
+                self.trace_view.collapsed_spans.remove(&ancestor);
             }
         }
         self.trace_view.selected = Some(item);
@@ -909,8 +906,8 @@ impl App {
     pub fn trace_panel_targets_in(&self, index: &crate::trace::summary::TraceIndex) -> Vec<crate::trace::summary::Target> {
         use crate::trace::summary;
         match self.trace_panel_subject() {
-            PanelSubject::Trace(root) => summary::detail(&self.trace, index, root).map(|d| d.targets()).unwrap_or_default(),
-            PanelSubject::Call(i) => summary::call_targets(&self.trace, index, i),
+            PanelSubject::Trace(root) => summary::detail(&self.trace, index, root).map(|d| d.rows().iter().map(summary::Row::target).collect()).unwrap_or_default(),
+            PanelSubject::Call(i) => summary::call_rows(&self.trace, index, i).iter().map(summary::Row::target).collect(),
             PanelSubject::Instant(_) | PanelSubject::Nothing => Vec::new(),
         }
     }

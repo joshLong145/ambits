@@ -470,20 +470,7 @@ mod tests {
     use std::sync::Arc;
 
     fn call(agent: &str, id: &str, tool: &str, at: &str) -> ambits::ingest::AgentToolCall {
-        ambits::ingest::AgentToolCall {
-            agent_id: Arc::from(agent),
-            tool_name: Arc::from(tool),
-            file_path: Some(PathBuf::from("/test/src/a.rs")),
-            read_depth: ambits::tracking::ReadDepth::FullBody,
-            description: format!("{tool} src/a.rs"),
-            timestamp_str: at.into(),
-            target_symbol: None,
-            target_lines: None,
-            target_selectors: Vec::new(),
-            label: Arc::from(agent),
-            tool_use_id: Some(Arc::from(id)),
-            effect: ambits::ingest::Effect::default(),
-        }
+        crate::ui::test_render::tool_call(agent, id, tool, "src/a.rs", at)
     }
 
     fn app() -> App {

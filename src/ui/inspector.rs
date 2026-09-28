@@ -65,12 +65,17 @@ pub(super) fn depth_word(depth: ReadDepth) -> &'static str {
     }
 }
 
+/// `● full body`: a read depth's glyph, in its colour, and its word.
+pub(super) fn depth_spans(depth: ReadDepth) -> Vec<Span<'static>> {
+    vec![text(format!("{} ", tree_view::depth_glyph(depth)), tree_view::depth_color(depth, false)), text(depth_word(depth), Color::White)]
+}
+
 fn symbol_facts(app: &App, row: &ambits::app::TreeRow) -> Vec<Line<'static>> {
     let depth = row.read_depth;
     let mut lines = Vec::new();
 
     // Read: the depth, and who read it how deeply.
-    let mut read = vec![text(format!("{} ", tree_view::depth_glyph(depth)), tree_view::depth_color(depth, false)), text(depth_word(depth), Color::White)];
+    let mut read = depth_spans(depth);
     if let Some(entry) = app.ledger.entries.get(&row.symbol_id).filter(|_| depth.is_seen()) {
         let mut by: Vec<(String, ReadDepth)> =
             entry.agent_depths.iter().filter(|(_, d)| d.is_seen()).map(|(a, d)| (app.agent_name(a).to_string(), *d)).collect();
@@ -189,12 +194,8 @@ mod tests {
         app.set_session_id(Some("sess".into()));
         app.set_expanded("mock/a.rs", RowKind::File, true);
         app.process_prompt(&Prompt { agent_id: Arc::from("sess"), timestamp: "2026-09-27T10:00:00Z".into(), text: "look at alpha".into() });
-        let call = ambits::ingest::AgentToolCall {
-            agent_id: Arc::from("sess"), tool_name: Arc::from("Read"), file_path: Some(PathBuf::from("/test/mock/a.rs")),
-            read_depth: ReadDepth::FullBody, description: "Read mock/a.rs".into(), timestamp_str: "2026-09-27T10:00:01Z".into(),
-            target_symbol: None, target_lines: None, target_selectors: Vec::new(), label: Arc::from("main"),
-            tool_use_id: Some(Arc::from("r1")), effect: ambits::ingest::Effect::Read,
-        };
+        let mut call = crate::ui::test_render::tool_call("sess", "r1", "Read", "mock/a.rs", "2026-09-27T10:00:01Z");
+        call.label = Arc::from("main");
         app.process_agent_event(call);
         app.process_tool_finished(&ToolFinished { id: Arc::from("r1"), agent_id: Arc::from("sess"), timestamp: "2026-09-27T10:00:02Z".into(), error: false, message: None, child_agent: None });
         app.record_write("sess", ambits::writes::WriteRecord {

@@ -13,6 +13,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 
 use ambits::app::{App, RightPane, SortMode};
+use ambits::writes::Status;
 
 pub fn render(f: &mut Frame, app: &App) {
     let activity_h = if app.show_activity { 8 } else { 0 };
@@ -124,12 +125,13 @@ fn render_legend(f: &mut Frame, area: Rect) {
         Span::styled(" before a compaction  ", dim),
         Span::styled("✎", Style::default().fg(colors::WRITE_CURRENT)),
         Span::styled(" written: ", dim),
-        Span::styled("still there", Style::default().fg(colors::WRITE_CURRENT)),
-        Span::styled(" · ", dim),
-        Span::styled("changed", Style::default().fg(colors::WRITE_CHANGED)),
-        Span::styled(" · ", dim),
-        Span::styled("gone", Style::default().fg(colors::WRITE_REMOVED)),
     ]);
+    for (n, status) in [Status::Current, Status::Changed, Status::Removed].into_iter().enumerate() {
+        if n > 0 {
+            spans.push(Span::styled(" · ", dim));
+        }
+        spans.push(Span::styled(status.word(), Style::default().fg(tree_view::write_color(status))));
+    }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -250,6 +252,27 @@ mod tests {
 pub(crate) mod test_render {
     use ratatui::backend::TestBackend;
     use ratatui::{Frame, Terminal};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    /// A full-body read of `file` (under `/test`) by `agent`, labelled by
+    /// its id, as call `id` at `at`: tests set what else they need.
+    pub fn tool_call(agent: &str, id: &str, tool: &str, file: &str, at: &str) -> ambits::ingest::AgentToolCall {
+        ambits::ingest::AgentToolCall {
+            agent_id: Arc::from(agent),
+            tool_name: Arc::from(tool),
+            file_path: Some(PathBuf::from(format!("/test/{file}"))),
+            read_depth: ambits::tracking::ReadDepth::FullBody,
+            description: format!("{tool} {file}"),
+            timestamp_str: at.into(),
+            target_symbol: None,
+            target_lines: None,
+            target_selectors: Vec::new(),
+            label: Arc::from(agent),
+            tool_use_id: Some(Arc::from(id)),
+            effect: ambits::ingest::Effect::Read,
+        }
+    }
 
     /// Row `row` of `backend`'s buffer, as text.
     pub fn row(backend: &TestBackend, row: u16) -> String {

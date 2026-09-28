@@ -76,6 +76,17 @@ impl Span {
             _ => self.tool.to_string(),
         }
     }
+
+    /// The symbol it named, as the tree names it (`impl App/fn run` is
+    /// `App/run`).
+    pub fn symbol_name(&self) -> Option<String> {
+        self.symbol.as_deref().map(crate::app::normalize_name_path)
+    }
+
+    /// The id of the symbol it named: `file::App/run`.
+    pub fn symbol_id(&self) -> Option<String> {
+        Some(format!("{}::{}", self.file.as_deref()?, self.symbol_name()?))
+    }
 }
 
 /// Something that happened at a moment rather than over time.

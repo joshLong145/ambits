@@ -42,7 +42,7 @@ pub fn touches(trace: &Trace, file: &str, symbol: Option<&str>, writes: &WriteIn
             (SpanKind::Write, Some(id), _) => (false, s.id.as_deref().and_then(|op| writes.get(op)).is_some_and(|w| w.touches_symbol(id))),
             (SpanKind::Write, None, _) => (false, true),
             (SpanKind::Read(_), Some(_), Some(name)) => {
-                let hit = match s.symbol.as_deref().map(crate::app::normalize_name_path) {
+                let hit = match s.symbol_name() {
                     None => true,
                     Some(target) => nested_in(name, &target) || nested_in(&target, name),
                 };

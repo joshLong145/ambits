@@ -46,6 +46,25 @@ impl TraceIndex {
     pub fn node(&self, span: usize) -> Option<&Node> {
         subtree(&self.tree, span)
     }
+
+    /// The spans above `span`, its root first: what folds it away.
+    pub fn ancestors(&self, span: usize) -> Vec<usize> {
+        fn walk(nodes: &[Node], want: usize, path: &mut Vec<usize>) -> bool {
+            nodes.iter().any(|n| {
+                if n.span == want {
+                    return true;
+                }
+                path.push(n.span);
+                let found = walk(&n.children, want, path);
+                if !found {
+                    path.pop();
+                }
+                found
+            })
+        }
+        let mut path = Vec::new();
+        if walk(&self.tree, span, &mut path) { path } else { Vec::new() }
+    }
 }
 
 /// One file's share of a trace.
@@ -166,22 +185,65 @@ pub enum Target {
     Instant(usize),
 }
 
+/// A selectable row of the trace panel: what it shows, and so where
+/// `Enter` on it goes. The panel draws these, in this order, and `Enter`
+/// indexes the same list — one order for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Row<'a> {
+    /// A file the trace touched.
+    File(&'a FileActivity),
+    /// A subagent it started.
+    Agent(&'a AgentRun),
+    /// A call of it that failed.
+    Failed(usize),
+    /// A commit made while it ran (an instant).
+    Commit(usize),
+    /// A call's own file.
+    ThisFile(&'a str),
+    /// Another call on that file, in the same trace, and whether it came
+    /// before the call.
+    Related { span: usize, before: bool },
+}
+
+impl Row<'_> {
+    /// The heading of the rows it is listed under.
+    pub fn section(&self) -> &'static str {
+        match self {
+            Row::File(_) => "files",
+            Row::Agent(_) => "agents",
+            Row::Failed(_) => "failed",
+            Row::Commit(_) => "commits",
+            Row::ThisFile(_) | Row::Related { .. } => "on this file",
+        }
+    }
+
+    pub fn target(&self) -> Target {
+        match *self {
+            Row::File(f) => Target::File(f.file.clone()),
+            Row::ThisFile(file) => Target::File(file.to_string()),
+            Row::Agent(a) => Target::Span(a.delegation),
+            Row::Failed(i) | Row::Related { span: i, .. } => Target::Span(i),
+            Row::Commit(i) => Target::Instant(i),
+        }
+    }
+}
+
 impl TraceDetail {
-    /// The summary's rows, in the order the panel shows them: files,
-    /// agents, failed calls, commits.
-    pub fn targets(&self) -> Vec<Target> {
-        let files = self.files.iter().map(|f| Target::File(f.file.clone()));
-        let agents = self.agents.iter().map(|a| Target::Span(a.delegation));
-        let failed = self.failed.iter().map(|&i| Target::Span(i));
-        let commits = self.commits.iter().map(|&i| Target::Instant(i));
+    /// The summary's rows: files, agents, failed calls, commits.
+    pub fn rows(&self) -> Vec<Row<'_>> {
+        let files = self.files.iter().map(Row::File);
+        let agents = self.agents.iter().map(Row::Agent);
+        let failed = self.failed.iter().map(|&i| Row::Failed(i));
+        let commits = self.commits.iter().map(|&i| Row::Commit(i));
         files.chain(agents).chain(failed).chain(commits).collect()
     }
 }
 
 /// A call's rows: its file, then the other calls on that file in its trace.
-pub fn call_targets(trace: &Trace, index: &TraceIndex, span: usize) -> Vec<Target> {
-    let file = trace.spans().get(span).and_then(|s| s.file.clone()).map(Target::File);
-    file.into_iter().chain(related(trace, index, span).into_iter().map(Target::Span)).collect()
+pub fn call_rows<'t>(trace: &'t Trace, index: &TraceIndex, span: usize) -> Vec<Row<'t>> {
+    let file = trace.spans().get(span).and_then(|s| s.file.as_deref()).map(Row::ThisFile);
+    let related = related(trace, index, span).into_iter().map(|j| Row::Related { span: j, before: j < span });
+    file.into_iter().chain(related).collect()
 }
 
 /// The other calls in `span`'s trace on the same file, in time order.
@@ -261,7 +323,7 @@ mod tests {
         let t = sample();
         let d = detail(&t, &TraceIndex::new(&t), 0).unwrap();
         assert_eq!(
-            d.targets(),
+            d.rows().iter().map(Row::target).collect::<Vec<_>>(),
             vec![
                 Target::File("src/a.rs".into()),
                 Target::File("src/b.rs".into()),
@@ -271,7 +333,9 @@ mod tests {
                 Target::Instant(0),
             ]
         );
-        assert_eq!(call_targets(&t, &TraceIndex::new(&t), 1), vec![Target::File("src/a.rs".into()), Target::Span(2), Target::Span(3), Target::Span(6), Target::Span(7)]);
+        let index = TraceIndex::new(&t);
+        assert_eq!(index.ancestors(6), vec![0, 5], "the prompt, then the delegation");
+        assert_eq!(call_rows(&t, &index, 1).iter().map(Row::target).collect::<Vec<_>>(), vec![Target::File("src/a.rs".into()), Target::Span(2), Target::Span(3), Target::Span(6), Target::Span(7)]);
     }
 
     #[test]

@@ -123,6 +123,16 @@ impl Status {
             Status::Unknown => "unknown: a file-level write carries no hash to compare",
         }
     }
+
+    /// The same in a word or two, for a row or a legend.
+    pub fn word(self) -> &'static str {
+        match self {
+            Status::Current => "still there",
+            Status::Changed => "changed",
+            Status::Removed => "gone",
+            Status::Unknown => "file-level",
+        }
+    }
 }
 
 impl WriteRecord {

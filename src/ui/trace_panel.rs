@@ -10,13 +10,13 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use ambits::app::{App, FocusPanel, PanelSubject};
-use ambits::trace::summary::{self, TraceDetail, TraceIndex};
+use ambits::trace::summary::{self, Row, TraceDetail};
 use ambits::trace::view;
 use ambits::trace::SpanKind;
 use ambits::writes::Status;
 
-use super::inspector::{depth_word, fact, text};
-use super::trace_view::{instant_glyph, span_color, span_name, Statuses, TraceFrame};
+use super::inspector::{depth_spans, fact, text};
+use super::trace_view::{instant_glyph, span_color, span_name, TraceFrame};
 use super::{colors, fit, tree_view};
 
 pub(super) fn render(f: &mut Frame, app: &App, area: Rect, frame: &TraceFrame<'_>) {
@@ -36,13 +36,21 @@ pub(super) fn render(f: &mut Frame, app: &App, area: Rect, frame: &TraceFrame<'_
     let inner = block.inner(area);
     f.render_widget(block, area);
     let width = inner.width as usize;
-    let rows = Rows { selected: focused.then_some(app.panel_index), next: 0, width };
+    let selected = focused.then_some(app.panel_index);
     let lines = match subject {
         PanelSubject::Trace(root) => match summary::detail(&app.trace, &frame.index, root) {
-            Some(d) => trace_lines(app, &d, &frame.statuses, rows),
+            Some(d) => {
+                let mut out = trace_lines(app, &d, width);
+                out.extend(rows_lines(app, frame, &d.rows(), selected, width));
+                out
+            }
             None => vec![Line::from(text(" nothing here", Color::DarkGray))],
         },
-        PanelSubject::Call(i) => call_lines(app, i, frame, rows),
+        PanelSubject::Call(i) => {
+            let mut out = call_lines(app, i, frame, width);
+            out.extend(rows_lines(app, frame, &summary::call_rows(&app.trace, &frame.index, i), selected, width));
+            out
+        }
         PanelSubject::Instant(i) => {
             let x = &app.trace.instants()[i];
             let (glyph, color) = instant_glyph(&x.kind);
@@ -54,30 +62,6 @@ pub(super) fn render(f: &mut Frame, app: &App, area: Rect, frame: &TraceFrame<'_
         PanelSubject::Nothing => vec![Line::from(text(" No traces yet.", Color::DarkGray))],
     };
     f.render_widget(Paragraph::new(lines), inner);
-}
-
-/// Numbers the panel's selectable rows as they are drawn, in the order
-/// `App::trace_panel_targets` lists them, and marks the selected one.
-struct Rows {
-    selected: Option<usize>,
-    next: usize,
-    width: usize,
-}
-
-impl Rows {
-    fn row(&mut self, spans: Vec<Span<'static>>, count: usize) -> Line<'static> {
-        let n = self.next;
-        self.next += 1;
-        let pick = self.selected.is_some_and(|s| s.min(count.saturating_sub(1)) == n);
-        let mut out = vec![Span::styled(if pick { " › " } else { "   " }, Style::default().fg(colors::HIGHLIGHT_FG))];
-        out.extend(spans);
-        let line = Line::from(out);
-        if pick {
-            line.style(Style::default().bg(colors::HIGHLIGHT_BG).add_modifier(Modifier::BOLD))
-        } else {
-            line
-        }
-    }
 }
 
 /// A fact whose value wraps under its label, up to `max` lines.
@@ -97,33 +81,19 @@ fn wrapped(label: &str, value: &str, color: Color, width: usize, max: usize) -> 
         .collect()
 }
 
-fn section(name: &str) -> Line<'static> {
-    Line::from(Span::styled(format!(" {name}"), Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)))
-}
-
 /// `✎ still there` and the like, in the write colours.
 fn write_word(status: Status) -> Span<'static> {
-    let word = match status {
-        Status::Current => "still there",
-        Status::Changed => "changed",
-        Status::Removed => "gone",
-        Status::Unknown => "file-level",
-    };
-    text(format!("✎ {word}"), tree_view::write_color(status))
+    text(format!("✎ {}", status.word()), tree_view::write_color(status))
 }
 
-/// A trace summed up: when and how long, what it called, the files it
-/// touched and what became of its writes, its agents, failures and commits.
-fn trace_lines(app: &App, d: &TraceDetail, statuses: &Statuses, mut rows: Rows) -> Vec<Line<'static>> {
-    let spans = app.trace.spans();
-    let count = d.targets().len();
+/// A trace summed up: the prompt, when and how long, what it called, how
+/// many calls failed and commits it saw. Its rows follow.
+fn trace_lines(app: &App, d: &TraceDetail, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-
     // The prompt in full, up to four lines.
-    let prompt: String = spans[d.root].description.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prompt: String = app.trace.spans()[d.root].description.split_whitespace().collect::<Vec<_>>().join(" ");
     let chars: Vec<char> = prompt.chars().collect();
-    let wrap = rows.width.saturating_sub(2).max(1);
-    for chunk in chars.chunks(wrap).take(4) {
+    for chunk in chars.chunks(width.saturating_sub(2).max(1)).take(4) {
         out.push(Line::from(text(format!(" {}", chunk.iter().collect::<String>()), Color::White)));
     }
     let agents = if d.agents.is_empty() { String::new() } else { format!(" · main + {} agent(s)", d.agents.len()) };
@@ -145,85 +115,33 @@ fn trace_lines(app: &App, d: &TraceDetail, statuses: &Statuses, mut rows: Rows) 
     if !tally.is_empty() {
         out.push(Line::from(tally));
     }
-
-    if !d.files.is_empty() {
-        out.push(Line::from(""));
-        let name_w = rows.width.saturating_sub(3 + 12 + 14).max(8);
-        out.push(section(&format!("files{}read wrote", " ".repeat(name_w.saturating_sub(2)))));
-        for file in &d.files {
-            let status = file.write_spans.last().and_then(|&i| spans[i].id.as_deref()).and_then(|op| statuses.get(op)).map(|(_, s)| *s);
-            let name = fit(&file.file, name_w);
-            let pad = name_w.saturating_sub(super::width(&name));
-            let mut line = vec![
-                text(format!("{name}{}", " ".repeat(pad)), Color::White),
-                text(format!(" {:>4} {:>5}  ", file.reads, file.writes), Color::Gray),
-            ];
-            line.extend(status.map(write_word));
-            out.push(rows.row(line, count));
-        }
-    }
-    if !d.agents.is_empty() {
-        out.push(Line::from(""));
-        out.push(section("agents"));
-        for run in &d.agents {
-            let failed = if run.failed > 0 { format!(" · {} ✗", run.failed) } else { String::new() };
-            let what = run.description.trim_start_matches("Agent: ").to_string();
-            let line = vec![
-                text(fit(&what, rows.width.saturating_sub(26).max(8)), Color::White),
-                text(format!("  {} · {} calls{failed}", view::duration(run.duration), run.calls), Color::Gray),
-            ];
-            out.push(rows.row(line, count));
-        }
-    }
-    if !d.failed.is_empty() {
-        out.push(Line::from(""));
-        out.push(section("failed"));
-        for &i in &d.failed {
-            let why = spans[i].message.as_deref().unwrap_or("failed");
-            let line = vec![text(fit(&format!("✗ {} — {why}", span_name(app, i)), rows.width.saturating_sub(4)), Color::Red)];
-            out.push(rows.row(line, count));
-        }
-    }
-    if !d.commits.is_empty() {
-        out.push(Line::from(""));
-        out.push(section("commits"));
-        for &i in &d.commits {
-            let line = vec![text(fit(&app.trace.instants()[i].kind.label(), rows.width.saturating_sub(4)), Color::Cyan)];
-            out.push(rows.row(line, count));
-        }
-    }
     out
 }
 
 /// One call: who, when, how long, in which trace; why it failed; what it
-/// read, wrote or ran; and the other calls on its file.
-fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, mut rows: Rows) -> Vec<Line<'static>> {
+/// read, wrote or ran. Its rows — its file, the other calls on it — follow.
+fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, width: usize) -> Vec<Line<'static>> {
     let s = &app.trace.spans()[i];
-    let (index, statuses): (&TraceIndex, &Statuses) = (&frame.index, &frame.statuses);
-    let count = summary::call_targets(&app.trace, index, i).len();
-    let when = frame.timing(app, i);
+    let (index, statuses) = (&frame.index, &frame.statuses);
     let mut out = vec![
         Line::from(Span::styled(format!(" {}", span_name(app, i)), Style::default().fg(span_color(app, statuses, i)).add_modifier(Modifier::BOLD))),
         fact("agent", vec![text(app.agent_name(&s.agent).to_string(), Color::Gray)]),
-        fact("when", vec![text(when, Color::Gray)]),
+        fact("when", vec![text(frame.timing(app, i), Color::Gray)]),
     ];
     if let Some(root) = index.root_of(i).filter(|r| *r != i) {
-        out.push(fact("in", vec![text(fit(&format!("\"{}\"", app.trace.spans()[root].name()), rows.width.saturating_sub(12)), Color::Gray)]));
+        out.push(fact("in", vec![text(fit(&format!("\"{}\"", app.trace.spans()[root].name()), width.saturating_sub(12)), Color::Gray)]));
     }
     if s.error {
-        out.extend(wrapped("failed", s.message.as_deref().unwrap_or("✗"), Color::Red, rows.width, 3));
+        out.extend(wrapped("failed", s.message.as_deref().unwrap_or("✗"), Color::Red, width, 3));
     }
 
     match s.kind {
         SpanKind::Read(depth) => {
-            let mut read = vec![text(format!("{} ", tree_view::depth_glyph(depth)), tree_view::depth_color(depth, false)), text(depth_word(depth), Color::White)];
-            if let (Some(file), Some(sym)) = (&s.file, &s.symbol) {
-                read.push(text(format!(" of {}", ambits::app::normalize_name_path(sym)), Color::Gray));
-                let now = app.ledger.depth_of(&format!("{file}::{}", ambits::app::normalize_name_path(sym)));
-                out.push(fact("read", read));
-                out.push(fact("now", vec![text(format!("{} {}", tree_view::depth_glyph(now), depth_word(now)), tree_view::depth_color(now, false))]));
-            } else {
-                out.push(fact("read", read));
+            let mut read = depth_spans(depth);
+            read.extend(s.symbol_name().map(|name| text(format!(" of {name}"), Color::Gray)));
+            out.push(fact("read", read));
+            if let Some(id) = s.symbol_id() {
+                out.push(fact("now", depth_spans(app.ledger.depth_of(&id))));
             }
         }
         SpanKind::Write => match s.id.as_deref().and_then(|op| statuses.get(op)) {
@@ -234,7 +152,7 @@ fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, mut rows: Rows) -> Ve
                 for (id, _) in w.syms.iter().take(8) {
                     let status = now.as_ref().map_or(Status::Removed, |n| n.symbol_status(id, w));
                     let name = ambits::symbols::split_id(id).1.to_string();
-                    out.push(fact("", vec![text(fit(&name, rows.width.saturating_sub(26).max(8)), Color::White), text("  ", Color::Gray), write_word(status)]));
+                    out.push(fact("", vec![text(fit(&name, width.saturating_sub(26).max(8)), Color::White), text("  ", Color::Gray), write_word(status)]));
                 }
                 if w.syms.len() > 8 {
                     out.push(fact("", vec![text(format!("… {} more", w.syms.len() - 8), Color::DarkGray)]));
@@ -251,29 +169,77 @@ fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, mut rows: Rows) -> Ve
                     }
                 }
             }
-            out.extend(wrapped("task", s.description.trim_start_matches("Agent: "), Color::Gray, rows.width, 4));
+            out.extend(wrapped("task", s.description.trim_start_matches("Agent: "), Color::Gray, width, 4));
         }
         SpanKind::Other | SpanKind::Prompt => {}
     }
     // A command or search — anything not about one file — in full, up to
     // six lines: a shell command can read (by naming symbols) as well.
     if s.file.is_none() && s.kind != SpanKind::Delegate {
-        out.extend(wrapped("ran", &s.description, Color::Gray, rows.width, 6));
+        out.extend(wrapped("ran", &s.description, Color::Gray, width, 6));
     }
+    out
+}
 
-    if let Some(file) = &s.file {
-        out.push(Line::from(""));
-        out.push(section("on this file"));
-        out.push(rows.row(vec![text(fit(file, rows.width.saturating_sub(16)), Color::White), text("  → tree", Color::DarkGray)], count));
-        for j in summary::related(&app.trace, index, i) {
-            let other = &app.trace.spans()[j];
-            let mark = if j < i { "before" } else { "after " };
-            let line = vec![
-                text(format!("{mark} {} ", ambits::time::clock(other.start)), Color::DarkGray),
-                text(fit(&span_name(app, j), rows.width.saturating_sub(24).max(8)), span_color(app, statuses, j)),
-            ];
-            out.push(rows.row(line, count));
+/// The width of a files row's name column: what the counts leave.
+fn file_name_width(width: usize) -> usize {
+    width.saturating_sub(3 + 12 + 14).max(8)
+}
+
+/// The panel's selectable rows, under a heading per section, the selected
+/// one marked: the same list, in the same order, that `Enter` opens.
+fn rows_lines(app: &App, frame: &TraceFrame<'_>, rows: &[Row<'_>], selected: Option<usize>, width: usize) -> Vec<Line<'static>> {
+    let spans = app.trace.spans();
+    let picked = selected.map(|s| s.min(rows.len().saturating_sub(1)));
+    let mut out = Vec::new();
+    let mut heading = None;
+    for (n, row) in rows.iter().enumerate() {
+        if heading != Some(row.section()) {
+            heading = Some(row.section());
+            let title = match row {
+                Row::File(_) => format!("files{}read wrote", " ".repeat(file_name_width(width).saturating_sub(2))),
+                _ => row.section().to_string(),
+            };
+            out.push(Line::from(""));
+            out.push(Line::from(Span::styled(format!(" {title}"), Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD))));
         }
+        let cells = match *row {
+            Row::File(file) => {
+                let status = file.write_spans.last().and_then(|&i| spans[i].id.as_deref()).and_then(|op| frame.statuses.get(op)).map(|(_, s)| *s);
+                let name_w = file_name_width(width);
+                let name = fit(&file.file, name_w);
+                let pad = name_w.saturating_sub(super::width(&name));
+                let mut cells = vec![
+                    text(format!("{name}{}", " ".repeat(pad)), Color::White),
+                    text(format!(" {:>4} {:>5}  ", file.reads, file.writes), Color::Gray),
+                ];
+                cells.extend(status.map(write_word));
+                cells
+            }
+            Row::Agent(run) => {
+                let failed = if run.failed > 0 { format!(" · {} ✗", run.failed) } else { String::new() };
+                let what = run.description.trim_start_matches("Agent: ").to_string();
+                vec![
+                    text(fit(&what, width.saturating_sub(26).max(8)), Color::White),
+                    text(format!("  {} · {} calls{failed}", view::duration(run.duration), run.calls), Color::Gray),
+                ]
+            }
+            Row::Failed(i) => {
+                let why = spans[i].message.as_deref().unwrap_or("failed");
+                vec![text(fit(&format!("✗ {} — {why}", span_name(app, i)), width.saturating_sub(4)), Color::Red)]
+            }
+            Row::Commit(i) => vec![text(fit(&app.trace.instants()[i].kind.label(), width.saturating_sub(4)), Color::Cyan)],
+            Row::ThisFile(file) => vec![text(fit(file, width.saturating_sub(16)), Color::White), text("  → tree", Color::DarkGray)],
+            Row::Related { span: j, before } => vec![
+                text(format!("{} {} ", if before { "before" } else { "after " }, ambits::time::clock(spans[j].start)), Color::DarkGray),
+                text(fit(&span_name(app, j), width.saturating_sub(24).max(8)), span_color(app, &frame.statuses, j)),
+            ],
+        };
+        let pick = picked == Some(n);
+        let mut line = vec![Span::styled(if pick { " › " } else { "   " }, Style::default().fg(colors::HIGHLIGHT_FG))];
+        line.extend(cells);
+        let line = Line::from(line);
+        out.push(if pick { line.style(Style::default().bg(colors::HIGHLIGHT_BG).add_modifier(Modifier::BOLD)) } else { line });
     }
     out
 }
@@ -287,20 +253,12 @@ mod tests {
     use std::sync::Arc;
 
     fn call(app: &mut App, id: &str, tool: &str, file: &str, at: &str, end: &str, message: Option<&str>) {
-        let c = ambits::ingest::AgentToolCall {
-            agent_id: Arc::from("sess"),
-            tool_name: Arc::from(tool),
-            file_path: Some(PathBuf::from(format!("/test/{file}"))),
-            read_depth: if tool == "Read" { ambits::tracking::ReadDepth::FullBody } else { ambits::tracking::ReadDepth::Unseen },
-            description: format!("{tool} {file}"),
-            timestamp_str: at.into(),
-            target_symbol: None,
-            target_lines: None,
-            target_selectors: Vec::new(),
-            label: Arc::from("main"),
-            tool_use_id: Some(Arc::from(id)),
-            effect: if tool == "Edit" { Effect::Write } else { Effect::Read },
-        };
+        let mut c = crate::ui::test_render::tool_call("sess", id, tool, file, at);
+        c.label = Arc::from("main");
+        if tool == "Edit" {
+            c.effect = Effect::Write;
+            c.read_depth = ambits::tracking::ReadDepth::Unseen;
+        }
         let root = app.project_root.clone();
         app.trace.start(&c, &root);
         app.trace.finish(&ToolFinished {
