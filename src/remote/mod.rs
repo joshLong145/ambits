@@ -66,8 +66,11 @@ pub struct PushRequest<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushOutcome {
-    /// The remote already holds this tip, or descends from it.
-    UpToDate { remote: String, tip: ObjectId },
+    /// The remote already holds this tip, or descends from it. Links
+    /// resolved since the last push still go (`links`); under
+    /// `--verify-all`, objects on the remote that no longer verified were
+    /// rewritten (`repaired`).
+    UpToDate { remote: String, tip: ObjectId, links: usize, repaired: usize },
     Pushed {
         remote: String,
         from: Option<ObjectId>,
@@ -102,7 +105,27 @@ pub fn push(req: &PushRequest<'_>) -> Result<PushOutcome> {
     // not become what --force-with-lease trusts.
     if let Some(r) = remote_tip {
         if graph.is_ancestor(&remote, tip, r)? {
-            return Ok(PushOutcome::UpToDate { remote: remote_name, tip: r });
+            // Links land after snapshots (the post-commit hook resolves
+            // them), so they must travel without a new one.
+            let links = pushable_links(req.project_root, req.session, req.ignore)?;
+            let have: HashSet<String> = crate::linkage::links_of(remote.root())?.into_iter().map(|(k, _)| k).collect();
+            let new: Vec<_> = links.into_iter().filter(|(k, _)| !have.contains(k)).collect();
+            let links = if new.is_empty() || req.dry_run {
+                new.len()
+            } else {
+                let _lock = lock::RemoteLock::acquire(&remote, &config::Config::store_id(req.project_root)?)?;
+                crate::linkage::add_links(remote.root(), new, Durability::Fsync)?
+            };
+            // Nothing to send is no reason to skip a full check: re-verify
+            // the remote's history — from its tip when this store has it (a
+            // fetch brought it), else from ours — and repair what rotted.
+            let mut repaired = 0;
+            if req.verify == transfer::Verify::Everything && !req.dry_run {
+                let from = if local.contains(&r) { r } else { tip };
+                let history = transfer::missing(&mut graph, &local, &remote, from, req.verify)?;
+                repaired = transfer::transfer(&local, &remote, &history)?.copied;
+            }
+            return Ok(PushOutcome::UpToDate { remote: remote_name, tip: r, links, repaired });
         }
     }
     let fast_forward = match remote_tip {

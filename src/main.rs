@@ -1180,7 +1180,16 @@ fn short(id: Option<&ambits::objects::ObjectId>) -> String {
 fn print_push(out: &mut impl Write, outcome: &ambits::remote::PushOutcome) -> io::Result<()> {
     use ambits::remote::PushOutcome;
     match outcome {
-        PushOutcome::UpToDate { remote, tip } => writeln!(out, "{remote} is up to date ({})", tip.short()),
+        PushOutcome::UpToDate { remote, tip, links, repaired } => {
+            write!(out, "{remote} is up to date ({})", tip.short())?;
+            if *links > 0 {
+                write!(out, "; {links} new link(s) sent")?;
+            }
+            if *repaired > 0 {
+                write!(out, "; {repaired} damaged object(s) on the remote repaired")?;
+            }
+            writeln!(out)
+        }
         PushOutcome::Pushed { remote, from, to, objects, links, forced, other_ignore } => {
             writeln!(
                 out,

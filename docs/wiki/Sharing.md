@@ -31,7 +31,8 @@ ambits -p . --session <session> pull              # or merge into the same sessi
   the whole history is in place, so an interrupted push leaves no ref
   pointing at missing objects.
 - If the remote already has this tip, or history after it, there is nothing
-  to push.
+  to push — but links resolved since (the git hook resolves them after you
+  commit) still go.
 - If the remote has snapshots of this session you do not, the push is
   refused: pull, snapshot, and push again. `--force-with-lease` overwrites
   them instead, but only if the remote still holds what you last fetched.
@@ -39,7 +40,8 @@ ambits -p . --session <session> pull              # or merge into the same sessi
 - Only what is new is sent and checked: the walk back from your tip stops at
   the first snapshot the remote already holds whole (it loads, and so do its
   reads and writes). `--verify-all` walks and re-checks the whole history
-  instead, repairing anything on the remote that no longer verifies.
+  instead, repairing anything on the remote that no longer verifies — even
+  when there is nothing new to push.
 - Links (which commit a write [landed in](Agent-Writes#which-commit-it-landed-in))
   go with it: only those of the writes being pushed, filtered by
   `[sync] ignore`.

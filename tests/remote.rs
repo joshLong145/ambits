@@ -363,6 +363,33 @@ fn fetched_links_are_kept_only_when_proven() {
     assert_eq!(kept.iter().map(|(_, l)| l.op.as_str()).collect::<Vec<_>>(), vec!["toolu_real"]);
 }
 
+/// Links resolved after a push (the post-commit hook runs after it) still
+/// go with the next push, though nothing else is new.
+#[test]
+fn links_resolved_later_are_pushed_without_a_new_snapshot() {
+    let (_dir, remote, a, _b) = pair();
+    let write = ambits::writes::WriteRecord {
+        op: "toolu_late".into(),
+        av: ambits::writes::ATTRIBUTION_VERSION,
+        a: "agent-1".into(),
+        t: "2026-09-27T10:00:00Z".into(),
+        tool: "Edit".into(),
+        file: "src/a.rs".into(),
+        ..Default::default()
+    };
+    let dir = a.root.join(".ambits/coverage");
+    std::fs::create_dir_all(&dir).unwrap();
+    let line = serde_json::to_string(&ambits::journal::Record::Write(Box::new(write))).unwrap();
+    std::fs::write(dir.join(format!("{SESSION}.ndjson")), format!("{line}\n")).unwrap();
+    a.snap();
+    a.push(false).unwrap();
+    let link = serde_json::json!({"k": "toolu_late", "link": {"op": "toolu_late", "target": "src/a.rs", "hash": null, "commit": "0".repeat(40), "verified": false, "path": "src/a.rs"}});
+    std::fs::write(a.root.join(".ambits/links.ndjson"), format!("{link}\n")).unwrap();
+    assert!(matches!(a.push(false).unwrap(), PushOutcome::UpToDate { links: 1, .. }));
+    assert!(std::fs::read_to_string(remote.join("links.ndjson")).unwrap().contains("toolu_late"));
+    assert!(matches!(a.push(false).unwrap(), PushOutcome::UpToDate { links: 0, .. }), "once");
+}
+
 /// A push sends only the links of writes it pushes, not the whole index.
 #[test]
 fn a_push_sends_only_its_own_links() {
@@ -470,6 +497,21 @@ fn verify_all_repairs_what_the_frontier_does_not_look_at() {
     })
     .unwrap();
     assert!(remote_store.get(&coverage, ambits::objects::Kind::Coverage).is_ok(), "repaired");
+
+    // Damaged again with nothing new to push: --verify-all still repairs.
+    std::fs::write(remote_store.path_of(&coverage), "rot").unwrap();
+    let outcome = remote::push(&remote::PushRequest {
+        project_root: &a.root,
+        remote: None,
+        session: SESSION,
+        force_with_lease: false,
+        dry_run: false,
+        ignore: &SyncIgnore::none(),
+        verify: remote::transfer::Verify::Everything,
+    })
+    .unwrap();
+    assert!(matches!(outcome, PushOutcome::UpToDate { repaired: 1, .. }), "{outcome:?}");
+    assert!(remote_store.get(&coverage, ambits::objects::Kind::Coverage).is_ok());
 }
 
 /// Two versions of one write at one attribution version: ours stays, theirs
