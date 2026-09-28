@@ -22,6 +22,7 @@ without that, a build tool writing into `target/` (rust-analyzer running
 leave the tree rather than lingering until you quit.
 
 - **Depth-aware coloring** — every symbol shaded by how deeply it was read
+- **Write marks** — `✎` on what this session's agents changed, coloured by whether their version is still there
 - **Per-file counts** — `seen/total` on each file header, so partial coverage shows without expanding
 - **Sortable tree** — alphabetical, or grouped by coverage to surface half-read files first
 - **Search** — `/` to jump to a symbol by name
@@ -75,6 +76,23 @@ own depth color when it was itself read):
 | Amber | Partially covered |
 | Yellow-green | All symbols seen, not all at full depth |
 | Green | Every symbol read in full |
+
+**Write marks**: a `✎` after the name of anything this session's agents
+changed ([Agent Writes](Agent-Writes)) — the filtered agent's, when one is.
+A symbol is marked through itself or anything nested in it; a file header
+shows `✎N`, its number of writes. The colour is the latest write's status,
+by the same rule as [`ambits touched`](Agent-Writes#ambits-touched), judged
+against the tree as it is now, so an edit of yours turns it amber at once:
+
+| Color | Meaning |
+|---|---|
+| Green | The agent's version is still there |
+| Amber | Changed since |
+| Red | Removed since |
+| Cyan | A file-level write: nothing in memory to compare it with |
+
+The Stats panel counts the session's writes (`✎ Written`). Writes made
+before this run come from the [read journal](Configuration#the-read-journal).
 
 ## Opening a symbol in your editor
 

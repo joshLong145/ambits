@@ -34,4 +34,5 @@ pub mod time;
 pub mod touched;
 pub mod trace;
 pub mod tracking;
+pub mod write_index;
 pub mod writes;

@@ -540,7 +540,7 @@ fn fold_lines(path: &Path, content: &str, records: Records) -> JournalContents {
 
 /// Keep one write per `op`: the highest attribution version wins, so a write
 /// re-attributed under newer rules replaces its older record (spec §2.6).
-fn fold_write(
+pub(crate) fn fold_write(
     writes: &mut std::collections::BTreeMap<String, crate::writes::WriteRecord>,
     record: crate::writes::WriteRecord,
 ) {

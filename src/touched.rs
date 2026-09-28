@@ -16,6 +16,7 @@ use crate::cache::{journal_dir, session_ids};
 use crate::journal::read_session_writes;
 use crate::parser::ParserRegistry;
 use crate::symbols::{nested_in, split_id};
+pub use crate::writes::Status;
 use crate::writes::{FileContents, Level, WriteRecord};
 
 /// Bumped on any breaking change to the JSON shape.
@@ -50,41 +51,18 @@ impl Target {
         }
     }
 
-    /// Whether `write` changed this target. A symbol is touched through
-    /// itself or any descendant: writes record innermost symbols only (D11),
-    /// so an edit inside `App/handle_key` is an edit to `App`. Only
-    /// symbol-level writes count for a symbol — a file-level write cannot say
-    /// which symbols it changed, and a symbol-level one names every symbol it
-    /// did (spec §2.3).
+    /// Whether `write` changed this target; see [`WriteRecord::touches_symbol`].
     fn is_touched_by(&self, write: &WriteRecord) -> bool {
         match self {
             Target::File(f) => write.file == *f,
-            Target::Symbol(id) => {
-                write.syms.iter().any(|(s, _)| nested_in(s, id)) || write.removed.iter().any(|s| nested_in(s, id))
-            }
+            Target::Symbol(id) => write.touches_symbol(id),
         }
     }
 }
 
-/// Whether the agent's version is still what is on disk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Status {
-    /// Unchanged since the agent wrote it.
-    Current,
-    /// Changed since.
-    Changed,
-    /// No longer exists.
-    Removed,
-    /// A file-level write with no hash to compare (spec §3.1).
-    Unknown,
-}
-
 /// The latest write touching `target`, across every session: `(session, write)`.
 ///
-/// Ordered by timestamp (RFC 3339 UTC from the log, so lexicographic order is
-/// chronological; a record with no timestamp sorts oldest), then by `op` so
-/// ties resolve the same way every time.
+/// Latest by [`WriteRecord::recency`].
 pub fn latest(project_root: &Path, target: &Target) -> Option<(String, WriteRecord)> {
     let dir = journal_dir(project_root);
     session_ids(&dir)
@@ -96,7 +74,7 @@ pub fn latest(project_root: &Path, target: &Target) -> Option<(String, WriteReco
                 .map(move |w| (session.clone(), w))
                 .collect::<Vec<_>>()
         })
-        .max_by(|(_, a), (_, b)| (&a.t, &a.op).cmp(&(&b.t, &b.op)))
+        .max_by(|(_, a), (_, b)| a.recency().cmp(&b.recency()))
 }
 
 /// Whether `write`'s version of `target` is still on disk.
@@ -106,42 +84,10 @@ pub fn status(project_root: &Path, registry: &ParserRegistry, target: &Target, w
     let Some(bytes) = crate::objects::read_regular(&project_root.join(target.file())) else {
         return Status::Removed;
     };
-
-    if let Target::File(_) = target {
-        if let Some(fh) = &write.fh {
-            return if crate::objects::file_hash(&bytes) == *fh { Status::Current } else { Status::Changed };
-        }
-        if write.level == Level::File || write.syms.is_empty() {
-            return Status::Unknown;
-        }
-    }
-
     let now = FileContents::read(target.file(), &bytes, registry);
-    if !now.parsed {
-        return Status::Unknown;
-    }
-    let name = |id: &str| split_id(id).1.to_string();
-    let unchanged = |id: &str, hash: &str| now.has(&name(id), hash);
-
     match target {
-        Target::Symbol(id) => {
-            // Present if anything by that name path is: an inherent impl is
-            // `impl App`, but its methods are `App/…`, so `App` can have
-            // children on disk with no symbol of its own.
-            if !now.any_within(&name(id)) {
-                return Status::Removed;
-            }
-            // Everything the write left under `id` must be as it left it:
-            // written symbols at their hash, deleted ones still gone. That
-            // includes `id` itself, which is back if the write deleted it.
-            let written_intact = write.syms.iter().filter(|(s, _)| nested_in(s, id)).all(|(s, h)| unchanged(s, h));
-            let deleted_gone = write.removed.iter().filter(|s| nested_in(s, id)).all(|s| now.hashes(&name(s)).is_empty());
-            if written_intact && deleted_gone { Status::Current } else { Status::Changed }
-        }
-        // A file whose written symbols changed or vanished has changed since.
-        Target::File(_) => {
-            if write.syms.iter().all(|(s, h)| unchanged(s, h)) { Status::Current } else { Status::Changed }
-        }
+        Target::Symbol(id) => now.symbol_status(id, write),
+        Target::File(_) => now.file_status(write),
     }
 }
 

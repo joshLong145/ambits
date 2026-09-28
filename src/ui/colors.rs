@@ -17,6 +17,13 @@ pub const FILE_ALL_SEEN: Color = Color::Rgb(180, 220, 80);
 pub const FILE_PARTIALLY_COVERED: Color = Color::Rgb(255, 180, 50);
 pub const FILE_NOT_COVERED: Color = Color::White;
 
+// ── Write marks (✎): whether the agent's version is still there ─────
+pub const WRITE_CURRENT: Color = Color::Rgb(80, 220, 120);
+pub const WRITE_CHANGED: Color = Color::Rgb(230, 160, 60);
+pub const WRITE_REMOVED: Color = Color::Rgb(220, 80, 80);
+/// A write with nothing in memory to compare (file-level).
+pub const WRITE_UNKNOWN: Color = Color::Rgb(120, 200, 220);
+
 // ── Coverage percentage gradient ────────────────────────────────────
 pub const PCT_LOW: Color = Color::Rgb(180, 60, 60);
 pub const PCT_MID_LOW: Color = Color::Rgb(230, 160, 60);

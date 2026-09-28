@@ -52,6 +52,10 @@ pub struct TreeRow {
     pub coverage_status: Option<FileCoverageStatus>,
     pub coverage_seen: usize,
     pub coverage_total: usize,
+    /// How this session's agents wrote the row (the filtered agent's, when
+    /// one is): a symbol through itself or anything nested in it, a file
+    /// through any write to it.
+    pub write: Option<crate::write_index::WriteMark>,
 }
 
 impl TreeRow {
@@ -168,6 +172,8 @@ pub struct App {
     /// Every tool call as a span, and compactions as instants, for the trace
     /// view. Its own store: the activity feed keeps only the latest calls.
     pub trace: crate::trace::Trace,
+    /// This session's writes, for the tree's marks.
+    pub writes: crate::write_index::WriteIndex,
 
     /// Path filter restricting which files are tracked, if any. Shared with
     /// the TUI re-parse paths (file watcher, Serena cache rescan) so that
@@ -222,6 +228,7 @@ impl App {
             journal_settings: None,
             pending_writes: Vec::new(),
             trace: crate::trace::Trace::default(),
+            writes: crate::write_index::WriteIndex::default(),
             filter: None,
             editor_template: None,
             pending_editor_request: None,
@@ -292,7 +299,23 @@ impl App {
         let rehydrated = self.rehydrate_from_journal();
         let warnings = self.enable_journal(settings.backend, settings.interval);
         self.sync_journal();
+        self.load_writes();
         JournalAttach { rehydrated, warnings }
+    }
+
+    /// Fold the session's journaled writes into the index: what earlier runs
+    /// attributed, which this run's replay only re-attributes later, if at
+    /// all.
+    fn load_writes(&mut self) {
+        let Some(session) = self.session_id.as_deref() else { return };
+        let journaled = crate::write_index::WriteIndex::load(&crate::journal::journal_dir(&self.project_root), session);
+        let had = !self.writes.is_empty() || !journaled.is_empty();
+        for record in journaled.into_records() {
+            self.writes.insert(record);
+        }
+        if had {
+            self.rebuild_tree_rows();
+        }
     }
 
     /// Fold this session's journal into the freshly replayed ledger.
@@ -431,6 +454,9 @@ impl App {
         self.sync_journal();
         self.retired_journal = self.journal.take();
         self.session_id = session_id;
+        // Writes are facts about files, so a `/clear` keeps them; a new
+        // session starts without.
+        self.writes.clear();
         self.reset_session();
     }
 
@@ -531,9 +557,15 @@ impl App {
             (0..self.project_tree.files.len()).collect()
         };
 
+        let mut writes = self.writes.by_file(agent_filter);
         for &idx in &file_indices {
             let file = &self.project_tree.files[idx];
             let file_path = file.file_path.to_string_lossy().to_string();
+            // Writes name files normalized; only look when there are any.
+            let file_writes = (!writes.is_empty())
+                .then(|| writes.remove(crate::objects::normalize_path(&file_path).as_str()))
+                .flatten()
+                .map(|w| crate::write_index::FileWrites::new(w, file));
             let file_id = file_path.clone();
             let is_expanded = self.expansion.is_expanded(&file_id, RowKind::File);
 
@@ -562,11 +594,13 @@ impl App {
                 coverage_status: Some(status),
                 coverage_seen: seen,
                 coverage_total: total,
+                write: file_writes.as_ref().and_then(|w| w.file_mark()),
             });
 
             if is_expanded {
+                let context = RowContext { expansion: &self.expansion, ledger: &self.ledger, agent_filter, writes: file_writes.as_ref() };
                 for sym in &file.symbols {
-                    flatten_symbol(sym, 1, &self.expansion, &self.ledger, agent_filter, &mut rows);
+                    flatten_symbol(sym, 1, &context, &mut rows);
                 }
             }
         }
@@ -1064,9 +1098,9 @@ impl App {
     }
 
     /// Journal an attributed write into the session it happened in — the
-    /// current one, or the one just switched away from. A write grants no
-    /// read credit (D9), so the ledger is untouched; the activity feed
-    /// already showed the call.
+    /// current one, or the one just switched away from — and, for the
+    /// current one, mark it on the tree. A write grants no read credit (D9),
+    /// so the ledger is untouched; the activity feed already showed the call.
     ///
     /// Never opens a file: a write for any older session is dropped, which
     /// takes two switches while one write is in the worker.
@@ -1085,6 +1119,10 @@ impl App {
                 "write arrived after its session's journal was closed; not journaled"
             ),
             None => {}
+        }
+        if self.session_id.as_deref() == Some(session) {
+            self.writes.insert(record);
+            self.rebuild_tree_rows();
         }
     }
 
@@ -1297,14 +1335,16 @@ fn mark_selected_symbols(
     }
 }
 
-fn flatten_symbol(
-    sym: &SymbolNode,
-    depth: usize,
-    expansion: &Expansion,
-    ledger: &ContextLedger,
-    agent_filter: Option<&str>,
-    rows: &mut Vec<TreeRow>,
-) {
+/// What every symbol row of one file is built from.
+struct RowContext<'a> {
+    expansion: &'a Expansion,
+    ledger: &'a ContextLedger,
+    agent_filter: Option<&'a str>,
+    writes: Option<&'a crate::write_index::FileWrites<'a>>,
+}
+
+fn flatten_symbol(sym: &SymbolNode, depth: usize, cx: &RowContext<'_>, rows: &mut Vec<TreeRow>) {
+    let RowContext { expansion, ledger, agent_filter, .. } = *cx;
     let is_expanded = expansion.is_expanded(&sym.id, RowKind::Symbol);
     let read_depth = match agent_filter {
         Some(agent_id) => ledger.depth_of_for_agent(&sym.id, agent_id),
@@ -1336,11 +1376,12 @@ fn flatten_symbol(
         coverage_status,
         coverage_seen,
         coverage_total,
+        write: cx.writes.and_then(|w| w.symbol_mark(&sym.id)),
     });
 
     if is_expanded {
         for child in &sym.children {
-            flatten_symbol(child, depth + 1, expansion, ledger, agent_filter, rows);
+            flatten_symbol(child, depth + 1, cx, rows);
         }
     }
 }
@@ -2771,6 +2812,94 @@ mod write_tests {
             file: "src/a.rs".into(),
             ..Default::default()
         }
+    }
+
+    /// `src/a.rs` with `S { a, b }`, expanded, in session `sess`.
+    fn marked_app(root: &Path) -> App {
+        let tree = project(vec![file("src/a.rs", vec![sym_with_children("src/a.rs::S", "S", vec![sym("src/a.rs::S/a", "a"), sym("src/a.rs::S/b", "b")])])]);
+        let mut app = App::new(tree, root.to_path_buf());
+        app.set_session_id(Some("sess".into()));
+        app.set_expanded("src/a.rs", RowKind::File, true);
+        app.set_expanded("src/a.rs::S", RowKind::Symbol, true);
+        app
+    }
+
+    fn mark(app: &App, id: &str) -> Option<crate::write_index::WriteMark> {
+        app.tree_rows.iter().find(|r| r.symbol_id == id).expect("row").write
+    }
+
+    fn wrote_a(app: &App) -> WriteRecord {
+        let a = &app.project_tree.files[0].symbols[0].children[0];
+        WriteRecord {
+            level: crate::writes::Level::Symbol,
+            syms: vec![(a.id.clone(), crate::journal::encode_hash(&a.content_hash))],
+            ..record("toolu_1")
+        }
+    }
+
+    /// A written symbol, its parent and its file are marked current, and
+    /// the symbol turns changed when a re-parse brings a new body.
+    #[test]
+    fn a_recorded_write_marks_the_tree_until_the_symbol_changes() {
+        use crate::writes::Status;
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = marked_app(dir.path());
+        app.record_write("sess", wrote_a(&app));
+        let current = Some(crate::write_index::WriteMark { status: Status::Current, count: 1 });
+        assert_eq!(mark(&app, "src/a.rs::S/a"), current);
+        assert_eq!(mark(&app, "src/a.rs::S"), current, "a parent rolls up");
+        assert_eq!(mark(&app, "src/a.rs::S/b"), None);
+        assert_eq!(mark(&app, "src/a.rs"), current);
+
+        // What the file watcher does on a change.
+        app.project_tree.files[0].symbols[0].children[0].content_hash = crate::symbols::merkle::content_hash("a2");
+        app.rebuild_tree_rows();
+        assert_eq!(mark(&app, "src/a.rs::S/a").map(|m| m.status), Some(Status::Changed));
+    }
+
+    /// A file-level write marks the file row only.
+    #[test]
+    fn a_file_level_write_marks_only_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = marked_app(dir.path());
+        app.record_write("sess", record("toolu_1"));
+        assert_eq!(mark(&app, "src/a.rs").map(|m| m.count), Some(1));
+        assert_eq!(mark(&app, "src/a.rs::S"), None);
+    }
+
+    /// Only the current session's writes are marked; the agent filter
+    /// narrows them to that agent's.
+    #[test]
+    fn only_this_sessions_writes_are_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = marked_app(dir.path());
+        app.record_write("other", wrote_a(&app));
+        assert_eq!(mark(&app, "src/a.rs"), None);
+
+        app.record_write("sess", wrote_a(&app));
+        app.agent_filter = Some("someone-else".into());
+        app.rebuild_tree_rows();
+        assert_eq!(mark(&app, "src/a.rs::S/a"), None);
+
+        app.switch_session(Some("next".into()));
+        app.agent_filter = None;
+        app.rebuild_tree_rows();
+        assert_eq!(mark(&app, "src/a.rs"), None, "a new session starts unmarked");
+    }
+
+    /// Attaching the journal brings back writes an earlier run recorded.
+    #[test]
+    fn attaching_the_journal_restores_its_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut earlier = marked_app(dir.path());
+        earlier.enable_journal("tree-sitter", std::time::Duration::ZERO);
+        earlier.record_write("sess", wrote_a(&earlier));
+        drop(earlier);
+
+        let mut app = marked_app(dir.path());
+        app.set_journal_settings(Some(JournalSettings { backend: "tree-sitter", interval: std::time::Duration::ZERO }));
+        app.attach_journal();
+        assert_eq!(mark(&app, "src/a.rs::S/a").map(|m| m.status), Some(crate::writes::Status::Current));
     }
 
     #[test]

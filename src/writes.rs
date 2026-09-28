@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ingest::{WriteEvent, WriteSource};
 use crate::parser::{LanguageParser, ParserRegistry};
-use crate::symbols::{SymbolId, SymbolNode};
+use crate::symbols::{nested_in, split_id, FileSymbols, SymbolId, SymbolNode};
 
 /// Version of the attribution rules. Recorded on every write (`av`) so a
 /// write re-attributed after the rules change replaces the old record rather
@@ -95,6 +95,38 @@ pub struct WriteRecord {
     pub fh: Option<String>,
 }
 
+/// Whether a write's version of a file or symbol is still what is there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    /// Unchanged since the agent wrote it.
+    Current,
+    /// Changed since.
+    Changed,
+    /// No longer exists.
+    Removed,
+    /// A file-level write with no hash to compare (spec §3.1).
+    Unknown,
+}
+
+impl WriteRecord {
+    /// Whether this write changed symbol `id`, through itself or anything
+    /// nested in it: writes record innermost symbols only (D11), so an edit
+    /// inside `App/handle_key` is an edit to `App`. Only symbol-level
+    /// writes count — a file-level write cannot say which symbols it
+    /// changed, and a symbol-level one names every symbol it did (§2.3).
+    pub fn touches_symbol(&self, id: &str) -> bool {
+        self.syms.iter().any(|(s, _)| nested_in(s, id)) || self.removed.iter().any(|s| nested_in(s, id))
+    }
+
+    /// Latest first: by timestamp (RFC 3339 UTC, so lexicographic order is
+    /// chronological; none sorts oldest), then by `op`, so ties resolve the
+    /// same way every time.
+    pub fn recency(&self) -> (&str, &str) {
+        (&self.t, &self.op)
+    }
+}
+
 /// What one version of a file holds, as writes are checked against it:
 /// the hash of its raw bytes, and each symbol's content hash by name path.
 /// The one reading of "is the agent's version still there" — for the file
@@ -112,19 +144,59 @@ pub struct FileContents {
 impl FileContents {
     /// Read `bytes` as project file `rel`. The bytes are not kept (§9.6).
     pub fn read(rel: &str, bytes: &[u8], registry: &ParserRegistry) -> Self {
-        let mut out = Self { hash: crate::objects::file_hash(bytes), ..Default::default() };
         let path = Path::new(rel);
         let parsed = std::str::from_utf8(bytes)
             .ok()
             .zip(registry.parser_for(path))
             .and_then(|(source, parser)| parser.parse_file(path, source).ok());
-        if let Some(parsed) = parsed {
-            out.parsed = true;
-            for sym in parsed.walk() {
-                out.symbols.entry(sym.name_path().to_string()).or_default().push(crate::journal::encode_hash(&sym.content_hash));
-            }
+        let mut out = parsed.as_ref().map(Self::from_symbols).unwrap_or_default();
+        out.hash = crate::objects::file_hash(bytes);
+        out
+    }
+
+    /// An already-parsed file, as the TUI holds it. No `hash`: the bytes are
+    /// not at hand, so a write known only by its file hash is
+    /// [`Status::Unknown`] here.
+    pub fn from_symbols(file: &FileSymbols) -> Self {
+        let mut out = Self { parsed: true, ..Default::default() };
+        for sym in file.walk() {
+            out.symbols.entry(sym.name_path().to_string()).or_default().push(crate::journal::encode_hash(&sym.content_hash));
         }
         out
+    }
+
+    /// Whether `write`'s version of symbol `id` is what this file holds.
+    /// Everything the write left under `id` must be as it left it: written
+    /// symbols at their hash, deleted ones still gone. That includes `id`
+    /// itself, which is back if the write deleted it.
+    pub fn symbol_status(&self, id: &str, write: &WriteRecord) -> Status {
+        if !self.parsed {
+            return Status::Unknown;
+        }
+        let name = |id: &str| split_id(id).1.to_string();
+        // Present if anything by that name path is: an inherent impl is
+        // `impl App`, but its methods are `App/…`, so `App` can have
+        // children with no symbol of its own.
+        if !self.any_within(&name(id)) {
+            return Status::Removed;
+        }
+        let written_intact = write.syms.iter().filter(|(s, _)| nested_in(s, id)).all(|(s, h)| self.has(&name(s), h));
+        let deleted_gone = write.removed.iter().filter(|s| nested_in(s, id)).all(|s| self.hashes(&name(s)).is_empty());
+        if written_intact && deleted_gone { Status::Current } else { Status::Changed }
+    }
+
+    /// Whether `write`'s version of the whole file is what this holds: by
+    /// the file hash when both sides have one, else by every symbol it
+    /// wrote. A file-level write with no hash cannot say (spec §3.1).
+    pub fn file_status(&self, write: &WriteRecord) -> Status {
+        if let (Some(fh), false) = (&write.fh, self.hash.is_empty()) {
+            return if *fh == self.hash { Status::Current } else { Status::Changed };
+        }
+        if write.level == Level::File || write.syms.is_empty() || !self.parsed {
+            return Status::Unknown;
+        }
+        let unchanged = write.syms.iter().all(|(s, h)| self.has(split_id(s).1, h));
+        if unchanged { Status::Current } else { Status::Changed }
     }
 
     /// Whether a symbol at `name_path` has content hash `hash`.

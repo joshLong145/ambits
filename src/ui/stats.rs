@@ -68,6 +68,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             total.saturating_sub(seen),
             colors::DEPTH_UNSEEN,
         ),
+        written_line(app),
         Line::from(""),
         Line::from(vec![
             Span::raw("  Files: "),
@@ -256,6 +257,14 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .block(block)
         .scroll((scroll_offset, 0));
     f.render_widget(paragraph, area);
+}
+
+/// `  ✎ Written:     N  in M files`, for the filtered agent when one is.
+fn written_line(app: &App) -> Line<'static> {
+    let by_file = app.writes.by_file(app.agent_filter.as_deref());
+    let mut line = stat_line("  ✎ Written", by_file.values().map(Vec::len).sum(), colors::WRITE_UNKNOWN);
+    line.spans.push(Span::styled(format!("  in {} files", by_file.len()), Style::default().fg(Color::DarkGray)));
+    line
 }
 
 fn stat_line(label: &str, count: usize, color: Color) -> Line<'static> {

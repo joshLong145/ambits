@@ -6,6 +6,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 
 use ambits::app::{App, FileCoverageStatus, FocusPanel};
 use ambits::tracking::ReadDepth;
+use ambits::writes::Status;
 
 use super::colors;
 
@@ -50,6 +51,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 if row.coverage_total > 0 {
                     spans.push(coverage_count(row, file_color));
                 }
+                if let Some(mark) = row.write {
+                    spans.push(Span::styled(format!(" ✎{}", mark.count), Style::default().fg(write_color(mark.status))));
+                }
                 spans.push(Span::styled(
                     format!("  ({})", row.line_range),
                     Style::default().fg(Color::DarkGray),
@@ -72,6 +76,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 spans.push(Span::styled(&row.display_name, symbol_style(name_color, row.restored)));
                 if let Some(c) = inner {
                     spans.push(coverage_count(row, c));
+                }
+                if let Some(mark) = row.write {
+                    spans.push(Span::styled(" ✎", Style::default().fg(write_color(mark.status))));
                 }
                 spans.push(Span::styled(
                     format!("  [{}] ~{} tok", row.line_range, row.token_count),
@@ -128,6 +135,17 @@ fn depth_color(depth: ReadDepth, stale: bool) -> Color {
         ReadDepth::Overview => colors::DEPTH_OVERVIEW,
         ReadDepth::Signature => colors::DEPTH_SIGNATURE,
         ReadDepth::FullBody => colors::DEPTH_FULL_BODY,
+    }
+}
+
+/// Green while the agent's version is still there, amber once it changed,
+/// red once it is gone.
+pub(super) fn write_color(status: Status) -> Color {
+    match status {
+        Status::Current => colors::WRITE_CURRENT,
+        Status::Changed => colors::WRITE_CHANGED,
+        Status::Removed => colors::WRITE_REMOVED,
+        Status::Unknown => colors::WRITE_UNKNOWN,
     }
 }
 
@@ -205,6 +223,35 @@ mod tests {
         assert_eq!(depth_color(ReadDepth::NameOnly, true), colors::DEPTH_STALE);
         // An unseen symbol can't be stale; don't let a bad flag recolor it.
         assert_eq!(depth_color(ReadDepth::Unseen, true), colors::DEPTH_UNSEEN);
+    }
+
+    /// A written symbol and its file carry a green `✎` while the agent's
+    /// version is there; the file's counts its writes.
+    #[test]
+    fn render_marks_written_rows() {
+        let tree = ProjectTree {
+            root: PathBuf::from("/test"),
+            files: vec![FileSymbols { file_path: "mock/w.rs".into(), symbols: vec![sym("mock/w.rs::alpha", "alpha"), sym("mock/w.rs::beta", "beta")], total_lines: 5 }],
+        };
+        let mut app = App::new(tree, PathBuf::from("/test"));
+        app.set_session_id(Some("sess".into()));
+        app.set_expanded("mock/w.rs", ambits::expansion::RowKind::File, true);
+        let alpha = &app.project_tree.files[0].symbols[0];
+        let write = ambits::writes::WriteRecord {
+            op: "toolu_1".into(),
+            file: "mock/w.rs".into(),
+            level: ambits::writes::Level::Symbol,
+            syms: vec![(alpha.id.clone(), ambits::journal::encode_hash(&alpha.content_hash))],
+            ..Default::default()
+        };
+        app.record_write("sess", write);
+        app.selected_index = 2;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 6)).unwrap();
+        terminal.draw(|f| render(f, &app, f.area())).unwrap();
+        assert_eq!(fg_color_of(terminal.backend(), 1, "✎1"), Some(colors::WRITE_CURRENT));
+        assert_eq!(fg_color_of(terminal.backend(), 2, "✎"), Some(colors::WRITE_CURRENT));
+        assert_eq!(fg_color_of(terminal.backend(), 3, "✎"), None, "beta was not written");
     }
 
     #[test]
