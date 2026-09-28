@@ -165,6 +165,9 @@ pub struct App {
     /// tailer — queues here, and the TUI drains the queue to its attribution
     /// worker each tick, so parsing never runs on the render thread.
     pending_writes: Vec<(Arc<str>, crate::ingest::WriteEvent)>,
+    /// Every tool call as a span, and compactions as instants, for the trace
+    /// view. Its own store: the activity feed keeps only the latest calls.
+    pub trace: crate::trace::Trace,
 
     /// Path filter restricting which files are tracked, if any. Shared with
     /// the TUI re-parse paths (file watcher, Serena cache rescan) so that
@@ -218,6 +221,7 @@ impl App {
             retired_journal: None,
             journal_settings: None,
             pending_writes: Vec::new(),
+            trace: crate::trace::Trace::default(),
             filter: None,
             editor_template: None,
             pending_editor_request: None,
@@ -396,6 +400,7 @@ impl App {
         self.agent_selection_index = 0;
         self.session_slug = None;
         self.compaction_history.clear();
+        self.trace.clear();
         self.compaction_call_count = 0;
         self.show_alignment_overlay = false;
         self.agent_alignment.clear();
@@ -453,6 +458,9 @@ impl App {
         agent_id: std::sync::Arc<str>,
         metadata: Option<crate::ingest::CompactionMetadata>,
     ) {
+        if let Some(t) = crate::time::parse_rfc3339_millis(&timestamp) {
+            self.trace.instant(t, Some(agent_id.clone()), crate::trace::InstantKind::Compaction);
+        }
         use std::collections::BTreeSet;
         let files_before: BTreeSet<std::path::PathBuf> = self
             .project_tree
@@ -1037,6 +1045,11 @@ impl App {
         });
     }
 
+    /// A tool call's result arrived: close its span in the trace.
+    pub fn process_tool_finished(&mut self, finished: &crate::ingest::ToolFinished) {
+        self.trace.finish(finished);
+    }
+
     /// Queue a write for attribution, tagged with the current session (see
     /// `pending_writes`). Without a session there is no journal to put it in.
     pub fn queue_write(&mut self, event: crate::ingest::WriteEvent) {
@@ -1077,6 +1090,7 @@ impl App {
 
     /// Process an agent tool call event and update the ledger.
     pub fn process_agent_event(&mut self, event: AgentToolCall) {
+        self.trace.start(&event, &self.project_root);
         self.compaction_call_count += 1;
         self.register_agent(&event.agent_id, &event.label);
 

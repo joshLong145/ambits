@@ -545,8 +545,25 @@ impl LineFeed {
                 writes.note_calls(&calls);
                 out.extend(calls.into_iter().map(SessionEvent::ToolCall));
             }
-            // A write's path comes from its call, remapped above.
-            ParsedLine::ToolResults(results) => out.extend(writes.resolve(results).into_iter().map(SessionEvent::Write)),
+            ParsedLine::ToolResults(results) => {
+                for r in &results {
+                    let child_agent = r
+                        .detail
+                        .as_ref()
+                        .and_then(|d| d.get("agentId"))
+                        .and_then(|v| v.as_str())
+                        .map(|id| Arc::from(format!("agent-{id}").as_str()));
+                    out.push(SessionEvent::ToolFinished(super::ToolFinished {
+                        id: r.tool_use_id.clone(),
+                        agent_id: Arc::from(self.default_id.as_str()),
+                        timestamp: r.timestamp.clone(),
+                        error: r.is_error,
+                        child_agent,
+                    }));
+                }
+                // A write's path comes from its call, remapped above.
+                out.extend(writes.resolve(results).into_iter().map(SessionEvent::Write));
+            }
             ParsedLine::CompactBoundary { metadata, .. } => self.pending_metadata = Some(metadata),
             ParsedLine::Compacted { summary, timestamp } => out.push(SessionEvent::Compacted {
                 summary,
@@ -1041,7 +1058,13 @@ impl LogTailer {
             self.positions.insert(self.files[i].clone(), current_len);
         }
 
-        let mut output = TailerOutput { events: Vec::new(), compactions: Vec::new(), session_cleared: false, writes: Vec::new() };
+        let mut output = TailerOutput {
+            events: Vec::new(),
+            compactions: Vec::new(),
+            session_cleared: false,
+            writes: Vec::new(),
+            finished: Vec::new(),
+        };
         for event in events {
             match event {
                 SessionEvent::ToolCall(call) => output.events.push(call),
@@ -1050,6 +1073,7 @@ impl LogTailer {
                     output.compactions.push(TailedCompaction { summary, timestamp, agent_id, metadata })
                 }
                 SessionEvent::SessionCleared => output.session_cleared = true,
+                SessionEvent::ToolFinished(f) => output.finished.push(f),
             }
         }
         output
@@ -2313,6 +2337,27 @@ mod write_tests {
         assert_eq!(polled.events[0].file_path.as_deref(), Some(Path::new("/proj/src/a.rs")));
         assert_eq!(polled.writes[0].path, PathBuf::from("/proj/src/a.rs"));
         assert_eq!(&*polled.events[0].label, "task", "labelled like the replay too");
+    }
+
+    /// Every result closes its call, errors included; a delegation's names
+    /// the subagent it started, as `agent-<agentId>`.
+    #[test]
+    fn every_result_finishes_its_call_and_delegations_name_their_agent() {
+        let events = parse(&[
+            call("toolu_1", "Edit", "/p/src/a.rs"),
+            result("toolu_1", serde_json::json!("String to replace not found"), true),
+            result("toolu_2", serde_json::json!({"agentId": "a2f", "status": "async_launched"}), false),
+        ]);
+        let finished: Vec<&crate::ingest::ToolFinished> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::ToolFinished(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finished.len(), 2);
+        assert!(finished[0].error);
+        assert_eq!(finished[1].child_agent.as_deref(), Some("agent-a2f"));
     }
 
     /// A partial patch would under-report the change, so any defect makes

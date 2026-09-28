@@ -88,6 +88,7 @@ pub fn replay_session(
                 }
                 SessionEvent::SessionCleared => app.reset_session(),
                 SessionEvent::Write(w) => app.queue_write(w),
+                SessionEvent::ToolFinished(f) => app.process_tool_finished(&f),
             }
         }
         handoff.files.push((file, replay.offset));
@@ -237,6 +238,9 @@ impl TuiSession {
             }
             for write in output.writes {
                 app.queue_write(write);
+            }
+            for finished in &output.finished {
+                app.process_tool_finished(finished);
             }
             for compaction in output.compactions {
                 app.process_compaction(compaction.summary, compaction.timestamp, compaction.agent_id, compaction.metadata);
@@ -482,6 +486,7 @@ mod tests {
                 compactions: Vec::new(),
                 session_cleared: false,
                 writes: std::mem::take(&mut self.writes),
+                finished: Vec::new(),
             }
         }
     }

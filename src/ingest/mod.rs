@@ -149,6 +149,22 @@ pub enum SessionEvent {
     SessionCleared,
     /// A write tool call that completed successfully (spec §1).
     Write(WriteEvent),
+    /// Any tool call's result arrived: when it ended, and how.
+    ToolFinished(ToolFinished),
+}
+
+/// The end of a tool call, paired with its start by `id` (`tool_use_id`).
+/// What gives a call a duration in the trace view and export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolFinished {
+    pub id: Arc<str>,
+    pub agent_id: Arc<str>,
+    pub timestamp: String,
+    /// The tool failed or was rejected.
+    pub error: bool,
+    /// For a delegation (`Agent`/`Task`), the subagent it started, named as
+    /// its events are (`agent-<agentId>`), when the result says.
+    pub child_agent: Option<Arc<str>>,
 }
 
 /// A compaction event surfaced by the incremental tailer (no ledger snapshot
@@ -190,6 +206,8 @@ pub struct TailerOutput {
     pub session_cleared: bool,
     /// Write tool calls whose successful result arrived in this poll.
     pub writes: Vec<WriteEvent>,
+    /// Every tool call whose result arrived in this poll.
+    pub finished: Vec<ToolFinished>,
 }
 
 /// Maps a raw tool call (name + JSON input) to an `AgentToolCall`.

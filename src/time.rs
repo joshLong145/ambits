@@ -45,6 +45,17 @@ pub fn parse_rfc3339(s: &str) -> Option<u64> {
     u64::try_from(days * 86_400 + h * 3600 + mi * 60 + se).ok()
 }
 
+/// Milliseconds since the epoch of an RFC 3339 UTC time, keeping the
+/// fraction [`parse_rfc3339`] drops: spans are often shorter than a second.
+pub fn parse_rfc3339_millis(s: &str) -> Option<u64> {
+    let (whole, fraction) = match s.split_once('.') {
+        Some((whole, rest)) => (format!("{whole}Z"), rest.strip_suffix('Z')?),
+        None => (s.to_string(), ""),
+    };
+    let millis: u64 = format!("{fraction:0<3}").get(..3)?.parse().ok()?;
+    Some(parse_rfc3339(&whole)? * 1000 + millis)
+}
+
 /// `secs` since the epoch as `YYYY-MM-DDTHH:MM:SSZ` (Howard Hinnant's
 /// civil-from-days, so no date dependency).
 pub fn rfc3339(secs: u64) -> String {
@@ -80,6 +91,15 @@ mod tests {
         assert_eq!(parse_rfc3339("2026-09-27T13:39:43.103Z"), parse_rfc3339("2026-09-27T13:39:43Z"));
         assert_eq!(parse_rfc3339("2026-09-27T13:39:43+02:00"), None);
         assert_eq!(parse_rfc3339("yesterday"), None);
+    }
+
+    #[test]
+    fn millisecond_precision_is_kept() {
+        let base = parse_rfc3339("2026-09-27T13:39:43Z").unwrap() * 1000;
+        assert_eq!(parse_rfc3339_millis("2026-09-27T13:39:43.103Z"), Some(base + 103));
+        assert_eq!(parse_rfc3339_millis("2026-09-27T13:39:43.1Z"), Some(base + 100));
+        assert_eq!(parse_rfc3339_millis("2026-09-27T13:39:43Z"), Some(base));
+        assert_eq!(parse_rfc3339_millis("nonsense"), None);
     }
 
     #[test]
