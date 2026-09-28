@@ -137,13 +137,13 @@ See [Sharing](Sharing).
 
 ## `ambits push`
 
-`ambits -p . push [remote] [--force-with-lease] [--dry-run] [--break-lock]` —
+`ambits -p . push [remote] [--force-with-lease] [--dry-run] [--break-lock] [--verify-all]` —
 the remote defaults to the only one, or `origin`; the session to `--session`
 or the latest.
 
 ## `ambits fetch` / `ambits pull`
 
-`ambits -p . fetch [remote]`, `ambits -p . pull [remote]`. After a fetch,
+`ambits -p . fetch [remote] [--verify-all]`, `ambits -p . pull [remote] [--verify-all]`. After a fetch,
 `<remote>/<session>` names a remote's session wherever a snapshot reference
 is taken (`log`, `restore`).
 

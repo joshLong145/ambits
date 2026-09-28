@@ -36,6 +36,10 @@ ambits -p . --session <session> pull              # or merge into the same sessi
   refused: pull, snapshot, and push again. `--force-with-lease` overwrites
   them instead, but only if the remote still holds what you last fetched.
 - `--dry-run` says how many objects and links would go, and sends nothing.
+- Only what is new is sent and checked: the walk back from your tip stops at
+  the first snapshot the remote already holds whole (it loads, and so do its
+  reads and writes). `--verify-all` walks and re-checks the whole history
+  instead, repairing anything on the remote that no longer verifies.
 - Links (which commit a write [landed in](Agent-Writes#which-commit-it-landed-in))
   go with it: only those of the writes being pushed, filtered by
   `[sync] ignore`.
@@ -57,7 +61,8 @@ every object is re-hashed, every snapshot's id and contents recomputed,
 symlinks, FIFOs and oversized files refused, malformed ref names ignored.
 Each session is fetched on its own: one that fails verification records
 nothing and is reported, the others still come, and the command exits
-non-zero.
+non-zero. As with push, only what is new is walked; `fetch --verify-all`
+(or `pull --verify-all`) re-checks everything here.
 
 The remote's links are kept only when this machine can prove them — the
 commit is reachable here and its version of the file holds the write — so

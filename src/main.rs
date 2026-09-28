@@ -249,6 +249,11 @@ enum Commands {
         /// store's and dead, or you confirm.
         #[arg(long)]
         break_lock: bool,
+
+        /// Re-check the whole history on the remote, repairing anything that
+        /// no longer verifies, not only what is new.
+        #[arg(long)]
+        verify_all: bool,
     },
 
     /// Copy every session's snapshots from a remote, verifying each, and
@@ -256,6 +261,11 @@ enum Commands {
     Fetch {
         /// The remote; defaults to the only one, or `origin`.
         remote: Option<String>,
+
+        /// Re-check every session's whole history here, repairing anything
+        /// that no longer verifies, not only what is new.
+        #[arg(long)]
+        verify_all: bool,
     },
 
     /// Fetch, then merge the remote's history of this session into it:
@@ -264,6 +274,10 @@ enum Commands {
     Pull {
         /// The remote; defaults to the only one, or `origin`.
         remote: Option<String>,
+
+        /// Fetch as `fetch --verify-all` does.
+        #[arg(long)]
+        verify_all: bool,
     },
 
     /// Maintain the links index (which commit agent writes landed in).
@@ -1143,6 +1157,10 @@ fn run_remote(project_path: &Path, command: &RemoteCommands) -> Result<()> {
     Ok(())
 }
 
+fn verify(all: bool) -> ambits::remote::transfer::Verify {
+    if all { ambits::remote::transfer::Verify::Everything } else { ambits::remote::transfer::Verify::Frontier }
+}
+
 /// Ask on the terminal; no terminal, no.
 fn confirm(prompt: &str) -> bool {
     use std::io::IsTerminal as _;
@@ -1436,7 +1454,7 @@ fn run() -> Result<()> {
     if let Some(Commands::Remote { command }) = &command {
         return run_remote(&project_path, command);
     }
-    if let Some(Commands::Push { remote, force_with_lease, dry_run, break_lock }) = &command {
+    if let Some(Commands::Push { remote, force_with_lease, dry_run, break_lock, verify_all }) = &command {
         let Some(session) = session_id.as_deref() else {
             color_eyre::eyre::bail!("no session to push: pass --session, or run inside a project with Claude Code logs");
         };
@@ -1455,12 +1473,13 @@ fn run() -> Result<()> {
             force_with_lease: *force_with_lease,
             dry_run: *dry_run,
             ignore: &ignore,
+            verify: verify(*verify_all),
         })?;
         print_push(&mut io::stdout().lock(), &outcome)?;
         return Ok(());
     }
-    if let Some(Commands::Fetch { remote }) = &command {
-        let report = ambits::remote::fetch(&project_path, remote.as_deref())?;
+    if let Some(Commands::Fetch { remote, verify_all }) = &command {
+        let report = ambits::remote::fetch(&project_path, remote.as_deref(), verify(*verify_all))?;
         print_fetch(&mut io::stdout().lock(), &report)?;
         if !report.failed.is_empty() {
             color_eyre::eyre::bail!("{} session(s) from {} did not verify and were not fetched", report.failed.len(), report.remote);
@@ -1576,7 +1595,7 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(Commands::Pull { remote }) = &command {
+    if let Some(Commands::Pull { remote, verify_all }) = &command {
         report_warnings(&config_warnings);
         let Some(session) = session_id.as_deref() else {
             color_eyre::eyre::bail!("no session to pull into: pass --session, or run inside a project with Claude Code logs");
@@ -1588,6 +1607,7 @@ fn run() -> Result<()> {
             tree: &project_tree,
             backend: if cli.serena { "serena" } else { "tree-sitter" },
             filter: filter.as_ref().map(|f| f.display()),
+            verify: verify(*verify_all),
         })?;
         print_pull(&mut io::stdout().lock(), session, &report)?;
         return Ok(());

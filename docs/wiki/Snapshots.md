@@ -123,6 +123,7 @@ Everything lives under `.ambits/`, private to your user:
 | `notes.ndjson` | Per snapshot: time, message and ambits version — never host, branch or path |
 | `links.ndjson` | Where agent writes landed ([Agent Writes](Agent-Writes#which-commit-it-landed-in)) |
 | `cache/never-landed.ndjson` | Writes not found in any commit yet, and the branch tips searched; local only |
+| `cache/graph.ndjson` | Each snapshot's parents, so history questions skip re-reading snapshots; each line checks itself against the snapshot's id; local only |
 | `config` | This store's random id and its [remotes](Sharing) |
 
 Everything but objects is one flat, append-only file: writers take the

@@ -13,6 +13,7 @@
 pub mod canonical;
 pub mod flat;
 pub mod gc;
+pub mod graph;
 pub mod inputs;
 pub mod record;
 pub mod refs;

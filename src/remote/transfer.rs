@@ -10,6 +10,7 @@ use std::collections::HashSet;
 
 use color_eyre::eyre::{bail, Result, WrapErr};
 
+use crate::objects::graph::Graph;
 use crate::objects::snapshot::{Snapshot, MAX_HISTORY};
 use crate::objects::store::{refresh_age, Store};
 use crate::objects::{Kind, ObjectId};
@@ -38,6 +39,64 @@ pub fn closure(store: &Store, tip: ObjectId) -> Result<Vec<Snapshot>> {
     Ok(out)
 }
 
+/// How much of a history a transfer re-checks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Verify {
+    /// Walk back only to what the destination already holds whole: the
+    /// store writes children before parents and gc deletes parents first,
+    /// so a snapshot held whole has all it descends from (§8).
+    #[default]
+    Frontier,
+    /// Walk and re-check the whole history, repairing anything that no
+    /// longer verifies (`--verify-all`).
+    Everything,
+}
+
+/// `id`, if `store` holds it whole: the snapshot and the objects it
+/// references all load and verify.
+fn held_whole(store: &Store, id: ObjectId) -> Option<Snapshot> {
+    if !store.contains(&id) {
+        return None;
+    }
+    let snap = Snapshot::load(store, id).ok()?;
+    (store.get(&snap.coverage, Kind::Coverage).is_ok() && store.get(&snap.writes, Kind::Writes).is_ok()).then_some(snap)
+}
+
+/// The part of `tip`'s history `to` needs from `from`, loaded and verified
+/// from `from`, parents before children. Under [`Verify::Frontier`] the walk
+/// stops at each snapshot `to` holds whole — after checking it is the same
+/// snapshot there, not another under its id — so a push or fetch costs what
+/// is new, not the whole history.
+pub fn missing(graph: &mut Graph, from: &Store, to: &Store, tip: ObjectId, verify: Verify) -> Result<Vec<Snapshot>> {
+    let mut out = Vec::new();
+    let mut queued: HashSet<ObjectId> = HashSet::from([tip]);
+    let mut stack: Vec<(ObjectId, Option<Snapshot>)> = vec![(tip, None)];
+    while let Some((id, loaded)) = stack.pop() {
+        if let Some(snap) = loaded {
+            out.push(snap);
+            continue;
+        }
+        if verify == Verify::Frontier {
+            if let Some(there) = held_whole(to, id) {
+                if Snapshot::load(from, id)?.state_digest != there.state_digest {
+                    bail!("snapshot {} already exists with different contents; refusing it", id.short());
+                }
+                graph.learn(&there);
+                continue;
+            }
+        }
+        let snap = Snapshot::load(from, id).wrap_err("history is incomplete")?;
+        graph.learn(&snap);
+        let parents: Vec<ObjectId> = snap.parents.iter().filter(|p| queued.insert(**p)).copied().collect();
+        if queued.len() > MAX_HISTORY {
+            bail!("history of {} is longer than {MAX_HISTORY} snapshots", tip.short());
+        }
+        stack.push((id, Some(snap)));
+        stack.extend(parents.into_iter().map(|p| (p, None)));
+    }
+    Ok(out)
+}
+
 /// What a transfer did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Stats {
@@ -46,9 +105,9 @@ pub struct Stats {
     pub present: usize,
 }
 
-/// Copy `history` (from [`closure`] over `from`) to `to`, repairing any
-/// object there that no longer verifies, then check `to` holds all of it —
-/// including what was skipped as already there.
+/// Copy `history` (from [`missing`] or [`closure`] over `from`) to `to`,
+/// repairing any object there that no longer verifies, then check `to`
+/// holds all of it — including what was skipped as already there.
 pub fn transfer(from: &Store, to: &Store, history: &[Snapshot]) -> Result<Stats> {
     let mut stats = Stats::default();
     for snap in history {

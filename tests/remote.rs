@@ -96,6 +96,7 @@ impl Clone {
             tree: &tree,
             backend: "tree-sitter",
             filter: None,
+            verify: Default::default(),
         })
         .unwrap()
         .outcome
@@ -117,6 +118,7 @@ fn push_from(root: &Path, session: &str, force: bool) -> color_eyre::Result<Push
         force_with_lease: force,
         dry_run: false,
         ignore: &SyncIgnore::none(),
+        verify: Default::default(),
     })
 }
 
@@ -202,11 +204,11 @@ fn after_a_force_with_lease_the_other_clone_still_fetches_and_pulls() {
     b.read("beta", "agent-2");
     let forced = created(b.snap());
     assert!(b.push(true).is_err(), "no lease yet: B never fetched");
-    remote::fetch(&b.root, None).unwrap();
+    remote::fetch(&b.root, None, Default::default()).unwrap();
     assert!(matches!(b.push(true).unwrap(), PushOutcome::Pushed { forced: true, .. }));
     assert_eq!(remote_tip(&remote), Some(forced));
 
-    let report = remote::fetch(&a.root, None).unwrap();
+    let report = remote::fetch(&a.root, None, Default::default()).unwrap();
     assert!(report.moved.iter().any(|m| m.forced && m.from == Some(s1) && m.to == forced));
     assert!(matches!(a.pull(), PullOutcome::Merged { reads: 1, .. }));
     assert_eq!(a.reads(), vec!["src/a.rs::alpha", "src/a.rs::beta"]);
@@ -260,7 +262,7 @@ fn fetch_refuses_what_does_not_verify() {
     let original = std::fs::read(&coverage).unwrap();
     let tracking = RefName::tracking("origin", SESSION).unwrap();
     let refused = |why: &str| {
-        let report = remote::fetch(&b.root, None).unwrap();
+        let report = remote::fetch(&b.root, None, Default::default()).unwrap();
         assert_eq!(report.failed.len(), 1, "{why}: {report:?}");
         assert_eq!(refs::read(&b.store(), &tracking).unwrap(), None, "{why}: nothing recorded");
         report.failed[0].1.clone()
@@ -287,7 +289,7 @@ fn fetch_refuses_what_does_not_verify() {
     assert!(refused("oversized").contains("limit"));
 
     std::fs::write(&coverage, original).unwrap();
-    assert!(remote::fetch(&b.root, None).unwrap().failed.is_empty());
+    assert!(remote::fetch(&b.root, None, Default::default()).unwrap().failed.is_empty());
     assert_eq!(refs::read(&b.store(), &tracking).unwrap(), Some(tip));
 }
 
@@ -307,7 +309,7 @@ fn a_bad_session_does_not_stop_the_others() {
     let coverage = remote_store.path_of(&Snapshot::load(&remote_store, bad).unwrap().coverage);
     std::fs::write(&coverage, "{}").unwrap();
 
-    let report = remote::fetch(&b.root, None).unwrap();
+    let report = remote::fetch(&b.root, None, Default::default()).unwrap();
     assert_eq!(report.failed.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(), vec![OTHER]);
     assert_eq!(refs::read(&b.store(), &RefName::tracking("origin", SESSION).unwrap()).unwrap(), Some(good));
     assert_eq!(refs::read(&b.store(), &RefName::tracking("origin", OTHER).unwrap()).unwrap(), None);
@@ -331,7 +333,7 @@ fn hostile_ref_names_on_the_remote_are_ignored() {
         reflog.push('\n');
     }
     std::fs::write(remote.join("reflog.ndjson"), reflog).unwrap();
-    let report = remote::fetch(&b.root, None).unwrap();
+    let report = remote::fetch(&b.root, None, Default::default()).unwrap();
     assert!(report.failed.is_empty(), "{report:?}");
     assert_eq!(report.moved.len(), 1);
 }
@@ -355,7 +357,7 @@ fn fetched_links_are_kept_only_when_proven() {
     let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
     std::fs::write(remote.join("links.ndjson"), text).unwrap();
 
-    let report = remote::fetch(&b.root, None).unwrap();
+    let report = remote::fetch(&b.root, None, Default::default()).unwrap();
     assert_eq!(report.links, 1);
     let kept = ambits::linkage::links_of(&b.root.join(".ambits")).unwrap();
     assert_eq!(kept.iter().map(|(_, l)| l.op.as_str()).collect::<Vec<_>>(), vec!["toolu_real"]);
@@ -414,7 +416,7 @@ fn an_interrupted_push_leaves_no_ref() {
     let history = remote::transfer::closure(&a.store(), tip).unwrap();
     remote::transfer::transfer(&a.store(), &Store::at_root(&remote), &history).unwrap();
     assert_eq!(remote_tip(&remote), None);
-    assert!(remote::fetch(&b.root, None).unwrap().moved.is_empty());
+    assert!(remote::fetch(&b.root, None, Default::default()).unwrap().moved.is_empty());
     assert!(matches!(a.push(false).unwrap(), PushOutcome::Pushed { objects: 0, .. }), "the objects are already there");
 }
 
@@ -433,6 +435,41 @@ fn a_push_repairs_a_corrupt_object_it_would_have_skipped() {
     a.snap();
     assert!(matches!(a.push(false).unwrap(), PushOutcome::Pushed { .. }));
     assert!(remote_store.get(&coverage, ambits::objects::Kind::Coverage).is_ok());
+}
+
+/// Damage behind the frontier — an old snapshot's object, under a newer
+/// one the remote holds whole — is not looked for by a normal push (that
+/// is the point), and `--verify-all` finds and repairs it.
+#[test]
+fn verify_all_repairs_what_the_frontier_does_not_look_at() {
+    let (_dir, remote, a, _b) = pair();
+    a.read("alpha", "agent-1");
+    let old = created(a.snap());
+    a.read("beta", "agent-1");
+    created(a.snap());
+    a.push(false).unwrap();
+    let remote_store = Store::at_root(&remote);
+    let coverage = Snapshot::load(&remote_store, old).unwrap().coverage;
+    std::fs::write(remote_store.path_of(&coverage), "rot").unwrap();
+
+    a.read("alpha", "agent-2");
+    a.snap();
+    a.push(false).unwrap();
+    assert!(remote_store.get(&coverage, ambits::objects::Kind::Coverage).is_err(), "not looked at");
+
+    a.read("beta", "agent-2");
+    a.snap();
+    remote::push(&remote::PushRequest {
+        project_root: &a.root,
+        remote: None,
+        session: SESSION,
+        force_with_lease: false,
+        dry_run: false,
+        ignore: &SyncIgnore::none(),
+        verify: remote::transfer::Verify::Everything,
+    })
+    .unwrap();
+    assert!(remote_store.get(&coverage, ambits::objects::Kind::Coverage).is_ok(), "repaired");
 }
 
 /// Two versions of one write at one attribution version: ours stays, theirs
@@ -494,11 +531,11 @@ fn crash_then_gc_then_fetch_recovers() {
     a.read("alpha", "agent-1");
     let tip = created(a.snap());
     a.push(false).unwrap();
-    remote::fetch(&b.root, None).unwrap();
+    remote::fetch(&b.root, None, Default::default()).unwrap();
     let snap = Snapshot::load(&b.store(), tip).unwrap();
     std::fs::remove_file(b.store().path_of(&snap.writes)).unwrap();
     ambits::objects::gc::gc(&b.store(), std::time::Duration::ZERO, ambits::objects::refs::REFLOG_EXPIRY).unwrap();
-    let report = remote::fetch(&b.root, None).unwrap();
+    let report = remote::fetch(&b.root, None, Default::default()).unwrap();
     assert_eq!(report.objects, 1);
     assert!(b.store().get(&snap.writes, ambits::objects::Kind::Writes).is_ok());
 }
@@ -548,4 +585,34 @@ fn the_cli_pushes_fetches_and_restores_across_clones() {
     assert!(out.contains(&format!("origin/{SESSION}: (none) →")), "{out}");
     let out = run_ambits(&b.root, &["restore", &format!("origin/{SESSION}")]);
     assert!(out.contains("src/a.rs: 1 verified"), "{out}");
+}
+
+/// Not a check but a measurement, run by hand:
+/// `cargo test --release --test remote history_walk_costs -- --ignored --nocapture`.
+/// A long history, then what the common operations cost once it is shared.
+#[test]
+#[ignore]
+fn history_walk_costs() {
+    let n: usize = std::env::var("SNAPSHOTS").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
+    let (_dir, _remote, a, b) = pair();
+    for i in 0..n {
+        a.read(if i % 2 == 0 { "alpha" } else { "beta" }, &format!("agent-{i}"));
+        a.snap();
+    }
+    let time = |what: &str, f: &mut dyn FnMut()| {
+        let t = std::time::Instant::now();
+        f();
+        eprintln!("{what:<32} {:>8.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+    };
+    time("first push", &mut || { let _ = a.push(false).unwrap(); });
+    time("push, nothing new", &mut || { let _ = a.push(false).unwrap(); });
+    a.read("alpha", "agent-last");
+    time("snapshot, one new read", &mut || { let _ = a.snap(); });
+    time("push, one new snapshot", &mut || { let _ = a.push(false).unwrap(); });
+    time("first fetch", &mut || { let _ = remote::fetch(&b.root, None, Default::default()).unwrap(); });
+    time("fetch, nothing new", &mut || { let _ = remote::fetch(&b.root, None, Default::default()).unwrap(); });
+    time("pull (merge)", &mut || { let _ = b.pull(); });
+    time("snapshot after pull", &mut || { let _ = b.snap(); });
+    time("pull, up to date", &mut || { let _ = b.pull(); });
+    time("snapshot, nothing changed", &mut || { let _ = b.snap(); });
 }

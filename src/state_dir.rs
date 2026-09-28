@@ -58,6 +58,9 @@ pub const LINKS: &str = "links.ndjson";
 pub const CACHE: &str = "cache";
 /// The never-landed cache, under [`CACHE`] (flat; never pushed).
 pub const NEVER_LANDED: &str = "never-landed.ndjson";
+/// The snapshot ancestry cache, under [`CACHE`]: each snapshot's parents,
+/// self-verifying (local; never pushed).
+pub const GRAPH: &str = "graph.ndjson";
 /// Directories ambits writes files into atomically — and so may leave a
 /// `.tmp-*` in after a crash — besides `STATE_DIR` itself.
 pub const STORE_DIRS: &[&str] = &[OBJECTS, CACHE];

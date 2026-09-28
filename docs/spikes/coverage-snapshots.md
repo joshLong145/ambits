@@ -804,6 +804,26 @@ Merges into the **same session id** locally.
 - **A merge is recorded whenever a pull writes anything** (history
   included), once per remote tip, so history alone while behind cannot
   leave a push non-fast-forward. Pending merge tips are gc roots.
+- **History walks cost what is new** (after measuring O(history) per push,
+  fetch, pull and snapshot):
+  - An ancestry cache, `cache/graph.ndjson`, holds `{id, inputs, parents}`
+    per snapshot. Since `id = snapshot_id(inputs, parents)` (D17) each line
+    verifies itself, so ancestry questions (fast-forward, "remote ahead",
+    merged, diverged, pending merges, parent reduction) walk memory with
+    early exit; misses load and verify from the store and are learned.
+  - Transfers walk back from the tip only to snapshots the destination
+    holds whole (the snapshot, its coverage and writes load and verify),
+    relying on §8's invariant that a present parent has its children; the
+    boundary is checked against the source's `state_digest`. Only what is
+    copied is re-verified. `--verify-all` restores the exhaustive walk.
+    §12.2's "verify the skipped closure" is therefore the boundary, not the
+    whole history, by default.
+  - A push reads its links' ops from the session journal, not every writes
+    object; a snapshot walks ancestry only when merges are pending.
+  - Measured at 50, 200 and 400 snapshots: a push of one new snapshot,
+    a no-op fetch, an up-to-date pull and a snapshot each stay at 25–55 ms
+    (they were 145–175 ms at 200 and growing). A first push or fetch is
+    still one fsync per object (about 20 ms per snapshot on macOS).
 - **"Up to date" leaves the lease alone**; notes and links reach the remote
   under its lock; `--break-lock` moves the lock aside and re-checks its
   token before deleting; a pid is alive if signalling it is merely

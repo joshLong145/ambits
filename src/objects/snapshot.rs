@@ -1,6 +1,5 @@
 //! `ambits snapshot` and `ambits log` (spec §6, §11).
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use color_eyre::eyre::{bail, eyre, Result};
@@ -10,6 +9,7 @@ use super::inputs::{self, Inputs};
 use super::refs::{self, RefName};
 use super::store::Store;
 use super::sync_ignore::SyncIgnore;
+use super::graph::Graph;
 use super::{b3, gc, record, Kind, ObjectId};
 use crate::ingest::tool_config::SyncConfig;
 use crate::symbols::ProjectTree;
@@ -171,17 +171,20 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
     // Parents: the session's tip, and every remote tip a pull merged in
     // that is not already its ancestor (§12.3).
     let tip = refs::read(&store, &name)?;
-    let known = match tip {
-        Some(t) => ancestors(&store, t)?,
-        None => HashSet::new(),
-    };
-    let pending: Vec<ObjectId> = prefix
-        .contents
-        .merges
-        .iter()
-        .filter_map(|m| ObjectId::parse(m).ok())
-        .filter(|m| store.contains(m) && !known.contains(m))
-        .collect();
+    // Ancestry only when a pull left merges: a snapshot costs what is new.
+    let mut graph = (!prefix.contents.merges.is_empty()).then(|| Graph::load(&store));
+    let mut pending: Vec<ObjectId> = Vec::new();
+    if let Some(graph) = graph.as_mut() {
+        for m in prefix.contents.merges.iter().filter_map(|m| ObjectId::parse(m).ok()).filter(|m| store.contains(m)) {
+            let merged = match tip {
+                Some(t) => graph.is_ancestor(&store, m, t)?,
+                None => false,
+            };
+            if !merged {
+                pending.push(m);
+            }
+        }
+    }
     let mut repair: Option<Snapshot> = None;
     if let (Some(tip), true) = (tip, pending.is_empty()) {
         let current = Snapshot::load(&store, tip)?;
@@ -199,10 +202,17 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
     parents.dedup();
     // A parent another parent descends from adds nothing: a pull that
     // appended while merely behind leaves the tip an ancestor of the merge.
-    if parents.len() > 1 {
-        let reachable: Vec<HashSet<ObjectId>> = parents.iter().map(|p| ancestors(&store, *p)).collect::<Result<_>>()?;
-        let kept: Vec<ObjectId> =
-            parents.iter().enumerate().filter(|(i, p)| !reachable.iter().enumerate().any(|(j, r)| j != *i && r.contains(p))).map(|(_, p)| *p).collect();
+    if let (Some(graph), true) = (graph.as_mut(), parents.len() > 1) {
+        let mut kept = Vec::new();
+        for p in &parents {
+            let mut inside = false;
+            for q in parents.iter().filter(|q| *q != p) {
+                inside |= graph.is_ancestor(&store, *p, *q)?;
+            }
+            if !inside {
+                kept.push(*p);
+            }
+        }
         parents = kept;
     }
     let id = inputs::snapshot_id(&inputs_digest, &parents);
@@ -243,24 +253,6 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
     refs::update(&store, &name, tip, id, "snapshot")?;
 
     Ok(Outcome::Created { id, parents, reads: records.reads, writes: records.write_count, dirty })
-}
-
-/// `tip` and every snapshot it descends from. Walked iteratively over
-/// verified snapshots, each once: a cycle cannot form (ids hash their
-/// parents), but a hostile store is not trusted to know that (§9.5).
-pub fn ancestors(store: &Store, tip: ObjectId) -> Result<HashSet<ObjectId>> {
-    let mut seen = HashSet::new();
-    let mut stack = vec![tip];
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        if seen.len() > MAX_HISTORY {
-            bail!("history of {} is longer than {MAX_HISTORY} snapshots", tip.short());
-        }
-        stack.extend(Snapshot::load(store, id)?.parents);
-    }
-    Ok(seen)
 }
 
 /// The most snapshots one history may hold (§9.5).

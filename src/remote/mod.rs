@@ -24,7 +24,8 @@ use serde_json::Value;
 
 use crate::journal::{self, EnvironmentManifest, Journal, Record};
 use crate::objects::refs::{self, RefName};
-use crate::objects::snapshot::{ancestors, Snapshot};
+use crate::objects::graph::Graph;
+use crate::objects::snapshot::Snapshot;
 use crate::objects::store::{Durability, Store};
 use crate::objects::sync_ignore::SyncIgnore;
 use crate::objects::{gc, valid_hash, valid_label, valid_op, valid_record_path, valid_symbol_id, Kind, ObjectId};
@@ -60,6 +61,7 @@ pub struct PushRequest<'a> {
     pub force_with_lease: bool,
     pub dry_run: bool,
     pub ignore: &'a SyncIgnore,
+    pub verify: transfer::Verify,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,18 +95,20 @@ pub fn push(req: &PushRequest<'_>) -> Result<PushOutcome> {
     };
     let remote_tip = refs::read(&remote, &name)?;
     let lease = refs::read(&local, &tracking)?;
+    let mut graph = Graph::load(&local);
 
     // Already there, or the remote is ahead of us: nothing to send. The
     // lease stays where the last fetch left it — a tip never fetched must
     // not become what --force-with-lease trusts.
     if let Some(r) = remote_tip {
-        if r == tip || ancestors(&remote, r)?.contains(&tip) {
+        if graph.is_ancestor(&remote, tip, r)? {
             return Ok(PushOutcome::UpToDate { remote: remote_name, tip: r });
         }
     }
-    let history = transfer::closure(&local, tip)?;
-    let ours: HashSet<ObjectId> = history.iter().map(|s| s.id).collect();
-    let fast_forward = remote_tip.is_none_or(|r| ours.contains(&r));
+    let fast_forward = match remote_tip {
+        None => true,
+        Some(r) => graph.is_ancestor(&local, r, tip)?,
+    };
     if !fast_forward {
         if !req.force_with_lease {
             bail!(
@@ -117,7 +121,9 @@ pub fn push(req: &PushRequest<'_>) -> Result<PushOutcome> {
         }
     }
 
-    let links = pushable_links(req.project_root, &local, &history, req.ignore)?;
+    let history = transfer::missing(&mut graph, &local, &remote, tip, req.verify)?;
+    let ours: HashSet<ObjectId> = history.iter().map(|s| s.id).collect();
+    let links = pushable_links(req.project_root, req.session, req.ignore)?;
     let other_ignore = history.iter().filter(|s| s.inputs.ignore != req.ignore.digest()).count();
     if req.dry_run {
         let missing = history
@@ -146,18 +152,15 @@ pub fn push(req: &PushRequest<'_>) -> Result<PushOutcome> {
     Ok(PushOutcome::Pushed { remote: remote_name, from: remote_tip, to: tip, objects: stats.copied, links, forced: !fast_forward, other_ignore })
 }
 
-/// The links of the writes in `history` whose file and target the ignore
+/// The links of `session`'s writes whose file and target the ignore
 /// filter lets leave the machine (§3.2, §10, D18) — not the whole index,
-/// which holds sessions never pushed.
-fn pushable_links(project_root: &Path, store: &Store, history: &[Snapshot], ignore: &SyncIgnore) -> Result<Vec<(String, crate::linkage::Link)>> {
-    let mut ops = HashSet::new();
-    for snap in history {
-        let writes = store.get(&snap.writes, Kind::Writes)?;
-        ops.extend(writes.get("writes").and_then(Value::as_array).into_iter().flatten().filter_map(|w| w.get("op")?.as_str().map(String::from)));
-    }
+/// which holds sessions never pushed. The session's writes come from its
+/// journal, which every snapshot of it was made from: no object is read.
+fn pushable_links(project_root: &Path, session: &str, ignore: &SyncIgnore) -> Result<Vec<(String, crate::linkage::Link)>> {
+    let ops = journal::read_session_writes(&journal::journal_dir(project_root), session);
     Ok(crate::linkage::links_of(&project_root.join(crate::state_dir::STATE_DIR))?
         .into_iter()
-        .filter(|(_, l)| ops.contains(&l.op))
+        .filter(|(_, l)| ops.contains_key(&l.op))
         .filter(|(_, l)| !ignore.is_ignored(&l.path) && !ignore.ignores_symbol(&l.target) && !ignore.is_ignored(&l.target))
         .collect())
 }
@@ -190,7 +193,7 @@ pub struct FetchReport {
 /// so one clone's force-with-lease cannot wedge every other's fetch (§16).
 /// A session that fails verification records nothing and is reported; the
 /// others still come.
-pub fn fetch(project_root: &Path, remote: Option<&str>) -> Result<FetchReport> {
+pub fn fetch(project_root: &Path, remote: Option<&str>, verify: transfer::Verify) -> Result<FetchReport> {
     let local = Store::at(project_root);
     let (remote_name, remote) = config::resolve(project_root, remote)?;
     if !remote.root().is_dir() {
@@ -200,20 +203,23 @@ pub fn fetch(project_root: &Path, remote: Option<&str>) -> Result<FetchReport> {
     let _gc = gc::GcLock::shared(&local)?;
     let mut report = FetchReport { remote: remote_name.clone(), ..Default::default() };
     let mut ids = HashSet::new();
+    let mut graph = Graph::load(&local);
     for (name, tip) in refs::all(&remote)? {
         // Only well-formed session refs; anything else is not ours to take.
         let Some(session) = name.strip_prefix("refs/sessions/") else { continue };
         let Ok(tracking) = RefName::tracking(&remote_name, session) else { continue };
         let fetched = (|| -> Result<Option<Fetched>> {
-            let history = transfer::closure(&remote, tip)?;
+            let history = transfer::missing(&mut graph, &remote, &local, tip, verify)?;
             report.objects += transfer::transfer(&remote, &local, &history)?.copied;
-            let theirs: HashSet<ObjectId> = history.iter().map(|s| s.id).collect();
+            ids.extend(history.iter().map(|s| s.id));
             let old = refs::read(&local, &tracking)?;
-            ids.extend(theirs.iter().copied());
             if old == Some(tip) {
                 return Ok(None);
             }
-            let forced = old.is_some_and(|o| !theirs.contains(&o));
+            let forced = match old {
+                Some(o) => !graph.is_ancestor(&local, o, tip)?,
+                None => false,
+            };
             refs::update(&local, &tracking, old, tip, if forced { "fetch (forced)" } else { "fetch" })?;
             Ok(Some(Fetched { session: session.to_string(), from: old, to: tip, forced }))
         })();
@@ -238,6 +244,7 @@ pub struct PullRequest<'a> {
     pub tree: &'a ProjectTree,
     pub backend: &'static str,
     pub filter: Option<String>,
+    pub verify: transfer::Verify,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,7 +292,7 @@ fn valid_write(w: &WriteRecord) -> bool {
 /// Fetch, then merge the remote's history of `req.session` into the same
 /// session here (§12.3), appending to its `.pull` shard.
 pub fn pull(req: &PullRequest<'_>) -> Result<PullReport> {
-    let fetch = fetch(req.project_root, req.remote)?;
+    let fetch = fetch(req.project_root, req.remote, req.verify)?;
     if let Some((_, why)) = fetch.failed.iter().find(|(s, _)| s == req.session) {
         bail!("{}'s history of session {} did not verify: {why}", fetch.remote, req.session);
     }
@@ -295,8 +302,9 @@ pub fn pull(req: &PullRequest<'_>) -> Result<PullReport> {
         return Ok(PullReport { fetch, outcome: PullOutcome::NotOnRemote });
     };
     let ours = refs::read(&store, &RefName::session(req.session)?)?;
+    let mut graph = Graph::load(&store);
     if let Some(ours) = ours {
-        if ours == theirs || ancestors(&store, ours)?.contains(&theirs) {
+        if graph.is_ancestor(&store, theirs, ours)? {
             return Ok(PullReport { fetch, outcome: PullOutcome::UpToDate });
         }
     }
@@ -380,7 +388,7 @@ pub fn pull(req: &PullRequest<'_>) -> Result<PullReport> {
     // (§12.3), so rounds settle.
     let diverged = match ours {
         None => true,
-        Some(o) => !ancestors(&store, theirs)?.contains(&o),
+        Some(o) => !graph.is_ancestor(&store, o, theirs)?,
     };
     if records.is_empty() && !diverged {
         return Ok(PullReport { fetch, outcome: PullOutcome::Behind });
