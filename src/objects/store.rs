@@ -274,9 +274,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
         let payload = json!({"entries": [], "n": 3});
-        let id = store.put(Kind::Dir, &payload).unwrap();
-        assert_eq!(store.put(Kind::Dir, &payload).unwrap(), id);
-        assert_eq!(store.get(&id, Kind::Dir).unwrap(), payload);
+        let id = store.put(Kind::Coverage, &payload).unwrap();
+        assert_eq!(store.put(Kind::Coverage, &payload).unwrap(), id);
+        assert_eq!(store.get(&id, Kind::Coverage).unwrap(), payload);
         assert_eq!(store.list().len(), 1);
     }
 
@@ -284,11 +284,11 @@ mod tests {
     fn a_tampered_or_mistyped_object_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
-        let id = store.put(Kind::Dir, &json!({"n": 1})).unwrap();
-        assert!(store.get(&id, Kind::File).is_err(), "wrong type");
+        let id = store.put(Kind::Coverage, &json!({"n": 1})).unwrap();
+        assert!(store.get(&id, Kind::Writes).is_err(), "wrong type");
 
-        fs::write(store.path_of(&id), br#"{"payload":{"n":2},"type":"dir"}"#).unwrap();
-        assert!(store.get(&id, Kind::Dir).is_err(), "content no longer matches the id");
+        fs::write(store.path_of(&id), br#"{"payload":{"n":2},"type":"coverage"}"#).unwrap();
+        assert!(store.get(&id, Kind::Coverage).is_err(), "content no longer matches the id");
     }
 
     #[cfg(unix)]
@@ -297,7 +297,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
-        let id = store.put(Kind::Dir, &json!({})).unwrap();
+        let id = store.put(Kind::Coverage, &json!({})).unwrap();
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&store.path_of(&id)), 0o600);
         assert_eq!(mode(store.path_of(&id).parent().unwrap()), 0o700);

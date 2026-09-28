@@ -5,13 +5,13 @@ use std::path::Path;
 use color_eyre::eyre::{bail, eyre, Result};
 use serde_json::{json, Value};
 
-use super::inputs::{self, Backend, Inputs};
+use super::inputs::{self, Inputs};
 use super::refs::{self, RefName};
 use super::store::Store;
 use super::sync_ignore::SyncIgnore;
-use super::{b3, gc, record, tree, Kind, ObjectId};
+use super::{b3, gc, record, Kind, ObjectId};
 use crate::ingest::tool_config::SyncConfig;
-use crate::symbols::{FileSymbols, ProjectTree};
+use crate::symbols::ProjectTree;
 
 /// A snapshot object, parsed and verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,20 +19,19 @@ pub struct Snapshot {
     pub id: ObjectId,
     pub inputs: Inputs,
     pub inputs_digest: [u8; 32],
-    pub root: ObjectId,
     pub coverage: ObjectId,
     pub writes: ObjectId,
     pub parents: Vec<ObjectId>,
     pub state_digest: [u8; 32],
 }
 
-/// `BLAKE3` over `root`, `coverage`, `writes` and the sorted parents (§6.3).
-fn state_digest(root: &ObjectId, coverage: &ObjectId, writes: &ObjectId, parents: &[ObjectId]) -> [u8; 32] {
+/// `BLAKE3` over `coverage`, `writes` and the sorted parents (§6.3).
+fn state_digest(coverage: &ObjectId, writes: &ObjectId, parents: &[ObjectId]) -> [u8; 32] {
     let mut sorted = parents.to_vec();
     sorted.sort();
     let mut h = blake3::Hasher::new();
-    h.update(b"ambits-state v1\0");
-    for id in [root, coverage, writes].into_iter().chain(sorted.iter()) {
+    h.update(b"ambits-state v2\0");
+    for id in [coverage, writes].into_iter().chain(sorted.iter()) {
         h.update(&id.0);
     }
     *h.finalize().as_bytes()
@@ -43,7 +42,6 @@ impl Snapshot {
         let mut v = self.inputs.to_value();
         let obj = v.as_object_mut().expect("inputs are an object");
         obj.insert("inputs".into(), json!(b3(&self.inputs_digest)));
-        obj.insert("root".into(), json!(self.root.hex()));
         obj.insert("coverage".into(), json!(self.coverage.hex()));
         obj.insert("writes".into(), json!(self.writes.hex()));
         let mut parents = self.parents.clone();
@@ -58,6 +56,15 @@ impl Snapshot {
     /// to its `state_digest` (§6.3, §9.4).
     pub fn load(store: &Store, id: ObjectId) -> Result<Self> {
         let v = store.get(&id, Kind::Snapshot)?;
+        // Before 1.0, older encodings are not migrated: say so plainly
+        // rather than as a malformed object.
+        if v.get("format").is_none() {
+            bail!(
+                "snapshot {} was written by an older ambits (object format 1) and cannot be read; \
+                 delete .ambits/objects, .ambits/refs, .ambits/logs and .ambits/notes to start a new history",
+                id.short()
+            );
+        }
         let text = |k: &str| v.get(k).and_then(Value::as_str).ok_or_else(|| eyre!("snapshot {}: missing {k}", id.short()));
         let hash = |k: &str| -> Result<[u8; 32]> {
             crate::journal::decode_hash(text(k)?).ok_or_else(|| eyre!("snapshot {}: bad {k}", id.short()))
@@ -70,8 +77,7 @@ impl Snapshot {
             session: text("session")?.to_string(),
             journal: hash("journal")?,
             git: (git != "none").then(|| git.to_string()),
-            parsers: list("parsers").iter().filter_map(|p| p.as_str().map(String::from)).collect(),
-            scan: hash("scan")?,
+            format: text("format")?.to_string(),
             ignore: hash("ignore")?,
             dirty: list("dirty")
                 .iter()
@@ -82,7 +88,6 @@ impl Snapshot {
         let snapshot = Self {
             id,
             inputs_digest: hash("inputs")?,
-            root: oid("root")?,
             coverage: oid("coverage")?,
             writes: oid("writes")?,
             state_digest: hash("state_digest")?,
@@ -106,7 +111,7 @@ impl Snapshot {
         if inputs::snapshot_id(&snapshot.inputs_digest, &snapshot.parents) != id {
             bail!("snapshot {}: does not match its id", id.short());
         }
-        if state_digest(&snapshot.root, &snapshot.coverage, &snapshot.writes, &snapshot.parents) != snapshot.state_digest {
+        if state_digest(&snapshot.coverage, &snapshot.writes, &snapshot.parents) != snapshot.state_digest {
             bail!("snapshot {}: its contents do not match its state digest", id.short());
         }
         Ok(snapshot)
@@ -114,7 +119,7 @@ impl Snapshot {
 
     /// The objects a snapshot references directly.
     pub fn references(&self) -> Vec<(ObjectId, Kind)> {
-        let mut out = vec![(self.root, Kind::Dir), (self.coverage, Kind::Coverage), (self.writes, Kind::Writes)];
+        let mut out = vec![(self.coverage, Kind::Coverage), (self.writes, Kind::Writes)];
         out.extend(self.parents.iter().map(|p| (*p, Kind::Snapshot)));
         out
     }
@@ -124,10 +129,8 @@ impl Snapshot {
 pub struct Request<'a> {
     pub project_root: &'a Path,
     pub session: &'a str,
+    /// The project as scanned now: which untracked files count as dirty.
     pub tree: &'a ProjectTree,
-    pub backend: Backend<'a>,
-    /// `--filter`/`--filter-regex` as the scan applied it.
-    pub filter: Option<String>,
     pub sync: &'a SyncConfig,
     pub message: Option<&'a str>,
     pub require_clean: bool,
@@ -138,16 +141,7 @@ pub struct Request<'a> {
 pub enum Outcome {
     /// Inputs equal the tip's and nothing is pending: nothing written (§6.4).
     NothingChanged(ObjectId),
-    Created {
-        id: ObjectId,
-        parents: Vec<ObjectId>,
-        files: usize,
-        reads: usize,
-        writes: usize,
-        dirty: usize,
-        /// Files whose path could not be stored (see [`tree::TreeStats::skipped`]).
-        skipped: Vec<String>,
-    },
+    Created { id: ObjectId, parents: Vec<ObjectId>, reads: usize, writes: usize, dirty: usize },
 }
 
 /// Make a snapshot of `req.session` (§6.4).
@@ -159,13 +153,7 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
     let _gc = gc::GcLock::shared(&store)?;
 
     let prefix = record::read_prefix(req.project_root, req.session)?;
-    // After the scan (§7): see `inputs::environment`.
-    let env = inputs::environment(req.project_root, req.tree, req.filter.as_deref(), &ignore)?;
-    let scanned = match &req.backend {
-        Backend::TreeSitter(registry) => reparse_dirty(req.tree, &env.contents, registry),
-        // Serena's symbols come from its cache, not from the files.
-        Backend::Serena { .. } => req.tree.clone(),
-    };
+    let env = inputs::environment(req.project_root, req.tree, &ignore)?;
     if req.require_clean && !env.dirty.is_empty() {
         bail!("working tree has {} dirty file(s); commit or stash them, or drop --require-clean", env.dirty.len());
     }
@@ -173,8 +161,7 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
         session: req.session.to_string(),
         journal: prefix.digest,
         git: env.git,
-        parsers: req.backend.parsers(),
-        scan: env.scan,
+        format: inputs::OBJECT_FORMAT.to_string(),
         ignore: ignore.digest(),
         dirty: env.dirty,
     };
@@ -187,7 +174,7 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
     if let Some(tip) = tip {
         let current = Snapshot::load(&store, tip)?;
         if current.inputs_digest == inputs_digest {
-            if [current.root, current.coverage, current.writes].iter().all(|id| store.contains(id)) {
+            if [current.coverage, current.writes].iter().all(|id| store.contains(id)) {
                 return Ok(Outcome::NothingChanged(tip));
             }
             // The tip survived a crash its objects did not. Same inputs,
@@ -199,16 +186,9 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
     let id = inputs::snapshot_id(&inputs_digest, &parents);
 
     // Children before parents; the snapshot object last (§8).
-    let parser_of = |file: &FileSymbols| -> String {
-        match &req.backend {
-            Backend::TreeSitter(registry) => registry.parser_for(&file.file_path).map_or_else(|| "none".into(), |p| p.identity()),
-            Backend::Serena { .. } => req.backend.parsers().join(","),
-        }
-    };
-    let tree = tree::write_tree(&store, &scanned, &parser_of, &ignore)?;
     let records = record::write_records(&store, req.session, &prefix.contents, &ignore)?;
     if let Some(tip) = repair {
-        if (tip.root, tip.coverage, tip.writes) != (tree.root, records.coverage, records.writes) {
+        if (tip.coverage, tip.writes) != (records.coverage, records.writes) {
             bail!("snapshot {} is missing objects that cannot be rebuilt from the current state", tip.id.short());
         }
         store.sync_dirs()?;
@@ -219,10 +199,9 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
         id,
         inputs,
         inputs_digest,
-        root: tree.root,
         coverage: records.coverage,
         writes: records.writes,
-        state_digest: state_digest(&tree.root, &records.coverage, &records.writes, &parents),
+        state_digest: state_digest(&records.coverage, &records.writes, &parents),
         parents: parents.clone(),
     };
     if store.contains(&id) {
@@ -241,46 +220,7 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
     refs::write_note(&store, &id, req.message)?;
     refs::update(&store, &name, tip, id, "snapshot")?;
 
-    Ok(Outcome::Created {
-        id,
-        parents,
-        files: tree.files,
-        reads: records.reads,
-        writes: records.write_count,
-        dirty,
-        skipped: tree.skipped,
-    })
-}
-
-/// `tree` with every dirty file parsed again from the bytes its fingerprint
-/// was taken from — or dropped when it is gone or no longer parses — so the
-/// tree and the `dirty` input describe the same moment even if a file
-/// changed while the project was being scanned (§7).
-fn reparse_dirty(
-    tree: &ProjectTree,
-    contents: &[(std::path::PathBuf, Option<Vec<u8>>)],
-    registry: &crate::parser::ParserRegistry,
-) -> ProjectTree {
-    let mut tree = tree.clone();
-    for (raw, bytes) in contents {
-        let key = super::normalize_path(&raw.to_string_lossy());
-        let Some(pos) = tree.files.iter().position(|f| super::normalize_path(&f.file_path.to_string_lossy()) == key) else {
-            continue;
-        };
-        let path = tree.files[pos].file_path.clone();
-        let parsed = bytes
-            .as_deref()
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .zip(registry.parser_for(&path))
-            .and_then(|(source, parser)| parser.parse_file(&path, source).ok());
-        match parsed {
-            Some(file) => tree.files[pos] = file,
-            None => {
-                tree.files.remove(pos);
-            }
-        }
-    }
-    tree
+    Ok(Outcome::Created { id, parents, reads: records.reads, writes: records.write_count, dirty })
 }
 
 /// Resolve what `ambits log` was given: a session id (its ref), a full
@@ -365,9 +305,6 @@ pub fn print_log(out: &mut impl std::io::Write, entries: &[LogEntry]) -> std::io
             let parents: Vec<String> = s.parents.iter().map(ObjectId::short).collect();
             writeln!(out, "  parents {}", parents.join(" "))?;
         }
-        if s.inputs.parsers.iter().any(|p| p.starts_with("serena@")) {
-            writeln!(out, "  non-reproducible (Serena backend)")?;
-        }
         if let Some(message) = e.note.as_ref().and_then(|n| n.message.as_deref()) {
             writeln!(out, "  {message}")?;
         }
@@ -379,11 +316,11 @@ pub fn print_log(out: &mut impl std::io::Write, entries: &[LogEntry]) -> std::io
 pub fn print_outcome(out: &mut impl std::io::Write, outcome: &Outcome) -> std::io::Result<()> {
     match outcome {
         Outcome::NothingChanged(tip) => writeln!(out, "nothing changed: {}", tip.short()),
-        Outcome::Created { id, parents, files, reads, writes, dirty, .. } => {
+        Outcome::Created { id, parents, reads, writes, dirty } => {
             let parent = parents.first().map_or("none".to_string(), ObjectId::short);
             writeln!(
                 out,
-                "snapshot {}  ({files} files, {reads} reads, {writes} writes, {dirty} dirty; parent {parent})",
+                "snapshot {}  ({reads} reads, {writes} writes, {dirty} dirty; parent {parent})",
                 id.short()
             )
         }

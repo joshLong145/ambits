@@ -41,11 +41,6 @@ use crate::symbols::{FileSymbols, NameInterner, SymbolCategory, SymbolNode};
 
 use super::LanguageParser;
 
-
-/// Version of this parser's symbol extraction — ids, spans, what counts as a
-/// symbol. Bump it whenever that output changes without a grammar change
-/// (#33 moved spans), so snapshots made before and after differ (spec §6.1).
-pub const SYMBOL_SCHEMA: u32 = 1;
 /// Parser for Python (`.py`) source files.
 ///
 /// Uses the tree-sitter-python grammar to produce a CST, then extracts
@@ -61,18 +56,6 @@ impl PythonParser {
 }
 
 impl LanguageParser for PythonParser {
-    fn name(&self) -> &'static str {
-        "python"
-    }
-
-    fn grammar_crate(&self) -> &'static str {
-        "tree-sitter-python"
-    }
-
-    fn symbol_schema(&self) -> u32 {
-        SYMBOL_SCHEMA
-    }
-
     fn extensions(&self) -> &[&str] {
         &["py"]
     }

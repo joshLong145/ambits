@@ -5,7 +5,6 @@ mod common;
 use std::path::PathBuf;
 
 use ambits::ingest::tool_config::SyncConfig;
-use ambits::objects::inputs::Backend;
 use ambits::objects::restore::{restore, Report, Request};
 use ambits::objects::snapshot::{snapshot, Outcome, Snapshot};
 use ambits::objects::store::Store;
@@ -72,8 +71,6 @@ impl Project {
             project_root: &self.root,
             session,
             tree: &tree,
-            backend: Backend::TreeSitter(&self.registry),
-            filter: None,
             sync: &SyncConfig::default(),
             message: None,
             require_clean: false,

@@ -1060,22 +1060,6 @@ fn run_log(project_path: &Path, reference: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Identifies the Serena caches a snapshot was built from: BLAKE3 over each
-/// cache file's name and bytes. Serena snapshots are not reproducible from
-/// the commit alone (spec §6.4), and this is what they depend on instead.
-fn serena_fingerprint(project_path: &Path) -> String {
-    let mut caches: Vec<(String, PathBuf)> = serena::find_serena_caches(project_path)
-        .into_iter()
-        .map(|p| (p.strip_prefix(project_path).unwrap_or(&p).to_string_lossy().replace('\\', "/"), p))
-        .collect();
-    caches.sort();
-    let parts: Vec<Vec<u8>> = caches
-        .into_iter()
-        .flat_map(|(name, path)| [name.into_bytes(), std::fs::read(&path).unwrap_or_default()])
-        .collect();
-    ambits::objects::hash_framed("ambits-serena v1", parts.iter().map(Vec::as_slice)).to_hex()[..16].to_string()
-}
-
 /// Build the project symbol tree with whichever backend was selected.
 ///
 /// Named because two call sites need it and they must not drift: `find`
@@ -1365,27 +1349,15 @@ fn run() -> Result<()> {
         let Some(session) = session_id.as_deref() else {
             color_eyre::eyre::bail!("no session to snapshot: pass --session, or run inside a project with Claude Code logs");
         };
-        let backend = if cli.serena {
-            ambits::objects::inputs::Backend::Serena { fingerprint: serena_fingerprint(&project_path) }
-        } else {
-            ambits::objects::inputs::Backend::TreeSitter(&registry)
-        };
         let outcome = ambits::objects::snapshot::snapshot(&ambits::objects::snapshot::Request {
             project_root: &project_path,
             session,
             tree: &project_tree,
-            backend,
-            filter: filter.as_ref().map(|f| f.display()),
             sync: &sync_cfg,
             message: message.as_deref(),
             require_clean: *require_clean,
         })?;
         ambits::objects::snapshot::print_outcome(&mut io::stdout().lock(), &outcome)?;
-        if let ambits::objects::snapshot::Outcome::Created { skipped, .. } = &outcome {
-            for path in skipped {
-                ambits::try_eprintln!("[ambit] left out of the snapshot: {path} (invalid name, or collides with another path by case)");
-            }
-        }
         return Ok(());
     }
 

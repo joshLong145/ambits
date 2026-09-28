@@ -3,7 +3,6 @@
 //!
 //! - [`canonical`] — the one byte encoding every object has.
 //! - [`store`] — loose objects on disk, written atomically.
-//! - [`tree`] — `symbol`, `file` and `dir` objects from a scanned project.
 //! - [`record`] — `coverage` and `writes` objects from a journal prefix.
 //! - [`inputs`] — what a snapshot's id is derived from (D17).
 //! - [`refs`] — session refs, their lock, and the reflog.
@@ -20,7 +19,6 @@ pub mod restore;
 pub mod snapshot;
 pub mod store;
 pub mod sync_ignore;
-pub mod tree;
 
 use std::fmt;
 
@@ -70,9 +68,6 @@ impl fmt::Debug for ObjectId {
 /// Object types (§5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
-    Symbol,
-    File,
-    Dir,
     Coverage,
     Writes,
     Snapshot,
@@ -81,9 +76,6 @@ pub enum Kind {
 impl Kind {
     pub fn name(self) -> &'static str {
         match self {
-            Kind::Symbol => "symbol",
-            Kind::File => "file",
-            Kind::Dir => "dir",
             Kind::Coverage => "coverage",
             Kind::Writes => "writes",
             Kind::Snapshot => "snapshot",
@@ -92,9 +84,6 @@ impl Kind {
 
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name {
-            "symbol" => Kind::Symbol,
-            "file" => Kind::File,
-            "dir" => Kind::Dir,
             "coverage" => Kind::Coverage,
             "writes" => Kind::Writes,
             "snapshot" => Kind::Snapshot,
@@ -174,11 +163,6 @@ pub fn read_regular(path: &std::path::Path) -> Option<Vec<u8>> {
     std::fs::read(path).ok()
 }
 
-/// NFC form of a name.
-pub fn nfc(s: &str) -> String {
-    s.nfc().collect()
-}
-
 /// A `dir` entry name must be one plain path component (§9.1).
 pub fn valid_entry_name(name: &str) -> bool {
     !name.is_empty()
@@ -201,7 +185,7 @@ mod tests {
 
     #[test]
     fn ids_round_trip_and_reject_junk() {
-        let id = content_id(Kind::Dir, b"[]");
+        let id = content_id(Kind::Coverage, b"[]");
         assert_eq!(ObjectId::parse(&id.hex()).unwrap(), id);
         for bad in ["", "abc", &"A".repeat(64), &"0".repeat(63), &format!("{}g", "0".repeat(63))] {
             assert!(ObjectId::parse(bad).is_err(), "{bad:?}");

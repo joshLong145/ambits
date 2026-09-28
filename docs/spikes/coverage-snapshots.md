@@ -7,6 +7,17 @@
 
 ### Revision history
 
+**Revision 4** — after implementing phases 2–5 and using them on this
+repository: **snapshots no longer store the symbol tree** (D1, D5 revised).
+Nothing read it: restore must check reads against the project *as it is
+now*, and every read already carries its symbol id and content hash. The
+tree at snapshot time is the pinned commit's for committed files, and dirty
+contents were never restorable. Dropping it removed ~3,000 of ~3,070 objects
+from this repository's store, the first-snapshot fsync cost, and the inputs
+that only kept the tree deterministic (`parsers`, `scan_inputs`,
+`SYMBOL_SCHEMA`). A `format` input (`ambits-objects@2`) versions the encoding
+instead.
+
 **Revision 3** — after a consistency review and an explicit-state model check
 of the sync protocol (§16):
 
@@ -85,11 +96,11 @@ or symbol, and which commit did that change land in?*
 
 | # | Decision | Rationale |
 |---|---|---|
-| D1 | Snapshots hold **symbols + coverage + writes**, pinned to a git commit; **no file contents** | Identifiers and paths are still shipped (§10) |
+| D1 | Snapshots hold **coverage + writes**, pinned to a git commit and dirty-file fingerprints; **no file contents and no symbol tree** (rev 4) | Restore verifies against the live tree; the tree at snapshot time is the pinned commit's |
 | D2 | First origin is a **dumb remote** | No server to build or secure |
 | D3 | **Canonical JSON** (RFC 8785 rules, §5.2) | Debuggable, like the journal |
 | D4 | Snapshots are **manual** | Predictable |
-| D5 | **Nested `dir` objects** | Sharing and cheap diffs |
+| D5 | ~~Nested `dir` objects~~ — withdrawn in rev 4 with the stored tree | — |
 | D6 | Sync exclusion is **gitignore syntax in `tools.toml`** | The `ignore` crate is already a dependency |
 | D7 | **Dirty working trees are tracked** | Agent sessions are dirty almost all the time |
 | D8 | Snapshot ids are **derived from inputs** (option B), not from hashing objects | Deterministic; robust to encoding changes |
@@ -382,18 +393,12 @@ ignore = ["secrets/**", "vendor/"]
 
 | Type | Payload | Id |
 |---|---|---|
-| `symbol` | `name`, `name_path`, `category`, `label`, `lines`, `bytes`, `hash` (`content_hash`), `children` (symbol object ids) | content |
-| `file` | `symbols` (top-level symbol object ids), `lines` (`total_lines`), `parser` (identity) | content |
-| `dir` | sorted entries `{name, kind: file\|dir, id}` | content |
 | `coverage` | sorted reads `(symbol id, hash at read, depth, agent)` — the fold's result, **no `history`, no origin** | content (D14) |
 | `writes` | write records (§2.6), sorted by canonical bytes — no `history`, no origin | content (D14) |
 | `snapshot` | §6.3 | derived (D17) |
 
-`estimated_tokens` is excluded from `symbol` payloads (recomputed on restore).
-`name_path` is the symbol id without its file (`App/handle_key`). It is
-needed because a child's id cannot be rebuilt from its parent's: an inherent
-impl is `impl App`, but its methods are `App/…`. Leaving the file out keeps
-the object shared when a file is renamed. (Found in implementation.)
+Rev 3 also had `symbol`, `file` and `dir` objects holding the scanned tree;
+rev 4 removed them (see the revision history).
 
 ### 5.2 Canonical JSON and object ids
 
@@ -414,8 +419,7 @@ inputs_digest = BLAKE3("ambits-inputs v1\0" ‖ canonical(
     session_id,
     journal_digest,
     git_commit | "none",
-    parsers,
-    scan_inputs,
+    format,
     sync_ignore_digest,
     dirty: sorted [(path, BLAKE3(raw bytes))]
 ))
@@ -425,25 +429,15 @@ snapshot_id = BLAKE3("ambits-snapshot v1\0" ‖ inputs_digest ‖ sorted parents
 
 | Input | Determines |
 |---|---|
-| `git_commit` + `parsers` + `scan_inputs` | the tree for clean files |
+| `git_commit` | the committed state the reads are relative to |
+| `format` | the object encodings (`ambits-objects@2`) |
 | `session_id` + `journal_digest` | reads, writes, and pending merges |
 | `dirty` | dirty files (§7) |
 | `sync_ignore_digest` | what is included |
 | `parents` | history (§6.4) |
 
-- **`parsers`**: backend, grammar versions **generated from `Cargo.lock` at
-  build time** (`build.rs`; the manifest's once hand-maintained list uses the
-  same source), and a per-language **`SYMBOL_SCHEMA`** constant bumped
-  whenever ambits' own extraction changes (#33 changed spans with no grammar
-  change). One string per parser, `rust:tree-sitter-rust@0.23.3:schema=1`,
-  plus `tree-sitter@<version>`; a `file` object records its parser's string.
-  Also `ambits-objects@1`, the object encoding version, so a change to how
-  objects are written makes new snapshots instead of colliding with ids from
-  the old encoding.
-- **`scan_inputs`**: everything the walker honours that is not in the commit —
-  `--filter`/`--filter-regex`, `.git/info/exclude`, global git excludes,
-  untracked `.ignore` files, and walker flags. `snapshot` records its own
-  effective values.
+- Rev 3's `parsers` and `scan_inputs` existed to make the stored tree
+  deterministic, and went with it (rev 4).
 
 **Not inputs** (stored as a note): time, host, message, ambits crate
 version, tool config.
@@ -462,12 +456,12 @@ id changes **once** on upgrade (§6.4).
 ### 6.3 The snapshot object
 
 ```json
-{"inputs":"b3:…","session":"…","journal":"b3:…","git":"<sha>|none","parsers":[…],
- "scan":"b3:…","ignore":"b3:…","dirty":[["src/app.rs","b3:…"]],
- "root":"<dir id>","coverage":"<id>","writes":"<id>","parents":["<snapshot id>",…],"state_digest":"b3:…"}
+{"inputs":"b3:…","session":"…","journal":"b3:…","git":"<sha>|none","format":"ambits-objects@2",
+ "ignore":"b3:…","dirty":[["src/app.rs","b3:…"]],
+ "coverage":"<id>","writes":"<id>","parents":["<snapshot id>",…],"state_digest":"b3:…"}
 ```
 
-`state_digest` = BLAKE3 over `root`, `coverage`, `writes` and `parents`. With
+`state_digest` = BLAKE3 over `coverage`, `writes` and `parents`. With
 parents in the id, **the same id always implies the same `state_digest`**;
 finding an existing id with a different digest is a **hard error** (it means
 corruption or a forged object), never an idempotent skip.
@@ -496,12 +490,12 @@ corruption or a forged object), never an idempotent skip.
 | Edited then **reverted** to an earlier state | New snapshot whose parent is the tip — history never rewinds (rev 2 bug) |
 | `pull` of a diverged tip that appended nothing but a merge record | New **two-parent** snapshot, so the next push fast-forwards (rev 2 bug) |
 | `pull` when merely behind and the remote adds nothing | Nothing appended; same id (no-op), so sync reaches a fixed point |
-| Symbol-extraction change (`SYMBOL_SCHEMA`) | New snapshot |
+| Object encoding change (`format`) | New snapshot |
 | Journal schema upgrade | New snapshot, once |
 | Same state in another session | Different id |
 
-**Serena backend**: parsers record `serena@<cache fingerprint>`; snapshots are
-flagged **non-reproducible**.
+**Serena backend**: nothing backend-specific is stored, so Serena snapshots
+are ordinary snapshots (rev 4).
 
 ---
 
@@ -510,18 +504,11 @@ flagged **non-reproducible**.
 - **Detected** with `git status --porcelain=v1 -z` (§9.2): modified tracked
   files and untracked files the scanner would parse. No git or not a repository
   ⇒ `git = "none"` and every file is dirty.
-- **Fingerprint** = BLAKE3 of the file's **raw bytes**, for every dirty file:
-  `file` object ids miss same-length edits outside symbols and whitespace-only
-  edits inside them (`content_hash` is normalized).
+- **Fingerprint** = BLAKE3 of the file's **raw bytes**, for every dirty file
+  (symbol hashes are whitespace-normalized and miss edits outside symbols).
+  `restore` reports reads that fail in a file dirty at snapshot time as
+  *unverifiable here*.
 - `ambits snapshot --require-clean` refuses dirty trees.
-- **Taken after the scan, and authoritative.** The environment is read after
-  the tree is scanned. Each dirty file is read **once**, and its symbols are
-  re-parsed from the bytes its fingerprint was taken from. A file saved
-  mid-scan therefore cannot leave a tree of the old bytes under an id of the
-  new ones (found in review).
-- A project in a **subdirectory** of its repository: `git status -- .`
-  covers only the project, so the `.gitignore`/`.ignore` files between the
-  repository top and the project are hashed into `scan_inputs`.
 - **Not detected** (git does not report them): changes inside submodules, and
   files marked `skip-worktree` or `assume-unchanged`.
 - `log` shows `a1b2c3d (dirty: 4 files)`.
@@ -556,7 +543,7 @@ flagged **non-reproducible**.
   fsynced before the snapshot object is written, and the snapshot's before
   the ref moves, so after a power loss a present parent always has its
   children. A tip whose objects are missing anyway is rebuilt from the
-  unchanged state by the next `snapshot` (the no-op check verifies `root`,
+  unchanged state by the next `snapshot` (the no-op check verifies
   `coverage` and `writes` exist). Loose objects uncompressed (zstd with packs, phase 7).
 - **Ref updates**: create `<ref>.lock` exclusively containing **pid, start time
   and a random token** (no host, D16); re-read the ref after locking; write;
@@ -782,14 +769,9 @@ Merges into the **same session id** locally.
 - **CRLF files** unverified; attribution must count lines as the parser does.
 - **Lazy commit resolution cost** grows with a file's history; bounded,
   cached, prewarmable.
-- **Parser determinism** assumed by D8; guarded by phase 3 tests and
-  `SYMBOL_SCHEMA`.
-- **First-snapshot cost.** Every object is fsynced (§8). On macOS that is
-  `F_FULLFSYNC`, which the disk serializes: this repository's first
-  snapshot (~2,500 objects) takes ~11 s even with files written in parallel.
-  Later snapshots write only new objects (~0.4 s; ~0.2 s for a no-op). If
-  it matters, batch the fsyncs (write every object, fsync each once, then
-  the snapshot) rather than drop them.
+- **First-snapshot cost** (rev 3: ~11 s here, from fsyncing ~2,500 tree
+  objects) went away with the stored tree: a snapshot writes at most three
+  objects.
 - **`--break-lock`** can lose a slow live push; conservative defaults only.
 - **`--force-with-lease` after a fetch** passes the lease even if the fetched
   tip was never merged (git's known gap). Consider git's `--force-if-includes`

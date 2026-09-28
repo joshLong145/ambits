@@ -9,7 +9,6 @@ mod common;
 use ambits::ingest::tool_config::SyncConfig;
 use common::{git, run_ambits};
 use ambits::objects::gc;
-use ambits::objects::inputs::Backend;
 use ambits::objects::snapshot::{snapshot, Outcome, Request, Snapshot};
 use ambits::objects::store::Store;
 use ambits::objects::{Kind, ObjectId};
@@ -49,14 +48,12 @@ impl Project {
         f.write_all(text.as_bytes()).unwrap();
     }
 
-    fn snapshot_with(&self, backend: Backend<'_>, sync: &SyncConfig) -> Outcome {
+    fn snapshot_with(&self, sync: &SyncConfig) -> Outcome {
         let tree = self.registry.scan_project(&self.root, None).unwrap();
         snapshot(&Request {
             project_root: &self.root,
             session: SESSION,
             tree: &tree,
-            backend,
-            filter: None,
             sync,
             message: None,
             require_clean: false,
@@ -65,7 +62,7 @@ impl Project {
     }
 
     fn snap(&self) -> Outcome {
-        self.snapshot_with(Backend::TreeSitter(&self.registry), &SyncConfig::default())
+        self.snapshot_with(&SyncConfig::default())
     }
 
     fn store(&self) -> Store {
@@ -133,7 +130,7 @@ fn reverting_makes_a_new_snapshot_on_top_of_the_tip() {
     assert_ne!(reverted, clean);
     let s = Snapshot::load(&p.store(), reverted).unwrap();
     assert_eq!(s.parents, vec![dirty]);
-    assert_eq!(s.root, Snapshot::load(&p.store(), clean).unwrap().root, "same tree as before");
+    assert_eq!(s.coverage, Snapshot::load(&p.store(), clean).unwrap().coverage, "same coverage as before");
 }
 
 /// The journal is an input: a new record is a new snapshot; a torn,
@@ -174,16 +171,6 @@ fn a_journal_schema_upgrade_changes_the_id_once() {
     assert_eq!(unchanged(p.snap()), upgraded, "a second open appends nothing");
 }
 
-/// The parsers are an input: a different extraction is a different state
-/// (standing in for a `SYMBOL_SCHEMA` bump, which is a compile-time constant).
-#[test]
-fn a_different_parser_identity_makes_a_new_snapshot() {
-    let p = Project::new();
-    let a = created(p.snapshot_with(Backend::Serena { fingerprint: "a".into() }, &SyncConfig::default()));
-    assert_eq!(unchanged(p.snapshot_with(Backend::Serena { fingerprint: "a".into() }, &SyncConfig::default())), a);
-    created(p.snapshot_with(Backend::Serena { fingerprint: "b".into() }, &SyncConfig::default()));
-}
-
 /// `[sync] ignore` covers every record type: tree, reads, writes and the
 /// dirty list (§4). Nothing names the ignored directory.
 #[test]
@@ -197,7 +184,7 @@ fn ignored_paths_appear_in_no_object() {
         r#"{"kind":"write","op":"toolu_1","av":2,"a":"agent-1","t":"2026-09-26T10:00:00Z","tool":"Edit","file":"secret/key.rs","level":"file"}"#
     ));
     let sync = SyncConfig { ignore: Some(vec!["secret/".into()]), global_ignore: vec![] };
-    let id = created(p.snapshot_with(Backend::TreeSitter(&p.registry), &sync));
+    let id = created(p.snapshot_with(&sync));
 
     for (_, path) in p.store().list() {
         let text = std::fs::read_to_string(&path).unwrap();
@@ -217,8 +204,6 @@ fn require_clean_refuses_a_dirty_tree() {
         project_root: &p.root,
         session: SESSION,
         tree: &tree,
-        backend: Backend::TreeSitter(&p.registry),
-        filter: None,
         sync: &sync,
         message: None,
         require_clean: true,
@@ -304,8 +289,10 @@ fn gc_deletes_parents_before_children() {
 fn reusing_an_object_refreshes_its_age() {
     let p = Project::new();
     let first = created(p.snap());
-    let root = Snapshot::load(&p.store(), first).unwrap().root;
-    let path = p.store().path_of(&root);
+    // A new read changes the coverage object, not the writes object, so
+    // the next snapshot reuses the latter.
+    let writes = Snapshot::load(&p.store(), first).unwrap().writes;
+    let path = p.store().path_of(&writes);
     let old = SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
     std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
 
@@ -357,49 +344,16 @@ fn file_contents_never_reach_objects_or_notes() {
     }
 }
 
-/// The root the project's current files produce, written the way a
-/// snapshot writes it.
-fn fresh_root(p: &Project) -> ObjectId {
-    let tree = p.registry.scan_project(&p.root, None).unwrap();
-    let parser_of = |f: &ambits::symbols::FileSymbols| p.registry.parser_for(&f.file_path).unwrap().identity();
-    ambits::objects::tree::write_tree(&p.store(), &tree, &parser_of, &ambits::objects::sync_ignore::SyncIgnore::none()).unwrap().root
-}
-
-/// A file saved between the scan and the fingerprint must not leave a tree
-/// of the old bytes under an id of the new ones: dirty files are parsed
-/// from the very bytes they are fingerprinted from.
-#[test]
-fn a_file_changed_after_the_scan_is_snapshotted_as_fingerprinted() {
-    let p = Project::new();
-    let stale = p.registry.scan_project(&p.root, None).unwrap();
-    std::fs::write(p.root.join("src/a.rs"), "fn alpha() {}\nfn gamma() {}\n").unwrap();
-    let sync = SyncConfig::default();
-    let id = created(
-        snapshot(&Request {
-            project_root: &p.root,
-            session: SESSION,
-            tree: &stale,
-            backend: Backend::TreeSitter(&p.registry),
-            filter: None,
-            sync: &sync,
-            message: None,
-            require_clean: false,
-        })
-        .unwrap(),
-    );
-    assert_eq!(Snapshot::load(&p.store(), id).unwrap().root, fresh_root(&p));
-}
-
 /// A tip whose objects were lost (a power cut after the ref moved) is
 /// repaired from the unchanged state rather than reported as fine.
 #[test]
 fn a_tip_with_missing_objects_is_repaired() {
     let p = Project::new();
     let id = created(p.snap());
-    let root = Snapshot::load(&p.store(), id).unwrap().root;
-    std::fs::remove_file(p.store().path_of(&root)).unwrap();
+    let coverage = Snapshot::load(&p.store(), id).unwrap().coverage;
+    std::fs::remove_file(p.store().path_of(&coverage)).unwrap();
     assert_eq!(unchanged(p.snap()), id);
-    assert!(p.store().contains(&root));
+    assert!(p.store().contains(&coverage));
 }
 
 /// A field no digest covers — a forged `host`, say — makes the snapshot
@@ -415,38 +369,6 @@ fn an_extra_field_in_a_snapshot_is_refused() {
     assert!(Snapshot::load(&p.store(), id).is_err());
 }
 
-/// A project in a subdirectory of its repository: the walker reads ignore
-/// files above it, so changing one changes the snapshot.
-#[test]
-fn an_ignore_file_above_a_subdirectory_project_counts() {
-    let dir = tempfile::tempdir().unwrap();
-    let top = dir.path().canonicalize().unwrap();
-    let root = top.join("proj");
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/a.rs"), "fn alpha() {}\n").unwrap();
-    std::fs::write(top.join(".gitignore"), ".ambits/\n").unwrap();
-    git(&top, &["init", "-q"]);
-    git(&top, &["add", "."]);
-    git(&top, &["commit", "-qm", "init"]);
-    let p = Project { _dir: dir, root, registry: ParserRegistry::new() };
-    p.append_journal(&format!("{READ}\n"));
-
-    let first = created(p.snap());
-    assert_eq!(unchanged(p.snap()), first);
-    std::fs::write(top.join(".gitignore"), ".ambits/\nsrc/generated/\n").unwrap();
-    created(p.snap());
-}
-
-/// Parser identity names the symbol schema, and every snapshot records
-/// the object format: either changing makes a new snapshot.
-#[test]
-fn parser_inputs_carry_the_schema_and_the_object_format() {
-    let registry = ParserRegistry::new();
-    let parsers = Backend::TreeSitter(&registry).parsers();
-    assert!(parsers.iter().any(|p| p == ambits::objects::inputs::OBJECT_FORMAT));
-    assert!(parsers.iter().any(|p| p.starts_with("rust:") && p.contains(":schema=")), "{parsers:?}");
-}
-
 /// Temp files a crash left are collected, and a leftover one in `refs/`
 /// is never mistaken for a ref.
 #[test]
@@ -459,4 +381,18 @@ fn gc_collects_leftover_temp_files() {
     let stats = gc::gc(&p.store(), Duration::ZERO, ambits::objects::refs::REFLOG_EXPIRY).unwrap();
     assert_eq!(stats.temp_files_removed, 1);
     assert!(!stray.exists());
+}
+
+/// A snapshot from before the tree was dropped (object format 1) is refused
+/// with a message saying what to do, not reported as corrupt.
+#[test]
+fn an_older_format_snapshot_is_refused_with_advice() {
+    let p = Project::new();
+    let id = created(p.snap());
+    let path = p.store().path_of(&id);
+    let mut envelope: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    envelope["payload"].as_object_mut().unwrap().remove("format");
+    std::fs::write(&path, ambits::objects::canonical::to_bytes(&envelope).unwrap()).unwrap();
+    let err = Snapshot::load(&p.store(), id).unwrap_err().to_string();
+    assert!(err.contains("older ambits") && err.contains("delete .ambits/objects"), "{err}");
 }

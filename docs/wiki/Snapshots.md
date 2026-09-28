@@ -1,9 +1,11 @@
 # Snapshots
 
 A snapshot records a session's state in one durable, content-addressed unit:
-the project's **symbol tree**, what agents **read**, what they **wrote**,
-the **git commit** it sits on, and any **uncommitted changes**. File contents
-are never stored — only paths, symbol names, spans and hashes.
+what agents **read** (each symbol with the hash it had), what they
+**wrote**, the **git commit** it sits on, and a fingerprint of every
+**uncommitted change**. File contents are never stored, and neither is the
+symbol tree: the commit already pins it, and restoring checks every read
+against the project as it is now.
 
 ```bash
 ambits -p . snapshot -m "before the refactor"
@@ -38,16 +40,12 @@ session on this machine; syncing to a remote is planned.
   log), fingerprinted by their raw bytes. `--require-clean` refuses a dirty
   working tree instead.
 - `-m` stores a message in the snapshot's local note.
-- A file whose path cannot be stored — a name with `:` or a control
-  character, or two paths differing only in case — is left out with a
-  warning; the rest of the snapshot goes ahead.
 - **What git does not report is not seen.** Changes inside a submodule, and
   to files marked `skip-worktree` or `assume-unchanged`, do not make a new
   snapshot.
 
-A project's first snapshot writes every symbol and can take a few seconds.
-Each object is flushed to disk so a crash can never leave one half-written.
-Later snapshots only write what changed and take well under a second.
+A snapshot writes at most three small objects and takes well under a
+second. Each is flushed to disk so a crash can never leave one half-written.
 
 ## History
 
@@ -55,9 +53,6 @@ Later snapshots only write what changed and take well under a second.
 git commit and dirty count, reads, writes, parents and message. `ref` is a
 session id, a snapshot id, or a unique prefix of one (7+ hex digits); it
 defaults to the current session.
-
-Snapshots made with `--serena` are marked **non-reproducible**: they depend
-on Serena's cache, not just the commit.
 
 ## Restoring
 
@@ -122,7 +117,7 @@ Everything lives under `.ambits/`, private to your user:
 
 | Path | Holds |
 |---|---|
-| `objects/ab/cdef….json` | Symbols, files, directories, coverage, writes and snapshots, as canonical JSON |
+| `objects/ab/cdef….json` | Coverage, writes and snapshots, as canonical JSON |
 | `refs/sessions/<id>` | The latest snapshot of each session |
 | `logs/refs/sessions/<id>` | Every move of that ref (the reflog) |
 | `notes/<snapshot>.json` | Time, message and ambits version — never host, branch or path |

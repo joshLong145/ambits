@@ -24,7 +24,7 @@ use serde_json::Value;
 use super::refs;
 use super::snapshot::Snapshot;
 use super::store::{create_private_dir, is_temp, walk_files, Store};
-use super::{canonical, tree, Kind, ObjectId};
+use super::{canonical, Kind, ObjectId};
 
 /// Unreachable objects younger than this many days are kept (§8).
 pub const DEFAULT_GRACE_DAYS: u64 = 14;
@@ -158,9 +158,6 @@ fn mark(store: &Store) -> Result<HashSet<ObjectId>> {
         for (child, kind) in snapshot.references() {
             match kind {
                 Kind::Snapshot => snapshots.push(child),
-                Kind::Dir => tree::walk(store, child, &mut |id, _| {
-                    reachable.insert(id);
-                })?,
                 _ => {
                     reachable.insert(child);
                 }
@@ -180,13 +177,14 @@ fn references_of(store: &Store, id: &ObjectId) -> Vec<ObjectId> {
         return Vec::new();
     };
     match kind {
-        Kind::Snapshot => ["root", "coverage", "writes"]
+        Kind::Snapshot => ["coverage", "writes"]
             .iter()
             .filter_map(|k| payload.get(*k).and_then(Value::as_str))
             .chain(payload.get("parents").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str))
             .filter_map(|s| ObjectId::parse(s).ok())
             .collect(),
-        _ => tree::references(kind, &payload).map(|r| r.into_iter().map(|(id, _)| id).collect()).unwrap_or_default(),
+        // Coverage and writes objects reference nothing.
+        _ => Vec::new(),
     }
 }
 

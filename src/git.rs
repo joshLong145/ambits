@@ -141,18 +141,6 @@ impl Repo {
         let p = PathBuf::from(git_line(&self.dir, &["rev-parse", "--git-path", name])?);
         Some(if p.is_absolute() { p } else { self.dir.join(p) })
     }
-
-    /// The global excludes file git would use: `core.excludesFile`, else
-    /// `$XDG_CONFIG_HOME/git/ignore`, else `~/.config/git/ignore`.
-    pub fn global_excludes(&self) -> Option<PathBuf> {
-        if let Some(p) = git_line(&self.dir, &["config", "--path", "--get", "core.excludesFile"]) {
-            return Some(PathBuf::from(p));
-        }
-        let config = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-        Some(config.join("git").join("ignore"))
-    }
 }
 
 /// One line of `git status`.

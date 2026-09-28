@@ -1855,17 +1855,6 @@ mod prefilter_tests {
             &["probe"]
         }
 
-        fn name(&self) -> &'static str {
-            "probe"
-        }
-
-        fn grammar_crate(&self) -> &'static str {
-            "tree-sitter-rust"
-        }
-
-        fn symbol_schema(&self) -> u32 {
-            1
-        }
 
         fn parse_file(&self, _path: &Path, _source: &str) -> color_eyre::Result<FileSymbols> {
             panic!("parsed a file it did not need to parse");

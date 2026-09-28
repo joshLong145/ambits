@@ -118,43 +118,15 @@ fn documents_enclosing_scope(comment: tree_sitter::Node) -> bool {
     found
 }
 
+// The tree-sitter crate versions this binary was built with, from
+// `Cargo.lock` (see `build.rs`), for the journal's environment manifest.
 include!(concat!(env!("OUT_DIR"), "/grammars.rs"));
-
-/// The version of grammar crate `name` this binary was built with, from
-/// `Cargo.lock` (see `build.rs`); `"unknown"` for a build without one.
-pub fn grammar_version(name: &str) -> &'static str {
-    GRAMMARS.iter().find(|(n, _)| *n == name).map_or("unknown", |(_, v)| v)
-}
 
 /// Trait for language-specific parsers.
 /// Implement this trait to add support for a new language.
 pub trait LanguageParser: Send + Sync {
     /// File extensions this parser handles (e.g., ["rs"] for Rust).
     fn extensions(&self) -> &[&str];
-
-    /// Short language name, e.g. `"rust"`.
-    fn name(&self) -> &'static str;
-
-    /// The tree-sitter grammar crate, whose version is looked up in
-    /// [`GRAMMARS`].
-    fn grammar_crate(&self) -> &'static str;
-
-    /// This parser's `SYMBOL_SCHEMA` (spec §6.1): bumped whenever its
-    /// extraction changes.
-    fn symbol_schema(&self) -> u32;
-
-    /// Everything that determines this parser's output, as one string:
-    /// language, grammar version and symbol schema. Recorded on every `file`
-    /// object and among a snapshot's inputs.
-    fn identity(&self) -> String {
-        format!(
-            "{}:{}@{}:schema={}",
-            self.name(),
-            self.grammar_crate(),
-            grammar_version(self.grammar_crate()),
-            self.symbol_schema()
-        )
-    }
 
     /// Parse a source file into a hierarchical symbol tree.
     fn parse_file(&self, path: &Path, source: &str) -> color_eyre::Result<FileSymbols>;
@@ -282,13 +254,6 @@ impl ParserRegistry {
             .iter()
             .flat_map(|p| p.extensions().iter().map(|e| (*e).to_string()))
             .collect()
-    }
-
-    /// Every registered parser's [`LanguageParser::identity`], sorted.
-    pub fn identities(&self) -> Vec<String> {
-        let mut out: Vec<String> = self.parsers.iter().map(|p| p.identity()).collect();
-        out.sort();
-        out
     }
 
     /// Find the appropriate parser for a given file path based on extension.
