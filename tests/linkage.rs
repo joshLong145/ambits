@@ -185,6 +185,19 @@ fn a_write_committed_under_a_new_name_is_found() {
     assert_eq!(repo.landed(&w), Landed::Verified { commits: vec![commit] });
 }
 
+/// Live entries of a flat cache: the last line per key, unless it is a
+/// tombstone (`link: null`, or a never-landed key without tips).
+fn live(root: &Path, file: &str) -> usize {
+    let text = std::fs::read_to_string(root.join(".ambits").join(file)).unwrap_or_default();
+    let mut last: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    for line in text.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()) {
+        let Some(k) = line.get("k").and_then(|k| k.as_str()) else { continue };
+        let alive = line.get("link").map_or_else(|| line.get("tips").is_some(), |l| !l.is_null());
+        last.insert(k.to_string(), alive);
+    }
+    last.values().filter(|a| **a).count()
+}
+
 /// "Not landed" is cached until a branch moves; a commit then finds it.
 #[test]
 fn never_landed_is_cached_until_a_branch_moves() {
@@ -192,13 +205,12 @@ fn never_landed_is_cached_until_a_branch_moves() {
     repo.write_file("src/a.rs", EDITED);
     let w = write("toolu_1", Level::Symbol, vec![("src/a.rs::alpha", hash_of(EDITED, "alpha"))], None);
     assert_eq!(repo.landed(&w), Landed::Uncommitted);
-    let cache = repo.root.join(".ambits/cache/never-landed");
-    assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1, "cached");
+    assert_eq!(live(&repo.root, "cache/never-landed.ndjson"), 1, "cached");
 
     let commit = repo.commit_all("edit alpha");
     assert_eq!(repo.landed(&w), Landed::Verified { commits: vec![commit] });
-    assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 0, "cleared once it landed");
-    assert_eq!(std::fs::read_dir(repo.root.join(".ambits/links")).unwrap().count(), 1);
+    assert_eq!(live(&repo.root, "cache/never-landed.ndjson"), 0, "cleared once it landed");
+    assert_eq!(live(&repo.root, "links.ndjson"), 1);
 }
 
 /// `touched` reports the landing commit, as text and JSON.
@@ -346,16 +358,15 @@ fn the_git_hook_records_links() {
     assert!(hooks_dir(&repo.root).join("post-commit").exists());
 
     repo.commit_all("edit alpha");
-    let links = repo.root.join(".ambits/links");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while std::fs::read_dir(&links).map_or(0, |d| d.count()) == 0 {
+    while live(&repo.root, "links.ndjson") == 0 {
         assert!(std::time::Instant::now() < deadline, "the hook wrote no link");
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
-/// The links index is part of the private store: files `0600`, and gc
-/// sweeps the temp files an interrupted write leaves there.
+/// The links index is part of the private store: `0600`, and gc sweeps
+/// the temp files an interrupted rewrite leaves beside the flat files.
 #[cfg(unix)]
 #[test]
 fn links_are_private_and_their_temp_files_are_swept() {
@@ -365,11 +376,10 @@ fn links_are_private_and_their_temp_files_are_swept() {
     let w = write("toolu_1", Level::Symbol, vec![("src/a.rs::alpha", hash_of(EDITED, "alpha"))], None);
     repo.commit_all("edit alpha");
     repo.landed(&w);
-    let links = repo.root.join(".ambits/links");
-    let link = std::fs::read_dir(&links).unwrap().next().unwrap().unwrap().path();
-    assert_eq!(std::fs::metadata(&link).unwrap().permissions().mode() & 0o777, 0o600);
+    let links = repo.root.join(".ambits/links.ndjson");
+    assert_eq!(std::fs::metadata(&links).unwrap().permissions().mode() & 0o777, 0o600);
 
-    let stray = [links.join(".tmp-1"), repo.root.join(".ambits/cache/never-landed/.tmp-2")];
+    let stray = [repo.root.join(".ambits/.tmp-1"), repo.root.join(".ambits/cache/.tmp-2")];
     for s in &stray {
         std::fs::create_dir_all(s.parent().unwrap()).unwrap();
         std::fs::write(s, "x").unwrap();

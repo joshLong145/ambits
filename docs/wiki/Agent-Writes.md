@@ -80,8 +80,9 @@ branch:
 
 A write that touched several symbols can land in several commits; all are
 listed. The file is followed through renames. Answers are cached in
-`.ambits/links/`, and a cached commit that was amended or rebased away is
-looked up again. Symbol hashes ignore whitespace, so a commit that differs
+`.ambits/links.ndjson` (and writes found in no commit yet, in
+`.ambits/cache/never-landed.ndjson`), and a cached commit that was amended or
+rebased away is looked up again. Symbol hashes ignore whitespace, so a commit that differs
 from the agent's version only in whitespace still counts as verified.
 
 To keep the cache warm, install the optional git hook:

@@ -7,6 +7,13 @@
 
 ### Revision history
 
+**Revision 5** — flat files. A file per links-index entry cost a
+filesystem block per ~250-byte line (553 files, 2.2 MB for 136 KB here), and
+every never-landed entry repeated every branch tip. The links index, the
+never-landed cache, the reflog (which now is the refs) and notes are each one
+append-only NDJSON file under an advisory lock (§3.2, §8); objects stay
+loose. Earlier stores are refused with what to delete, not converted.
+
 **Revision 4** — after implementing phases 2–5 and using them on this
 repository: **snapshots no longer store the symbol tree** (D1, D5 revised).
 Nothing read it: restore must check reads against the project *as it is
@@ -322,22 +329,26 @@ can match; documented. A cached result is **re-checked for reachability**
 (`git merge-base --is-ancestor C <branch>` over `--branches`) before display,
 so amends and rebases re-resolve.
 
-**Links index** (`.ambits/links/`), one entry per `(op, symbol, hash)`:
+**Links index** (`.ambits/links.ndjson`), one line per `(op, symbol, hash)`
+(revision 5: flat files, below):
 
 - **Pushed as hints** (D18). The ignore filter (§4) is applied **at push
   time** — links are written after snapshots, by `touched` or the hook.
   Fetched links are re-verified locally before display (§9.4).
 - The **never-landed** cache is **local-only**, never pushed. It is keyed by
   a digest of every branch tip and `HEAD`, not `HEAD` alone, since
-  resolution searches all branches (`.ambits/cache/never-landed/`).
-- Entries are files named by `BLAKE3(op, target, hash)`, so no journal
-  string becomes a path.
+  resolution searches all branches (`.ambits/cache/never-landed.ndjson`).
+- Entries are keyed by `BLAKE3(op, target, hash)`; the last line per key
+  wins, and a link whose commit is gone gets a `null` line. Each set of
+  branch tips is written once and referenced by digest.
 - A never-landed entry records the branch tips it was searched up to and
   the names the file had. While the tips are unchanged it answers directly;
   after they move, only `git log <tips> --not <old tips>` is searched, so a
   post-commit refresh costs one commit's worth, not the whole window.
-- Caching is best-effort (never fails `touched`), and cache files are
-  renamed into place without fsync: losing one only means resolving again.
+- Caching is best-effort (never fails `touched`): a resolver reads both
+  files once and appends what it learned when it is dropped, under each
+  file's lock, without fsync — losing a line only means resolving again.
+  Once most lines are dead the file is rewritten with the live ones.
 - **Known limits:** content introduced while resolving a merge conflict
   never lands, since merge commits list no changes; files whose names have
   `:`, `\` or control characters never match; a history whose commit clocks
@@ -528,13 +539,23 @@ are ordinary snapshots (rev 4).
 .ambits/
   coverage/                          # journal shards (v3)
   objects/ab/cdef….json              # loose objects, uncompressed canonical JSON
-  refs/sessions/<session-id>
-  refs/remotes/<remote>/sessions/<id>
-  logs/refs/…                        # reflog
-  links/…                            # links index (§3.2), keyed by (op, symbol, hash)
-  cache/never-landed/…               # local-only (§3.2)
-  notes/<snapshot-id>.json           # time, message, version — no host, branch or root (D16)
+  reflog.ndjson                      # every ref move; a ref's tip is its last line
+  notes.ndjson                       # per snapshot: time, message, version — no host, branch or root (D16)
+  links.ndjson                       # links index (§3.2), keyed by (op, symbol, hash)
+  cache/never-landed.ndjson          # local-only (§3.2)
   config
+```
+
+Revision 5: everything but objects is a **flat, append-only NDJSON file**
+(`src/objects/flat.rs`), not a file per entry — a file per link cost a
+filesystem block per 250 bytes. Every write (append or rewrite) holds
+`<file>.lock`, an OS advisory lock, so a rewrite cannot lose an append made
+meanwhile; readers take no lock and skip a line a crash cut short. Objects
+stay loose: immutable, large, few, and what sync will move. A store in the
+earlier layout is refused with what to delete, not converted (pre-1.0).
+
+```text
+reflog line: {"ref":"refs/sessions/<id>","old":…,"new":…,"secs":…,"time":…,"action":…}
 ```
 
 - Store mode `0700`, files `0600`.
@@ -545,17 +566,19 @@ are ordinary snapshots (rev 4).
   children. A tip whose objects are missing anyway is rebuilt from the
   unchanged state by the next `snapshot` (the no-op check verifies
   `coverage` and `writes` exist). Loose objects uncompressed (zstd with packs, phase 7).
-- **Ref updates**: create `<ref>.lock` exclusively containing **pid, start time
-  and a random token** (no host, D16); re-read the ref after locking; write;
-  rename; append to the reflog.
-- **Reflog** entries expire after 90 days (`gc --reflog-expiry-days`).
+- **Ref updates**: take `reflog.ndjson.lock`; re-read the ref's tip (its
+  last line) and refuse if it moved; append the move, fsynced.
+- **Reflog** entries expire after 90 days (`gc --reflog-expiry-days`),
+  except each ref's latest, which is where it points.
 - **gc** (found necessary by the model, §16):
   - `gc` holds `.ambits/gc.lock` **exclusively**; `snapshot`, `fetch` and
     `pull` hold it **shared** for their duration. It is an OS advisory lock
     (`flock` on Unix, `LockFileEx` on Windows — e.g. via the `fs2` crate),
     not a create-exclusive file, so a crashed holder releases it and cannot
     block gc forever.
-  - Roots: refs, `refs/remotes/*`, unexpired reflog entries.
+  - Roots: every ref's tip (local and, later, remote-tracking) and every
+    unexpired reflog entry. gc refuses a store in the earlier layout, where
+    it would find no refs and collect everything.
   - Deletes only unreachable objects older than a **grace period** (default
     14 days), **re-checking age at the moment of deletion**, and in
     **parents-first order**, so a present object always has its children.

@@ -118,9 +118,19 @@ Everything lives under `.ambits/`, private to your user:
 | Path | Holds |
 |---|---|
 | `objects/ab/cdef….json` | Coverage, writes and snapshots, as canonical JSON |
-| `refs/sessions/<id>` | The latest snapshot of each session |
-| `logs/refs/sessions/<id>` | Every move of that ref (the reflog) |
-| `notes/<snapshot>.json` | Time, message and ambits version — never host, branch or path |
+| `reflog.ndjson` | Every move of every session's ref, one line each; a session's latest snapshot is its last line |
+| `notes.ndjson` | Per snapshot: time, message and ambits version — never host, branch or path |
+| `links.ndjson` | Where agent writes landed ([Agent Writes](Agent-Writes#which-commit-it-landed-in)) |
+| `cache/never-landed.ndjson` | Writes not found in any commit yet, and the branch tips searched; local only |
+
+Everything but objects is one flat, append-only file: writers take the
+file's lock (`<file>.lock`), readers never wait, and a line cut short by a
+crash is skipped. Objects stay one file each: they are immutable, large, and
+what a future sync will move.
+
+A store from before this layout (`refs/`, `logs/`, `notes/` directories) is
+not converted: `snapshot`, `log`, `restore` and `gc` refuse it and say what
+to delete.
 
 The format is specified in the design spike,
 [`docs/spikes/coverage-snapshots.md`](https://github.com/joshLong145/ambits/blob/main/docs/spikes/coverage-snapshots.md).

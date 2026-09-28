@@ -61,7 +61,7 @@ impl Snapshot {
         if v.get("format").is_none() {
             bail!(
                 "snapshot {} was written by an older ambits (object format 1) and cannot be read; \
-                 delete .ambits/objects, .ambits/refs, .ambits/logs and .ambits/notes to start a new history",
+                 delete .ambits/objects, .ambits/reflog.ndjson and .ambits/notes.ndjson to start a new history",
                 id.short()
             );
         }
@@ -263,6 +263,7 @@ pub fn history(store: &Store, start: ObjectId) -> Result<Vec<LogEntry>> {
     let count = |id: &ObjectId, kind: Kind, key: &str| -> Result<usize> {
         Ok(store.get(id, kind)?.get(key).and_then(Value::as_array).map_or(0, Vec::len))
     };
+    let mut notes = refs::notes(store);
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![start];
@@ -273,7 +274,7 @@ pub fn history(store: &Store, start: ObjectId) -> Result<Vec<LogEntry>> {
         let snapshot = Snapshot::load(store, id)?;
         stack.extend(snapshot.parents.iter().copied());
         out.push(LogEntry {
-            note: refs::read_note(store, &id),
+            note: notes.remove(&id),
             reads: count(&snapshot.coverage, Kind::Coverage, "reads")?,
             writes: count(&snapshot.writes, Kind::Writes, "writes")?,
             snapshot,

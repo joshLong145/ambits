@@ -11,6 +11,7 @@
 //! - [`gc`] — reclaiming unreachable objects.
 
 pub mod canonical;
+pub mod flat;
 pub mod gc;
 pub mod inputs;
 pub mod record;

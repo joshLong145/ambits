@@ -232,9 +232,10 @@ fn crash_then_gc_then_snapshot_never_loses_an_object() {
     // A "crashed" snapshot: its objects are written, the ref was not moved.
     std::fs::write(p.root.join("src/a.rs"), "fn alpha() { 9; }\n").unwrap();
     let orphan = created(p.snap());
-    let ref_path = p.root.join(format!(".ambits/refs/sessions/{SESSION}"));
-    std::fs::write(&ref_path, format!("{kept}\n")).unwrap();
-    let _ = std::fs::remove_dir_all(p.root.join(".ambits/logs"));
+    // The reflog as it was before the crashed snapshot moved the ref.
+    let reflog = p.root.join(".ambits/reflog.ndjson");
+    let first = std::fs::read_to_string(&reflog).unwrap().lines().next().unwrap().to_string();
+    std::fs::write(&reflog, format!("{first}\n")).unwrap();
 
     // Within the grace period nothing unreachable goes.
     let young = gc::gc(&p.store(), gc::DEFAULT_GRACE, ambits::objects::refs::REFLOG_EXPIRY).unwrap();
@@ -259,8 +260,7 @@ fn gc_deletes_parents_before_children() {
     let _ = created(p.snap());
     std::fs::write(p.root.join("src/a.rs"), "fn alpha() { 1; }\n").unwrap();
     let _ = created(p.snap());
-    std::fs::remove_dir_all(p.root.join(".ambits/refs")).unwrap();
-    std::fs::remove_dir_all(p.root.join(".ambits/logs")).unwrap();
+    std::fs::remove_file(p.root.join(".ambits/reflog.ndjson")).unwrap();
 
     // Record who references whom before gc removes it all.
     let mut references: Vec<(ObjectId, Vec<ObjectId>)> = Vec::new();
@@ -369,15 +369,13 @@ fn an_extra_field_in_a_snapshot_is_refused() {
     assert!(Snapshot::load(&p.store(), id).is_err());
 }
 
-/// Temp files a crash left are collected, and a leftover one in `refs/`
-/// is never mistaken for a ref.
+/// Temp files a crash left beside the flat files are collected.
 #[test]
 fn gc_collects_leftover_temp_files() {
     let p = Project::new();
     created(p.snap());
-    let stray = p.root.join(".ambits/refs/sessions/.tmp-deadbeef");
-    std::fs::write(&stray, format!("{}\n", "0".repeat(64))).unwrap();
-    assert!(ambits::objects::refs::all(&p.store()).iter().all(|(name, _)| !name.contains(".tmp-")));
+    let stray = p.root.join(".ambits/.tmp-deadbeef");
+    std::fs::write(&stray, "{}\n").unwrap();
     let stats = gc::gc(&p.store(), Duration::ZERO, ambits::objects::refs::REFLOG_EXPIRY).unwrap();
     assert_eq!(stats.temp_files_removed, 1);
     assert!(!stray.exists());

@@ -3,9 +3,11 @@
 //! Resolved lazily, per *unit* of a write — each `(op, symbol, hash)` of a
 //! symbol-level write, or the file of a file-level one — because one write's
 //! symbols can land in different commits (`git add -p`). Results are kept in
-//! the **links index** (`.ambits/links/`), re-checked for reachability before
-//! use so amends and rebases re-resolve; misses go to the local-only
-//! **never-landed** cache, valid until any branch moves.
+//! the **links index** (`.ambits/links.ndjson`), re-checked for reachability
+//! before use so amends and rebases re-resolve; misses go to the local-only
+//! **never-landed** cache (`.ambits/cache/never-landed.ndjson`), valid until
+//! any branch moves. Both are flat files ([`crate::objects::flat`]): read
+//! once per [`Resolver`], written when it is dropped.
 //!
 //! Nothing here reads file contents into anything persisted: blobs are
 //! parsed or hashed and dropped (§9.6).
@@ -125,10 +127,74 @@ enum Change {
 
 /// The never-landed cache entry: the branch tips a unit was last searched
 /// up to, and the names its file had by then.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct NeverLanded {
     tips: Vec<String>,
     names: Vec<String>,
+}
+
+/// A line of the links index: where a unit landed, or `null` once that
+/// commit is gone (amended, rebased away).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LinkLine {
+    k: String,
+    link: Option<Link>,
+}
+
+/// A line of the never-landed cache: a set of branch tips, stored once
+/// (`tips` + `list`); a unit searched up to them (`k` + `tips` + `names`);
+/// or a unit that has since landed (`k` alone).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct NeverLine {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    k: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tips: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    list: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    names: Option<Vec<String>>,
+}
+
+/// Both caches, folded (last line per key wins), and what this resolver
+/// has learned since.
+#[derive(Debug, Default)]
+struct Caches {
+    loaded: bool,
+    links: HashMap<String, Option<Link>>,
+    /// Unit → (tips digest, names); `None` once it landed.
+    never: HashMap<String, Option<(String, Vec<String>)>>,
+    tip_lists: HashMap<String, Vec<String>>,
+    new_links: Vec<LinkLine>,
+    new_never: Vec<NeverLine>,
+}
+
+fn fold_links(lines: Vec<LinkLine>, into: &mut HashMap<String, Option<Link>>) {
+    for l in lines {
+        into.insert(l.k, l.link);
+    }
+}
+
+fn fold_never(lines: Vec<NeverLine>, never: &mut HashMap<String, Option<(String, Vec<String>)>>, tip_lists: &mut HashMap<String, Vec<String>>) {
+    for l in lines {
+        match l {
+            NeverLine { k: None, tips: Some(d), list: Some(list), .. } => {
+                tip_lists.insert(d, list);
+            }
+            NeverLine { k: Some(k), tips: Some(d), names, .. } => {
+                never.insert(k, Some((d, names.unwrap_or_default())));
+            }
+            NeverLine { k: Some(k), tips: None, .. } => {
+                never.insert(k, None);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A set of branch tips, by content.
+fn tips_digest(tips: &[String]) -> String {
+    crate::objects::hash_framed("ambits-tips v1", tips.iter().map(|t| t.as_bytes())).to_hex().to_string()
 }
 
 /// Resolves units against one repository.
@@ -147,6 +213,7 @@ pub struct Resolver {
     contents: HashMap<(String, String), FileContents>,
     /// Whether each commit is reachable, asked once: many links share one.
     reachable: HashMap<String, bool>,
+    caches: Caches,
 }
 
 /// Arguments every `git log` here runs with, overriding user config that
@@ -163,16 +230,85 @@ impl Resolver {
     pub fn new(project_root: &Path) -> Option<Self> {
         let repo = Repo::discover(project_root).filter(|r| r.head.is_some())?;
         let tips = tips(&repo);
+        let state = project_root.join(crate::state_dir::STATE_DIR);
+        // A file per entry, as older ambits kept them: caches, so dropped.
+        let _ = std::fs::remove_dir_all(state.join("links"));
+        let _ = std::fs::remove_dir_all(state.join(crate::state_dir::CACHE).join("never-landed"));
         Some(Self {
             repo,
-            state: project_root.join(crate::state_dir::STATE_DIR),
+            state,
             registry: ParserRegistry::new(),
             log: Vec::new(),
             log_since: None,
             tips,
             contents: HashMap::new(),
             reachable: HashMap::new(),
+            caches: Caches::default(),
         })
+    }
+
+    fn links_file(&self) -> crate::objects::flat::FlatLog {
+        crate::objects::flat::FlatLog::at(self.state.join(crate::state_dir::LINKS))
+    }
+
+    fn never_file(&self) -> crate::objects::flat::FlatLog {
+        crate::objects::flat::FlatLog::at(self.state.join(crate::state_dir::CACHE).join(crate::state_dir::NEVER_LANDED))
+    }
+
+    /// Read both caches, once.
+    fn load(&mut self) {
+        if self.caches.loaded {
+            return;
+        }
+        self.caches.loaded = true;
+        fold_links(self.links_file().read(), &mut self.caches.links);
+        let lines = self.never_file().read();
+        fold_never(lines, &mut self.caches.never, &mut self.caches.tip_lists);
+    }
+
+    /// Write what was learned: appended under each file's lock, or, once
+    /// most of a file is dead lines, the file rewritten with what is live —
+    /// merged with whatever other writers appended meanwhile. Best-effort:
+    /// a cache that cannot be written costs speed, never the answer.
+    pub fn flush(&mut self) -> Result<()> {
+        use crate::objects::flat::worth_compacting;
+        use crate::objects::store::Durability;
+        let new_links = std::mem::take(&mut self.caches.new_links);
+        if !new_links.is_empty() {
+            let file = self.links_file();
+            let lock = file.lock()?;
+            let on_disk: Vec<LinkLine> = file.read();
+            let lines = file.line_count() + new_links.len();
+            let mut folded = HashMap::new();
+            fold_links(on_disk, &mut folded);
+            fold_links(new_links.clone(), &mut folded);
+            let live: Vec<LinkLine> = folded.into_iter().filter(|(_, l)| l.is_some()).map(|(k, link)| LinkLine { k, link }).collect();
+            if worth_compacting(lines, live.len()) {
+                file.rewrite(&lock, &live, Durability::NoSync)?;
+            } else {
+                file.append(&lock, &new_links, Durability::NoSync)?;
+            }
+        }
+        let new_never = std::mem::take(&mut self.caches.new_never);
+        if !new_never.is_empty() {
+            let file = self.never_file();
+            let lock = file.lock()?;
+            let lines = file.line_count() + new_never.len();
+            let (mut never, mut lists) = (HashMap::new(), HashMap::new());
+            fold_never(file.read(), &mut never, &mut lists);
+            fold_never(new_never.clone(), &mut never, &mut lists);
+            let live: Vec<(String, (String, Vec<String>))> = never.into_iter().filter_map(|(k, v)| Some((k, v?))).collect();
+            let used: std::collections::HashSet<&String> = live.iter().map(|(_, (d, _))| d).collect();
+            if worth_compacting(lines, live.len() + used.len()) {
+                let mut out: Vec<NeverLine> =
+                    lists.iter().filter(|(d, _)| used.contains(d)).map(|(d, l)| NeverLine { tips: Some(d.clone()), list: Some(l.clone()), ..Default::default() }).collect();
+                out.extend(live.iter().map(|(k, (d, names))| NeverLine { k: Some(k.clone()), tips: Some(d.clone()), names: Some(names.clone()), ..Default::default() }));
+                file.rewrite(&lock, &out, Durability::NoSync)?;
+            } else {
+                file.append(&lock, &new_never, Durability::NoSync)?;
+            }
+        }
+        Ok(())
     }
 
     fn dir(&self) -> &Path {
@@ -197,19 +333,21 @@ impl Resolver {
     /// is still reachable, else resolved and cached. Caching is best-effort:
     /// a store that cannot be written costs speed, never the answer.
     pub fn landing(&mut self, write: &WriteRecord, unit: &Unit) -> Result<Landing> {
+        self.load();
         let key = link_key(&write.op, &unit.target, unit.hash());
-        let link_path = self.state.join(crate::state_dir::LINKS).join(format!("{key}.json"));
-        let never_path = self.state.join(crate::state_dir::CACHE).join("never-landed").join(format!("{key}.json"));
 
-        if let Some(link) = std::fs::read_to_string(&link_path).ok().and_then(|s| serde_json::from_str::<Link>(&s).ok()) {
+        if let Some(link) = self.caches.links.get(&key).cloned().flatten() {
             if is_commit_id(&link.commit) && self.reachable(&link.commit) {
                 return Ok(Landing::Landed(link));
             }
             // Amended or rebased away: resolve again.
-            let _ = std::fs::remove_file(&link_path);
+            self.caches.links.insert(key.clone(), None);
+            self.caches.new_links.push(LinkLine { k: key.clone(), link: None });
         }
 
-        let cached: Option<NeverLanded> = std::fs::read_to_string(&never_path).ok().and_then(|s| serde_json::from_str(&s).ok());
+        let cached: Option<NeverLanded> = self.caches.never.get(&key).cloned().flatten().and_then(|(digest, names)| {
+            Some(NeverLanded { tips: self.caches.tip_lists.get(&digest)?.clone(), names })
+        });
         let (landing, names) = match cached {
             // Nothing has moved since it was last searched.
             Some(c) if c.tips == self.tips => return Ok(Landing::Uncommitted),
@@ -223,12 +361,21 @@ impl Resolver {
         };
         match &landing {
             Landing::Landed(link) => {
-                let _ = write_cache(&link_path, &serde_json::to_vec(link)?);
-                let _ = std::fs::remove_file(&never_path);
+                self.caches.links.insert(key.clone(), Some(link.clone()));
+                self.caches.new_links.push(LinkLine { k: key.clone(), link: Some(link.clone()) });
+                if matches!(self.caches.never.get(&key), Some(Some(_))) {
+                    self.caches.never.insert(key.clone(), None);
+                    self.caches.new_never.push(NeverLine { k: Some(key), ..Default::default() });
+                }
             }
             Landing::Uncommitted => {
-                let entry = NeverLanded { tips: self.tips.clone(), names };
-                let _ = write_cache(&never_path, &serde_json::to_vec(&entry)?);
+                let digest = tips_digest(&self.tips);
+                if !self.caches.tip_lists.contains_key(&digest) {
+                    self.caches.tip_lists.insert(digest.clone(), self.tips.clone());
+                    self.caches.new_never.push(NeverLine { tips: Some(digest.clone()), list: Some(self.tips.clone()), ..Default::default() });
+                }
+                self.caches.never.insert(key.clone(), Some((digest.clone(), names.clone())));
+                self.caches.new_never.push(NeverLine { k: Some(key), tips: Some(digest), names: Some(names), ..Default::default() });
             }
         }
         Ok(landing)
@@ -426,14 +573,15 @@ fn tips(repo: &Repo) -> Vec<String> {
     tips
 }
 
-/// Write a cache file: private and atomic, but not fsynced — losing one
-/// to a crash only means resolving it again.
-fn write_cache(path: &Path, bytes: &[u8]) -> Result<()> {
-    crate::objects::store::write_atomic_with(path, bytes, crate::objects::store::Durability::NoSync)
+impl Drop for Resolver {
+    fn drop(&mut self) {
+        if let Err(e) = self.flush() {
+            log::warn!(target: "ambits::linkage", "links cache not written: {e}");
+        }
+    }
 }
 
-/// The file name of a unit's entry: a hash of `(op, target, hash)`, so
-/// untrusted strings never become paths.
+/// A unit's key in both caches: a hash of `(op, target, hash)`.
 fn link_key(op: &str, target: &str, hash: Option<&str>) -> String {
     let parts = [op, target, hash.unwrap_or("")];
     crate::objects::hash_framed("ambits-link v1", parts.iter().map(|p| p.as_bytes())).to_hex().to_string()
@@ -578,9 +726,80 @@ mod tests {
         let unit = &units(&write)[0];
         let mut resolver = Resolver::new(&root).unwrap();
         let key = link_key(&write.op, &unit.target, unit.hash());
-        let entry = NeverLanded { tips: resolver.tips.clone(), names: vec!["a.txt".into()] };
-        write_cache(&root.join(".ambits/cache/never-landed").join(format!("{key}.json")), &serde_json::to_vec(&entry).unwrap()).unwrap();
+        let digest = tips_digest(&resolver.tips);
+        let file = resolver.never_file();
+        let lock = file.lock().unwrap();
+        let lines = [
+            NeverLine { tips: Some(digest.clone()), list: Some(resolver.tips.clone()), ..Default::default() },
+            NeverLine { k: Some(key), tips: Some(digest), names: Some(vec!["a.txt".into()]), ..Default::default() },
+        ];
+        file.append(&lock, &lines, crate::objects::store::Durability::NoSync).unwrap();
+        drop(lock);
         assert_eq!(resolver.landing(&write, unit).unwrap(), Landing::Uncommitted);
+    }
+
+    /// A repo with one commit of `a.txt`, and `n` file-level writes to it
+    /// that never landed (their file hash matches nothing).
+    fn unlanded(n: usize) -> (tempfile::TempDir, PathBuf, Vec<WriteRecord>) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        for args in [&["init", "-q"][..], &["add", "."], &["commit", "-qm", "c"]] {
+            crate::git::test_git(&root, args, &[]);
+        }
+        let writes = (0..n)
+            .map(|i| WriteRecord {
+                op: format!("toolu_{i}"),
+                av: 2,
+                t: crate::time::rfc3339(crate::time::now_secs() - 60),
+                tool: "Write".into(),
+                file: "a.txt".into(),
+                fh: Some(crate::objects::file_hash(format!("never {i}").as_bytes())),
+                ..Default::default()
+            })
+            .collect();
+        (dir, root, writes)
+    }
+
+    /// What one resolver learns, the next reads from one flat file: the
+    /// branch tips stored once, however many units share them.
+    #[test]
+    fn the_caches_are_two_flat_files_read_back_by_the_next_resolver() {
+        let (_dir, root, writes) = unlanded(3);
+        std::fs::create_dir_all(root.join(".ambits/links")).unwrap();
+        std::fs::create_dir_all(root.join(".ambits/cache/never-landed")).unwrap();
+        {
+            let mut r = Resolver::new(&root).unwrap();
+            assert!(!root.join(".ambits/links").exists(), "the per-entry cache is dropped");
+            for w in &writes {
+                assert_eq!(r.landing(w, &units(w)[0]).unwrap(), Landing::Uncommitted);
+            }
+        }
+        let file = crate::objects::flat::FlatLog::at(root.join(".ambits/cache/never-landed.ndjson"));
+        let lines: Vec<NeverLine> = file.read();
+        assert_eq!(lines.iter().filter(|l| l.list.is_some()).count(), 1, "one tip list");
+        assert_eq!(lines.iter().filter(|l| l.k.is_some()).count(), 3);
+        assert_eq!(std::fs::read_dir(root.join(".ambits/cache")).unwrap().count(), 2, "the file and its lock");
+
+        let mut r = Resolver::new(&root).unwrap();
+        r.load();
+        assert_eq!(r.caches.never.values().flatten().count(), 3);
+    }
+
+    /// Once most lines are dead, a flush rewrites the file with what is live.
+    #[test]
+    fn a_mostly_dead_cache_is_compacted() {
+        let (_dir, root, writes) = unlanded(1);
+        let (w, unit) = (&writes[0], &units(&writes[0])[0]);
+        for _ in 0..80 {
+            // A branch moving each time makes every search a new entry.
+            let mut r = Resolver::new(&root).unwrap();
+            r.tips.push(format!("{:040x}", r.tips.len() + crate::time::now_secs() as usize));
+            r.tips.sort();
+            r.landing(w, unit).unwrap();
+        }
+        let lines = crate::objects::flat::FlatLog::at(root.join(".ambits/cache/never-landed.ndjson")).line_count();
+        assert!(lines <= 70, "compacted, not 160 lines: {lines}");
     }
 
     #[test]

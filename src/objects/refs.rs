@@ -1,20 +1,21 @@
-//! Session refs, their lock, the reflog and notes (spec §8).
+//! Session refs, the reflog and notes (spec §8), each one flat file:
 //!
 //! ```text
-//! .ambits/refs/sessions/<session-id>       tip snapshot id
-//! .ambits/logs/refs/sessions/<session-id>  reflog, one JSON line per move
-//! .ambits/notes/<snapshot-id>.json         time, message, version
+//! .ambits/reflog.ndjson   one line per ref move; a ref's tip is its last
+//! .ambits/notes.ndjson    one line per snapshot: time, message, version
 //! ```
+//!
+//! The reflog is the refs: moving a ref appends its entry under the file's
+//! lock, after checking the ref still points where the caller saw it.
 
-use std::fs;
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use std::time::Duration;
 
-use color_eyre::eyre::{bail, Result, WrapErr};
+use color_eyre::eyre::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-use super::store::{create_private_dir, is_temp, private_options, random_token, walk_files, write_atomic, Store};
+use super::flat::FlatLog;
+use super::store::{Durability, Store};
 use super::ObjectId;
 use crate::time::{now_rfc3339, now_secs};
 
@@ -24,7 +25,7 @@ pub const REFLOG_EXPIRY_DAYS: u64 = 90;
 /// [`REFLOG_EXPIRY_DAYS`] as a duration.
 pub const REFLOG_EXPIRY: Duration = Duration::from_secs(REFLOG_EXPIRY_DAYS * crate::time::SECS_PER_DAY);
 
-/// A validated ref name, relative to `.ambits/`, e.g. `refs/sessions/<id>`.
+/// A validated ref name, e.g. `refs/sessions/<id>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefName(String);
 
@@ -48,86 +49,37 @@ impl RefName {
     }
 }
 
-fn ref_path(store: &Store, name: &RefName) -> PathBuf {
-    store.root().join(name.as_str())
-}
+/// Directories an older ambits kept refs, reflogs and notes in.
+const OLD_LAYOUT: [&str; 3] = ["refs", "logs", "notes"];
 
-fn reflog_path(store: &Store, name: &RefName) -> PathBuf {
-    store.root().join(crate::state_dir::LOGS).join(name.as_str())
-}
-
-/// The snapshot `name` points at, if any.
-pub fn read(store: &Store, name: &RefName) -> Result<Option<ObjectId>> {
-    match fs::read_to_string(ref_path(store, name)) {
-        Ok(s) => Ok(Some(ObjectId::parse(s.trim())?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).wrap_err_with(|| format!("reading {}", name.as_str())),
+/// Refuse a store laid out by an older ambits: pre-1.0, it is not
+/// converted.
+fn check_layout(store: &Store) -> Result<()> {
+    let old: Vec<&str> = OLD_LAYOUT.into_iter().filter(|d| store.root().join(d).is_dir()).collect();
+    if !old.is_empty() {
+        let dirs: Vec<String> = old.iter().map(|d| format!(".ambits/{d}")).collect();
+        bail!(
+            "this snapshot store was written by an older ambits (a file per ref, reflog and note) and is not converted; \
+             delete {} and .ambits/objects to start a new history",
+            dirs.join(", ")
+        );
     }
+    Ok(())
 }
 
-/// Every ref under `.ambits/refs/`, local and remote-tracking, with its tip.
-pub fn all(store: &Store) -> Vec<(String, ObjectId)> {
-    let mut out: Vec<(String, ObjectId)> = walk_files(&store.root().join(crate::state_dir::REFS))
-        .into_iter()
-        .filter(|p| !is_temp(p) && p.extension().is_none_or(|e| e != "lock"))
-        .filter_map(|path| {
-            let id = ObjectId::parse(fs::read_to_string(&path).ok()?.trim()).ok()?;
-            let name = path.strip_prefix(store.root()).unwrap_or(&path).to_string_lossy().replace('\\', "/");
-            Some((name, id))
-        })
-        .collect();
-    out.sort();
-    out
+fn reflog_file(store: &Store) -> FlatLog {
+    FlatLog::at(store.root().join(crate::state_dir::REFLOG))
 }
 
-/// Held while a ref is being moved: `<ref>.lock`, created exclusively and
-/// holding a pid, start time and random token — no host (D16). Removed on
-/// drop.
-struct RefLock(PathBuf);
-
-impl RefLock {
-    fn acquire(path: &Path) -> Result<Self> {
-        let lock = path.with_extension("lock");
-        create_private_dir(lock.parent().unwrap_or(path))?;
-        let mut file = match private_options().create_new(true).open(&lock) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let holder = fs::read_to_string(&lock).unwrap_or_default();
-                bail!("{} is locked by another ambits process ({}); if none is running, delete the lock file", lock.display(), holder.trim());
-            }
-            Err(e) => return Err(e).wrap_err_with(|| format!("locking {}", lock.display())),
-        };
-        let body = serde_json::json!({"pid": std::process::id(), "start": now_secs(), "token": random_token()});
-        file.write_all(body.to_string().as_bytes())?;
-        Ok(Self(lock))
-    }
+fn notes_file(store: &Store) -> FlatLog {
+    FlatLog::at(store.root().join(crate::state_dir::NOTES))
 }
 
-impl Drop for RefLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
-/// Move `name` from `expected` to `new`, and record the move in the reflog.
-///
-/// The ref is re-read after locking: if it no longer holds `expected`,
-/// another process moved it and nothing is written.
-pub fn update(store: &Store, name: &RefName, expected: Option<ObjectId>, new: ObjectId, action: &str) -> Result<()> {
-    let path = ref_path(store, name);
-    let _lock = RefLock::acquire(&path)?;
-    let current = read(store, name)?;
-    if current != expected {
-        bail!("{} moved while this snapshot was being made; run it again", name.as_str());
-    }
-    write_atomic(&path, format!("{new}\n").as_bytes())?;
-    super::store::fsync_dir(path.parent().unwrap_or(&path))?;
-    append_reflog(store, name, &ReflogEntry { old: current.map(|c| c.hex()), new: new.hex(), secs: now_secs(), time: now_rfc3339(), action: action.to_string() })
-}
-
-/// One reflog line.
+/// One move of one ref.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReflogEntry {
+    #[serde(rename = "ref")]
+    pub name: String,
     pub old: Option<String>,
     pub new: String,
     /// Seconds since the epoch, for expiry.
@@ -136,46 +88,70 @@ pub struct ReflogEntry {
     pub action: String,
 }
 
-fn append_reflog(store: &Store, name: &RefName, entry: &ReflogEntry) -> Result<()> {
-    let path = reflog_path(store, name);
-    create_private_dir(path.parent().unwrap_or(&path))?;
-    let mut file = private_options()
-        .create(true)
-        .append(true)
-        .open(&path).wrap_err_with(|| format!("opening {}", path.display()))?;
-    file.write_all(format!("{}\n", serde_json::to_string(entry)?).as_bytes())?;
-    file.sync_all()?;
-    Ok(())
+/// Every ref's tip: the `new` of its last entry.
+fn tips(entries: &[ReflogEntry]) -> HashMap<&str, &str> {
+    entries.iter().map(|e| (e.name.as_str(), e.new.as_str())).collect()
 }
 
-/// Every reflog, as `(file, entries)`. Unparseable lines are skipped.
-pub fn reflogs(store: &Store) -> Vec<(PathBuf, Vec<ReflogEntry>)> {
-    walk_files(&store.root().join(crate::state_dir::LOGS))
-        .into_iter()
-        .filter(|p| !is_temp(p))
-        .map(|path| {
-            let entries = fs::read_to_string(&path)
-                .unwrap_or_default()
-                .lines()
-                .filter_map(|l| serde_json::from_str(l).ok())
-                .collect();
-            (path, entries)
-        })
-        .collect()
+/// The snapshot `name` points at, if any.
+pub fn read(store: &Store, name: &RefName) -> Result<Option<ObjectId>> {
+    check_layout(store)?;
+    let entries = reflog(store);
+    tips(&entries).get(name.as_str()).map(|t| ObjectId::parse(t)).transpose()
 }
 
-/// Drop reflog entries older than `expiry`, rewriting each log atomically.
+/// Every ref, local and remote-tracking, with its tip.
+pub fn all(store: &Store) -> Vec<(String, ObjectId)> {
+    let entries = reflog(store);
+    let mut out: Vec<(String, ObjectId)> =
+        tips(&entries).into_iter().filter_map(|(name, tip)| Some((name.to_string(), ObjectId::parse(tip).ok()?))).collect();
+    out.sort();
+    out
+}
+
+/// Move `name` from `expected` to `new`: one reflog entry, appended under
+/// the reflog's lock once the ref is seen to hold `expected` still — if it
+/// does not, another process moved it and nothing is written.
+pub fn update(store: &Store, name: &RefName, expected: Option<ObjectId>, new: ObjectId, action: &str) -> Result<()> {
+    check_layout(store)?;
+    let file = reflog_file(store);
+    let lock = file.lock()?;
+    let entries = reflog(store);
+    let current = tips(&entries).get(name.as_str()).and_then(|t| ObjectId::parse(t).ok());
+    if current != expected {
+        bail!("{} moved while this snapshot was being made; run it again", name.as_str());
+    }
+    let entry = ReflogEntry {
+        name: name.as_str().to_string(),
+        old: current.map(|c| c.hex()),
+        new: new.hex(),
+        secs: now_secs(),
+        time: now_rfc3339(),
+        action: action.to_string(),
+    };
+    file.append(&lock, &[entry], Durability::Fsync)
+}
+
+/// Every reflog entry, oldest first. Unparseable lines are skipped.
+pub fn reflog(store: &Store) -> Vec<ReflogEntry> {
+    reflog_file(store).read()
+}
+
+/// Drop reflog entries older than `expiry` — but never a ref's latest,
+/// which is where it points.
 pub fn expire_reflogs(store: &Store, expiry: Duration) -> Result<usize> {
+    // gc runs this first: on an old layout it would see no refs, and
+    // collect every object.
+    check_layout(store)?;
     let cutoff = now_secs().saturating_sub(expiry.as_secs());
-    let mut dropped = 0;
-    for (path, entries) in reflogs(store) {
-        let kept: Vec<&ReflogEntry> = entries.iter().filter(|e| e.secs >= cutoff).collect();
-        if kept.len() == entries.len() {
-            continue;
-        }
-        dropped += entries.len() - kept.len();
-        let body: String = kept.iter().map(|e| format!("{}\n", serde_json::to_string(e).unwrap_or_default())).collect();
-        write_atomic(&path, body.as_bytes())?;
+    let file = reflog_file(store);
+    let lock = file.lock()?;
+    let entries = reflog(store);
+    let last: HashMap<&str, usize> = entries.iter().enumerate().map(|(i, e)| (e.name.as_str(), i)).collect();
+    let kept: Vec<&ReflogEntry> = entries.iter().enumerate().filter(|(i, e)| e.secs >= cutoff || last[e.name.as_str()] == *i).map(|(_, e)| e).collect();
+    let dropped = entries.len() - kept.len();
+    if dropped > 0 {
+        file.rewrite(&lock, &kept, Durability::Fsync)?;
     }
     Ok(dropped)
 }
@@ -190,17 +166,45 @@ pub struct Note {
     pub version: String,
 }
 
-pub fn note_path(store: &Store, id: &ObjectId) -> PathBuf {
-    store.root().join(crate::state_dir::NOTES).join(format!("{id}.json"))
+/// A note as stored: with the snapshot it belongs to.
+#[derive(Serialize, Deserialize)]
+struct NoteLine {
+    id: String,
+    #[serde(flatten)]
+    note: Note,
 }
 
 pub fn write_note(store: &Store, id: &ObjectId, message: Option<&str>) -> Result<()> {
+    check_layout(store)?;
     let note = Note { time: now_rfc3339(), message: message.map(String::from), version: env!("CARGO_PKG_VERSION").to_string() };
-    write_atomic(&note_path(store, id), serde_json::to_string(&note)?.as_bytes())
+    let file = notes_file(store);
+    let lock = file.lock()?;
+    file.append(&lock, &[NoteLine { id: id.hex(), note }], Durability::Fsync)
+}
+
+/// Every snapshot's note; the last written wins.
+pub fn notes(store: &Store) -> HashMap<ObjectId, Note> {
+    notes_file(store).read::<NoteLine>().into_iter().filter_map(|l| Some((ObjectId::parse(&l.id).ok()?, l.note))).collect()
 }
 
 pub fn read_note(store: &Store, id: &ObjectId) -> Option<Note> {
-    serde_json::from_str(&fs::read_to_string(note_path(store, id)).ok()?).ok()
+    notes(store).remove(id)
+}
+
+/// Drop the notes of snapshots `keep` rejects; how many went.
+pub fn prune_notes(store: &Store, keep: impl Fn(&ObjectId) -> bool) -> Result<usize> {
+    let file = notes_file(store);
+    if !file.path().exists() {
+        return Ok(0);
+    }
+    let lock = file.lock()?;
+    let lines: Vec<NoteLine> = file.read();
+    let kept: Vec<&NoteLine> = lines.iter().filter(|l| ObjectId::parse(&l.id).is_ok_and(|id| keep(&id))).collect();
+    let dropped = lines.len() - kept.len();
+    if dropped > 0 {
+        file.rewrite(&lock, &kept, Durability::Fsync)?;
+    }
+    Ok(dropped)
 }
 
 #[cfg(test)]
@@ -230,18 +234,79 @@ mod tests {
         assert_eq!(read(&store, &name).unwrap(), Some(b));
         assert_eq!(all(&store), vec![(name.as_str().to_string(), b)]);
 
-        let logs = reflogs(&store);
-        assert_eq!(logs.len(), 1);
-        let news: Vec<&str> = logs[0].1.iter().map(|e| e.new.as_str()).collect();
+        let news: Vec<String> = reflog(&store).into_iter().map(|e| e.new).collect();
         assert_eq!(news, vec![a.hex(), b.hex()]);
+        assert_eq!(std::fs::read_dir(dir.path().join(".ambits")).unwrap().count(), 2, "one reflog and its lock");
     }
 
+    /// Two writers racing from the same tip: exactly one moves the ref.
     #[test]
-    fn a_held_lock_refuses_a_second_writer() {
+    fn racing_writers_move_a_ref_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let wins: usize = (1..=6u8)
+            .map(|n| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    let store = Store::at(&root);
+                    update(&store, &RefName::session(SESSION).unwrap(), None, ObjectId([n; 32]), "snapshot").is_ok()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| usize::from(t.join().unwrap()))
+            .sum();
+        assert_eq!(wins, 1);
+        assert_eq!(reflog(&Store::at(&root)).len(), 1);
+    }
+
+    /// Expiry drops old moves but never where a ref points.
+    #[test]
+    fn expiry_keeps_every_refs_tip() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
         let name = RefName::session(SESSION).unwrap();
-        let _held = RefLock::acquire(&ref_path(&store, &name)).unwrap();
-        assert!(update(&store, &name, None, ObjectId([1; 32]), "snapshot").is_err());
+        let entry = |old: Option<u8>, new: u8| ReflogEntry {
+            name: name.as_str().to_string(),
+            old: old.map(|o| ObjectId([o; 32]).hex()),
+            new: ObjectId([new; 32]).hex(),
+            secs: 1_000,
+            time: "1970-01-01T00:16:40Z".into(),
+            action: "snapshot".into(),
+        };
+        let file = reflog_file(&store);
+        let lock = file.lock().unwrap();
+        file.append(&lock, &[entry(None, 1), entry(Some(1), 2)], Durability::NoSync).unwrap();
+        drop(lock);
+        assert_eq!(expire_reflogs(&store, REFLOG_EXPIRY).unwrap(), 1, "both are old; the tip's stays");
+        assert_eq!(read(&store, &name).unwrap(), Some(ObjectId([2; 32])));
+    }
+
+    #[test]
+    fn notes_fold_by_snapshot_and_prune() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let (a, b) = (ObjectId([1; 32]), ObjectId([2; 32]));
+        write_note(&store, &a, Some("first")).unwrap();
+        write_note(&store, &b, None).unwrap();
+        assert_eq!(read_note(&store, &a).unwrap().message.as_deref(), Some("first"));
+        assert_eq!(prune_notes(&store, |id| *id == b).unwrap(), 1);
+        assert!(read_note(&store, &a).is_none());
+        assert!(read_note(&store, &b).is_some());
+    }
+
+    /// A store an older ambits laid out is refused, not misread.
+    #[test]
+    fn the_old_layout_is_refused_with_what_to_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ambits/refs/sessions")).unwrap();
+        let store = Store::at(dir.path());
+        let err = read(&store, &RefName::session(SESSION).unwrap()).unwrap_err().to_string();
+        assert!(err.contains("older ambits") && err.contains(".ambits/refs"), "{err}");
+        let objects = dir.path().join(".ambits/objects/ab");
+        std::fs::create_dir_all(&objects).unwrap();
+        std::fs::write(objects.join("cd.json"), "{}").unwrap();
+        assert!(crate::objects::gc::gc(&store, Duration::ZERO, REFLOG_EXPIRY).is_err(), "gc must not see no refs and collect everything");
+        assert!(objects.join("cd.json").exists());
     }
 }

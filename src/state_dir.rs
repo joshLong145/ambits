@@ -48,19 +48,19 @@ const COVERAGE: &str = "coverage";
 
 /// Loose objects, `objects/ab/cdef….json`.
 pub const OBJECTS: &str = "objects";
-/// Refs, `refs/sessions/<id>`.
-pub const REFS: &str = "refs";
-/// Reflogs, mirroring `refs/`.
-pub const LOGS: &str = "logs";
-/// Snapshot notes, `notes/<id>.json`.
-pub const NOTES: &str = "notes";
-/// The links index (where agent writes landed).
-pub const LINKS: &str = "links";
-/// Local-only caches, such as `cache/never-landed/`.
+/// Every ref move, one line each; a ref's tip is its last (flat).
+pub const REFLOG: &str = "reflog.ndjson";
+/// Snapshot notes, one line per snapshot (flat).
+pub const NOTES: &str = "notes.ndjson";
+/// The links index: where agent writes landed (flat; pushed as hints).
+pub const LINKS: &str = "links.ndjson";
+/// Local-only caches.
 pub const CACHE: &str = "cache";
-/// Every directory ambits writes files into atomically — and so may leave
-/// a `.tmp-*` in after a crash.
-pub const STORE_DIRS: &[&str] = &[OBJECTS, REFS, LOGS, NOTES, LINKS, CACHE];
+/// The never-landed cache, under [`CACHE`] (flat; never pushed).
+pub const NEVER_LANDED: &str = "never-landed.ndjson";
+/// Directories ambits writes files into atomically — and so may leave a
+/// `.tmp-*` in after a crash — besides `STATE_DIR` itself.
+pub const STORE_DIRS: &[&str] = &[OBJECTS, CACHE];
 
 /// The project `start` belongs to, for when `--project` is not given: the
 /// nearest directory — `start` itself or an ancestor — holding `.git` (a

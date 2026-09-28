@@ -119,19 +119,14 @@ pub fn gc(store: &Store, grace: Duration, reflog_expiry: Duration) -> Result<GcS
     stats.kept = unreachable.len() - stats.deleted.len();
 
     // Notes of snapshots that no longer exist.
-    for path in walk_files(&store.root().join(crate::state_dir::NOTES)) {
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let orphan = name.strip_suffix(".json").and_then(|n| ObjectId::parse(n).ok()).is_some_and(|id| !store.contains(&id));
-        if orphan && fs::remove_file(&path).is_ok() {
-            stats.notes_removed += 1;
-        }
-    }
-    // Temp files a crash left, wherever ambits writes atomically.
-    for dir in crate::state_dir::STORE_DIRS {
-        for path in walk_files(&store.root().join(dir)) {
-            if is_temp(&path) && older_than(&path, grace) && fs::remove_file(&path).is_ok() {
-                stats.temp_files_removed += 1;
-            }
+    stats.notes_removed = refs::prune_notes(store, |id| store.contains(id))?;
+    // Temp files a crash left, wherever ambits writes atomically: the
+    // store directories, and `.ambits` itself, where the flat files live.
+    let top = fs::read_dir(store.root()).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_file());
+    let nested = crate::state_dir::STORE_DIRS.iter().flat_map(|dir| walk_files(&store.root().join(dir)));
+    for path in top.chain(nested) {
+        if is_temp(&path) && older_than(&path, grace) && fs::remove_file(&path).is_ok() {
+            stats.temp_files_removed += 1;
         }
     }
     Ok(stats)
@@ -141,11 +136,9 @@ pub fn gc(store: &Store, grace: Duration, reflog_expiry: Duration) -> Result<GcS
 /// remote-tracking) and every unexpired reflog entry (§8).
 fn mark(store: &Store) -> Result<HashSet<ObjectId>> {
     let mut roots: Vec<ObjectId> = refs::all(store).into_iter().map(|(_, id)| id).collect();
-    for (_, entries) in refs::reflogs(store) {
-        for e in entries {
-            roots.extend(ObjectId::parse(&e.new));
-            roots.extend(e.old.as_deref().and_then(|o| ObjectId::parse(o).ok()));
-        }
+    for e in refs::reflog(store) {
+        roots.extend(ObjectId::parse(&e.new));
+        roots.extend(e.old.as_deref().and_then(|o| ObjectId::parse(o).ok()));
     }
 
     let mut reachable = HashSet::new();

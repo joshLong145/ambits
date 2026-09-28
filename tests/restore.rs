@@ -125,11 +125,12 @@ fn restoring_twice_changes_nothing() {
     let p = Project::new();
     created(p.snapshot(SOURCE));
     p.restore(SOURCE, Some(TARGET));
-    let (shard, reflog) = (p.shard(TARGET), std::fs::read_to_string(p.root.join(format!(".ambits/logs/refs/sessions/{TARGET}"))).unwrap());
+    let reflog = || std::fs::read_to_string(p.root.join(".ambits/reflog.ndjson")).unwrap();
+    let (shard, before) = (p.shard(TARGET), reflog());
     let again = p.restore(SOURCE, Some(TARGET));
     assert_eq!((again.reads_appended, again.writes_appended, again.ref_moved), (0, 0, false));
     assert_eq!(p.shard(TARGET), shard);
-    assert_eq!(std::fs::read_to_string(p.root.join(format!(".ambits/logs/refs/sessions/{TARGET}"))).unwrap(), reflog);
+    assert_eq!(reflog(), before);
 }
 
 /// The target's next snapshot descends from the restored one.
