@@ -11,6 +11,8 @@ ambits -p . trace --format chrome > session.trace.json   # Chrome trace events
 ambits -p . --session <id> --agent a1b2 trace            # one subagent's subtree
 ```
 
+The [TUI's trace view](TUI#trace-view) (`t`) shows the same trace live.
+
 The trace is rebuilt from the Claude Code logs of the session (`--session`, or
 the latest), including its subagents' logs. Nothing is stored.
 

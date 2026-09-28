@@ -5,6 +5,7 @@ pub mod stats;
 pub mod activity;
 pub mod compaction;
 pub mod alignment;
+pub mod trace_view;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -30,7 +31,11 @@ pub fn render(f: &mut Frame, app: &App) {
         ])
         .split(outer[0]);
 
-    tree_view::render(f, app, top[0]);
+    if app.trace_view.open {
+        trace_view::render(f, app, top[0]);
+    } else {
+        tree_view::render(f, app, top[0]);
+    }
     stats::render(f, app, top[1]);
     activity::render(f, app, outer[1]);
     render_detail_line(f, app, outer[2]);
@@ -54,8 +59,13 @@ fn render_detail_line(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(text).style(Style::default().fg(Color::Gray)), area);
 }
 
+/// Display columns of `text`.
+pub(crate) fn width(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
+}
+
 /// `text` in at most `width` columns, ending in `…` when cut.
-fn fit(text: &str, width: usize) -> String {
+pub(crate) fn fit(text: &str, width: usize) -> String {
     use unicode_width::UnicodeWidthChar;
     if unicode_width::UnicodeWidthStr::width(text) <= width {
         return text.to_string();
@@ -86,6 +96,17 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             format!(" {message}"),
             Style::default().fg(Color::Red),
         )])
+    } else if app.trace_view.open {
+        let key = |k: &'static str, what: &'static str| [Span::styled(k, Style::default().fg(Color::DarkGray)), Span::raw(what)];
+        let mut spans = vec![Span::raw(" ")];
+        for (k, what) in [
+            ("[t]", "ree "), ("[v]", "layout "), ("[w/s]", "zoom "), ("[a/d]", "pan "), ("[0]", "fit "),
+            ("[j/k]", "row "), ("[h/l]", "fold/step "), ("[enter]", "follow "), ("[space]", "fold "),
+            ("[/]", "find "), ("[e]", "rror "), ("[tab]", "agent "),
+        ] {
+            spans.extend(key(k, what));
+        }
+        Line::from(spans)
     } else if app.search_mode {
         Line::from(vec![
             Span::styled(" /", Style::default().fg(Color::Yellow)),
@@ -113,6 +134,8 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             Span::raw("gents "),
             Span::styled("[tab]", Style::default().fg(Color::DarkGray)),
             Span::raw("focus "),
+            Span::styled("[t]", Style::default().fg(Color::DarkGray)),
+            Span::raw("race "),
         ];
 
         if !app.compaction_history.is_empty() {

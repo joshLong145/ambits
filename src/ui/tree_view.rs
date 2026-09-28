@@ -125,7 +125,7 @@ fn symbol_style(color: Color, restored: bool) -> Style {
 /// Stale symbols get the stale color regardless of how deeply they were read —
 /// "what you know is out of date" is the more urgent fact than "how much of it
 /// you read".
-fn depth_color(depth: ReadDepth, stale: bool) -> Color {
+pub(super) fn depth_color(depth: ReadDepth, stale: bool) -> Color {
     if stale && depth.is_seen() {
         return colors::DEPTH_STALE;
     }

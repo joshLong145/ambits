@@ -85,11 +85,16 @@ pub fn ticks(vp: &Viewport, cols: usize, origin: u64, min_gap: usize) -> Vec<(us
     while t < vp.end {
         let col = vp.col(t, cols) as usize;
         if col < cols {
-            out.push((col, duration(t - origin)));
+            out.push((col, offset(t - origin)));
         }
         t += step;
     }
     out
+}
+
+/// An offset from the session's start: [`duration`], but the start is `0`.
+pub fn offset(ms: u64) -> String {
+    if ms == 0 { "0".into() } else { duration(ms) }
 }
 
 /// A duration, compactly: `250ms`, `1.5s`, `42s`, `3m05s`, `1h02m`.
@@ -625,7 +630,7 @@ mod tests {
         assert_eq!(label(3_600_000), "10m");
         assert_eq!(label(36_000_000), "1h");
         let t = ticks(&Viewport { start: BASE, end: BASE + 60_000 }, 100, BASE, 10);
-        assert_eq!(t[0], (0, "0ms".into()));
+        assert_eq!(t[0], (0, "0".into()));
         assert!(t.windows(2).all(|w| w[1].0 - w[0].0 >= 10));
     }
 

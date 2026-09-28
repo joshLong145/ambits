@@ -65,6 +65,18 @@ impl TreeRow {
     }
 }
 
+/// Where the trace view drew its time axis and rows, so a mouse position
+/// maps to a moment and a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceGeometry {
+    pub bars_x: u16,
+    pub bars_width: u16,
+    pub rows_y: u16,
+    pub rows: u16,
+    /// The row index drawn first (the scroll offset).
+    pub first_row: usize,
+}
+
 /// Which panel is focused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPanel {
@@ -174,6 +186,13 @@ pub struct App {
     pub trace: crate::trace::Trace,
     /// This session's writes, for the tree's marks.
     pub writes: crate::write_index::WriteIndex,
+    /// The trace view (`t`): layout, zoom and selection.
+    pub trace_view: crate::trace::view::TraceView,
+    /// Where the trace view last drew its rows, for the mouse. Set while
+    /// rendering, which only borrows the app.
+    pub trace_geometry: std::cell::Cell<Option<TraceGeometry>>,
+    /// The column a drag on the trace started from.
+    trace_drag: Option<u16>,
 
     /// Path filter restricting which files are tracked, if any. Shared with
     /// the TUI re-parse paths (file watcher, Serena cache rescan) so that
@@ -229,6 +248,9 @@ impl App {
             pending_writes: Vec::new(),
             trace: crate::trace::Trace::default(),
             writes: crate::write_index::WriteIndex::default(),
+            trace_view: crate::trace::view::TraceView::default(),
+            trace_geometry: std::cell::Cell::new(None),
+            trace_drag: None,
             filter: None,
             editor_template: None,
             pending_editor_request: None,
@@ -424,6 +446,7 @@ impl App {
         self.session_slug = None;
         self.compaction_history.clear();
         self.trace.clear();
+        self.trace_view.reset();
         self.compaction_call_count = 0;
         self.show_alignment_overlay = false;
         self.agent_alignment.clear();
@@ -615,6 +638,10 @@ impl App {
             self.handle_search_key(key);
             return;
         }
+        if self.trace_view.open {
+            self.handle_trace_key(key);
+            return;
+        }
 
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
@@ -683,6 +710,7 @@ impl App {
                 }
             }
             KeyCode::Char('d') => self.open_alignment_overlay(),
+            KeyCode::Char('t') => self.trace_view.open = true,
             KeyCode::Esc if self.show_alignment_overlay => {
                 self.show_alignment_overlay = false;
             }
@@ -695,6 +723,10 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.trace_view.open {
+            self.handle_trace_mouse(mouse);
+            return;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp => match self.focus {
                 FocusPanel::Activity => {
@@ -710,6 +742,251 @@ impl App {
                 FocusPanel::Stats => self.move_agent_selection(1),
                 FocusPanel::Tree => self.move_selection(3),
             },
+            _ => {}
+        }
+    }
+
+    /// The trace view's rows under the current agent filter.
+    pub fn trace_rows(&self) -> Vec<crate::trace::view::Row> {
+        let tv = &self.trace_view;
+        crate::trace::view::waterfall(&self.trace, self.agent_filter.as_deref(), &tv.collapsed_spans, &tv.query)
+    }
+
+    /// The tracks and their screen rows under the current agent filter.
+    pub fn trace_tracks(&self) -> (Vec<crate::trace::view::Track>, Vec<crate::trace::view::TrackRow>) {
+        let tracks = crate::trace::view::tracks(&self.trace, self.agent_filter.as_deref(), self.trace_open_end());
+        let rows = crate::trace::view::track_rows(&tracks, &self.trace_view.collapsed_agents);
+        (tracks, rows)
+    }
+
+    /// Where a call still running is drawn to: the last moment seen.
+    pub fn trace_open_end(&self) -> u64 {
+        self.trace.range().map_or(0, |(_, end)| end)
+    }
+
+    /// The trace view's keys: modal, as in Perfetto (`w`/`a`/`s`/`d` zoom
+    /// and pan only here).
+    fn handle_trace_key(&mut self, key: KeyEvent) {
+        use crate::trace::view::Layout;
+        let tv = &mut self.trace_view;
+        if tv.typing {
+            match key.code {
+                KeyCode::Esc => {
+                    tv.typing = false;
+                    tv.query.clear();
+                }
+                KeyCode::Enter => tv.typing = false,
+                KeyCode::Backspace => {
+                    tv.query.pop();
+                }
+                KeyCode::Char(c) => tv.query.push(c),
+                _ => {}
+            }
+            return;
+        }
+        let waterfall = tv.layout == Layout::Waterfall;
+        match key.code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.should_quit = true,
+            KeyCode::Char('t') | KeyCode::Esc => self.trace_view.open = false,
+            KeyCode::Char('v') => {
+                self.trace_view.layout = if waterfall { Layout::Tracks } else { Layout::Waterfall };
+            }
+            KeyCode::Char('w') => self.trace_view.zoom(&self.trace, 0.5, None),
+            KeyCode::Char('s') => self.trace_view.zoom(&self.trace, 2.0, None),
+            KeyCode::Char('a') => self.trace_view.pan(&self.trace, -0.25),
+            KeyCode::Char('d') => self.trace_view.pan(&self.trace, 0.25),
+            KeyCode::Char('0') => self.trace_view.fit(),
+            KeyCode::Char('j') | KeyCode::Down => self.move_trace_row(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_trace_row(-1),
+            KeyCode::PageDown => self.move_trace_row(20),
+            KeyCode::PageUp => self.move_trace_row(-20),
+            KeyCode::Char('g') => self.move_trace_row(isize::MIN / 2),
+            KeyCode::Char('G') => self.move_trace_row(isize::MAX / 2),
+            KeyCode::Char('h') | KeyCode::Left if waterfall => self.trace_view.toggle_span(Some(false)),
+            KeyCode::Char('l') | KeyCode::Right if waterfall => self.trace_view.toggle_span(Some(true)),
+            KeyCode::Char('h') | KeyCode::Left => {
+                let (tracks, rows) = self.trace_tracks();
+                self.trace_view.step_span(&tracks, &rows, -1);
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                let (tracks, rows) = self.trace_tracks();
+                self.trace_view.step_span(&tracks, &rows, 1);
+            }
+            KeyCode::Char(' ') if waterfall => self.trace_view.toggle_span(None),
+            KeyCode::Char(' ') => {
+                let (tracks, rows) = self.trace_tracks();
+                if let Some(row) = rows.get(self.trace_view.track_row) {
+                    let agent = tracks[row.track].agent.clone();
+                    if !self.trace_view.collapsed_agents.remove(&agent) {
+                        self.trace_view.collapsed_agents.insert(agent);
+                    }
+                }
+            }
+            KeyCode::Char('/') if waterfall => {
+                self.trace_view.typing = true;
+                self.trace_view.query.clear();
+            }
+            KeyCode::Char('e') => {
+                let rows = self.trace_rows();
+                self.trace_view.next_error(&self.trace, &rows);
+                self.follow_selection_to_track();
+            }
+            KeyCode::Enter => self.follow_trace_selection(),
+            KeyCode::Tab => self.cycle_agent_filter(),
+            KeyCode::BackTab => self.cycle_agent_filter_backward(),
+            _ => {}
+        }
+    }
+
+    fn move_trace_row(&mut self, delta: isize) {
+        if self.trace_view.layout == crate::trace::view::Layout::Waterfall {
+            let rows = self.trace_rows();
+            self.trace_view.move_row(&rows, delta);
+        } else {
+            let (tracks, rows) = self.trace_tracks();
+            self.trace_view.move_track_row(&self.trace, &tracks, &rows, delta);
+        }
+    }
+
+    /// In the tracks layout, put the lane cursor on the selected span's row.
+    fn follow_selection_to_track(&mut self) {
+        let Some(crate::trace::view::Item::Span(i)) = self.trace_view.selected else { return };
+        let (tracks, rows) = self.trace_tracks();
+        if let Some(r) = rows.iter().position(|r| r.spans(&tracks).contains(&i)) {
+            self.trace_view.track_row = r;
+        }
+    }
+
+    /// `Enter` on a span: into a delegation's subagent, or out to the
+    /// symbol or file it was about, in the tree.
+    fn follow_trace_selection(&mut self) {
+        use crate::trace::view::{Item, Layout};
+        let Some(Item::Span(i)) = self.trace_view.selected else { return };
+        let span = self.trace.spans()[i].clone();
+        if let Some(child) = &span.child_agent {
+            if self.trace_view.layout == Layout::Waterfall {
+                self.trace_view.collapsed_spans.remove(&i);
+                let rows = self.trace_rows();
+                if let Some(pos) = rows.iter().position(|r| r.item == Item::Span(i)) {
+                    if let Some(first) = rows.get(pos + 1).filter(|r| r.depth > rows[pos].depth) {
+                        self.trace_view.selected = Some(first.item);
+                    }
+                }
+            } else {
+                let (tracks, rows) = self.trace_tracks();
+                self.trace_view.collapsed_agents.remove(&**child);
+                self.trace_view.select_track(&tracks, &rows, child);
+            }
+            return;
+        }
+        if let Some(file) = &span.file {
+            if self.reveal(file, span.symbol.as_deref()) {
+                self.trace_view.open = false;
+                self.focus = FocusPanel::Tree;
+            }
+        }
+    }
+
+    /// Select `file` (project-relative) in the tree, or the symbol in it
+    /// named by `symbol`, expanding what hides it. `false` when the file is
+    /// not in the tree.
+    pub fn reveal(&mut self, file: &str, symbol: Option<&str>) -> bool {
+        let Some(tree_file) = self
+            .project_tree
+            .files
+            .iter()
+            .find(|f| crate::objects::normalize_path(&f.file_path.to_string_lossy()) == file)
+        else {
+            return false;
+        };
+        let file_id = tree_file.file_path.to_string_lossy().into_owned();
+        let target = symbol.map(normalize_name_path).and_then(|name| {
+            let nodes = tree_file.walk();
+            let exact = nodes.iter().find(|n| n.name_path() == name);
+            let by_tail = || nodes.iter().find(|n| n.name_path().ends_with(&format!("/{name}")) || *n.name == *name);
+            exact.or_else(by_tail).map(|n| n.id.clone())
+        });
+        self.set_expanded(&file_id, RowKind::File, true);
+        if let Some(id) = &target {
+            let (path, name) = crate::symbols::split_id(id);
+            let segments: Vec<&str> = name.split('/').collect();
+            for n in 1..segments.len() {
+                self.set_expanded(&format!("{path}::{}", segments[..n].join("/")), RowKind::Symbol, true);
+            }
+        }
+        let want = target.unwrap_or(file_id);
+        if let Some(ix) = self.tree_rows.iter().position(|r| r.symbol_id == want) {
+            self.selected_index = ix;
+        }
+        true
+    }
+
+    /// Every write of the session by op, and whether its version is still
+    /// in the tree: read once per written file, for a frame to colour by.
+    pub fn write_statuses(&self) -> std::collections::HashMap<&str, (&crate::writes::WriteRecord, crate::writes::Status)> {
+        let mut out = std::collections::HashMap::new();
+        for (file, writes) in self.writes.by_file(None) {
+            let now = self
+                .project_tree
+                .files
+                .iter()
+                .find(|f| crate::objects::normalize_path(&f.file_path.to_string_lossy()) == file)
+                .map(crate::writes::FileContents::from_symbols);
+            for w in writes {
+                let status = match &now {
+                    Some(now) => now.file_status(w),
+                    // Out of the tree: gone, unless a path filter just hides it.
+                    None if self.filter.is_some() => crate::writes::Status::Unknown,
+                    None => crate::writes::Status::Removed,
+                };
+                out.insert(w.op.as_str(), (w, status));
+            }
+        }
+        out
+    }
+
+    /// Wheel zooms at the pointer, a click selects, a drag pans.
+    fn handle_trace_mouse(&mut self, mouse: MouseEvent) {
+        use crate::trace::view::{Item, Layout};
+        let Some(g) = self.trace_geometry.get() else { return };
+        let in_bars = mouse.column >= g.bars_x && mouse.column < g.bars_x + g.bars_width;
+        let col = mouse.column.saturating_sub(g.bars_x) as usize;
+        let vp = self.trace_view.viewport(&self.trace);
+        let at = in_bars.then(|| vp.time_at(col, g.bars_width as usize));
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.trace_view.zoom(&self.trace, 0.8, at),
+            MouseEventKind::ScrollDown => self.trace_view.zoom(&self.trace, 1.25, at),
+            MouseEventKind::Down(_) => {
+                self.trace_drag = in_bars.then_some(mouse.column);
+                if mouse.row < g.rows_y || mouse.row >= g.rows_y + g.rows {
+                    return;
+                }
+                let row = g.first_row + (mouse.row - g.rows_y) as usize;
+                if self.trace_view.layout == Layout::Waterfall {
+                    if let Some(r) = self.trace_rows().get(row) {
+                        self.trace_view.selected = Some(r.item);
+                    }
+                } else {
+                    let (tracks, rows) = self.trace_tracks();
+                    if let Some(r) = rows.get(row) {
+                        self.trace_view.track_row = row;
+                        let open_end = self.trace_open_end();
+                        let hit = crate::trace::view::span_at(&self.trace, &r.spans(&tracks), &vp, g.bars_width as usize, col, open_end);
+                        if let Some(i) = hit {
+                            self.trace_view.selected = Some(Item::Span(i));
+                        }
+                    }
+                }
+            }
+            MouseEventKind::Drag(_) => {
+                if let Some(from) = self.trace_drag {
+                    let moved = f64::from(from) - f64::from(mouse.column);
+                    self.trace_view.pan(&self.trace, moved / f64::from(g.bars_width.max(1)));
+                    self.trace_drag = Some(mouse.column);
+                }
+            }
+            MouseEventKind::Up(_) => self.trace_drag = None,
             _ => {}
         }
     }
@@ -3192,5 +3469,117 @@ mod write_tests {
 
         let contents = crate::journal::read_journal_session(&crate::journal::journal_dir(dir.path()), "sess");
         assert_eq!(contents.reads["src/a.rs::f"], (read_at, ReadDepth::FullBody));
+    }
+}
+
+/// The trace view's keys and mouse (UI-7): modal, following delegations
+/// into their agents and spans out to the tree.
+#[cfg(test)]
+mod trace_view_tests {
+    use super::*;
+    use crate::helpers::*;
+    use crate::ingest::ToolFinished;
+    use crate::trace::view::{Item, Layout};
+
+    fn key(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// `src/a.rs` with `S { a }`; main reads `S/a`, then delegates to `ax1`,
+    /// whose edit fails.
+    fn app() -> App {
+        let tree = project(vec![file("src/a.rs", vec![sym_with_children("src/a.rs::S", "S", vec![sym("src/a.rs::S/a", "a")])])]);
+        let mut app = App::new(tree, PathBuf::from("/test/project"));
+        app.set_session_id(Some("sess".into()));
+        let root = app.project_root.clone();
+        let mut calls = vec![
+            ("sess", "r1", "Read", "2026-09-27T10:00:00.000Z", "2026-09-27T10:00:01.000Z", None, false),
+            ("sess", "d1", "Agent", "2026-09-27T10:00:02.000Z", "2026-09-27T10:00:02.100Z", Some("ax1"), false),
+            ("ax1", "x1", "Edit", "2026-09-27T10:00:03.000Z", "2026-09-27T10:00:04.000Z", None, true),
+        ];
+        for (agent, id, tool, start, end, child, error) in calls.drain(..) {
+            let mut c = tool_call_targeted(tool, "/test/project/src/a.rs", ReadDepth::FullBody, "S/a");
+            c.agent_id = Arc::from(agent);
+            c.tool_use_id = Some(Arc::from(id));
+            c.timestamp_str = start.into();
+            app.trace.start(&c, &root);
+            app.trace.finish(&ToolFinished {
+                id: Arc::from(id),
+                agent_id: Arc::from(agent),
+                timestamp: end.into(),
+                error,
+                child_agent: child.map(Arc::from),
+            });
+        }
+        key(&mut app, KeyCode::Char('t'));
+        app
+    }
+
+    #[test]
+    fn t_opens_the_trace_and_its_keys_are_modal() {
+        let mut app = app();
+        assert!(app.trace_view.open);
+        let filter = app.agent_filter.clone();
+        key(&mut app, KeyCode::Char('w'));
+        assert!(app.trace_view.viewport.is_some(), "w zooms");
+        key(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.agent_filter, filter, "a pans here, not the agent filter");
+        key(&mut app, KeyCode::Char('0'));
+        assert!(app.trace_view.viewport.is_none(), "0 fits");
+        key(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.trace_view.layout, Layout::Tracks);
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.trace_view.open);
+    }
+
+    #[test]
+    fn enter_follows_a_delegation_into_its_agent() {
+        let mut app = app();
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.trace_view.selected, Some(Item::Span(1)));
+        key(&mut app, KeyCode::Char('h'));
+        assert!(app.trace_view.collapsed_spans.contains(&1), "h folds");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.trace_view.selected, Some(Item::Span(2)), "unfolded, into ax1's edit");
+
+        key(&mut app, KeyCode::Char('v'));
+        app.trace_view.selected = Some(Item::Span(1));
+        key(&mut app, KeyCode::Enter);
+        let (tracks, rows) = app.trace_tracks();
+        assert_eq!(&*tracks[rows[app.trace_view.track_row].track].agent, "ax1");
+    }
+
+    #[test]
+    fn enter_on_a_read_shows_its_symbol_in_the_tree() {
+        let mut app = app();
+        app.trace_view.selected = Some(Item::Span(0));
+        key(&mut app, KeyCode::Enter);
+        assert!(!app.trace_view.open);
+        assert_eq!(app.tree_rows[app.selected_index].symbol_id, "src/a.rs::S/a", "expanded down to it");
+    }
+
+    #[test]
+    fn e_finds_the_failure_and_tab_filters_by_agent() {
+        let mut app = app();
+        key(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.trace_view.selected, Some(Item::Span(2)));
+        key(&mut app, KeyCode::Tab);
+        assert!(app.agent_filter.is_some(), "tab cycles the agent filter");
+        assert!(app.trace_view.open);
+    }
+
+    #[test]
+    fn a_click_selects_and_the_wheel_zooms_at_the_pointer() {
+        let mut app = app();
+        app.trace_geometry.set(Some(TraceGeometry { bars_x: 10, bars_width: 40, rows_y: 5, rows: 10, first_row: 0 }));
+        let mouse = |kind, column, row| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
+        app.handle_mouse(mouse(MouseEventKind::Down(crossterm::event::MouseButton::Left), 12, 7));
+        assert_eq!(app.trace_view.selected, Some(Item::Span(2)), "third row");
+        let before = app.trace_view.viewport(&app.trace);
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 10, 7));
+        let after = app.trace_view.viewport.expect("zoomed");
+        assert_eq!(after.start, before.start, "zoomed about the left edge, where the pointer is");
+        assert!(after.width() < before.width());
     }
 }

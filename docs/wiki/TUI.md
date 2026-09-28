@@ -28,6 +28,7 @@ leave the tree rather than lingering until you quit.
 - **Sortable tree** — alphabetical, or grouped by coverage to surface half-read files first
 - **Search** — `/` to jump to a symbol by name
 - **Compaction history** — `C` for this session's compaction boundaries
+- **Trace view** — `t` puts the session's tool calls on a time axis, as an OpenTelemetry waterfall or Perfetto-style agent tracks (see [below](#trace-view))
 - **Sub-agent alignment** — `d` compares two agents file by file: where they read the same code, and where only one looked (see [Coverage and Multi-Agent](Coverage-and-Multi-Agent))
 
 Symbols carried over from before a compaction render dimmed — the read
@@ -49,6 +50,7 @@ While it runs, the TUI is also the sole writer of the
 | `s` | Toggle sort (alphabetical / coverage) |
 | `a` / `A` | Cycle agent filter forward / backward |
 | `d` | Sub-agent alignment view |
+| `t` | [Trace view](#trace-view) in place of the tree |
 | `C` | Compaction history (`[` / `]` to page) |
 | `g` / `G` | Jump to first / last |
 | `PgUp` / `PgDn` | Scroll by page |
@@ -94,6 +96,48 @@ against the tree as it is now, so an edit of yours turns it amber at once:
 
 The Stats panel counts the session's writes (`✎ Written`). Writes made
 before this run come from the [read journal](Configuration#the-read-journal).
+
+## Trace view
+
+`t` replaces the tree with the session's tool calls on a time axis: every
+call a bar from its call to its result, each subagent's calls under the
+delegation that started it. It is the model [`ambits trace`](Traces)
+exports, so what you see here is what Jaeger or Perfetto would show.
+
+Two layouts, `v` to switch:
+
+- **Waterfall** (as Jaeger or Tempo show an OpenTelemetry trace): one row per
+  call, nested by delegation, with its duration. A delegation lasts until
+  its agent last stopped; `h` / `l` or `Space` fold its calls away.
+- **Tracks** (as Perfetto shows a system trace): one track per agent, in
+  delegation order, overlapping calls stacked into lanes, names drawn inside
+  bars wide enough to hold them. A folded track (`Space`) is one row of
+  density.
+
+Bars take the tree's colours: reads by depth, writes by whether their
+version is still there, failures red, delegations grey. `▼` marks a
+compaction. The line under the bars details the selected call: its agent,
+start, end and duration, depth or write status, and where `Enter` goes.
+
+The view follows the session live until you zoom; `0` goes back to that.
+Its keys are modal, as in Perfetto:
+
+| Key | Action |
+|---|---|
+| `w` / `s` | Zoom in / out around the selection |
+| `a` / `d` | Pan earlier / later |
+| `0` | Fit the whole session, and follow it |
+| `j` / `k`, `g` / `G` | Next / previous row; first / last |
+| `h` / `l` | Waterfall: fold / unfold. Tracks: previous / next call on the lane |
+| `Space` | Fold the selected delegation (waterfall) or track (tracks) |
+| `Enter` | On a delegation, into its agent's calls; on a read or write, to its symbol or file in the tree |
+| `/` | Waterfall: list only calls whose name contains the text (`Esc` clears) |
+| `e` | Next failed call |
+| `Tab` / `Shift+Tab` | Cycle the agent filter (`a` pans here) |
+| `v` | Waterfall / tracks |
+| `t`, `Esc` | Back to the tree |
+
+The mouse wheel zooms at the pointer, a drag pans, a click selects.
 
 ## Opening a symbol in your editor
 
