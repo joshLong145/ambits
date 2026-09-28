@@ -218,15 +218,16 @@ fn multi_agent_session() {
 fn parse_log_file_e2e() {
     let lines = vec![
         jsonl_read("/some/file.rs"),
-        // A user message line that should be ignored:
+        // A user message: a prompt, not a tool call.
         r#"{"type":"user","message":{"role":"user","content":"hello"}}"#.to_string(),
         jsonl_grep("foo"),
         jsonl_find_symbol("bar.rs", "baz", false),
     ];
     let tmp = write_jsonl(&lines);
     let events = parse_log_file(tmp.path(), &builtin_cfg());
-    // User message is ignored; the other 3 produce events.
-    assert_eq!(events.len(), 3);
+    let calls = events.iter().filter(|e| matches!(e, ambits::ingest::SessionEvent::ToolCall(_))).count();
+    let prompts = events.iter().filter(|e| matches!(e, ambits::ingest::SessionEvent::Prompt(_))).count();
+    assert_eq!((calls, prompts), (3, 1));
 }
 
 /// Three files at 0%, 50%, 100% → sorted ascending by full_percent in report.

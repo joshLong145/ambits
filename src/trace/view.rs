@@ -3,7 +3,8 @@
 //! go, which rows the waterfall shows, and how each agent's spans stack
 //! into lanes on its track.
 //!
-//! Two layouts share one [`TraceView`]:
+//! The view opens on a list of traces, one per prompt ([`traces`]);
+//! `Enter` on one shows its timeline. Two layouts share one [`TraceView`]:
 //! - the **waterfall**, as Jaeger or Tempo show an OpenTelemetry trace: one
 //!   row per span, nested by [`Trace::tree`];
 //! - the **tracks**, as Perfetto shows a system trace: one track per agent,
@@ -12,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use super::{Node, Trace};
+use super::{Node, SpanKind, Trace};
 
 /// The narrowest window zoom goes to, in milliseconds.
 const MIN_WIDTH_MS: u64 = 20;
@@ -145,6 +146,62 @@ pub fn bar(from: f64, to: f64, cols: usize) -> Vec<(usize, char)> {
         .collect()
 }
 
+/// One trace in the list: a root of the span tree — a prompt and its
+/// turn, or a call made before any prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceSummary {
+    /// The root span.
+    pub root: usize,
+    pub start: u64,
+    pub end: u64,
+    /// Calls under it, at any depth.
+    pub calls: usize,
+    pub failed: usize,
+    /// Subagents it started, at any depth.
+    pub agents: usize,
+}
+
+/// The traces, in time order; under `filter`, those in which that agent
+/// made a call.
+pub fn traces(trace: &Trace, filter: Option<&str>) -> Vec<TraceSummary> {
+    let spans = trace.spans();
+    trace
+        .tree()
+        .iter()
+        .filter_map(|node| {
+            let mut all = Vec::new();
+            collect(node, &mut all);
+            if let Some(f) = filter {
+                if !all.iter().any(|&i| spans[i].agent.starts_with(f)) {
+                    return None;
+                }
+            }
+            let under = &all[1..];
+            Some(TraceSummary {
+                root: node.span,
+                start: spans[node.span].start,
+                end: node.end,
+                calls: under.len(),
+                failed: all.iter().filter(|&&i| spans[i].error).count(),
+                agents: under.iter().filter(|&&i| spans[i].child_agent.is_some()).count(),
+            })
+        })
+        .collect()
+}
+
+/// `node` and everything under it, depth first.
+fn collect(node: &Node, out: &mut Vec<usize>) {
+    out.push(node.span);
+    for child in &node.children {
+        collect(child, out);
+    }
+}
+
+/// The node for span `root`, wherever it sits in `tree`.
+pub fn subtree(tree: &[Node], root: usize) -> Option<&Node> {
+    tree.iter().find_map(|n| if n.span == root { Some(n) } else { subtree(&n.children, root) })
+}
+
 /// A span or an instant: what a row, or a selection, stands for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Item {
@@ -164,18 +221,25 @@ pub struct Row {
     pub end: u64,
 }
 
-/// The waterfall's rows: the span tree under `filter`, depth first,
-/// collapsed subtrees shut, instants among the roots in time order. A
-/// non-empty `query` lists instead every span whose name contains it
-/// (case-insensitive), still indented by depth.
-pub fn waterfall(trace: &Trace, filter: Option<&str>, collapsed: &HashSet<usize>, query: &str) -> Vec<Row> {
-    let tree = trace.tree();
+/// The waterfall's rows: the span tree — or, `within` a trace, that
+/// trace's subtree — under `filter`, depth first, collapsed subtrees shut,
+/// instants among the roots in time order. A non-empty `query` lists
+/// instead every span whose name contains it (case-insensitive), still
+/// indented by depth.
+pub fn waterfall(trace: &Trace, filter: Option<&str>, within: Option<usize>, collapsed: &HashSet<usize>, query: &str) -> Vec<Row> {
+    let full = trace.tree();
+    let tree: Vec<Node> = match within {
+        Some(root) => subtree(&full, root).cloned().into_iter().collect(),
+        None => full,
+    };
     let roots = trace.roots(&tree, filter);
     let query = query.to_lowercase();
+    let window = tree.first().filter(|_| within.is_some()).map(|n| (trace.spans()[n.span].start, n.end));
 
     let mut out = Vec::new();
     let mut instants: Vec<usize> = (0..trace.instants().len())
         .filter(|&i| filter.is_none_or(|a| trace.instants()[i].agent.as_deref().is_none_or(|ia| ia.starts_with(a))))
+        .filter(|&i| window.is_none_or(|(s, e)| (s..=e).contains(&trace.instants()[i].t)))
         .collect();
     instants.sort_by_key(|&i| trace.instants()[i].t);
     let mut instants = instants.into_iter().peekable();
@@ -232,15 +296,29 @@ pub struct Track {
 /// after the one that started it, siblings by start). A span still running
 /// is laid out as if it ended at `open_end`; a delegation lasts until its
 /// subagent's last moment.
-pub fn tracks(trace: &Trace, filter: Option<&str>, open_end: u64) -> Vec<Track> {
+pub fn tracks(trace: &Trace, filter: Option<&str>, within: Option<usize>, open_end: u64) -> Vec<Track> {
     let spans = trace.spans();
-    let ends = effective_ends(&trace.tree());
+    let tree = trace.tree();
+    let ends = effective_ends(&tree);
     let end_of = |i: usize| ends.get(&i).copied().or(spans[i].end).unwrap_or(open_end).max(spans[i].start + 1);
+    // Within one trace, only its spans. A prompt is the trace itself, not a
+    // call on a track.
+    let mut shown: Vec<usize> = match within.and_then(|r| subtree(&tree, r)) {
+        Some(node) => {
+            let mut all = Vec::new();
+            collect(node, &mut all);
+            all
+        }
+        None if within.is_some() => Vec::new(),
+        None => (0..spans.len()).collect(),
+    };
+    shown.retain(|&i| spans[i].kind != SpanKind::Prompt);
+    shown.sort_by_key(|&i| (spans[i].start, i));
 
     // Each agent's spans, in start order, and the delegation that started it.
     let mut by_agent: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (i, s) in spans.iter().enumerate() {
-        by_agent.entry(&s.agent).or_default().push(i);
+    for &i in &shown {
+        by_agent.entry(&spans[i].agent).or_default().push(i);
     }
     let started_by: HashMap<&str, usize> =
         spans.iter().enumerate().filter_map(|(i, s)| Some((s.child_agent.as_deref()?, i))).collect();
@@ -384,6 +462,11 @@ pub enum Layout {
 #[derive(Debug, Default)]
 pub struct TraceView {
     pub open: bool,
+    /// The trace whose timeline is shown (its root span); `None` shows the
+    /// list of traces.
+    pub focus: Option<usize>,
+    /// The trace selected in the list (its root span); `None` is the latest.
+    pub list: Option<usize>,
     pub layout: Layout,
     /// `None` fits the whole session, growing as it does.
     pub viewport: Option<Viewport>,
@@ -402,9 +485,47 @@ impl TraceView {
         *self = Self { open: self.open, layout: self.layout, ..Self::default() };
     }
 
-    /// The window on screen.
+    /// The window on screen: the focused trace's, until zoomed.
     pub fn viewport(&self, trace: &Trace) -> Viewport {
-        self.viewport.unwrap_or_else(|| Viewport::fit(trace.range().unwrap_or((0, 1000))))
+        self.viewport.unwrap_or_else(|| Viewport::fit(self.range(trace).unwrap_or((0, 1000))))
+    }
+
+    /// The focused trace's first and last moment, else the session's.
+    pub fn range(&self, trace: &Trace) -> Option<(u64, u64)> {
+        match self.focus {
+            Some(root) => subtree(&trace.tree(), root).map(|n| (trace.spans()[root].start, n.end)),
+            None => trace.range(),
+        }
+    }
+
+    /// Show `root`'s timeline, from the whole of it, nothing selected.
+    pub fn open_trace(&mut self, root: usize) {
+        self.focus = Some(root);
+        self.list = Some(root);
+        self.viewport = None;
+        self.selected = None;
+        self.track_row = 0;
+        self.query.clear();
+    }
+
+    /// Back to the list, on the trace that was open.
+    pub fn close_trace(&mut self) {
+        self.focus = None;
+        self.viewport = None;
+        self.selected = None;
+    }
+
+    /// Move the list selection by `delta`.
+    pub fn move_list(&mut self, traces: &[TraceSummary], delta: isize) {
+        let Some(last) = traces.len().checked_sub(1) else { return };
+        let at = self.list.and_then(|r| traces.iter().position(|t| t.root == r)).unwrap_or(last);
+        self.list = Some(traces[at.saturating_add_signed(delta).min(last)].root);
+    }
+
+    /// The list row selected: the chosen trace, else the latest.
+    pub fn list_index(&self, traces: &[TraceSummary]) -> Option<usize> {
+        let last = traces.len().checked_sub(1)?;
+        Some(self.list.and_then(|r| traces.iter().position(|t| t.root == r)).unwrap_or(last))
     }
 
     /// Where zoom centres: the selection when it is on screen, else the middle.
@@ -647,7 +768,7 @@ mod tests {
     #[test]
     fn the_waterfall_nests_a_delegations_calls_and_collapses() {
         let t = sample();
-        let rows = waterfall(&t, None, &HashSet::new(), "");
+        let rows = waterfall(&t, None, None, &HashSet::new(), "");
         assert_eq!(
             items(&rows),
             vec![(Item::Span(0), 0), (Item::Span(1), 0), (Item::Span(2), 1), (Item::Span(3), 1), (Item::Span(4), 0)]
@@ -655,7 +776,7 @@ mod tests {
         assert_eq!(rows[1].descendants, 2);
         assert_eq!(rows[1].end, BASE + 6_000, "a delegation lasts until its agent's last call");
 
-        let rows = waterfall(&t, None, &HashSet::from([1]), "");
+        let rows = waterfall(&t, None, None, &HashSet::from([1]), "");
         assert_eq!(items(&rows), vec![(Item::Span(0), 0), (Item::Span(1), 0), (Item::Span(4), 0)]);
         assert!(rows[1].collapsed);
     }
@@ -663,22 +784,22 @@ mod tests {
     #[test]
     fn the_waterfall_filter_reroots_and_the_query_lists_matches() {
         let t = sample();
-        assert_eq!(items(&waterfall(&t, Some("x"), &HashSet::new(), "")), vec![(Item::Span(2), 0), (Item::Span(3), 0)]);
-        let rows = waterfall(&t, None, &HashSet::from([1]), "edit");
+        assert_eq!(items(&waterfall(&t, Some("x"), None, &HashSet::new(), "")), vec![(Item::Span(2), 0), (Item::Span(3), 0)]);
+        let rows = waterfall(&t, None, None, &HashSet::from([1]), "edit");
         assert_eq!(items(&rows), vec![(Item::Span(3), 1)], "a match inside a collapsed subtree still shows");
     }
 
     #[test]
     fn an_unmatched_subagent_hangs_off_the_root() {
         let t = trace(&[("main", "m1", "Read", 0, Some(10), None), ("orphan", "o1", "Read", 5, Some(9), None)]);
-        assert_eq!(items(&waterfall(&t, None, &HashSet::new(), "")), vec![(Item::Span(0), 0), (Item::Span(1), 0)]);
+        assert_eq!(items(&waterfall(&t, None, None, &HashSet::new(), "")), vec![(Item::Span(0), 0), (Item::Span(1), 0)]);
     }
 
     #[test]
     fn instants_sit_among_the_roots_in_time_order() {
         let mut t = sample();
         t.instant(BASE + 2_500, Some(Arc::from("main")), InstantKind::Compaction);
-        let rows = waterfall(&t, None, &HashSet::new(), "");
+        let rows = waterfall(&t, None, None, &HashSet::new(), "");
         let pos = rows.iter().position(|r| r.item == Item::Instant(0)).unwrap();
         assert_eq!(rows[pos + 1].item, Item::Span(4), "before the read at 3.5s");
     }
@@ -686,21 +807,21 @@ mod tests {
     #[test]
     fn tracks_follow_the_delegation_tree_and_stack_overlaps() {
         let t = sample();
-        let tr = tracks(&t, None, BASE + 10_000);
+        let tr = tracks(&t, None, None, BASE + 10_000);
         assert_eq!(tr.iter().map(|t| (&*t.agent, t.depth)).collect::<Vec<_>>(), vec![("main", 0), ("x", 1)]);
         // main: its read at 3.5s overlaps the delegation, which lasts to 6s.
         assert_eq!(tr[0].lanes, vec![vec![0, 1], vec![4]]);
         assert_eq!(tr[1].lanes, vec![vec![2], vec![3]], "two overlapping calls take two lanes");
         assert_eq!(tr[1].delegation, Some(1));
 
-        let only = tracks(&t, Some("x"), BASE + 10_000);
+        let only = tracks(&t, Some("x"), None, BASE + 10_000);
         assert_eq!(only.iter().map(|t| (&*t.agent, t.depth)).collect::<Vec<_>>(), vec![("x", 0)]);
     }
 
     #[test]
     fn a_collapsed_track_is_one_density_row() {
         let t = sample();
-        let tr = tracks(&t, None, BASE + 10_000);
+        let tr = tracks(&t, None, None, BASE + 10_000);
         let rows = track_rows(&tr, &HashSet::from([Arc::from("x")]));
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[2], TrackRow { track: 1, lane: None });
@@ -715,14 +836,14 @@ mod tests {
         let mut t = sample();
         t.instant(BASE + 4_500, Some(Arc::from("x")), InstantKind::Compaction);
         t.instant(BASE + 4_600, None, InstantKind::Commit("abc".into()));
-        let tr = tracks(&t, None, BASE + 10_000);
+        let tr = tracks(&t, None, None, BASE + 10_000);
         assert_eq!((tr[0].instants.clone(), tr[1].instants.clone()), (vec![1], vec![0]));
     }
 
     #[test]
     fn navigation_moves_by_row_span_and_error() {
         let t = sample();
-        let rows = waterfall(&t, None, &HashSet::new(), "");
+        let rows = waterfall(&t, None, None, &HashSet::new(), "");
         let mut view = TraceView::default();
         view.move_row(&rows, 1);
         assert_eq!(view.selected, Some(Item::Span(0)));
@@ -731,7 +852,7 @@ mod tests {
         view.next_error(&t, &rows);
         assert_eq!(view.selected, Some(Item::Span(3)), "the failed edit");
 
-        let tr = tracks(&t, None, BASE + 10_000);
+        let tr = tracks(&t, None, None, BASE + 10_000);
         let trows = track_rows(&tr, &HashSet::new());
         assert!(view.select_track(&tr, &trows, "x"));
         assert_eq!((view.track_row, view.selected), (2, Some(Item::Span(2))));

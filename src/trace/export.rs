@@ -65,7 +65,8 @@ fn depth_name(depth: crate::tracking::ReadDepth) -> &'static str {
 }
 
 fn span_attributes(span: &Span) -> Vec<Value> {
-    let operation = if span.kind == SpanKind::Delegate { "invoke_agent" } else { "execute_tool" };
+    // A prompt invokes the session's agent, as a delegation invokes a subagent.
+    let operation = if matches!(span.kind, SpanKind::Delegate | SpanKind::Prompt) { "invoke_agent" } else { "execute_tool" };
     let mut attrs = vec![
         attr("gen_ai.operation.name", json!(operation)),
         attr("gen_ai.tool.name", json!(&*span.tool)),
@@ -83,6 +84,7 @@ fn span_attributes(span: &Span) -> Vec<Value> {
     match span.kind {
         SpanKind::Read(depth) => attrs.push(attr("ambits.read.depth", json!(depth_name(depth)))),
         SpanKind::Write => attrs.push(attr("ambits.write", json!(true))),
+        SpanKind::Prompt => attrs.push(attr("ambits.prompt", json!(true))),
         SpanKind::Delegate | SpanKind::Other => {}
     }
     if let Some(child) = &span.child_agent {
@@ -224,6 +226,7 @@ pub fn chrome(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
             SpanKind::Read(_) => "read",
             SpanKind::Write => "write",
             SpanKind::Delegate => "delegate",
+            SpanKind::Prompt => "prompt",
             SpanKind::Other => "other",
         };
         let mut args = serde_json::Map::new();
@@ -240,7 +243,8 @@ pub fn chrome(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
             "ts": micros(s.start), "dur": micros(n.end - s.start), "args": args,
         }));
         // A delegation's flow arrow to the first span of its subagent.
-        if let Some(first) = n.children.iter().map(|c| &trace.spans()[c.span]).min_by_key(|c| c.start) {
+        let first = n.children.iter().map(|c| &trace.spans()[c.span]).filter(|c| s.child_agent.as_ref() == Some(&c.agent)).min_by_key(|c| c.start);
+        if let Some(first) = first {
             events.push(json!({"name": "delegate", "cat": "delegate", "ph": "s", "id": flow, "pid": 1, "tid": tid, "ts": micros(s.start)}));
             events.push(json!({"name": "delegate", "cat": "delegate", "ph": "f", "bp": "e", "id": flow, "pid": 1, "tid": tids[&*first.agent], "ts": micros(first.start)}));
         }

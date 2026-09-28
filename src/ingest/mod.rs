@@ -151,6 +151,20 @@ pub enum SessionEvent {
     Write(WriteEvent),
     /// Any tool call's result arrived: when it ended, and how.
     ToolFinished(ToolFinished),
+    /// The user asked something: the start of a turn, whose tool calls
+    /// the trace nests under it.
+    Prompt(Prompt),
+}
+
+/// A prompt the user typed (not a tool result, a notification, or text
+/// Claude Code injected).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prompt {
+    /// The agent it was put to: the session's own.
+    pub agent_id: Arc<str>,
+    pub timestamp: String,
+    /// What was asked; a slash command as `/name args`.
+    pub text: String,
 }
 
 /// The end of a tool call, paired with its start by `id` (`tool_use_id`).
@@ -162,8 +176,8 @@ pub struct ToolFinished {
     pub timestamp: String,
     /// The tool failed or was rejected.
     pub error: bool,
-    /// For a delegation (`Agent`/`Task`), the subagent it started, named as
-    /// its events are (`agent-<agentId>`), when the result says.
+    /// For a delegation (`Agent`/`Task`), the subagent it started, by the
+    /// bare id its events carry, when the result says.
     pub child_agent: Option<Arc<str>>,
 }
 
@@ -208,6 +222,8 @@ pub struct TailerOutput {
     pub writes: Vec<WriteEvent>,
     /// Every tool call whose result arrived in this poll.
     pub finished: Vec<ToolFinished>,
+    /// Prompts typed in this poll.
+    pub prompts: Vec<Prompt>,
 }
 
 /// Maps a raw tool call (name + JSON input) to an `AgentToolCall`.

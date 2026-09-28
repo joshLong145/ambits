@@ -746,15 +746,20 @@ impl App {
         }
     }
 
+    /// The traces, one per prompt, under the current agent filter.
+    pub fn trace_list(&self) -> Vec<crate::trace::view::TraceSummary> {
+        crate::trace::view::traces(&self.trace, self.agent_filter.as_deref())
+    }
+
     /// The trace view's rows under the current agent filter.
     pub fn trace_rows(&self) -> Vec<crate::trace::view::Row> {
         let tv = &self.trace_view;
-        crate::trace::view::waterfall(&self.trace, self.agent_filter.as_deref(), &tv.collapsed_spans, &tv.query)
+        crate::trace::view::waterfall(&self.trace, self.agent_filter.as_deref(), tv.focus, &tv.collapsed_spans, &tv.query)
     }
 
     /// The tracks and their screen rows under the current agent filter.
     pub fn trace_tracks(&self) -> (Vec<crate::trace::view::Track>, Vec<crate::trace::view::TrackRow>) {
-        let tracks = crate::trace::view::tracks(&self.trace, self.agent_filter.as_deref(), self.trace_open_end());
+        let tracks = crate::trace::view::tracks(&self.trace, self.agent_filter.as_deref(), self.trace_view.focus, self.trace_open_end());
         let rows = crate::trace::view::track_rows(&tracks, &self.trace_view.collapsed_agents);
         (tracks, rows)
     }
@@ -785,10 +790,15 @@ impl App {
             return;
         }
         let waterfall = tv.layout == Layout::Waterfall;
+        if tv.focus.is_none() {
+            self.handle_trace_list_key(key);
+            return;
+        }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.should_quit = true,
-            KeyCode::Char('t') | KeyCode::Esc => self.trace_view.open = false,
+            KeyCode::Char('t') => self.trace_view.open = false,
+            KeyCode::Esc | KeyCode::Backspace => self.trace_view.close_trace(),
             KeyCode::Char('v') => {
                 self.trace_view.layout = if waterfall { Layout::Tracks } else { Layout::Waterfall };
             }
@@ -833,6 +843,33 @@ impl App {
                 self.follow_selection_to_track();
             }
             KeyCode::Enter => self.follow_trace_selection(),
+            KeyCode::Tab => self.cycle_agent_filter(),
+            KeyCode::BackTab => self.cycle_agent_filter_backward(),
+            _ => {}
+        }
+    }
+
+    /// The list of traces: choose one and `Enter` shows its timeline.
+    fn handle_trace_list_key(&mut self, key: KeyEvent) {
+        use crate::trace::view::Layout;
+        let traces = self.trace_list();
+        let tv = &mut self.trace_view;
+        match key.code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.should_quit = true,
+            KeyCode::Char('t') | KeyCode::Esc => tv.open = false,
+            KeyCode::Char('j') | KeyCode::Down => tv.move_list(&traces, 1),
+            KeyCode::Char('k') | KeyCode::Up => tv.move_list(&traces, -1),
+            KeyCode::PageDown => tv.move_list(&traces, 20),
+            KeyCode::PageUp => tv.move_list(&traces, -20),
+            KeyCode::Char('g') => tv.move_list(&traces, isize::MIN / 2),
+            KeyCode::Char('G') => tv.move_list(&traces, isize::MAX / 2),
+            KeyCode::Enter => {
+                if let Some(ix) = tv.list_index(&traces) {
+                    tv.open_trace(traces[ix].root);
+                }
+            }
+            KeyCode::Char('v') => tv.layout = if tv.layout == Layout::Waterfall { Layout::Tracks } else { Layout::Waterfall },
             KeyCode::Tab => self.cycle_agent_filter(),
             KeyCode::BackTab => self.cycle_agent_filter_backward(),
             _ => {}
@@ -950,6 +987,20 @@ impl App {
     fn handle_trace_mouse(&mut self, mouse: MouseEvent) {
         use crate::trace::view::{Item, Layout};
         let Some(g) = self.trace_geometry.get() else { return };
+        if self.trace_view.focus.is_none() {
+            let traces = self.trace_list();
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.trace_view.move_list(&traces, -3),
+                MouseEventKind::ScrollDown => self.trace_view.move_list(&traces, 3),
+                MouseEventKind::Down(_) if (g.rows_y..g.rows_y + g.rows).contains(&mouse.row) => {
+                    if let Some(t) = traces.get(g.first_row + (mouse.row - g.rows_y) as usize) {
+                        self.trace_view.list = Some(t.root);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         let in_bars = mouse.column >= g.bars_x && mouse.column < g.bars_x + g.bars_width;
         let col = mouse.column.saturating_sub(g.bars_x) as usize;
         let vp = self.trace_view.viewport(&self.trace);
@@ -1359,6 +1410,11 @@ impl App {
     /// A tool call's result arrived: close its span in the trace.
     pub fn process_tool_finished(&mut self, finished: &crate::ingest::ToolFinished) {
         self.trace.finish(finished);
+    }
+
+    /// A prompt starts a turn: the trace nests the calls that follow under it.
+    pub fn process_prompt(&mut self, prompt: &crate::ingest::Prompt) {
+        self.trace.prompt(prompt);
     }
 
     /// Queue a write for attribution, tagged with the current session (see
@@ -3511,8 +3567,34 @@ mod trace_view_tests {
                 child_agent: child.map(Arc::from),
             });
         }
+        // Read after its calls, as a tailer poll can deliver it; its time
+        // still makes it their parent.
+        app.process_prompt(&crate::ingest::Prompt {
+            agent_id: Arc::from("sess"),
+            timestamp: "2026-09-27T09:59:59.000Z".into(),
+            text: "review the code".into(),
+        });
         key(&mut app, KeyCode::Char('t'));
+        key(&mut app, KeyCode::Enter);
         app
+    }
+
+    /// `t` opens on the list of traces, one per prompt; `Enter` opens one,
+    /// `Esc` goes back to the list and then to the tree.
+    #[test]
+    fn the_trace_view_opens_on_a_list_of_prompts() {
+        let mut app = app();
+        key(&mut app, KeyCode::Esc);
+        assert!(app.trace_view.open && app.trace_view.focus.is_none(), "back on the list");
+        let traces = app.trace_list();
+        assert_eq!(traces.len(), 1);
+        assert_eq!((traces[0].root, traces[0].calls, traces[0].failed, traces[0].agents), (3, 3, 1, 1));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.trace_view.focus, Some(3));
+        assert_eq!(app.trace_rows().len(), 4, "the prompt and its three calls");
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.trace_view.open);
     }
 
     #[test]
@@ -3528,13 +3610,14 @@ mod trace_view_tests {
         assert!(app.trace_view.viewport.is_none(), "0 fits");
         key(&mut app, KeyCode::Char('v'));
         assert_eq!(app.trace_view.layout, Layout::Tracks);
-        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('t'));
         assert!(!app.trace_view.open);
     }
 
     #[test]
     fn enter_follows_a_delegation_into_its_agent() {
         let mut app = app();
+        key(&mut app, KeyCode::Char('j'));
         key(&mut app, KeyCode::Char('j'));
         key(&mut app, KeyCode::Char('j'));
         assert_eq!(app.trace_view.selected, Some(Item::Span(1)));
@@ -3575,7 +3658,7 @@ mod trace_view_tests {
         app.trace_geometry.set(Some(TraceGeometry { bars_x: 10, bars_width: 40, rows_y: 5, rows: 10, first_row: 0 }));
         let mouse = |kind, column, row| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
         app.handle_mouse(mouse(MouseEventKind::Down(crossterm::event::MouseButton::Left), 12, 7));
-        assert_eq!(app.trace_view.selected, Some(Item::Span(2)), "third row");
+        assert_eq!(app.trace_view.selected, Some(Item::Span(1)), "the third row: the prompt, the read, the delegation");
         let before = app.trace_view.viewport(&app.trace);
         app.handle_mouse(mouse(MouseEventKind::ScrollUp, 10, 7));
         let after = app.trace_view.viewport.expect("zoomed");

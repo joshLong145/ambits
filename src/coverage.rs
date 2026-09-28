@@ -644,7 +644,7 @@ pub fn run_report(
                         compactions.clear();
                     }
                     // Writes grant no read credit (spec D9).
-                    SessionEvent::Write(_) | SessionEvent::ToolFinished(_) => {}
+                    SessionEvent::Write(_) | SessionEvent::ToolFinished(_) | SessionEvent::Prompt(_) => {}
                 }
             }
         }

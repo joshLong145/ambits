@@ -290,6 +290,8 @@ pub enum ParsedLine {
     /// `type:"queue-operation"` enqueuing a `<task-notification>`: a
     /// background agent stopped, long after its call's own result.
     AgentStopped { tool_use_id: Arc<str>, agent: Arc<str>, timestamp: String, error: bool },
+    /// `type:"user"` text the user typed: a turn begins.
+    Prompt { agent: Option<Arc<str>>, text: String, timestamp: String },
     Ignored,
 }
 
@@ -584,6 +586,11 @@ impl LineFeed {
                     child_agent: Some(agent),
                 }))
             }
+            ParsedLine::Prompt { agent, text, timestamp } => out.push(SessionEvent::Prompt(super::Prompt {
+                agent_id: agent.unwrap_or_else(|| Arc::from(self.default_id.as_str())),
+                timestamp,
+                text,
+            })),
             ParsedLine::Ignored => {}
         }
     }
@@ -600,6 +607,46 @@ fn parse_compact_metadata(meta: &Value) -> Option<CompactionMetadata> {
         post_tokens: meta.get("postTokens").and_then(|v| v.as_u64()).unwrap_or(0),
         duration_ms: meta.get("durationMs").and_then(|v| v.as_u64()).unwrap_or(0),
     })
+}
+
+/// A prompt the user typed. Claude Code marks one `origin.kind: "human"`;
+/// a log without `origin` falls back to plain text that is neither meta,
+/// a subagent's (sidechain) opening prompt, nor injected (`<…>` tags other
+/// than a slash command).
+fn parse_prompt(obj: &Value) -> Option<ParsedLine> {
+    if obj.get("isSidechain").and_then(Value::as_bool) == Some(true) || obj.get("isMeta").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let text = match obj.pointer("/message/content")? {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    let command = text.contains("<command-name>");
+    match obj.pointer("/origin/kind").and_then(Value::as_str) {
+        Some(kind) if kind != "human" => return None,
+        Some(_) => {}
+        None if text.trim_start().starts_with('<') && !command => return None,
+        None if text.starts_with("[Request interrupted") => return None,
+        None => {}
+    }
+    let text = if command {
+        let tag = |name: &str| text.split_once(&format!("<{name}>")).and_then(|(_, rest)| rest.split_once(&format!("</{name}>"))).map(|(v, _)| v.trim());
+        [tag("command-name"), tag("command-args")].into_iter().flatten().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ")
+    } else {
+        text.trim().to_string()
+    };
+    if text.is_empty() {
+        return None;
+    }
+    let agent = obj.get("sessionId").and_then(Value::as_str).map(Arc::from);
+    let timestamp = obj.get("timestamp").and_then(Value::as_str).unwrap_or("").to_string();
+    Some(ParsedLine::Prompt { agent, text, timestamp })
 }
 
 /// A `<task-notification>` as Claude Code enqueues it when a background
@@ -677,6 +724,9 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
             .unwrap_or("");
         if content.contains("<command-name>/clear</command-name>") {
             return ParsedLine::SessionCleared;
+        }
+        if let Some(prompt) = parse_prompt(&obj) {
+            return prompt;
         }
         let results = parse_tool_results(&mut obj);
         return if results.is_empty() {
@@ -1102,6 +1152,7 @@ impl LogTailer {
             session_cleared: false,
             writes: Vec::new(),
             finished: Vec::new(),
+            prompts: Vec::new(),
         };
         for event in events {
             match event {
@@ -1112,6 +1163,7 @@ impl LogTailer {
                 }
                 SessionEvent::SessionCleared => output.session_cleared = true,
                 SessionEvent::ToolFinished(f) => output.finished.push(f),
+                SessionEvent::Prompt(p) => output.prompts.push(p),
             }
         }
         output
@@ -1486,7 +1538,9 @@ mod tests {
 
         let config = ToolMappingConfig::builtin().expect("builtin config");
         let events = parse_log_file(&log, &config);
-        assert_eq!(events.len(), 2);
+        let calls = events.iter().filter(|e| matches!(e, SessionEvent::ToolCall(_))).count();
+        let prompts = events.iter().filter(|e| matches!(e, SessionEvent::Prompt(_))).count();
+        assert_eq!((calls, prompts), (2, 2), "the user's messages are prompts, not calls");
     }
 
     #[test]
@@ -1551,7 +1605,7 @@ mod tests {
         let log = tmp.path().join("agent-test123.jsonl");
         let mut f = fs::File::create(&log).unwrap();
         // First line: user message with task prompt.
-        writeln!(f, r#"{{"agentId":"test123","type":"user","message":{{"role":"user","content":"Check the coverage"}},"sessionId":"sess-1","timestamp":"2025-01-01T00:00:00Z"}}"#).unwrap();
+        writeln!(f, r#"{{"agentId":"test123","isSidechain":true,"type":"user","message":{{"role":"user","content":"Check the coverage"}},"sessionId":"sess-1","timestamp":"2025-01-01T00:00:00Z"}}"#).unwrap();
         // Second line: assistant with a tool call.
         writeln!(f, "{}", jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/a.rs"}"#)).unwrap();
         drop(f);
@@ -1612,11 +1666,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_compact_command_returns_ignored() {
-        // /compact must NOT trigger SessionCleared.
+    fn parse_compact_command_is_a_prompt_not_a_clear() {
+        // /compact must NOT trigger SessionCleared; the user typed it.
         let line = r#"{"type":"user","sessionId":"abc","message":{"role":"user","content":"<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>"}}"#;
         let config = ToolMappingConfig::builtin().expect("builtin config");
-        assert!(matches!(parse_jsonl_line(line, "d", &config), ParsedLine::Ignored));
+        assert!(matches!(parse_jsonl_line(line, "d", &config), ParsedLine::Prompt { text, .. } if text == "/compact"));
+    }
+
+    /// What the user typed is a prompt; what Claude Code injected, a
+    /// subagent's opening prompt, and meta text are not.
+    #[test]
+    fn only_what_the_user_typed_is_a_prompt() {
+        let config = ToolMappingConfig::builtin().expect("builtin config");
+        let prompt = |line: serde_json::Value| match parse_jsonl_line(&line.to_string(), "d", &config) {
+            ParsedLine::Prompt { text, agent, .. } => Some((text, agent.map(|a| a.to_string()))),
+            _ => None,
+        };
+        let user = |content: serde_json::Value, extra: serde_json::Value| {
+            let mut line = serde_json::json!({"type": "user", "sessionId": "s1", "timestamp": "2026-09-27T10:00:00Z", "message": {"role": "user", "content": content}});
+            line.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            line
+        };
+        use serde_json::json;
+        assert_eq!(prompt(user(json!("fix the bug"), json!({"origin": {"kind": "human"}}))), Some(("fix the bug".into(), Some("s1".into()))));
+        assert_eq!(prompt(user(json!([{"type": "text", "text": "with an image"}]), json!({}))).map(|p| p.0), Some("with an image".into()));
+        assert_eq!(prompt(user(json!("<task-notification>…"), json!({"origin": {"kind": "task-notification"}}))), None);
+        assert_eq!(prompt(user(json!("<task-notification>…"), json!({}))), None, "no origin: a tag is injected");
+        assert_eq!(prompt(user(json!("go"), json!({"isSidechain": true}))), None, "a subagent's prompt");
+        assert_eq!(prompt(user(json!("skill text"), json!({"isMeta": true}))), None);
+        assert_eq!(prompt(user(json!([{"type": "text", "text": "[Request interrupted by user]"}]), json!({}))), None);
     }
 
     #[test]
@@ -1947,6 +2025,7 @@ description  = "UserTool {target}"
                 ParsedLine::SessionCleared => "SessionCleared",
                 ParsedLine::ToolResults(_) => "ToolResults",
                 ParsedLine::AgentStopped { .. } => "AgentStopped",
+                ParsedLine::Prompt { .. } => "Prompt",
                 ParsedLine::Ignored => "Ignored",
             }),
         }

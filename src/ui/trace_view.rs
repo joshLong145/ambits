@@ -1,6 +1,7 @@
-//! The trace view (`t`): the session's tool calls on a time axis, as an
-//! OpenTelemetry waterfall or as Perfetto-style agent tracks (`v`). Layout
-//! comes from [`ambits::trace::view`]; this only draws it.
+//! The trace view (`t`): first a list of traces, one per prompt; `Enter`
+//! on one shows its tool calls on a time axis, as an OpenTelemetry
+//! waterfall or as Perfetto-style agent tracks (`v`). Layout comes from
+//! [`ambits::trace::view`]; this only draws it.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -29,10 +30,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         Layout::Tracks => "tracks",
     };
     let who = app.agent_filter.as_deref().map_or("all agents".to_string(), |a| app_agent(app, a).to_string());
-    let block = Block::default()
-        .title(format!(" Trace — {who} · {layout} "))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+    let title = match tv.focus {
+        Some(root) => format!(" Trace — {} · {who} · {layout} ", super::fit(&app.trace.spans()[root].name(), 48)),
+        None => format!(" Traces — {who} "),
+    };
+    let block = Block::default().title(title).borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
     f.render_widget(block, area);
     // Summary, ruler, at least two rows, the separator and the details.
@@ -40,10 +42,15 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let Some(range) = app.trace.range() else {
+    if app.trace.range().is_none() {
         f.render_widget(Paragraph::new(" No tool calls yet.").style(Style::default().fg(Color::DarkGray)), inner);
         return;
-    };
+    }
+    if tv.focus.is_none() {
+        render_list(f, app, inner);
+        return;
+    }
+    let Some(range) = tv.range(&app.trace) else { return };
     let vp = tv.viewport(&app.trace);
     let label_w = match tv.layout {
         Layout::Waterfall => (inner.width as usize * 2 / 5).max(24),
@@ -70,20 +77,90 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     app.trace_geometry.set(Some(TraceGeometry { bars_x, bars_width: bars_w as u16, rows_y, rows: rows_h, first_row }));
 }
 
+/// The traces, one row per prompt: when, what was asked, how long it took,
+/// how many calls, failures and subagents. The selected prompt in full
+/// below.
+fn render_list(f: &mut Frame, app: &App, inner: Rect) {
+    let traces = app.trace_list();
+    let dim = Style::default().fg(Color::DarkGray);
+    let rows_h = inner.height - 3 - DETAILS;
+    let selected = app.trace_view.list_index(&traces);
+    let first = scroll(app, selected, traces.len(), rows_h as usize);
+    let prompts = traces.iter().filter(|t| app.trace.spans()[t.root].kind == SpanKind::Prompt).count();
+
+    // when · prompt · took · calls · failed · agents
+    let text_w = (inner.width as usize).saturating_sub(13 + 8 + 10 + 9 + 9);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(" {prompts} prompts · {} traces · Enter opens one", traces.len()),
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            format!(" {:<11} {:<text_w$} {:>7} {:>9} {:>8} {:>8}", "when", "prompt", "took", "calls", "failed", "agents"),
+            dim,
+        )),
+    ];
+    for (ix, t) in traces.iter().enumerate().skip(first).take(rows_h as usize) {
+        let root = &app.trace.spans()[t.root];
+        let style = if Some(ix) == selected { selected_style() } else { Style::default() };
+        let what = match root.kind {
+            SpanKind::Prompt => root.name(),
+            _ => format!("(before any prompt) {}", root.name()),
+        };
+        let what = super::fit(&what, text_w);
+        let pad = text_w.saturating_sub(super::width(&what));
+        let failed = if t.failed > 0 { format!("{} ✗", t.failed) } else { String::new() };
+        let agents = if t.agents > 0 { t.agents.to_string() } else { String::new() };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {:<11} ", day_clock(t.start)), style.fg(Color::DarkGray)),
+            Span::styled(format!("{what}{}", " ".repeat(pad)), style.fg(Color::White)),
+            Span::styled(format!(" {:>7}", view::duration(t.end - t.start)), style.fg(Color::Gray)),
+            Span::styled(format!(" {:>9}", t.calls), style.fg(Color::Gray)),
+            Span::styled(format!(" {failed:>8}"), style.fg(Color::Red)),
+            Span::styled(format!(" {agents:>8}"), style.fg(Color::Gray)),
+        ]));
+    }
+    lines.resize(2 + rows_h as usize, Line::from(""));
+    lines.push(Line::from(Span::styled("─".repeat(inner.width as usize), dim)));
+    if let Some(t) = selected.map(|i| &traces[i]) {
+        let text = app.trace.spans()[t.root].description.split_whitespace().collect::<Vec<_>>().join(" ");
+        let width = (inner.width as usize).saturating_sub(2).max(1);
+        let chars: Vec<char> = text.chars().collect();
+        for (n, chunk) in chars.chunks(width).take(DETAILS as usize).enumerate() {
+            let mut line: String = chunk.iter().collect();
+            if n + 1 == DETAILS as usize && chars.len() > width * DETAILS as usize {
+                line = super::fit(&format!("{line}…"), width);
+            }
+            lines.push(Line::from(Span::styled(format!(" {line}"), Style::default().fg(Color::Gray))));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+    app.trace_geometry.set(Some(TraceGeometry { bars_x: inner.x, bars_width: 0, rows_y: inner.y + 2, rows: rows_h, first_row: first }));
+}
+
+/// `MM-DD HH:MM` UTC.
+fn day_clock(ms: u64) -> String {
+    let t = ambits::time::rfc3339(ms / 1000);
+    format!("{} {}", t.get(5..10).unwrap_or(""), t.get(11..16).unwrap_or(""))
+}
+
 /// `12m04s · 1,204 calls · 3 failed · 0s–12m04s shown`
 fn summary(app: &App, (start, end): (u64, u64)) -> Line<'static> {
-    let spans = app.trace.spans();
-    let failed = spans.iter().filter(|s| s.error).count();
+    let (calls, failed) = match app.trace_view.focus.and_then(|r| app.trace_list().into_iter().find(|t| t.root == r)) {
+        Some(t) => (t.calls, t.failed),
+        None => (app.trace.spans().len(), app.trace.spans().iter().filter(|s| s.error).count()),
+    };
     let vp = app.trace_view.viewport(&app.trace);
     let shown = format!("{}–{}", view::offset(vp.start.saturating_sub(start)), view::offset(vp.end.saturating_sub(start)));
     let mut out = vec![
         Span::styled(format!(" {}", view::duration(end - start)), Style::default().fg(Color::White)),
-        Span::styled(format!(" · {} calls", spans.len()), Style::default().fg(Color::Gray)),
+        Span::styled(format!(" · {calls} calls"), Style::default().fg(Color::Gray)),
     ];
     if failed > 0 {
         out.push(Span::styled(format!(" · {failed} failed"), Style::default().fg(Color::Red)));
     }
     let zoom = if app.trace_view.viewport.is_some() { "" } else { " (all, following)" };
+    let zoom = format!("{zoom} · Esc: all traces");
     out.push(Span::styled(format!(" · {shown} shown{zoom}"), Style::default().fg(Color::DarkGray)));
     if !app.trace_view.query.is_empty() || app.trace_view.typing {
         let cursor = if app.trace_view.typing { "_" } else { "" };
@@ -300,6 +377,7 @@ fn details(app: &App, statuses: &Statuses) -> Vec<Line<'static>> {
                         facts.push(format!("→ {child} ({n} calls) · Enter follows"));
                     }
                 }
+                SpanKind::Prompt => facts.push("the prompt: every call below answered it".into()),
                 SpanKind::Other => {}
             }
             if s.error {
@@ -364,6 +442,7 @@ fn span_color(app: &App, statuses: &Statuses, i: usize) -> Color {
             None => colors::WRITE_UNKNOWN,
         },
         SpanKind::Delegate => Color::Gray,
+        SpanKind::Prompt => Color::Cyan,
         SpanKind::Other => Color::Rgb(150, 150, 150),
     }
 }
@@ -445,7 +524,13 @@ mod tests {
         app.trace.finish(&finish("d1", "2026-09-27T10:00:03.100Z", Some("ax1"), false));
         app.trace.start(&call("ax1", "x1", "Edit", "2026-09-27T10:00:04.000Z"), &app.project_root.clone());
         app.trace.finish(&finish("x1", "2026-09-27T10:00:09.000Z", None, true));
+        app.process_prompt(&ambits::ingest::Prompt {
+            agent_id: Arc::from("sess"),
+            timestamp: "2026-09-27T09:59:59.000Z".into(),
+            text: "review the code\nand tell me".into(),
+        });
         app.trace_view.open = true;
+        app.trace_view.open_trace(3);
         app
     }
 
@@ -462,8 +547,10 @@ mod tests {
         app.trace_view.selected = Some(Item::Span(2));
         let lines = screen(&app);
         let text = lines.join("\n");
-        assert!(lines[0].contains("Trace — all agents · waterfall"), "{text}");
-        assert!(lines[1].contains("9s · 3 calls · 1 failed"), "{text}");
+        assert!(lines[0].contains("· all agents · waterfall"), "{text}");
+        assert!(lines[0].contains("Trace — review the code…"), "{text}");
+        assert!(lines[1].contains("10s · 3 calls · 1 failed"), "{text}");
+        assert!(lines.iter().any(|l| l.contains("▾ review the code…")), "the prompt is the root: {text}");
         let read = lines.iter().position(|l| l.contains("Read src/a.rs")).expect(&text);
         let edit = lines.iter().position(|l| l.contains("✗ Edit src/a.rs")).expect(&text);
         assert!(lines.iter().any(|l| l.contains("▾ Agent src/a.rs → ax1")), "{text}");
@@ -483,6 +570,21 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("▾ main")), "{text}");
         let sub = lines.iter().find(|l| l.contains("▾ Agent src/a.rs")).expect(&text);
         assert!(sub.contains("Edit"), "the name is drawn inside a wide enough bar: {sub}");
+    }
+
+    /// The top level lists prompts, not a time axis.
+    #[test]
+    fn the_list_shows_one_row_per_prompt() {
+        let mut app = app();
+        app.trace_view.close_trace();
+        let lines = screen(&app);
+        let text = lines.join("\n");
+        assert!(lines[0].contains("Traces — all agents"), "{text}");
+        assert!(lines[1].contains("1 prompts · 1 traces"), "{text}");
+        let row = lines.iter().find(|l| l.contains("09-27 09:59")).expect(&text);
+        assert!(row.contains("review the code…") && row.contains("10s") && row.contains("1 ✗"), "{row}");
+        assert!(text.contains("review the code and tell me"), "the whole prompt below: {text}");
+        assert!(!text.contains('█'), "no bars at the top level: {text}");
     }
 
     #[test]

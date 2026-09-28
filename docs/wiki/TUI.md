@@ -28,7 +28,7 @@ leave the tree rather than lingering until you quit.
 - **Sortable tree** — alphabetical, or grouped by coverage to surface half-read files first
 - **Search** — `/` to jump to a symbol by name
 - **Compaction history** — `C` for this session's compaction boundaries
-- **Trace view** — `t` puts the session's tool calls on a time axis, as an OpenTelemetry waterfall or Perfetto-style agent tracks (see [below](#trace-view))
+- **Trace view** — `t` lists the session's prompts; `Enter` puts one prompt's tool calls on a time axis, as an OpenTelemetry waterfall or Perfetto-style agent tracks (see [below](#trace-view))
 - **Sub-agent alignment** — `d` compares two agents file by file: where they read the same code, and where only one looked (see [Coverage and Multi-Agent](Coverage-and-Multi-Agent))
 
 Symbols carried over from before a compaction render dimmed — the read
@@ -99,10 +99,17 @@ before this run come from the [read journal](Configuration#the-read-journal).
 
 ## Trace view
 
-`t` replaces the tree with the session's tool calls on a time axis: every
-call a bar from its call to its result, each subagent's calls under the
-delegation that started it. It is the model [`ambits trace`](Traces)
-exports, so what you see here is what Jaeger or Perfetto would show.
+`t` replaces the tree with the session's **traces, one per prompt**: when
+you asked, what, how long answering took, how many tool calls it made, how
+many failed, and how many subagents it started. The selected prompt is shown
+in full below the list. `j` / `k` choose, `Enter` opens one, `Esc` goes back
+to the tree.
+
+An open trace is that prompt's tool calls on a time axis: the prompt is the
+root span, every call made answering it a sub-span, each subagent's calls
+under the delegation that started it. It is the model
+[`ambits trace`](Traces) exports, so what you see here is what Jaeger or
+Perfetto would show. `Esc` returns to the list.
 
 Two layouts, `v` to switch:
 
@@ -119,7 +126,7 @@ version is still there, failures red, delegations grey. `▼` marks a
 compaction. The line under the bars details the selected call: its agent,
 start, end and duration, depth or write status, and where `Enter` goes.
 
-The view follows the session live until you zoom; `0` goes back to that.
+The timeline follows its trace live until you zoom; `0` goes back to that.
 Its keys are modal, as in Perfetto:
 
 | Key | Action |
@@ -135,7 +142,8 @@ Its keys are modal, as in Perfetto:
 | `e` | Next failed call |
 | `Tab` / `Shift+Tab` | Cycle the agent filter (`a` pans here) |
 | `v` | Waterfall / tracks |
-| `t`, `Esc` | Back to the tree |
+| `Esc` | Back to the list of traces |
+| `t` | Back to the tree |
 
 The mouse wheel zooms at the pointer, a drag pans, a click selects.
 

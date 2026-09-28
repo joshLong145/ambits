@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::ingest::{AgentToolCall, Effect, SessionEvent, ToolFinished};
+use crate::ingest::{AgentToolCall, Effect, Prompt, SessionEvent, ToolFinished};
 use crate::tracking::ReadDepth;
 
 /// What a span did.
@@ -27,6 +27,8 @@ pub enum SpanKind {
     Write,
     /// Started a subagent.
     Delegate,
+    /// A prompt the user typed: the parent of the turn's calls.
+    Prompt,
     /// Anything else: a shell command, a search that saw nothing, …
     Other,
 }
@@ -55,8 +57,14 @@ pub struct Span {
 }
 
 impl Span {
-    /// A short name: the symbol, else the file, else the description.
+    /// A short name: the symbol, else the file, else the description; a
+    /// prompt by its first line, cut at 80 characters.
     pub fn name(&self) -> String {
+        if self.kind == SpanKind::Prompt {
+            let line = self.description.lines().next().unwrap_or_default();
+            let cut: String = line.chars().take(80).collect();
+            return if cut.len() < line.len() || self.description.lines().nth(1).is_some() { format!("{cut}…") } else { cut };
+        }
         match (&self.symbol, &self.file) {
             (Some(s), _) => format!("{} {s}", self.tool),
             (None, Some(f)) => format!("{} {f}", self.tool),
@@ -158,6 +166,25 @@ impl Trace {
         }
     }
 
+    /// A turn began. Its span's own end is its start; it lasts, in the
+    /// tree, as long as the calls under it.
+    pub fn prompt(&mut self, prompt: &Prompt) {
+        let Some(t) = crate::time::parse_rfc3339_millis(&prompt.timestamp) else { return };
+        self.spans.push(Span {
+            id: None,
+            agent: prompt.agent_id.clone(),
+            start: t,
+            end: Some(t),
+            tool: Arc::from("prompt"),
+            kind: SpanKind::Prompt,
+            file: None,
+            symbol: None,
+            description: prompt.text.clone(),
+            error: false,
+            child_agent: None,
+        });
+    }
+
     pub fn instant(&mut self, t: u64, agent: Option<Arc<str>>, kind: InstantKind) {
         self.instants.push(Instant { t, agent, kind });
     }
@@ -182,6 +209,7 @@ impl Trace {
                 }
             }
             SessionEvent::SessionCleared => self.clear(),
+            SessionEvent::Prompt(p) => self.prompt(p),
             SessionEvent::Write(_) => {}
         }
     }
@@ -193,10 +221,14 @@ impl Trace {
         Some((starts.min()?, ends.max()?))
     }
 
-    /// The span tree, as OTel sees a trace: the session is the root; each
-    /// delegation is the parent of every span its subagent made; everything
-    /// else hangs off the root. A subagent no delegation names (a truncated
-    /// log) hangs off the root too — never dropped.
+    /// The span tree, as OTel sees a trace: each prompt is a root, the
+    /// parent of the calls its agent made from then until the next prompt;
+    /// each delegation is the parent of every span its subagent made.
+    /// Calls before any prompt are roots, and so is a subagent no
+    /// delegation names (a truncated log) — never dropped.
+    ///
+    /// Parents come from timestamps, not arrival order, so a prompt read
+    /// after the calls that follow it still gathers them.
     pub fn tree(&self) -> Vec<Node> {
         let delegated: HashMap<&str, usize> = self
             .spans
@@ -204,13 +236,35 @@ impl Trace {
             .enumerate()
             .filter_map(|(i, s)| Some((s.child_agent.as_deref()?, i)))
             .collect();
+        let mut prompts: HashMap<&str, Vec<(u64, usize)>> = HashMap::new();
+        for (i, s) in self.spans.iter().enumerate().filter(|(_, s)| s.kind == SpanKind::Prompt) {
+            prompts.entry(&s.agent).or_default().push((s.start, i));
+        }
+        for list in prompts.values_mut() {
+            list.sort_unstable();
+        }
+        let prompt_of = |span: &Span| {
+            let list = prompts.get(&*span.agent)?;
+            let before = list.partition_point(|&(t, _)| t <= span.start);
+            before.checked_sub(1).map(|p| list[p].1)
+        };
         let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
         let mut roots = Vec::new();
         for (i, span) in self.spans.iter().enumerate() {
-            match delegated.get(&*span.agent) {
-                Some(&parent) if parent != i => children.entry(parent).or_default().push(i),
-                _ => roots.push(i),
+            let parent = match span.kind {
+                SpanKind::Prompt => None,
+                _ => delegated.get(&*span.agent).copied().filter(|&p| p != i).or_else(|| prompt_of(span)),
+            };
+            match parent {
+                Some(parent) => children.entry(parent).or_default().push(i),
+                None => roots.push(i),
             }
+        }
+        // Arrival order is not time order across kinds; the tree is.
+        let start = |i: &usize| (self.spans[*i].start, *i);
+        roots.sort_by_key(start);
+        for kids in children.values_mut() {
+            kids.sort_by_key(start);
         }
         fn build(ix: usize, trace: &Trace, children: &HashMap<usize, Vec<usize>>) -> Node {
             let kids: Vec<Node> = children.get(&ix).into_iter().flatten().map(|&c| build(c, trace, children)).collect();

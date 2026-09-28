@@ -309,7 +309,7 @@ pub fn replay_session_logs(
                 }
                 SessionEvent::Compacted { .. } => {}
                 // Writes grant no read credit (spec D9).
-                SessionEvent::Write(_) | SessionEvent::ToolFinished(_) => {}
+                SessionEvent::Write(_) | SessionEvent::ToolFinished(_) | SessionEvent::Prompt(_) => {}
             }
         }
     }
