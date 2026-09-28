@@ -102,6 +102,9 @@ pub struct AgentToolCall {
     /// Read or write, from the tool's stanza. A write carries
     /// `ReadDepth::Unseen`: it grants no read credit (D9).
     pub effect: Effect,
+    /// What the call is for, in the agent's own words, when its tool takes
+    /// one: Bash's `description`. Names it in the trace view.
+    pub summary: Option<String>,
 }
 
 /// Point-in-time ledger snapshot captured at a compaction boundary.
@@ -286,9 +289,10 @@ pub trait SessionIngester: Send + Sync {
         self.new_tailer(handoff.files.into_iter().map(|(file, _)| file).collect())
     }
 
-    /// What call `id` read or wrote, from the session's log `files`, for
-    /// display only: never persisted (spec §9.6). Default: not available.
-    fn call_content(&self, files: &[PathBuf], id: &str, kind: content::ContentKind) -> Option<content::CallContent> {
+    /// Call `id`'s arguments and what it read or wrote, from the session's
+    /// log `files`, for display only: never persisted (spec §9.6).
+    /// Default: not available.
+    fn call_detail(&self, files: &[PathBuf], id: &str, kind: content::ContentKind) -> Option<content::CallDetail> {
         let _ = (files, id, kind);
         None
     }

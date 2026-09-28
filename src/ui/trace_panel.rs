@@ -131,7 +131,7 @@ fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, width: usize) -> Vec<
     let (index, statuses) = (&frame.index, &frame.statuses);
     let mut out = vec![
         Line::from(Span::styled(format!(" {}", span_name(app, i)), Style::default().fg(span_color(app, statuses, i)).add_modifier(Modifier::BOLD))),
-        fact("agent", vec![text(app.agent_name(&s.agent).to_string(), Color::Gray)]),
+        fact("agent", vec![text(fit(&app.agent_title(&s.agent), width.saturating_sub(12)), Color::Gray)]),
         fact("when", vec![text(frame.timing(app, i), Color::Gray)]),
     ];
     if let Some(root) = index.root_of(i).filter(|r| *r != i) {
@@ -168,19 +168,25 @@ fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, width: usize) -> Vec<
         SpanKind::Delegate => {
             if let Some(d) = index.root_of(i).and_then(|r| summary::detail(&app.trace, index, r)) {
                 if let Some(run) = d.agents.iter().find(|a| a.delegation == i) {
-                    out.push(fact("agent", vec![text(format!("{} · {} calls · {}", run.agent, run.calls, view::duration(run.duration)), Color::White)]));
+                    let mut started = vec![text(format!("a subagent · {} calls · {}", run.calls, view::duration(run.duration)), Color::White)];
                     if run.failed > 0 {
-                        out.push(fact("", vec![text(format!("{} failed", run.failed), Color::Red)]));
+                        started.push(text(format!(" · {} failed", run.failed), Color::Red));
                     }
+                    out.push(fact("started", started));
                 }
             }
-            out.extend(wrapped("task", s.description.trim_start_matches("Agent: "), Color::Gray, width, 4));
+            // Its task is among its arguments, once they are loaded.
+            if !super::content::has_args(app, i) {
+                out.extend(wrapped("task", s.description.trim_start_matches("Agent: "), Color::Gray, width, 4));
+            }
         }
         SpanKind::Other | SpanKind::Prompt => {}
     }
     // A command or search — anything not about one file — in full, up to
     // six lines: a shell command can read (by naming symbols) as well.
-    if s.file.is_none() && s.kind != SpanKind::Delegate {
+    // Until its arguments are loaded, what it ran — a command or search
+    // not about one file — in one line.
+    if s.file.is_none() && s.kind != SpanKind::Delegate && !super::content::has_args(app, i) {
         out.extend(wrapped("ran", &s.description, Color::Gray, width, 6));
     }
     out.extend(super::content::preview(app, i, width));
@@ -453,7 +459,7 @@ mod tests {
     /// shows it in full, scrolled by hunk.
     #[test]
     fn a_calls_content_is_previewed_and_opens_in_full() {
-        use ambits::ingest::content::{CallContent, DiffLine, Hunk};
+        use ambits::ingest::content::{args, CallContent, CallDetail, DiffLine, Hunk};
         use crossterm::event::KeyCode;
         let mut app = app();
         app.trace_view.open_trace(0);
@@ -464,25 +470,31 @@ mod tests {
         assert!(screen(&app).contains("loading…"));
 
         let hunk = |at: u32| Hunk { old_start: Some(at), new_start: Some(at), lines: (0..10).map(|n| DiffLine::Added(format!("line {n}"))).collect() };
-        app.set_call_content(key, Some(CallContent::Change { hunks: vec![hunk(1), hunk(50)], exact: true }));
-        let text = screen(&app);
-        for want in ["@@ -1,0 +1,10 @@", " 1 + line 0", "… 10 more · o opens in full"] {
+        let input = serde_json::json!({"file_path": "src/a.rs", "old_string": "x", "replace_all": false});
+        let content = CallContent::Change { hunks: vec![hunk(1), hunk(50)], exact: true };
+        app.set_call_content(key, Some(CallDetail { args: args(&input), content: Some(content) }));
+        let text = crate::ui::test_render::lines(60, 40, |f| render(f, &app, f.area(), &TraceFrame::new(&app))).join("\n");
+        for want in ["arguments", "file_path    src/a.rs", "replace_all  false", "old_string   1 line · in the change below", "change", "@@ -1,0 +1,10 @@", " 1 + line 0", "… 10 more · o opens in full"] {
             assert!(text.contains(want), "{want}: {text}");
         }
 
         press(&mut app, KeyCode::Char('o'));
         assert!(app.content_view.is_some());
         let full = crate::ui::test_render::lines(80, 20, |f| crate::ui::render(f, &app)).join("\n");
-        for want in ["Edit src/a.rs · main", "@@ -1,0 +1,10 @@", "   1 + line 0", "o/Esc close"] {
+        for want in ["Edit src/a.rs · main", "arguments", "file_path    src/a.rs", "@@ -1,0 +1,10 @@", "    1 + line 0", "o/Esc close"] {
             assert!(full.contains(want), "{want}: {full}");
         }
         app.content_view.as_ref().unwrap().height.set(5);
+        // Rows: arguments (a heading, three), a blank, change (a heading,
+        // two hunks of eleven): 28.
         press(&mut app, KeyCode::Char('n'));
-        assert_eq!(app.content_view.as_ref().unwrap().scroll, 11, "the second hunk");
+        assert_eq!(app.content_view.as_ref().unwrap().scroll, 6, "the first hunk");
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.content_view.as_ref().unwrap().scroll, 17, "the second");
         press(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.content_view.as_ref().unwrap().scroll, 12);
+        assert_eq!(app.content_view.as_ref().unwrap().scroll, 18);
         press(&mut app, KeyCode::Char('G'));
-        assert_eq!(app.content_view.as_ref().unwrap().scroll, 22 - 5, "the last page");
+        assert_eq!(app.content_view.as_ref().unwrap().scroll, 28 - 5, "the last page");
         press(&mut app, KeyCode::Esc);
         assert!(app.content_view.is_none());
     }

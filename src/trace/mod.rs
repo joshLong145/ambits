@@ -58,16 +58,22 @@ pub struct Span {
     pub message: Option<String>,
     /// For a delegation: the subagent it started.
     pub child_agent: Option<Arc<str>>,
+    /// What the call is for, in the agent's words (Bash's `description`).
+    pub summary: Option<String>,
 }
 
 impl Span {
-    /// A short name: the symbol, else the file, else the description; a
+    /// A short name: what the agent said the call is for (`Bash · Run the
+    /// tests`), else the symbol, else the file, else the description; a
     /// prompt by its first line, cut at 80 characters.
     pub fn name(&self) -> String {
         if self.kind == SpanKind::Prompt {
             let line = self.description.lines().next().unwrap_or_default();
             let cut: String = line.chars().take(80).collect();
             return if cut.len() < line.len() || self.description.lines().nth(1).is_some() { format!("{cut}…") } else { cut };
+        }
+        if let Some(summary) = &self.summary {
+            return format!("{} · {summary}", self.tool);
         }
         match (&self.symbol, &self.file) {
             (Some(s), _) => format!("{} {s}", self.tool),
@@ -176,6 +182,7 @@ impl Trace {
             error: false,
             message: None,
             child_agent: None,
+            summary: call.summary.clone(),
         });
     }
 
@@ -214,6 +221,7 @@ impl Trace {
             error: false,
             message: None,
             child_agent: None,
+            summary: None,
         });
     }
 

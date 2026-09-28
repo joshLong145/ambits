@@ -82,7 +82,7 @@ pub struct ContentKey {
 /// agent's log and held in memory only: never written (spec §9.6).
 #[derive(Debug, Default)]
 pub struct CallContents {
-    loaded: Option<(ContentKey, Option<Arc<crate::ingest::content::CallContent>>)>,
+    loaded: Option<(ContentKey, Option<Arc<crate::ingest::content::CallDetail>>)>,
     asked: Option<ContentKey>,
 }
 
@@ -92,7 +92,7 @@ pub enum ContentState<'a> {
     Loading,
     /// The log has none: no id, no log, or not there.
     Missing,
-    Loaded(&'a crate::ingest::content::CallContent),
+    Loaded(&'a crate::ingest::content::CallDetail),
 }
 
 /// The full-width view of a call's content (`o`).
@@ -101,8 +101,9 @@ pub struct ContentView {
     pub span: usize,
     /// The first row shown.
     pub scroll: usize,
-    /// Rows the view last had room for, set while rendering.
+    /// Rows and columns the view last had room for, set while rendering.
     pub height: std::cell::Cell<usize>,
+    pub width: std::cell::Cell<usize>,
 }
 
 /// Where the trace view drew its time axis and rows, so a mouse position
@@ -995,7 +996,7 @@ impl App {
     }
 
     /// The content worker's answer.
-    pub fn set_call_content(&mut self, key: ContentKey, content: Option<crate::ingest::content::CallContent>) {
+    pub fn set_call_content(&mut self, key: ContentKey, content: Option<crate::ingest::content::CallDetail>) {
         self.contents.loaded = Some((key, content.map(Arc::new)));
     }
 
@@ -1015,7 +1016,7 @@ impl App {
     fn open_content_view(&mut self) {
         if let PanelSubject::Call(span) = self.trace_panel_subject() {
             if self.content_kind(span).is_some() {
-                self.content_view = Some(ContentView { span, scroll: 0, height: std::cell::Cell::new(0) });
+                self.content_view = Some(ContentView { span, scroll: 0, height: std::cell::Cell::new(0), width: std::cell::Cell::new(80) });
             }
         }
     }
@@ -1024,7 +1025,7 @@ impl App {
     fn handle_content_key(&mut self, key: KeyEvent) {
         let Some(view) = &self.content_view else { return };
         let (rows, hunks) = match self.content_state(view.span) {
-            ContentState::Loaded(c) => (c.rows().len(), c.hunk_rows()),
+            ContentState::Loaded(c) => (c.rows(view.width.get()).len(), c.hunk_rows(view.width.get())),
             _ => (0, Vec::new()),
         };
         let page = view.height.get().max(1);
@@ -1786,6 +1787,17 @@ impl App {
     /// `main` for the session's own agent, else the agent id.
     pub fn agent_name<'a>(&self, id: &'a str) -> &'a str {
         if self.session_id.as_deref() == Some(id) { "main" } else { id }
+    }
+
+    /// An agent as a reader knows it: `main`, or a subagent by the task
+    /// that started it (`Expert review of phase 6`), else by its id.
+    pub fn agent_title(&self, id: &str) -> String {
+        let started = self.trace.spans().iter().find(|s| s.child_agent.as_deref() == Some(id));
+        let task = started.map(|s| s.summary.clone().unwrap_or_else(|| s.description.trim_start_matches("Agent: ").trim().to_string()));
+        match task {
+            Some(task) if !task.is_empty() => task,
+            _ => self.agent_name(id).to_string(),
+        }
     }
 
     /// Process an agent tool call event and update the ledger.
@@ -3446,6 +3458,7 @@ mod tests {
             label: "agent-abc".into(),
             tool_use_id: None,
             effect: crate::ingest::Effect::Read,
+            summary: None,
         };
         app.process_agent_event(event);
 

@@ -171,6 +171,7 @@ mod tests {
             label: "agent-abc123".into(),
             tool_use_id: None,
             effect: ambits::ingest::Effect::Read,
+            summary: None,
         });
 
         let backend = TestBackend::new(60, 10);

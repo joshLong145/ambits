@@ -1303,6 +1303,7 @@ mod tests {
             label: "ag".into(),
             tool_use_id: None,
             effect: crate::ingest::Effect::Read,
+            summary: None,
         })
     }
 

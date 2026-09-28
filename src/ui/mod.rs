@@ -276,6 +276,7 @@ pub(crate) mod test_render {
             label: Arc::from(agent),
             tool_use_id: Some(Arc::from(id)),
             effect: ambits::ingest::Effect::Read,
+            summary: None,
         }
     }
 

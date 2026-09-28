@@ -386,7 +386,7 @@ fn details(app: &App, frame: &TraceFrame<'_>) -> Vec<Line<'static>> {
             let took = frame.took(app, i);
             let mut spans = vec![
                 Span::styled(format!(" {}", span_name(app, i)), Style::default().fg(span_color(app, statuses, i)).add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" · {} · {took}", app.agent_name(&s.agent)), dim),
+                Span::styled(format!(" · {} · {took}", app.agent_title(&s.agent)), dim),
             ];
             if s.error {
                 spans.push(Span::styled(format!(" · ✗ {}", s.message.as_deref().unwrap_or("failed")), Style::default().fg(Color::Red)));
@@ -406,20 +406,13 @@ fn details(app: &App, frame: &TraceFrame<'_>) -> Vec<Line<'static>> {
 /// What a span is called on screen: a delegation by its description and
 /// the agent it started.
 pub(super) fn span_name(app: &App, i: usize) -> String {
-    let s = &app.trace.spans()[i];
-    match (&s.kind, &s.child_agent) {
-        (SpanKind::Delegate, Some(child)) => format!("{} → {}", s.description, child),
-        _ => s.name(),
-    }
+    app.trace.spans()[i].name()
 }
 
-/// A subagent by what it was started for (its id is in the details), the
-/// session's own agent as `main`.
+/// A subagent by what it was started for, the session's own agent as
+/// `main`.
 fn track_name(app: &App, track: &view::Track) -> String {
-    match track.delegation.map(|d| app.trace.spans()[d].description.trim_start_matches("Agent: ").trim()) {
-        Some(what) if !what.is_empty() => what.to_string(),
-        _ => app.agent_name(&track.agent).to_string(),
-    }
+    app.agent_title(&track.agent)
 }
 
 /// Reads in their depth colour, writes by whether they still stand,
@@ -515,10 +508,10 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("▾ review the code…")), "the prompt is the root: {text}");
         let read = lines.iter().position(|l| l.contains("Read src/a.rs")).expect(&text);
         let edit = lines.iter().position(|l| l.contains("✗ Edit src/a.rs")).expect(&text);
-        assert!(lines.iter().any(|l| l.contains("▾ Agent src/a.rs → ax1")), "{text}");
+        assert!(lines.iter().any(|l| l.contains("▾ Agent src/a.rs")), "{text}");
         assert!(edit > read);
         assert!(lines[read].contains(" 2s") && lines[read].contains('█'), "{}", lines[read]);
-        assert!(text.contains("Edit src/a.rs · ax1 · 5s · ✗ failed"), "one line for the selection: {text}");
+        assert!(text.contains("Edit src/a.rs · Agent src/a.rs · 5s · ✗ failed"), "one line for the selection, its agent by its task: {text}");
         assert!(app.trace_geometry.get().is_some());
     }
 

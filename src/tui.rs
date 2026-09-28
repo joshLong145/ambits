@@ -82,7 +82,7 @@ fn spawn_content_loader(ingester: Arc<dyn SessionIngester>, log_dir: Option<Path
                 (Some(dir), Some(session)) => ingester.session_log_files(dir, session),
                 _ => Vec::new(),
             };
-            let content = ingester.call_content(&files, &key.id, kind);
+            let content = ingester.call_detail(&files, &key.id, kind);
             if tx.send(AppEvent::ContentLoaded { key, content }).is_err() {
                 break;
             }

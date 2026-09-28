@@ -35,7 +35,7 @@ pub enum AppEvent {
     /// worker `TuiSession` spawns. Held in memory only (spec §9.6).
     ContentLoaded {
         key: ambits::app::ContentKey,
-        content: Option<ambits::ingest::content::CallContent>,
+        content: Option<ambits::ingest::content::CallDetail>,
     },
 }
 

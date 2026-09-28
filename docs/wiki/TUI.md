@@ -180,7 +180,7 @@ Its keys are modal, as in Perfetto:
 | `Enter` | On a delegation, into its agent's calls; on a read or write, to its symbol or file in the tree |
 | `/` | Waterfall: list only calls whose name contains the text (`Esc` clears) |
 | `e` | Next failed call |
-| `o` | The selected call's [content](#what-a-call-read-or-wrote), full-width |
+| `o` | The selected call's [arguments and content](#a-calls-arguments-and-content), full-width |
 | `v` | Waterfall / tracks |
 | `Esc` | Back to the list of traces |
 | `t` | Back to the tree |
@@ -227,13 +227,17 @@ that worked — and a write no journal entry explains says `? unjournaled`.
 Up to six lines a file; the panel scrolls to keep the selected row, and
 what it shows under it, in view.
 
-**A call**: who made it, when and for how long, in which trace; why it
-failed (the error's own line: a traceback's last, a compiler's first
-`error`, "rejected by the user"); what it read and the symbol's depth now;
-what it wrote, symbol by symbol, with whether each still stands; the
-command it ran, in full; what an agent it started did; a preview of [what
-it read or wrote](#what-a-call-read-or-wrote); and the other calls on its
-file, before and after it.
+**A call**: which agent made it (a subagent by the task it was started
+for), when and for how long, in which trace; why it failed (the error's own
+line: a traceback's last, a compiler's first `error`, "rejected by the
+user"); what it read and the symbol's depth now; what it wrote, symbol by
+symbol, with whether each still stands; what an agent it started did; [its
+arguments, and what it read, wrote or returned](#a-calls-arguments-and-content);
+and the other calls on its file, before and after it.
+
+A call is named by what the agent said it was for, when its tool takes a
+`description` — `Bash · Run the remote tests`, `Agent · Expert review of
+phase 6` — else by its symbol or file.
 
 `Tab` to the panel, `j` / `k` to a row, `Enter` to open it: a file shows in
 the tree; an agent, a failure, a related call or a commit is selected in
@@ -241,13 +245,21 @@ the timeline (the trace opened, and unfolded down to it). Focus stays on
 the panel, so you can keep following the trail. `Esc` returns to the
 timeline.
 
-### What a call read or wrote
+### A call's arguments and content
 
-The panel previews a call's content, and `o` opens it over the timeline and
-panel:
+The panel shows a call as its log recorded it — its arguments, a few lines
+of each, then the start of what it read, wrote or returned — and `o` opens
+all of it over the timeline and panel:
 
 ```
 ┌ Edit src/ingest/claude.rs · main · 16:02:11.4 ─────────────────────┐
+│ arguments                                                          │
+│ file_path    /Users/me/ambit/src/ingest/claude.rs                  │
+│ replace_all  false                                                 │
+│ old_string   1 line · in the change below                          │
+│ new_string   1 line · in the change below                          │
+│                                                                    │
+│ change                                                             │
 │ @@ -552,7 +552,7 @@                                                │
 │ 552 552                          .and_then(|v| v.as_str())         │
 │ 553     -                        .map(|id| Arc::from(format!(…     │
@@ -256,6 +268,12 @@ panel:
 └ j/k scroll · n/N hunk · g/G ends · o/Esc close ────────────────────┘
 ```
 
+- **Arguments** come first: what the call is for and what it acts on
+  (`description`, `command`, `file_path`, `pattern`, `prompt`, …), then the
+  rest, each value wrapped under its key. File contents a write passed
+  (`old_string`, `content`, …) are counted, not repeated: the change shows
+  them. A delegation's arguments are its subagent's type, task and prompt;
+  each call the subagent made has its own.
 - **A write** is a diff: the tool's own patch, with line numbers in the file
   before and after. A write that failed shows what it tried (`✗ not
   applied`); one whose tool records no patch (Serena's, say) shows what it

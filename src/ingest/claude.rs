@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use crate::tracking::ReadDepth;
 use super::{AgentToolCall, CompactionMetadata, Effect, EventTailer, FileReplay, Handoff, Hunk, SessionEvent, SessionIngester, TailedCompaction, TailerOutput, ToolCallMapper, WriteEvent, WriteSource};
-use super::content::{CallContent, ContentKind};
+use super::content::{CallContent, CallDetail, ContentKind};
 use super::tool_config::ToolMappingConfig;
 
 /// Derive the Claude Code log directory for a given project path.
@@ -491,11 +491,12 @@ fn content_text(content: &Value) -> Option<String> {
     }
 }
 
-/// What call `id` read or wrote, from its lines in `files` (the session's
-/// logs): its `tool_use` input and its `tool_result`. `None` when the log
-/// has neither yet. Only lines naming `id` are parsed; nothing is kept but
-/// what is returned, and nothing is logged (spec §9.6).
-pub fn call_content(files: &[PathBuf], id: &str, kind: ContentKind) -> Option<CallContent> {
+/// Call `id` as its log recorded it — its arguments, and what it read,
+/// wrote or returned — from its lines in `files` (the session's logs): its
+/// `tool_use` input and its `tool_result`. `None` when the log has neither
+/// yet. Only lines naming `id` are parsed; nothing is kept but what is
+/// returned, and nothing is logged (spec §9.6).
+pub fn call_detail(files: &[PathBuf], id: &str, kind: ContentKind) -> Option<CallDetail> {
     let mut input: Option<Value> = None;
     let mut result: Option<(Value, Option<Value>, bool)> = None;
     let mut buf = Vec::new();
@@ -534,7 +535,13 @@ pub fn call_content(files: &[PathBuf], id: &str, kind: ContentKind) -> Option<Ca
             break;
         }
     }
-    build_content(kind, input.as_ref(), result.as_ref().map(|(c, d, e)| (c, d.as_ref(), *e)))
+    if input.is_none() && result.is_none() {
+        return None;
+    }
+    Some(CallDetail {
+        args: input.as_ref().map(super::content::args).unwrap_or_default(),
+        content: build_content(kind, input.as_ref(), result.as_ref().map(|(c, d, e)| (c, d.as_ref(), *e))),
+    })
 }
 
 /// A call's content from its input and its result (content, `toolUseResult`
@@ -993,10 +1000,12 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
                     label: agent_id.clone(),
                     tool_use_id: None,
                     effect: Effect::Read,
+                    summary: None,
                 }
             }
         };
-        events.push(AgentToolCall { tool_use_id, ..event });
+        let summary = input.get("description").and_then(Value::as_str).map(|d| d.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|d| !d.is_empty());
+        events.push(AgentToolCall { tool_use_id, summary, ..event });
     }
 
     ParsedLine::Events(events)
@@ -1223,6 +1232,7 @@ pub fn map_tool_call(
         // Set by `parse_jsonl_line`, which sees the tool_use block's id.
         tool_use_id: None,
         effect,
+        summary: None,
     })
 }
 
@@ -1401,8 +1411,8 @@ impl SessionIngester for ClaudeIngester {
     fn resume_tailer(&self, handoff: Handoff) -> Box<dyn EventTailer> {
         Box::new(LogTailer::resume(handoff, Arc::clone(&self.mapper)))
     }
-    fn call_content(&self, files: &[PathBuf], id: &str, kind: ContentKind) -> Option<CallContent> {
-        call_content(files, id, kind)
+    fn call_detail(&self, files: &[PathBuf], id: &str, kind: ContentKind) -> Option<CallDetail> {
+        call_detail(files, id, kind)
     }
 }
 
@@ -1438,8 +1448,8 @@ mod tests {
         let (Ok(log), Ok(id)) = (std::env::var("AMBITS_LOG"), std::env::var("AMBITS_ID")) else { return };
         for kind in [ContentKind::Write, ContentKind::Read] {
             let t = std::time::Instant::now();
-            let got = call_content(&[PathBuf::from(&log)], &id, kind);
-            eprintln!("{kind:?}: {:?} in {:?}", got.map(|c| c.rows().len()), t.elapsed());
+            let got = call_detail(&[PathBuf::from(&log)], &id, kind);
+            eprintln!("{kind:?}: {:?} in {:?}", got.map(|c| c.rows(100).len()), t.elapsed());
         }
     }
 
@@ -1454,7 +1464,7 @@ mod tests {
             r#""ok""#,
             r#"{"oldString":"x","newString":"y","structuredPatch":[{"oldStart":3,"oldLines":2,"newStart":3,"newLines":2,"lines":[" a","-x","+y","\\ No newline at end of file"]}]}"#,
         );
-        let got = call_content(&[log], "toolu_1", ContentKind::Write).unwrap();
+        let got = call_detail(&[log], "toolu_1", ContentKind::Write).unwrap().content.unwrap();
         let hunk = Change { old_start: Some(3), new_start: Some(3), lines: vec![DiffLine::Same("a".into()), DiffLine::Removed("x".into()), DiffLine::Added("y".into())] };
         assert_eq!(got, CallContent::Change { hunks: vec![hunk], exact: true });
     }
@@ -1463,7 +1473,7 @@ mod tests {
     fn a_failed_edit_shows_what_it_tried() {
         let dir = tempfile::tempdir().unwrap();
         let log = content_log(dir.path(), "a.jsonl", r#"{"file_path":"/p/a.rs","old_string":"x\ny","new_string":"z"}"#, r#""String to replace not found""#, r#""Error: String to replace not found""#);
-        let CallContent::Change { hunks, exact } = call_content(&[log], "toolu_1", ContentKind::Write).unwrap() else { panic!("a change") };
+        let Some(CallContent::Change { hunks, exact }) = call_detail(&[log], "toolu_1", ContentKind::Write).unwrap().content else { panic!("a change") };
         assert!(!exact);
         assert_eq!(hunks[0].header(), "@@ -2 +1 lines @@");
     }
@@ -1472,16 +1482,18 @@ mod tests {
     fn a_read_shows_the_text_it_saw_from_its_first_line() {
         let dir = tempfile::tempdir().unwrap();
         let log = content_log(dir.path(), "a.jsonl", r#"{"file_path":"/p/a.rs"}"#, r#""40\tfn a() {}""#, r#"{"type":"text","file":{"filePath":"/p/a.rs","content":"fn a() {}\n}","startLine":40}}"#);
-        let got = call_content(&[log], "toolu_1", ContentKind::Read).unwrap();
+        let got = call_detail(&[log], "toolu_1", ContentKind::Read).unwrap().content.unwrap();
         assert_eq!(got, CallContent::Read { start: 40, lines: vec!["fn a() {}".into(), "}".into()], cut: 0 });
-        assert!(call_content(&[dir.path().join("a.jsonl")], "toolu_2", ContentKind::Read).is_none(), "another call's");
+        assert!(call_detail(&[dir.path().join("a.jsonl")], "toolu_2", ContentKind::Read).is_none(), "another call's");
     }
 
     #[test]
     fn a_command_shows_its_output() {
         let dir = tempfile::tempdir().unwrap();
         let log = content_log(dir.path(), "a.jsonl", r#"{"command":"ls"}"#, r#"[{"type":"text","text":"a\nb"}]"#, "null");
-        assert_eq!(call_content(&[log], "toolu_1", ContentKind::Other), Some(CallContent::Output { lines: vec!["a".into(), "b".into()], cut: 0 }));
+        let got = call_detail(&[log], "toolu_1", ContentKind::Other).unwrap();
+        assert_eq!(got.content, Some(CallContent::Output { lines: vec!["a".into(), "b".into()], cut: 0 }));
+        assert_eq!((got.args[0].key.as_str(), got.args[0].value.as_str()), ("command", "ls"), "with its arguments");
     }
 
     /// Convenience: unwrap `ParsedLine::Events` for tests that don't care about clear detection.
