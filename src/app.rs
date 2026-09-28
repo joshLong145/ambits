@@ -725,8 +725,12 @@ impl App {
 
     /// The right-hand panel's keys: its rows, and what `Enter` opens.
     fn handle_right_key(&mut self, key: KeyEvent) {
+        let rows = if self.trace_view.open { self.trace_panel_targets().len() } else { usize::MAX };
         match (self.trace_view.open, self.right_pane, key.code) {
-            (_, _, KeyCode::Char('j') | KeyCode::Down) if self.trace_view.open || self.right_pane == RightPane::Inspector => self.panel_index += 1,
+            (true, RightPane::Inspector, KeyCode::Enter) => self.open_panel_target(),
+            (_, _, KeyCode::Char('j') | KeyCode::Down) if self.trace_view.open || self.right_pane == RightPane::Inspector => {
+                self.panel_index = (self.panel_index + 1).min(rows.saturating_sub(1));
+            }
             (_, _, KeyCode::Char('k') | KeyCode::Up) if self.trace_view.open || self.right_pane == RightPane::Inspector => {
                 self.panel_index = self.panel_index.saturating_sub(1)
             }
@@ -746,6 +750,58 @@ impl App {
             KeyCode::Char('G') => self.activity_scroll_offset = 0,
             _ => {}
         }
+    }
+
+    /// `Enter` on a trace panel row: a file shows in the tree; a call or a
+    /// moment is selected in its trace's timeline — opened, and unfolded
+    /// down to it, as needed. Focus stays on the panel, to go on from there.
+    fn open_panel_target(&mut self) {
+        use crate::trace::summary::Target;
+        use crate::trace::view::Item;
+        let targets = self.trace_panel_targets();
+        let Some(target) = targets.get(self.panel_index.min(targets.len().saturating_sub(1))).cloned() else { return };
+        let item = match target {
+            Target::File(file) => {
+                if self.reveal(&file, None) {
+                    self.trace_view.open = false;
+                    self.focus = FocusPanel::Left;
+                }
+                return;
+            }
+            Target::Span(i) => Item::Span(i),
+            Target::Instant(i) => Item::Instant(i),
+        };
+        if self.trace_view.focus.is_none() {
+            let root = match item {
+                Item::Span(i) => crate::trace::summary::root_of(&self.trace, i),
+                Item::Instant(_) => self.trace_view.list,
+            };
+            let Some(root) = root.or_else(|| self.trace_view.list_index(&self.trace_list()).map(|i| self.trace_list()[i].root)) else { return };
+            self.trace_view.open_trace(root);
+        }
+        if let Item::Span(i) = item {
+            // Unfold what hides it.
+            let tree = self.trace.tree();
+            let mut path = Vec::new();
+            fn find(nodes: &[crate::trace::Node], want: usize, path: &mut Vec<usize>) -> bool {
+                nodes.iter().any(|n| {
+                    path.push(n.span);
+                    let found = n.span == want || find(&n.children, want, path);
+                    if !found {
+                        path.pop();
+                    }
+                    found
+                })
+            }
+            if find(&tree, i, &mut path) {
+                for ancestor in path {
+                    self.trace_view.collapsed_spans.remove(&ancestor);
+                }
+            }
+        }
+        self.trace_view.selected = Some(item);
+        self.follow_selection_to_track();
+        self.panel_index = 0;
     }
 
     /// The file tree's keys.

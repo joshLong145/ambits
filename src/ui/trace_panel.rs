@@ -366,4 +366,32 @@ mod tests {
         assert!(text.contains(" › before 10:00:01.0 Read src/a.rs"), "the selected row is marked: {text}");
         assert_eq!(app.trace_panel_targets().len(), 2, "the file and the read");
     }
+
+    fn press(app: &mut App, code: crossterm::event::KeyCode) {
+        app.handle_key(crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE));
+    }
+
+    /// From the list, Enter on a failure opens its trace at that call; from
+    /// a call, Enter on a related call goes to it; j stops at the last row.
+    #[test]
+    fn enter_on_a_row_goes_where_it_points() {
+        use crossterm::event::KeyCode;
+        let mut app = app();
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus, FocusPanel::Right);
+        // Rows: src/a.rs, src/b.rs, then the failed edit.
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        assert_eq!(app.panel_index, 2, "stops at the last row");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.trace_view.focus, Some(0), "its trace opened");
+        assert_eq!(app.trace_view.selected, Some(ambits::trace::view::Item::Span(3)), "at the failed call");
+        assert_eq!(app.focus, FocusPanel::Right, "focus stays, to go on from there");
+
+        app.trace_view.selected = Some(ambits::trace::view::Item::Span(2));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.trace_view.selected, Some(ambits::trace::view::Item::Span(1)), "the read before it on a.rs");
+    }
 }
