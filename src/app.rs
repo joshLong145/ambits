@@ -3569,7 +3569,7 @@ mod trace_view_tests {
                 agent_id: Arc::from(agent),
                 timestamp: end.into(),
                 error,
-                child_agent: child.map(Arc::from),
+                message: None, child_agent: child.map(Arc::from),
             });
         }
         // Read after its calls, as a tailer poll can deliver it; its time

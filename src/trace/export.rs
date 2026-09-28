@@ -158,7 +158,8 @@ pub fn otlp(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
     while let Some((node, parent)) = stack.pop() {
         let span = &trace.spans()[node.span];
         let id = span_id(session, span, node.span);
-        let status = if span.error { json!({"code": 2, "message": "tool call failed"}) } else { json!({"code": 0}) };
+        let why = span.message.as_deref().unwrap_or("tool call failed");
+        let status = if span.error { json!({"code": 2, "message": why}) } else { json!({"code": 0}) };
         let mut out = json!({
             "traceId": tid,
             "spanId": id,
@@ -300,7 +301,7 @@ mod tests {
     }
 
     fn done(agent: &str, id: &str, at: &str, child: Option<&str>, error: bool) -> ToolFinished {
-        ToolFinished { id: Arc::from(id), agent_id: Arc::from(agent), timestamp: at.into(), error, child_agent: child.map(Arc::from) }
+        ToolFinished { id: Arc::from(id), agent_id: Arc::from(agent), timestamp: at.into(), error, message: None, child_agent: child.map(Arc::from) }
     }
 
     /// main reads, delegates to agent-x (which reads and fails an edit),

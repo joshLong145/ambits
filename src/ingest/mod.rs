@@ -179,6 +179,8 @@ pub struct ToolFinished {
     /// For a delegation (`Agent`/`Task`), the subagent it started, by the
     /// bare id its events carry, when the result says.
     pub child_agent: Option<Arc<str>>,
+    /// Why it failed, in one line (see `claude::error_summary`).
+    pub message: Option<String>,
 }
 
 /// A compaction event surfaced by the incremental tailer (no ledger snapshot

@@ -704,7 +704,7 @@ mod tests {
                     agent_id: Arc::from(agent),
                     timestamp: at(end),
                     error: tool == "Edit",
-                    child_agent: child.map(Arc::from),
+                    message: None, child_agent: child.map(Arc::from),
                 });
             }
         }

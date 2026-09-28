@@ -196,7 +196,7 @@ mod tests {
             tool_use_id: Some(Arc::from("r1")), effect: ambits::ingest::Effect::Read,
         };
         app.process_agent_event(call);
-        app.process_tool_finished(&ToolFinished { id: Arc::from("r1"), agent_id: Arc::from("sess"), timestamp: "2026-09-27T10:00:02Z".into(), error: false, child_agent: None });
+        app.process_tool_finished(&ToolFinished { id: Arc::from("r1"), agent_id: Arc::from("sess"), timestamp: "2026-09-27T10:00:02Z".into(), error: false, message: None, child_agent: None });
         app.record_write("sess", ambits::writes::WriteRecord {
             op: "w1".into(), a: "sess".into(), t: "2026-09-27T10:00:03Z".into(), tool: "Edit".into(), file: "mock/a.rs".into(),
             level: ambits::writes::Level::Symbol, syms: vec![("mock/a.rs::alpha".into(), ambits::journal::encode_hash(&hash))],

@@ -54,6 +54,8 @@ pub struct Span {
     /// The call's own description (`Read src/app.rs`, a command, …).
     pub description: String,
     pub error: bool,
+    /// Why it failed, in one line, when the result said.
+    pub message: Option<String>,
     /// For a delegation: the subagent it started.
     pub child_agent: Option<Arc<str>>,
 }
@@ -161,6 +163,7 @@ impl Trace {
             symbol: call.target_symbol.clone(),
             description: call.description.clone(),
             error: false,
+            message: None,
             child_agent: None,
         });
     }
@@ -175,6 +178,9 @@ impl Trace {
             span.end = Some(span.end.unwrap_or(0).max(t).max(span.start));
         }
         span.error |= f.error;
+        if f.message.is_some() {
+            span.message = f.message.clone();
+        }
         if f.child_agent.is_some() {
             span.child_agent = f.child_agent.clone();
         }
@@ -195,6 +201,7 @@ impl Trace {
             symbol: None,
             description: prompt.text.clone(),
             error: false,
+            message: None,
             child_agent: None,
         });
     }
@@ -363,7 +370,7 @@ mod tests {
             agent_id: Arc::from(agent),
             timestamp: at.to_string(),
             error: false,
-            child_agent: child.map(Arc::from),
+            message: None, child_agent: child.map(Arc::from),
         }
     }
 

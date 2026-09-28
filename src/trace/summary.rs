@@ -151,7 +151,7 @@ mod tests {
             c.read_depth = crate::tracking::ReadDepth::Unseen;
         }
         t.start(&c, Path::new("/p"));
-        t.finish(&ToolFinished { id: Arc::from(id), agent_id: Arc::from(agent), timestamp: end.into(), error, child_agent: child.map(Arc::from) });
+        t.finish(&ToolFinished { id: Arc::from(id), agent_id: Arc::from(agent), timestamp: end.into(), error, message: None, child_agent: child.map(Arc::from) });
     }
 
     /// A prompt (0) with: two reads and an edit of a.rs, a failed edit of

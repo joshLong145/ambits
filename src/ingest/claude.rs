@@ -289,7 +289,7 @@ pub enum ParsedLine {
     ToolResults(Vec<ToolResult>),
     /// `type:"queue-operation"` enqueuing a `<task-notification>`: a
     /// background agent stopped, long after its call's own result.
-    AgentStopped { tool_use_id: Arc<str>, agent: Arc<str>, timestamp: String, error: bool },
+    AgentStopped { tool_use_id: Arc<str>, agent: Arc<str>, timestamp: String, status: String },
     /// `type:"user"` text the user typed: a turn begins.
     Prompt { agent: Option<Arc<str>>, text: String, timestamp: String },
     Ignored,
@@ -306,6 +306,8 @@ pub struct ToolResult {
     /// belongs to this block (the line holds a single `tool_result`).
     pub detail: Option<Value>,
     pub timestamp: String,
+    /// For a failed call, why, in one line.
+    pub message: Option<String>,
 }
 
 /// Pairs write tool calls with their results (spec §1).
@@ -459,19 +461,54 @@ fn parse_tool_results(obj: &mut Value) -> Vec<ToolResult> {
     // when there is exactly one.
     let single = results.len() == 1;
     let string_result = detail.as_ref().is_some_and(|d| d.is_string());
+    // A string `toolUseResult` is the tool's own error message.
+    let detail_text = detail.clone().filter(|d| single && d.is_string());
     results
         .into_iter()
         .filter_map(|b| {
             let id = b.get("tool_use_id")?.as_str()?;
+            let is_error = b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) || (single && string_result);
             Some(ToolResult {
                 tool_use_id: Arc::from(id),
-                is_error: b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false)
-                    || (single && string_result),
+                is_error,
                 detail: detail.take().filter(|d| single && d.is_object()),
                 timestamp: timestamp.clone(),
+                // The content has the error and the output that explains it
+                // (a bare "Error: Exit code 1" in `toolUseResult` does not).
+                message: is_error.then(|| b.get("content").and_then(error_summary).or_else(|| detail_text.as_ref().and_then(error_summary))).flatten(),
             })
         })
         .collect()
+}
+
+/// Why a tool failed, from its result's content, in one line of at most 200
+/// characters: a rejection named as one, `<tool_use_error>` tags dropped,
+/// and a bare `Exit code N` joined with the first line of output after it.
+/// Only this line is kept, never the rest of the output.
+pub fn error_summary(content: &Value) -> Option<String> {
+    let text = match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"),
+        _ => return None,
+    };
+    let text = text.replace("<tool_use_error>", "").replace("</tool_use_error>", "");
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = lines.next()?;
+    let first = first.strip_prefix("Error: ").unwrap_or(first);
+    let line = if first.starts_with("The user doesn't want to proceed") || first == "User rejected tool use" {
+        "rejected by the user".to_string()
+    } else if first.starts_with("Permission for this tool use was denied") {
+        "permission denied".to_string()
+    } else if first.starts_with("Exit code") {
+        match lines.next() {
+            Some(next) => format!("{first}: {next}"),
+            None => first.to_string(),
+        }
+    } else {
+        first.to_string()
+    };
+    let line: String = line.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    Some(if line.chars().count() > 200 { format!("{}…", line.chars().take(199).collect::<String>()) } else { line })
 }
 
 /// Parse all events from a JSONL log file.
@@ -564,6 +601,7 @@ impl LineFeed {
                         timestamp: r.timestamp.clone(),
                         error: r.is_error,
                         child_agent,
+                        message: r.message.clone(),
                     }));
                 }
                 // A write's path comes from its call, remapped above.
@@ -577,13 +615,16 @@ impl LineFeed {
                 metadata: self.pending_metadata.take(),
             }),
             ParsedLine::SessionCleared => out.push(SessionEvent::SessionCleared),
-            ParsedLine::AgentStopped { tool_use_id, agent, timestamp, error } => {
+            ParsedLine::AgentStopped { tool_use_id, agent, timestamp, status } => {
+                // Background shells notify too: say what the notification said.
+                let error = status != "completed";
                 out.push(SessionEvent::ToolFinished(super::ToolFinished {
                     id: tool_use_id,
                     agent_id: Arc::from(self.default_id.as_str()),
                     timestamp,
                     error,
                     child_agent: Some(agent),
+                    message: error.then(|| format!("ended: {}", crate::objects::printable(&status))),
                 }))
             }
             ParsedLine::Prompt { agent, text, timestamp } => out.push(SessionEvent::Prompt(super::Prompt {
@@ -667,7 +708,7 @@ fn parse_agent_stopped(obj: &Value) -> Option<ParsedLine> {
         tool_use_id: Arc::from(tag("tool-use-id")?),
         agent: Arc::from(tag("task-id")?),
         timestamp: obj.get("timestamp")?.as_str()?.to_string(),
-        error: tag("status") != Some("completed"),
+        status: tag("status").unwrap_or("unknown").to_string(),
     })
 }
 
@@ -2199,7 +2240,8 @@ mod write_tests {
     fn result(id: &str, detail: serde_json::Value, is_error: bool) -> String {
         serde_json::json!({
             "type": "user", "timestamp": "2026-09-26T10:00:01Z",
-            "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": "ok", "is_error": is_error}]},
+            // As in real logs, a failure's content carries its error text.
+            "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": detail.as_str().filter(|_| is_error).unwrap_or("ok"), "is_error": is_error}]},
             "toolUseResult": detail
         })
         .to_string()
@@ -2417,7 +2459,7 @@ mod write_tests {
         for i in 0..3 * WriteCorrelator::MAX_PENDING {
             let id = format!("t{i}");
             c.note_calls(&[write_call(&id)]);
-            let done = ToolResult { tool_use_id: Arc::from(id.as_str()), is_error: false, detail: None, timestamp: String::new() };
+            let done = ToolResult { tool_use_id: Arc::from(id.as_str()), is_error: false, detail: None, timestamp: String::new(), message: None };
             assert_eq!(c.resolve(vec![done]).len(), 1);
         }
         c.note_calls(&[write_call("last")]);
@@ -2475,6 +2517,7 @@ mod write_tests {
             .collect();
         assert_eq!(finished.len(), 2);
         assert!(finished[0].error);
+        assert_eq!(finished[0].message.as_deref(), Some("String to replace not found"), "why, carried to the trace");
         assert_eq!(finished[1].child_agent.as_deref(), Some("a2f"));
     }
 
@@ -2493,13 +2536,33 @@ mod write_tests {
             .to_string()
         };
         match parse_jsonl_line(&line("enqueue", "completed"), "d", &config) {
-            ParsedLine::AgentStopped { tool_use_id, agent, timestamp, error } => {
-                assert_eq!((&*tool_use_id, &*agent, timestamp.as_str(), error), ("toolu_9", "a03c", "2026-09-26T19:39:16.480Z", false));
+            ParsedLine::AgentStopped { tool_use_id, agent, timestamp, status } => {
+                assert_eq!((&*tool_use_id, &*agent, timestamp.as_str(), status.as_str()), ("toolu_9", "a03c", "2026-09-26T19:39:16.480Z", "completed"));
             }
             _ => panic!("expected AgentStopped"),
         }
-        assert!(matches!(parse_jsonl_line(&line("enqueue", "failed"), "d", &config), ParsedLine::AgentStopped { error: true, .. }));
+        assert!(matches!(parse_jsonl_line(&line("enqueue", "failed"), "d", &config), ParsedLine::AgentStopped { status, .. } if status == "failed"));
         assert!(matches!(parse_jsonl_line(&line("remove", "completed"), "d", &config), ParsedLine::Ignored));
+    }
+
+    /// The shapes Claude Code logs for a failed call, each down to one line.
+    #[test]
+    fn a_failure_is_summed_up_in_one_line() {
+        use serde_json::json;
+        let one = |v: serde_json::Value| error_summary(&v);
+        assert_eq!(one(json!("<tool_use_error>String to replace not found in file.\nString: foo</tool_use_error>")).as_deref(), Some("String to replace not found in file."));
+        assert_eq!(one(json!("Exit code 1\n\nerror[E0308]: mismatched types\n  --> src/a.rs")).as_deref(), Some("Exit code 1: error[E0308]: mismatched types"));
+        assert_eq!(one(json!("Exit code 2")).as_deref(), Some("Exit code 2"));
+        assert_eq!(one(json!("Error: Exit code 2")).as_deref(), Some("Exit code 2"));
+        assert_eq!(one(json!("User rejected tool use")).as_deref(), Some("rejected by the user"));
+        assert_eq!(one(json!("Permission for this tool use was denied. The tool use was rejected")).as_deref(), Some("permission denied"));
+        assert_eq!(
+            one(json!([{"type": "text", "text": "The user doesn't want to proceed with this tool use. The tool use was rejected"}])).as_deref(),
+            Some("rejected by the user")
+        );
+        assert_eq!(one(json!("x".repeat(500))).map(|s| s.chars().count()), Some(200));
+        assert_eq!(one(json!("bad\u{1b}[31m")).as_deref(), Some("bad [31m"));
+        assert_eq!(one(json!("   ")), None);
     }
 
     /// A partial patch would under-report the change, so any defect makes
