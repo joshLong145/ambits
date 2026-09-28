@@ -16,10 +16,11 @@ use ambits::trace::{InstantKind, SpanKind};
 use super::colors;
 
 /// Each write's record and status by op, computed once per frame.
-type Statuses<'a> = std::collections::HashMap<&'a str, (&'a ambits::writes::WriteRecord, ambits::writes::Status)>;
+pub(super) type Statuses<'a> = std::collections::HashMap<&'a str, (&'a ambits::writes::WriteRecord, ambits::writes::Status)>;
 
-/// Lines the details pane takes at the bottom.
-const DETAILS: u16 = 3;
+/// Lines the summary strip takes at the bottom; the right-hand panel has
+/// the rest (`trace_panel`).
+const DETAILS: u16 = 1;
 /// Columns between ticks on the ruler.
 const TICK_GAP: usize = 12;
 
@@ -125,16 +126,14 @@ fn render_list(f: &mut Frame, app: &App, inner: Rect) {
     lines.resize(2 + rows_h as usize, Line::from(""));
     lines.push(Line::from(Span::styled("─".repeat(inner.width as usize), dim)));
     if let Some(t) = selected.map(|i| &traces[i]) {
-        let text = app.trace.spans()[t.root].description.split_whitespace().collect::<Vec<_>>().join(" ");
-        let width = (inner.width as usize).saturating_sub(2).max(1);
-        let chars: Vec<char> = text.chars().collect();
-        for (n, chunk) in chars.chunks(width).take(DETAILS as usize).enumerate() {
-            let mut line: String = chunk.iter().collect();
-            if n + 1 == DETAILS as usize && chars.len() > width * DETAILS as usize {
-                line = super::fit(&format!("{line}…"), width);
-            }
-            lines.push(Line::from(Span::styled(format!(" {line}"), Style::default().fg(Color::Gray))));
-        }
+        let line = format!(
+            " {} · {} · {} calls{} · Tab for its summary",
+            ambits::time::day_minute(t.start),
+            view::duration(t.end - t.start),
+            t.calls,
+            if t.failed > 0 { format!(" · {} failed", t.failed) } else { String::new() }
+        );
+        lines.push(Line::from(Span::styled(super::fit(&line, inner.width as usize), Style::default().fg(Color::Gray))));
     }
     f.render_widget(Paragraph::new(lines), inner);
     app.trace_geometry.set(Some(TraceGeometry { bars_x: inner.x, bars_width: 0, rows_y: inner.y + 2, rows: rows_h, first_row: first }));
@@ -350,61 +349,36 @@ fn cells_line(cols: usize, cells: impl IntoIterator<Item = (usize, char, Style)>
     out
 }
 
-/// The selected item's facts.
+/// The selected item in one line; the right-hand panel has the rest.
 fn details(app: &App, statuses: &Statuses) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
-    match app.trace_view.selected {
+    let line = match app.trace_view.selected {
         Some(Item::Span(i)) => {
             let Some(s) = app.trace.spans().get(i) else { return Vec::new() };
-            // A prompt or delegation lasts as long as what it started.
             let end = view::effective_ends(&app.trace.tree()).get(&i).copied().filter(|_| s.end.is_some());
-            let when = match end {
-                Some(end) => format!("{} → {} ({})", ambits::time::clock(s.start), ambits::time::clock(end), view::duration(end - s.start)),
-                None => format!("{} → running", ambits::time::clock(s.start)),
-            };
-            let mut facts: Vec<String> = Vec::new();
-            match s.kind {
-                SpanKind::Read(depth) => facts.push(format!("read {depth}")),
-                SpanKind::Write => match s.id.as_deref().and_then(|op| statuses.get(op)) {
-                    Some((w, status)) => facts.push(format!("{:?}-level write · {}", w.level, status.phrase()).to_lowercase()),
-                    None => facts.push("write (not attributed)".into()),
-                },
-                SpanKind::Delegate => {
-                    if let Some(child) = &s.child_agent {
-                        let n = app.trace.spans().iter().filter(|x| x.agent == *child).count();
-                        facts.push(format!("→ {child} ({n} calls) · Enter follows"));
-                    }
-                }
-                SpanKind::Prompt => facts.push("the prompt: every call below answered it".into()),
-                SpanKind::Other => {}
-            }
+            let took = end.map_or("running".to_string(), |e| view::duration(e - s.start));
+            let mut spans = vec![
+                Span::styled(format!(" {}", span_name(app, i)), Style::default().fg(span_color(app, statuses, i)).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" · {} · {took}", app.agent_name(&s.agent)), dim),
+            ];
             if s.error {
-                facts.push("✗ failed".into());
+                spans.push(Span::styled(format!(" · ✗ {}", s.message.as_deref().unwrap_or("failed")), Style::default().fg(Color::Red)));
             }
-            if s.file.is_some() && s.child_agent.is_none() {
-                facts.push("Enter shows it in the tree".into());
-            }
-            vec![
-                Line::from(Span::styled(format!(" {}", span_name(app, i)), Style::default().fg(span_color(app, statuses, i)).add_modifier(Modifier::BOLD))),
-                Line::from(Span::styled(format!(" {} · {when}", app.agent_name(&s.agent)), dim)),
-                Line::from(Span::styled(format!(" {}", facts.join(" · ")), dim)),
-            ]
+            Line::from(spans)
         }
         Some(Item::Instant(i)) => {
             let Some(x) = app.trace.instants().get(i) else { return Vec::new() };
             let (glyph, color) = instant_glyph(&x.kind);
-            vec![
-                Line::from(Span::styled(format!(" {glyph} {}", x.kind.label()), Style::default().fg(color))),
-                Line::from(Span::styled(format!(" {}", ambits::time::clock(x.t)), dim)),
-            ]
+            Line::from(vec![Span::styled(format!(" {glyph} {}", x.kind.label()), Style::default().fg(color)), Span::styled(format!(" · {}", ambits::time::clock(x.t)), dim)])
         }
-        None => vec![Line::from(Span::styled(" j/k to select a call", dim))],
-    }
+        None => Line::from(Span::styled(" j/k to select a call · Tab for the trace's summary", dim)),
+    };
+    vec![line]
 }
 
 /// What a span is called on screen: a delegation by its description and
 /// the agent it started.
-fn span_name(app: &App, i: usize) -> String {
+pub(super) fn span_name(app: &App, i: usize) -> String {
     let s = &app.trace.spans()[i];
     match (&s.kind, &s.child_agent) {
         (SpanKind::Delegate, Some(child)) => format!("{} → {}", s.description, child),
@@ -423,7 +397,7 @@ fn track_name(app: &App, track: &view::Track) -> String {
 
 /// Reads in their depth colour, writes by whether they still stand,
 /// failures red, delegations neutral.
-fn span_color(app: &App, statuses: &Statuses, i: usize) -> Color {
+pub(super) fn span_color(app: &App, statuses: &Statuses, i: usize) -> Color {
     let s = &app.trace.spans()[i];
     if s.error {
         return Color::Red;
@@ -448,7 +422,7 @@ fn label_color(app: &App, item: Item) -> Color {
     }
 }
 
-fn instant_glyph(kind: &InstantKind) -> (char, Color) {
+pub(super) fn instant_glyph(kind: &InstantKind) -> (char, Color) {
     match kind {
         InstantKind::Compaction => ('▼', Color::Yellow),
         InstantKind::Snapshot(_) => ('◆', Color::Magenta),
@@ -530,8 +504,7 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("▾ Agent src/a.rs → ax1")), "{text}");
         assert!(edit > read);
         assert!(lines[read].contains(" 2s") && lines[read].contains('█'), "{}", lines[read]);
-        assert!(text.contains("ax1 · 10:00:04.0 → 10:00:09.0 (5s)"), "{text}");
-        assert!(text.contains("✗ failed"), "{text}");
+        assert!(text.contains("Edit src/a.rs · ax1 · 5s · ✗ failed"), "one line for the selection: {text}");
         assert!(app.trace_geometry.get().is_some());
     }
 
@@ -557,7 +530,7 @@ mod tests {
         assert!(lines[1].contains("1 prompts · 1 traces"), "{text}");
         let row = lines.iter().find(|l| l.contains("09-27 09:59")).expect(&text);
         assert!(row.contains("review the code…") && row.contains("10s") && row.contains("1 ✗"), "{row}");
-        assert!(text.contains("review the code and tell me"), "the whole prompt below: {text}");
+        assert!(text.contains("09-27 09:59 · 10s · 3 calls · 1 failed · Tab for its summary"), "one line; the panel has the rest: {text}");
         assert!(!text.contains('█'), "no bars at the top level: {text}");
     }
 

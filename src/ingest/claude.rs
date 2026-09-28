@@ -500,7 +500,11 @@ pub fn error_summary(content: &Value) -> Option<String> {
     } else if first.starts_with("Permission for this tool use was denied") {
         "permission denied".to_string()
     } else if first.starts_with("Exit code") {
-        match lines.next() {
+        // The line that names the error — a traceback's last, a compiler's
+        // first `error` — else the last line of output.
+        let rest: Vec<&str> = lines.collect();
+        let named = rest.iter().find(|l| l.to_lowercase().contains("error") && !l.starts_with("Traceback")).or(rest.last());
+        match named {
             Some(next) => format!("{first}: {next}"),
             None => first.to_string(),
         }
@@ -2553,6 +2557,11 @@ mod write_tests {
         assert_eq!(one(json!("<tool_use_error>String to replace not found in file.\nString: foo</tool_use_error>")).as_deref(), Some("String to replace not found in file."));
         assert_eq!(one(json!("Exit code 1\n\nerror[E0308]: mismatched types\n  --> src/a.rs")).as_deref(), Some("Exit code 1: error[E0308]: mismatched types"));
         assert_eq!(one(json!("Exit code 2")).as_deref(), Some("Exit code 2"));
+        assert_eq!(
+            one(json!("Exit code 1\nTraceback (most recent call last):\n  File \"<string>\", line 1\nModuleNotFoundError: No module named 'pyte'")).as_deref(),
+            Some("Exit code 1: ModuleNotFoundError: No module named 'pyte'")
+        );
+        assert_eq!(one(json!("Exit code 1\nwarming up\ndone, sort of")).as_deref(), Some("Exit code 1: done, sort of"), "no error named: the last line");
         assert_eq!(one(json!("Error: Exit code 2")).as_deref(), Some("Exit code 2"));
         assert_eq!(one(json!("User rejected tool use")).as_deref(), Some("rejected by the user"));
         assert_eq!(one(json!("Permission for this tool use was denied. The tool use was rejected")).as_deref(), Some("permission denied"));

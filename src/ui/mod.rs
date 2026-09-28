@@ -7,6 +7,7 @@ pub mod compaction;
 pub mod alignment;
 pub mod trace_view;
 pub mod inspector;
+pub mod trace_panel;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -37,9 +38,12 @@ pub fn render(f: &mut Frame, app: &App) {
     } else {
         tree_view::render(f, app, main[0]);
     }
-    match app.right_pane {
-        RightPane::Inspector => inspector::render(f, app, main[1]),
-        RightPane::Session => stats::render(f, app, main[1]),
+    // The right-hand panel follows the left: the trace view's own panel,
+    // else the inspector; `i` swaps in the session pane from either.
+    match (app.right_pane, app.trace_view.open) {
+        (RightPane::Session, _) => stats::render(f, app, main[1]),
+        (RightPane::Inspector, true) => trace_panel::render(f, app, main[1]),
+        (RightPane::Inspector, false) => inspector::render(f, app, main[1]),
     }
     if app.show_activity {
         activity::render(f, app, outer[2]);

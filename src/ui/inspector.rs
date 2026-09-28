@@ -45,17 +45,17 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn fact(label: &str, spans: Vec<Span<'static>>) -> Line<'static> {
+pub(super) fn fact(label: &str, spans: Vec<Span<'static>>) -> Line<'static> {
     let mut out = vec![Span::styled(format!(" {label:<LABEL$}"), Style::default().fg(Color::DarkGray))];
     out.extend(spans);
     Line::from(out)
 }
 
-fn text(s: impl Into<String>, color: Color) -> Span<'static> {
+pub(super) fn text(s: impl Into<String>, color: Color) -> Span<'static> {
     Span::styled(s.into(), Style::default().fg(color))
 }
 
-fn depth_word(depth: ReadDepth) -> &'static str {
+pub(super) fn depth_word(depth: ReadDepth) -> &'static str {
     match depth {
         ReadDepth::Unseen => "not read",
         ReadDepth::NameOnly => "name only",

@@ -114,6 +114,36 @@ pub fn detail(trace: &Trace, root: usize) -> Option<TraceDetail> {
     Some(TraceDetail { root, start, end, calls: under.len(), by_tool, files, agents, failed, commits })
 }
 
+/// What a row of the trace panel points at, for `Enter`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// A project file: shown in the tree.
+    File(String),
+    /// A call (a delegation, a failure, a related call): selected in the
+    /// timeline.
+    Span(usize),
+    /// A commit or compaction: selected in the timeline.
+    Instant(usize),
+}
+
+impl TraceDetail {
+    /// The summary's rows, in the order the panel shows them: files,
+    /// agents, failed calls, commits.
+    pub fn targets(&self) -> Vec<Target> {
+        let files = self.files.iter().map(|f| Target::File(f.file.clone()));
+        let agents = self.agents.iter().map(|a| Target::Span(a.delegation));
+        let failed = self.failed.iter().map(|&i| Target::Span(i));
+        let commits = self.commits.iter().map(|&i| Target::Instant(i));
+        files.chain(agents).chain(failed).chain(commits).collect()
+    }
+}
+
+/// A call's rows: its file, then the other calls on that file in its trace.
+pub fn call_targets(trace: &Trace, span: usize) -> Vec<Target> {
+    let file = trace.spans().get(span).and_then(|s| s.file.clone()).map(Target::File);
+    file.into_iter().chain(related(trace, span).into_iter().map(Target::Span)).collect()
+}
+
 /// The other calls in `span`'s trace on the same file, in time order.
 pub fn related(trace: &Trace, span: usize) -> Vec<usize> {
     let spans = trace.spans();
@@ -190,6 +220,24 @@ mod tests {
         assert_eq!((&*run.agent, run.calls, run.failed, run.duration), ("x", 2, 0, 11_000));
         assert_eq!(d.commits, vec![0]);
         assert!(detail(&t, 1).is_none(), "not a root");
+    }
+
+    #[test]
+    fn rows_point_at_files_calls_and_commits_in_panel_order() {
+        let t = sample();
+        let d = detail(&t, 0).unwrap();
+        assert_eq!(
+            d.targets(),
+            vec![
+                Target::File("src/a.rs".into()),
+                Target::File("src/b.rs".into()),
+                Target::File("src/x.md".into()),
+                Target::Span(5),
+                Target::Span(4),
+                Target::Instant(0),
+            ]
+        );
+        assert_eq!(call_targets(&t, 1), vec![Target::File("src/a.rs".into()), Target::Span(2), Target::Span(3), Target::Span(6), Target::Span(7)]);
     }
 
     #[test]

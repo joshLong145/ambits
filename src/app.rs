@@ -91,6 +91,18 @@ pub enum RightPane {
     Session,
 }
 
+/// What the trace view's right-hand panel is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelSubject {
+    /// A whole trace (its root span): on the list, or its prompt selected.
+    Trace(usize),
+    /// One call in the open trace.
+    Call(usize),
+    /// A commit or compaction.
+    Instant(usize),
+    Nothing,
+}
+
 /// Which panel is focused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPanel {
@@ -812,6 +824,33 @@ impl App {
                 FocusPanel::Left => self.move_selection(3),
             },
             _ => {}
+        }
+    }
+
+    /// What the trace panel shows: the trace chosen on the list, or the
+    /// call or moment selected in the open trace (its prompt, the trace).
+    pub fn trace_panel_subject(&self) -> PanelSubject {
+        use crate::trace::view::Item;
+        let tv = &self.trace_view;
+        let Some(root) = tv.focus else {
+            let traces = self.trace_list();
+            return tv.list_index(&traces).map_or(PanelSubject::Nothing, |i| PanelSubject::Trace(traces[i].root));
+        };
+        match tv.selected {
+            Some(Item::Span(i)) if i == root => PanelSubject::Trace(root),
+            Some(Item::Span(i)) => PanelSubject::Call(i),
+            Some(Item::Instant(i)) => PanelSubject::Instant(i),
+            None => PanelSubject::Trace(root),
+        }
+    }
+
+    /// The trace panel's rows, as `Enter` sees them.
+    pub fn trace_panel_targets(&self) -> Vec<crate::trace::summary::Target> {
+        use crate::trace::summary;
+        match self.trace_panel_subject() {
+            PanelSubject::Trace(root) => summary::detail(&self.trace, root).map(|d| d.targets()).unwrap_or_default(),
+            PanelSubject::Call(i) => summary::call_targets(&self.trace, i),
+            PanelSubject::Instant(_) | PanelSubject::Nothing => Vec::new(),
         }
     }
 
