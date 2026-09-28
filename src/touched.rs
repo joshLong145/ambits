@@ -109,6 +109,9 @@ struct WriteDto<'a> {
     status: Status,
     /// Which commit the write landed in (§3.2).
     landed: crate::linkage::Landed,
+    /// The remote a pull brought it from; absent for this machine's own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<&'a str>,
 }
 
 /// Print the answer for `arg`, as text or JSON.
@@ -144,6 +147,7 @@ pub fn run(project_root: &Path, arg: &str, json: bool) -> Result<()> {
                 level: w.level,
                 status,
                 landed,
+                origin: w.origin.as_deref(),
             }),
         };
         writeln!(out, "{}", serde_json::to_string(&dto)?)?;
@@ -154,7 +158,8 @@ pub fn run(project_root: &Path, arg: &str, json: bool) -> Result<()> {
         writeln!(out, "{arg} — no agent writes recorded")?;
         return Ok(());
     };
-    writeln!(out, "{arg} — last written {} by {} ({})", w.t, w.a, w.tool)?;
+    let origin = w.origin.as_deref().map(|o| format!(", pulled from {o}")).unwrap_or_default();
+    writeln!(out, "{arg} — last written {} by {} ({}){origin}", w.t, w.a, w.tool)?;
     writeln!(out, "  session {session}, write {}", w.op)?;
     writeln!(out, "  {}", status.phrase())?;
     if let Some(landed) = &landed {

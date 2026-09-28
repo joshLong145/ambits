@@ -221,6 +221,51 @@ enum Commands {
         reference: Option<String>,
     },
 
+    /// Manage remotes: directories (a local disk or a mount) snapshots are
+    /// shared through.
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommands,
+    },
+
+    /// Copy this session's snapshot history to a remote and move its ref
+    /// there. Refuses to overwrite snapshots the remote has and you do not,
+    /// unless --force-with-lease and the remote is where you last saw it.
+    Push {
+        /// The remote; defaults to the only one, or `origin`.
+        remote: Option<String>,
+
+        /// Overwrite the remote's history of this session, if it still
+        /// holds what you last fetched.
+        #[arg(long)]
+        force_with_lease: bool,
+
+        /// Say what would be sent; send nothing.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remove a lock an interrupted push left on the remote: only if it
+        /// is over 10 minutes old, and then only if it is provably this
+        /// store's and dead, or you confirm.
+        #[arg(long)]
+        break_lock: bool,
+    },
+
+    /// Copy every session's snapshots from a remote, verifying each, and
+    /// record where the remote's sessions point (`<remote>/<session>`).
+    Fetch {
+        /// The remote; defaults to the only one, or `origin`.
+        remote: Option<String>,
+    },
+
+    /// Fetch, then merge the remote's history of this session into it:
+    /// reads still valid here are added, stale ones kept as history, and the
+    /// next snapshot descends from both.
+    Pull {
+        /// The remote; defaults to the only one, or `origin`.
+        remote: Option<String>,
+    },
+
     /// Maintain the links index (which commit agent writes landed in).
     #[command(hide = true)]
     Links {
@@ -763,6 +808,16 @@ enum LinksCommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum RemoteCommands {
+    /// Add a remote: a directory path, created on the first push.
+    Add { name: String, path: PathBuf },
+    /// List remotes.
+    List,
+    /// Forget a remote (its copies of refs stay until gc).
+    Remove { name: String },
+}
+
+#[derive(Subcommand, Debug)]
 enum SkillCommands {
     /// Install the ambit skill for Claude Code
     Install {
@@ -1069,6 +1124,91 @@ fn days_flag(n: u64, flag: &str) -> Result<Duration> {
 }
 
 /// `ambits log`: the history of `reference`, or of the current session.
+fn run_remote(project_path: &Path, command: &RemoteCommands) -> Result<()> {
+    use ambits::remote::config;
+    let mut out = io::stdout().lock();
+    match command {
+        RemoteCommands::Add { name, path } => {
+            for warning in config::add(project_path, name, path)? {
+                eprintln!("warning: {warning}");
+            }
+        }
+        RemoteCommands::List => {
+            for (name, remote) in config::Config::load(project_path)?.remotes {
+                writeln!(out, "{name}\t{}", remote.path.display())?;
+            }
+        }
+        RemoteCommands::Remove { name } => config::remove(project_path, name)?,
+    }
+    Ok(())
+}
+
+/// Ask on the terminal; no terminal, no.
+fn confirm(prompt: &str) -> bool {
+    use std::io::IsTerminal as _;
+    if !io::stdin().is_terminal() {
+        eprintln!("{prompt} (not asked: stdin is not a terminal)");
+        return false;
+    }
+    eprint!("{prompt} [y/N] ");
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer).is_ok() && matches!(answer.trim(), "y" | "Y" | "yes")
+}
+
+fn short(id: Option<&ambits::objects::ObjectId>) -> String {
+    id.map_or_else(|| "(none)".to_string(), |i| i.short())
+}
+
+fn print_push(out: &mut impl Write, outcome: &ambits::remote::PushOutcome) -> io::Result<()> {
+    use ambits::remote::PushOutcome;
+    match outcome {
+        PushOutcome::UpToDate { remote, tip } => writeln!(out, "{remote} is up to date ({})", tip.short()),
+        PushOutcome::Pushed { remote, from, to, objects, links, forced } => writeln!(
+            out,
+            "{remote}: {} → {}{}; {objects} object(s), {links} link(s) sent",
+            short(from.as_ref()),
+            to.short(),
+            if *forced { " (forced)" } else { "" }
+        ),
+        PushOutcome::DryRun { remote, from, to, objects, links } => writeln!(
+            out,
+            "would push to {remote}: {} → {}; {objects} object(s), {links} link(s)",
+            short(from.as_ref()),
+            to.short()
+        ),
+    }
+}
+
+fn print_fetch(out: &mut impl Write, report: &ambits::remote::FetchReport) -> io::Result<()> {
+    for m in &report.moved {
+        let forced = if m.forced { "  (forced: the remote was overwritten; the old tip stays in the reflog)" } else { "" };
+        writeln!(out, "{}/{}: {} → {}{forced}", report.remote, m.session, short(m.from.as_ref()), m.to.short())?;
+    }
+    writeln!(out, "fetched from {}: {} session(s) moved, {} object(s), {} link(s)", report.remote, report.moved.len(), report.objects, report.links)
+}
+
+fn print_pull(out: &mut impl Write, session: &str, report: &ambits::remote::PullReport) -> io::Result<()> {
+    use ambits::remote::PullOutcome;
+    print_fetch(out, &report.fetch)?;
+    let remote = &report.fetch.remote;
+    match &report.outcome {
+        PullOutcome::NotOnRemote => writeln!(out, "{remote} has no snapshots of session {session}"),
+        PullOutcome::UpToDate => writeln!(out, "already up to date with {remote}"),
+        PullOutcome::Behind => writeln!(out, "{remote} is ahead but adds nothing this session lacks; nothing merged"),
+        PullOutcome::Merged { tip, reads, stale, writes, conflicts, merged } => {
+            writeln!(
+                out,
+                "merged {remote}/{} into {session}: {reads} read(s), {writes} write(s); {stale} stale read(s) and {conflicts} conflicting write(s) kept as history",
+                tip.short()
+            )?;
+            if *merged {
+                writeln!(out, "the next `ambits snapshot` descends from both")?;
+            }
+            Ok(())
+        }
+    }
+}
+
 fn run_log(project_path: &Path, reference: Option<&str>) -> Result<()> {
     use ambits::objects::snapshot;
     let Some(reference) = reference else {
@@ -1280,6 +1420,38 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(Commands::Remote { command }) = &command {
+        return run_remote(&project_path, command);
+    }
+    if let Some(Commands::Push { remote, force_with_lease, dry_run, break_lock }) = &command {
+        let Some(session) = session_id.as_deref() else {
+            color_eyre::eyre::bail!("no session to push: pass --session, or run inside a project with Claude Code logs");
+        };
+        if *break_lock {
+            let (_, store) = ambits::remote::config::resolve(&project_path, remote.as_deref())?;
+            let id = ambits::remote::config::Config::store_id(&project_path)?;
+            if let ambits::remote::lock::Broken::Broken(h) = ambits::remote::lock::break_lock(&store, &id, confirm)? {
+                eprintln!("broke the remote lock held by pid {} since {}", h.pid, ambits::time::rfc3339(h.start));
+            }
+        }
+        let ignore = ambits::objects::sync_ignore::SyncIgnore::new(&sync_cfg)?;
+        let outcome = ambits::remote::push(&ambits::remote::PushRequest {
+            project_root: &project_path,
+            remote: remote.as_deref(),
+            session,
+            force_with_lease: *force_with_lease,
+            dry_run: *dry_run,
+            ignore: &ignore,
+        })?;
+        print_push(&mut io::stdout().lock(), &outcome)?;
+        return Ok(());
+    }
+    if let Some(Commands::Fetch { remote }) = &command {
+        let report = ambits::remote::fetch(&project_path, remote.as_deref())?;
+        print_fetch(&mut io::stdout().lock(), &report)?;
+        return Ok(());
+    }
+
     // Snapshot history and gc read only the store; no scan needed.
     if let Some(Commands::Log { reference }) = &command {
         return run_log(&project_path, reference.as_deref().or(session_id.as_deref()));
@@ -1385,6 +1557,23 @@ fn run() -> Result<()> {
             filter: filter.as_ref().map(|f| f.display()),
         })?;
         ambits::objects::restore::print_report(&mut io::stdout().lock(), &report)?;
+        return Ok(());
+    }
+
+    if let Some(Commands::Pull { remote }) = &command {
+        report_warnings(&config_warnings);
+        let Some(session) = session_id.as_deref() else {
+            color_eyre::eyre::bail!("no session to pull into: pass --session, or run inside a project with Claude Code logs");
+        };
+        let report = ambits::remote::pull(&ambits::remote::PullRequest {
+            project_root: &project_path,
+            remote: remote.as_deref(),
+            session,
+            tree: &project_tree,
+            backend: if cli.serena { "serena" } else { "tree-sitter" },
+            filter: filter.as_ref().map(|f| f.display()),
+        })?;
+        print_pull(&mut io::stdout().lock(), session, &report)?;
         return Ok(());
     }
 
@@ -1695,7 +1884,7 @@ fn run_tui(
             Ok(AppEvent::Tick) => {
                 session.handle_tick(log_dir, app, serena_mode, project_path);
             }
-            Ok(AppEvent::WriteRecorded { session, record }) => app.record_write(&session, record),
+            Ok(AppEvent::WriteRecorded { session, record }) => app.record_write(&session, *record),
             Ok(AppEvent::CommitsFound(commits)) => app.trace.set_commits(&commits),
             Err(flume::RecvTimeoutError::Timeout) => {}
             Err(flume::RecvTimeoutError::Disconnected) => break,
@@ -1787,7 +1976,7 @@ fn suspend_for_editor(
             AppEvent::Tick => {
                 session.handle_tick(log_dir, app, serena_mode, project_path);
             }
-            AppEvent::WriteRecorded { session, record } => app.record_write(&session, record),
+            AppEvent::WriteRecorded { session, record } => app.record_write(&session, *record),
             AppEvent::CommitsFound(commits) => app.trace.set_commits(&commits),
         }
     }

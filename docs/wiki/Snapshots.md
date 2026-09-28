@@ -21,7 +21,8 @@ snapshot 871171228aa7  2026-09-27T16:36:33Z
 ```
 
 Snapshots are manual. A snapshot can be [restored](#restoring) into another
-session on this machine; syncing to a remote is planned.
+session on this machine, or [shared](Sharing) through a remote and restored
+or pulled on another.
 
 ## Taking a snapshot
 
@@ -122,6 +123,7 @@ Everything lives under `.ambits/`, private to your user:
 | `notes.ndjson` | Per snapshot: time, message and ambits version — never host, branch or path |
 | `links.ndjson` | Where agent writes landed ([Agent Writes](Agent-Writes#which-commit-it-landed-in)) |
 | `cache/never-landed.ndjson` | Writes not found in any commit yet, and the branch tips searched; local only |
+| `config` | This store's random id and its [remotes](Sharing) |
 
 Everything but objects is one flat, append-only file: writers take the
 file's lock (`<file>.lock`), readers never wait, and a line cut short by a

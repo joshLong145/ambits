@@ -93,7 +93,9 @@ pub fn write_records(store: &Store, session: &str, contents: &JournalContents, i
     let mut writes: Vec<Value> = Vec::new();
     for record in contents.writes.values() {
         if !ignore.is_ignored(&super::normalize_path(&record.file)) {
-            writes.push(serde_json::to_value(record)?);
+            // Where a record came from is this machine's business.
+            let record = crate::writes::WriteRecord { origin: None, ..record.clone() };
+            writes.push(serde_json::to_value(&record)?);
         }
     }
     sort_canonically(&mut writes)?;

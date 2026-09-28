@@ -1,5 +1,6 @@
 //! `ambits snapshot` and `ambits log` (spec §6, §11).
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use color_eyre::eyre::{bail, eyre, Result};
@@ -38,7 +39,7 @@ fn state_digest(coverage: &ObjectId, writes: &ObjectId, parents: &[ObjectId]) ->
 }
 
 impl Snapshot {
-    fn to_value(&self) -> Value {
+    pub fn to_value(&self) -> Value {
         let mut v = self.inputs.to_value();
         let obj = v.as_object_mut().expect("inputs are an object");
         obj.insert("inputs".into(), json!(b3(&self.inputs_digest)));
@@ -167,11 +168,22 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
     };
     let inputs_digest = inputs.digest()?;
 
-    // Parents: the session's tip. Pending merge tips join them once `pull`
-    // records merges (phase 6); until then there are none.
+    // Parents: the session's tip, and every remote tip a pull merged in
+    // that is not already its ancestor (§12.3).
     let tip = refs::read(&store, &name)?;
+    let known = match tip {
+        Some(t) => ancestors(&store, t)?,
+        None => HashSet::new(),
+    };
+    let pending: Vec<ObjectId> = prefix
+        .contents
+        .merges
+        .iter()
+        .filter_map(|m| ObjectId::parse(m).ok())
+        .filter(|m| store.contains(m) && !known.contains(m))
+        .collect();
     let mut repair: Option<Snapshot> = None;
-    if let Some(tip) = tip {
+    if let (Some(tip), true) = (tip, pending.is_empty()) {
         let current = Snapshot::load(&store, tip)?;
         if current.inputs_digest == inputs_digest {
             if [current.coverage, current.writes].iter().all(|id| store.contains(id)) {
@@ -182,7 +194,17 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
             repair = Some(current);
         }
     }
-    let parents: Vec<ObjectId> = tip.into_iter().collect();
+    let mut parents: Vec<ObjectId> = tip.into_iter().chain(pending).collect();
+    parents.sort();
+    parents.dedup();
+    // A parent another parent descends from adds nothing: a pull that
+    // appended while merely behind leaves the tip an ancestor of the merge.
+    if parents.len() > 1 {
+        let reachable: Vec<HashSet<ObjectId>> = parents.iter().map(|p| ancestors(&store, *p)).collect::<Result<_>>()?;
+        let kept: Vec<ObjectId> =
+            parents.iter().enumerate().filter(|(i, p)| !reachable.iter().enumerate().any(|(j, r)| j != *i && r.contains(p))).map(|(_, p)| *p).collect();
+        parents = kept;
+    }
     let id = inputs::snapshot_id(&inputs_digest, &parents);
 
     // Children before parents; the snapshot object last (§8).
@@ -223,11 +245,37 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
     Ok(Outcome::Created { id, parents, reads: records.reads, writes: records.write_count, dirty })
 }
 
-/// Resolve what `ambits log` was given: a session id (its ref), a full
-/// snapshot id, or an unambiguous prefix of one (at least 7 digits).
+/// `tip` and every snapshot it descends from. Walked iteratively over
+/// verified snapshots, each once: a cycle cannot form (ids hash their
+/// parents), but a hostile store is not trusted to know that (§9.5).
+pub fn ancestors(store: &Store, tip: ObjectId) -> Result<HashSet<ObjectId>> {
+    let mut seen = HashSet::new();
+    let mut stack = vec![tip];
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if seen.len() > MAX_HISTORY {
+            bail!("history of {} is longer than {MAX_HISTORY} snapshots", tip.short());
+        }
+        stack.extend(Snapshot::load(store, id)?.parents);
+    }
+    Ok(seen)
+}
+
+/// The most snapshots one history may hold (§9.5).
+pub const MAX_HISTORY: usize = 1_000_000;
+
+/// Resolve what `ambits log` was given: a session id (its ref), a remote's
+/// copy of one (`<remote>/<session>`, after a fetch), a full snapshot id, or
+/// an unambiguous prefix of one (at least 7 digits).
 pub fn resolve(store: &Store, arg: &str) -> Result<ObjectId> {
     if let Ok(name) = RefName::session(arg) {
         return refs::read(store, &name)?.ok_or_else(|| eyre!("session {arg} has no snapshots"));
+    }
+    if let Some((remote, session)) = arg.split_once('/') {
+        let name = RefName::tracking(remote, session)?;
+        return refs::read(store, &name)?.ok_or_else(|| eyre!("{arg}: not fetched from {remote}; run `ambits fetch {remote}`"));
     }
     if let Ok(id) = ObjectId::parse(arg) {
         return Ok(id);

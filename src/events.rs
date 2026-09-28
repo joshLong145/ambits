@@ -26,7 +26,7 @@ pub enum AppEvent {
     /// session it happened in, which a switch may since have left.
     WriteRecorded {
         session: std::sync::Arc<str>,
-        record: ambits::writes::WriteRecord,
+        record: Box<ambits::writes::WriteRecord>,
     },
     /// The commits made during the session, found off the render thread by
     /// the worker `TuiSession` spawns for the trace view.

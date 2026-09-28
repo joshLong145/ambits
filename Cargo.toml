@@ -32,7 +32,7 @@ serde_json = "1"
 color-eyre = "0.6"
 serde-pickle = "1.2"
 flume = "0.12"
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
 blake3 = "1"
 regex = "1"
 dhat = { version = "0.3", optional = true }

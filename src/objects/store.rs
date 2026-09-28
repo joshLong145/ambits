@@ -38,7 +38,13 @@ impl Store {
     /// The store of `project_root`. Nothing is created until something is
     /// written.
     pub fn at(project_root: &Path) -> Self {
-        Self { root: project_root.join(crate::state_dir::STATE_DIR), written_dirs: Default::default() }
+        Self::at_root(&project_root.join(crate::state_dir::STATE_DIR))
+    }
+
+    /// A store whose root is `dir` itself: a remote, laid out as `.ambits/`
+    /// is (§12.2).
+    pub fn at_root(dir: &Path) -> Self {
+        Self { root: dir.to_path_buf(), written_dirs: Default::default() }
     }
 
     /// Make every object written so far durable: fsync each directory that

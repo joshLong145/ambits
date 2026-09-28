@@ -581,6 +581,30 @@ impl Drop for Resolver {
     }
 }
 
+/// The links index of the store at `root` (a project's `.ambits`, or a
+/// remote): every unit's live link, by key.
+pub fn links_of(root: &Path) -> Vec<(String, Link)> {
+    let mut folded = HashMap::new();
+    fold_links(crate::objects::flat::FlatLog::at(root.join(crate::state_dir::LINKS)).read(), &mut folded);
+    let mut out: Vec<(String, Link)> = folded.into_iter().filter_map(|(k, l)| Some((k, l?))).collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Add to the links index at `root` whichever of `links` it lacks, as
+/// hints: a link is re-checked for reachability before use (§9.4). How
+/// many were added.
+pub fn add_links(root: &Path, links: Vec<(String, Link)>) -> Result<usize> {
+    let file = crate::objects::flat::FlatLog::at(root.join(crate::state_dir::LINKS));
+    let lock = file.lock()?;
+    let mut have = HashMap::new();
+    fold_links(file.read(), &mut have);
+    let new: Vec<LinkLine> =
+        links.into_iter().filter(|(k, _)| !matches!(have.get(k), Some(Some(_)))).map(|(k, link)| LinkLine { k, link: Some(link) }).collect();
+    file.append(&lock, &new, crate::objects::store::Durability::NoSync)?;
+    Ok(new.len())
+}
+
 /// A unit's key in both caches: a hash of `(op, target, hash)`.
 fn link_key(op: &str, target: &str, hash: Option<&str>) -> String {
     let parts = [op, target, hash.unwrap_or("")];

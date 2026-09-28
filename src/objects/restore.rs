@@ -69,14 +69,14 @@ pub struct Report {
 }
 
 /// One entry of a `coverage` object: `[symbol, hash, depth, agent]`.
-struct CoverageRead {
-    symbol: String,
-    hash: [u8; 32],
-    depth: ReadDepth,
-    agent: String,
+pub(crate) struct CoverageRead {
+    pub(crate) symbol: String,
+    pub(crate) hash: [u8; 32],
+    pub(crate) depth: ReadDepth,
+    pub(crate) agent: String,
 }
 
-fn coverage_reads(payload: &Value) -> Result<Vec<CoverageRead>> {
+pub(crate) fn coverage_reads(payload: &Value) -> Result<Vec<CoverageRead>> {
     let entries = payload.get("reads").and_then(Value::as_array).ok_or_else(|| eyre!("coverage object has no reads"))?;
     entries
         .iter()
@@ -181,7 +181,7 @@ pub fn restore(req: &Request<'_>) -> Result<Report> {
 }
 
 /// Whether a read still holds, and under which id.
-enum Verdict {
+pub(crate) enum Verdict {
     Valid { symbol: String },
     Invalid,
 }
@@ -190,7 +190,7 @@ enum Verdict {
 /// hash per symbol, but two agents may have read two versions of one
 /// symbol, so reads are split into layers with at most one hash per symbol
 /// and each layer classified — almost always there is just one.
-fn classify_reads<'a>(reads: &'a [CoverageRead], tree: &ProjectTree) -> HashMap<(&'a str, [u8; 32]), Verdict> {
+pub(crate) fn classify_reads<'a>(reads: &'a [CoverageRead], tree: &ProjectTree) -> HashMap<(&'a str, [u8; 32]), Verdict> {
     let mut layers: Vec<ReadSet> = Vec::new();
     for read in reads {
         let slot = layers.iter_mut().find(|l| l.get(&read.symbol).is_none_or(|(h, _)| *h == read.hash));

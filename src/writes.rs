@@ -93,6 +93,10 @@ pub struct WriteRecord {
     /// storing contents is not (spec §9.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fh: Option<String>,
+    /// The remote a pull brought this record from (§9.4). Local-only:
+    /// never in a snapshot object, so never pushed on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// Whether a write's version of a file or symbol is still what is there.
@@ -306,6 +310,7 @@ pub fn build_record(
         syms,
         removed,
         fh,
+        origin: None,
     })
 }
 

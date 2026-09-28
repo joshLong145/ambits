@@ -309,6 +309,9 @@ pub enum Record {
         #[serde(flatten)]
         rest: serde_json::Map<String, serde_json::Value>,
     },
+    /// A pull merged `remote`'s snapshot `tip` into this session (§12.3):
+    /// the next snapshot takes it as a second parent. Local-only.
+    Merge { remote: String, tip: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +405,12 @@ pub struct JournalContents {
     /// restore). Not folded into `writes` — history never is — but known, so
     /// restoring again appends nothing.
     pub history_writes: std::collections::BTreeSet<String>,
+    /// `(symbol, hash)` of every read kept as history (`history{of:"read"}`,
+    /// a stale remote read), so pulling again appends nothing.
+    pub history_reads: std::collections::BTreeSet<(String, String)>,
+    /// Remote snapshots pulled into this session (`merge` records): the next
+    /// snapshot's extra parents, until they are its ancestors.
+    pub merges: std::collections::BTreeSet<String>,
     pub warnings: Vec<String>,
 }
 
@@ -528,9 +537,15 @@ fn fold_lines(path: &Path, content: &str, records: Records) -> JournalContents {
             },
             Record::Write(record) => fold_write(&mut out.writes, *record),
             Record::History { of, rest } => {
-                if let (true, Some(op)) = (of == "write", rest.get("op").and_then(|v| v.as_str())) {
-                    out.history_writes.insert(op.to_string());
+                let field = |k: &str| rest.get(k).and_then(|v| v.as_str()).map(String::from);
+                match of.as_str() {
+                    "write" => out.history_writes.extend(field("op")),
+                    "read" => out.history_reads.extend(field("sym").zip(field("h"))),
+                    _ => {}
                 }
+            }
+            Record::Merge { tip, .. } => {
+                out.merges.insert(tip);
             }
         }
     }
@@ -640,6 +655,8 @@ pub fn merge_shard(out: &mut JournalContents, shard: JournalContents) {
         fold_write(&mut out.writes, record);
     }
     out.history_writes.extend(shard.history_writes);
+    out.history_reads.extend(shard.history_reads);
+    out.merges.extend(shard.merges);
 }
 
 // ---------------------------------------------------------------------------

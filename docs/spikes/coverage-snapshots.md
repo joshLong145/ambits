@@ -663,7 +663,7 @@ nowhere in the journal, objects, links or notes.
 | `ambits restore <ref> [--into <session>]` | §12.1 |
 | `ambits touched <file\|symbol>` | §3.3 |
 | `ambits remote add <name> <path>` | Record in `.ambits/config`; warn if world-writable |
-| `ambits push [remote] [ref] [--force-with-lease] [--dry-run]` | §12.2 |
+| `ambits push [remote] [--force-with-lease] [--dry-run] [--break-lock]` | §12.2; the session is `--session`'s |
 | `ambits fetch [remote]` / `ambits pull [remote]` | §12.2, §12.3 (tracking refs always mirror the remote) |
 | `ambits gc` | §8 |
 | `ambits hook install --git` / `hook uninstall --git` | §9.3 |
@@ -760,6 +760,27 @@ Merges into the **same session id** locally.
    pull → snapshot → push round mint two new snapshots forever (model, §16).
 6. Symbol trees are never merged.
 
+**Implementation notes (phase 6).**
+
+- A remote is a store root: `objects/`, `reflog.ndjson`, `notes.ndjson`,
+  `links.ndjson` (§8, revision 5), plus `refs.lock`. The remote ref moves
+  under both that create-exclusive lock (for other machines) and the
+  reflog's advisory lock (for this one), after the compare-and-swap.
+- A push whose local tip the remote's history already contains is *up to
+  date*, not refused: a clone that is merely behind keeps its tip (step 5),
+  so its push must not fail.
+- A pull into a session with no local tip counts as diverged and records a
+  merge, so the first local snapshot descends from the remote's.
+- A snapshot's parents drop any parent another parent descends from, so a
+  pull that appended while merely behind yields one parent, not two.
+- Remote reads are classified with restore's `classify_reads` (moved
+  symbols followed); stale ones are `history{of:"read", sym, h, d, a,
+  origin}`, deduplicated by `(sym, h)`. Pulled writes carry `origin`;
+  snapshot objects drop it (§5.1), so it never travels further.
+- `<remote>/<session>` resolves to the tracking ref wherever a snapshot
+  reference is taken (`log`, `restore`): cross-machine restore is `fetch`
+  then `restore origin/<session>`.
+
 ---
 
 ## 13. Compatibility and migration
@@ -780,7 +801,7 @@ Merges into the **same session id** locally.
 | 3 | Objects + snapshots | §5–§8 locally: objects, D17 ids, no-op rule, `log`, reflog, gc; a writes-only scan for `touched`. **Delivered.** Pending merge tips join a snapshot's parents once phase 6 writes `merge` records | snapshot twice ⇒ same id; `touch` ⇒ same id; whitespace or same-length dirty edit ⇒ new; **revert ⇒ new snapshot, parent = tip**; journal append ⇒ new; torn line ignored; schema upgrade ⇒ one new id; `SYMBOL_SCHEMA` ⇒ new; `\`/`/`, NFC/NFD, shuffled dirty ⇒ same; ignore covers every record type; user-global ignore not negatable; **gc: crash → gc → re-snapshot never loses an object; parents-first deletion; age refresh** |
 | 4 | Git linkage | §3: lazy resolution, links index, verified/unverified, reachability re-check, optional hook. **Delivered** (`links refresh`, hidden, is what the hook runs) | write → commit → link; `add -p` across two commits; file-level `Write` via `fh`; later edit ⇒ changed since; amend and rebase ⇒ re-resolved; other branch; rename; never-landed cached locally; hook chains and never fails a commit |
 | 5 | Restore (same machine) | §12.1. **Delivered** | into a new session; restore twice ⇒ no change; ref set ⇒ next snapshot descends; moved symbols; drifted; different commit ⇒ warning |
-| 6 | Dumb remote | §9, §12.2, §12.3; cross-machine restore; origin in `touched` | two clones converge both ways; **repeated pull/snapshot/push with no new reads ⇒ no new snapshots after one round**; **diverged pull with nothing to append ⇒ two-parent snapshot ⇒ fast-forward**; **after B's force-with-lease, A's fetch and pull still work**; pulled reads the fold already has are not re-appended; stale remote read ⇒ history; concurrent push rejected; force-with-lease; **crash → gc → fetch recovers**; push verifies skipped closure; colliding id refused; hostile names, symlinks, oversized and cyclic objects rejected; interrupted push leaves no dangling ref; break-lock rules |
+| 6 | Dumb remote | §9, §12.2, §12.3; cross-machine restore; origin in `touched`. **Delivered** (`src/remote/`) | two clones converge both ways; **repeated pull/snapshot/push with no new reads ⇒ no new snapshots after one round**; **diverged pull with nothing to append ⇒ two-parent snapshot ⇒ fast-forward**; **after B's force-with-lease, A's fetch and pull still work**; pulled reads the fold already has are not re-appended; stale remote read ⇒ history; concurrent push rejected; force-with-lease; **crash → gc → fetch recovers**; push verifies skipped closure; colliding id refused; hostile names, symlinks, oversized and cyclic objects rejected; interrupted push leaves no dangling ref; break-lock rules |
 | 7 | Network transports | SSH / object storage; packs with an index and zstd | — |
 | — | *(later)* | Smart `ambits serve`; signed snapshots; `blame`; `share_provenance`; Serena symbol writes (`replace_symbol_body` and friends name their symbol in the log, so they could be definite symbol-level touches under D15) | — |
 

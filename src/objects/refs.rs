@@ -39,6 +39,16 @@ impl RefName {
         Ok(Self(format!("refs/sessions/{session}")))
     }
 
+    /// This store's copy of `remote`'s ref for `session`, as last fetched
+    /// or pushed: `refs/remotes/<remote>/sessions/<session>`.
+    pub fn tracking(remote: &str, session: &str) -> Result<Self> {
+        if !valid_remote_name(remote) {
+            bail!("not a remote name: {remote:?}");
+        }
+        let session = Self::session(session)?;
+        Ok(Self(format!("refs/remotes/{remote}/sessions/{}", session.session_id())))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -47,6 +57,14 @@ impl RefName {
     pub fn session_id(&self) -> &str {
         self.0.rsplit('/').next().unwrap_or(&self.0)
     }
+}
+
+/// A remote's name: letters, digits, `.`, `_` and `-`, not starting with
+/// `.`, at most 64 — one path component and one ref component (§9.1).
+pub fn valid_remote_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && !name.starts_with('.')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Directories an older ambits kept refs, reflogs and notes in.
@@ -189,6 +207,22 @@ pub fn notes(store: &Store) -> HashMap<ObjectId, Note> {
 
 pub fn read_note(store: &Store, id: &ObjectId) -> Option<Note> {
     notes(store).remove(id)
+}
+
+/// Copy `from`'s notes for `ids` that `to` lacks; how many.
+pub fn copy_notes(from: &Store, to: &Store, ids: &std::collections::HashSet<ObjectId>) -> Result<usize> {
+    let have = notes(to);
+    let missing: Vec<NoteLine> = notes(from)
+        .into_iter()
+        .filter(|(id, _)| ids.contains(id) && !have.contains_key(id))
+        .map(|(id, note)| NoteLine { id: id.hex(), note })
+        .collect();
+    if !missing.is_empty() {
+        let file = notes_file(to);
+        let lock = file.lock()?;
+        file.append(&lock, &missing, Durability::Fsync)?;
+    }
+    Ok(missing.len())
 }
 
 /// Drop the notes of snapshots `keep` rejects; how many went.

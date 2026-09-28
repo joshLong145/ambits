@@ -18,6 +18,10 @@ collects them in one place.
 | `ambits -p <path> log [ref]` | [Snapshot history](Snapshots#history) |
 | `ambits -p <path> restore <ref> [--into <session>]` | [Restore a snapshot](Snapshots#restoring) into a session |
 | `ambits -p <path> trace [--format otlp\|chrome]` | [Export the session as a trace](Traces) |
+| `ambits -p <path> remote add\|list\|remove` | [Remotes](Sharing#configuration): directories snapshots are shared through |
+| `ambits -p <path> push [remote]` | [Push](Sharing#push) this session's snapshots |
+| `ambits -p <path> fetch [remote]` | [Fetch](Sharing#fetch) every session's snapshots |
+| `ambits -p <path> pull [remote]` | [Pull](Sharing#pull): fetch, and merge into this session |
 | `ambits -p <path> gc` | Delete [unreachable snapshot objects](Snapshots#garbage-collection) |
 | `ambits -p <path> --coverage` | [Coverage report](Coverage-and-Multi-Agent) |
 | `ambits -p <path> --dump` | Print the symbol tree |
@@ -115,7 +119,8 @@ prefix (7+ hex digits); the current session by default.
 
 ## `ambits restore`
 
-`ambits -p . restore REF [--into SESSION]` — `REF` as for `log`. Without
+`ambits -p . restore REF [--into SESSION]` — `REF` as for `log`, or
+`<remote>/<session>` after a fetch. Without
 `--into`, a new session id is minted and printed. Distinct from
 `restore-context`, which prints what the current session has read.
 
@@ -124,6 +129,23 @@ prefix (7+ hex digits); the current session by default.
 `ambits -p . trace [--format otlp|chrome]` — the session (`--session`, or the
 latest) and its subagents as a trace on stdout; default `otlp`. `--agent`
 keeps one agent's subtree. See [Traces](Traces).
+
+## `ambits remote`
+
+`ambits -p . remote add <name> <path>`, `remote list`, `remote remove <name>`.
+See [Sharing](Sharing).
+
+## `ambits push`
+
+`ambits -p . push [remote] [--force-with-lease] [--dry-run] [--break-lock]` —
+the remote defaults to the only one, or `origin`; the session to `--session`
+or the latest.
+
+## `ambits fetch` / `ambits pull`
+
+`ambits -p . fetch [remote]`, `ambits -p . pull [remote]`. After a fetch,
+`<remote>/<session>` names a remote's session wherever a snapshot reference
+is taken (`log`, `restore`).
 
 ## `ambits gc`
 

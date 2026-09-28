@@ -82,7 +82,7 @@ fn spawn_write_attributor(
             else {
                 continue;
             };
-            if tx.send(AppEvent::WriteRecorded { session, record }).is_err() {
+            if tx.send(AppEvent::WriteRecorded { session, record: Box::new(record) }).is_err() {
                 break;
             }
         }

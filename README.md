@@ -77,6 +77,14 @@ ambits -p . --coverage --format json | jq '.totals.full_percent'
 ```
 → [Coverage and Multi-Agent](https://github.com/joshLong145/ambits/wiki/Coverage-and-Multi-Agent)
 
+**Snapshots and sharing**: a session's reads and writes as durable, content-addressed history, shared through any directory:
+
+```bash
+ambits -p . snapshot && ambits -p . remote add origin /mnt/team/ambits && ambits -p . push
+ambits -p . fetch && ambits -p . restore origin/<session>   # on another machine
+```
+→ [Snapshots](https://github.com/joshLong145/ambits/wiki/Snapshots), [Sharing](https://github.com/joshLong145/ambits/wiki/Sharing)
+
 **Traces**: every tool call a span, subagents nested under their delegation, for any OpenTelemetry backend or Perfetto:
 
 ```bash
