@@ -88,15 +88,15 @@ fn render_list(f: &mut Frame, app: &App, inner: Rect) {
     let first = scroll(app, selected, traces.len(), rows_h as usize);
     let prompts = traces.iter().filter(|t| app.trace.spans()[t.root].kind == SpanKind::Prompt).count();
 
-    // when · prompt · took · calls · failed · agents
-    let text_w = (inner.width as usize).saturating_sub(13 + 8 + 10 + 9 + 9);
+    // when · prompt · took · calls · failed · agents · commits
+    let text_w = (inner.width as usize).saturating_sub(13 + 8 + 10 + 9 + 9 + 9);
     let mut lines = vec![
         Line::from(Span::styled(
             format!(" {prompts} prompts · {} traces · Enter opens one", traces.len()),
             Style::default().fg(Color::Gray),
         )),
         Line::from(Span::styled(
-            format!(" {:<11} {:<text_w$} {:>7} {:>9} {:>8} {:>8}", "when", "prompt", "took", "calls", "failed", "agents"),
+            format!(" {:<11} {:<text_w$} {:>7} {:>9} {:>8} {:>8} {:>8}", "when", "prompt", "took", "calls", "failed", "agents", "commits"),
             dim,
         )),
     ];
@@ -111,6 +111,7 @@ fn render_list(f: &mut Frame, app: &App, inner: Rect) {
         let pad = text_w.saturating_sub(super::width(&what));
         let failed = if t.failed > 0 { format!("{} ✗", t.failed) } else { String::new() };
         let agents = if t.agents > 0 { t.agents.to_string() } else { String::new() };
+        let commits = if t.commits > 0 { t.commits.to_string() } else { String::new() };
         lines.push(Line::from(vec![
             Span::styled(format!(" {:<11} ", day_clock(t.start)), style.fg(Color::DarkGray)),
             Span::styled(format!("{what}{}", " ".repeat(pad)), style.fg(Color::White)),
@@ -118,6 +119,7 @@ fn render_list(f: &mut Frame, app: &App, inner: Rect) {
             Span::styled(format!(" {:>9}", t.calls), style.fg(Color::Gray)),
             Span::styled(format!(" {failed:>8}"), style.fg(Color::Red)),
             Span::styled(format!(" {agents:>8}"), style.fg(Color::Gray)),
+            Span::styled(format!(" {commits:>8}"), style.fg(Color::Cyan)),
         ]));
     }
     lines.resize(2 + rows_h as usize, Line::from(""));
@@ -231,7 +233,7 @@ fn waterfall_lines(app: &App, statuses: &Statuses, vp: &Viewport, label_w: usize
                     let (glyph, color) = instant_glyph(&x.kind);
                     let col = vp.col(x.t, bars_w);
                     let cells = (0.0..bars_w as f64).contains(&col).then_some((col as usize, glyph, Style::default().fg(color)));
-                    (format!("{indent}  {glyph} {}", instant_name(&x.kind)), String::new(), cells_line(bars_w, cells))
+                    (format!("{indent}  {glyph} {}", x.kind.label()), String::new(), cells_line(bars_w, cells))
                 }
             };
             let style = if is_selected { selected_style() } else { Style::default() };
@@ -360,7 +362,9 @@ fn details(app: &App, statuses: &Statuses) -> Vec<Line<'static>> {
     match app.trace_view.selected {
         Some(Item::Span(i)) => {
             let Some(s) = app.trace.spans().get(i) else { return Vec::new() };
-            let when = match s.end {
+            // A prompt or delegation lasts as long as what it started.
+            let end = view::effective_ends(&app.trace.tree()).get(&i).copied().filter(|_| s.end.is_some());
+            let when = match end {
                 Some(end) => format!("{} → {} ({})", clock(s.start), clock(end), view::duration(end - s.start)),
                 None => format!("{} → running", clock(s.start)),
             };
@@ -396,7 +400,7 @@ fn details(app: &App, statuses: &Statuses) -> Vec<Line<'static>> {
             let Some(x) = app.trace.instants().get(i) else { return Vec::new() };
             let (glyph, color) = instant_glyph(&x.kind);
             vec![
-                Line::from(Span::styled(format!(" {glyph} {}", instant_name(&x.kind)), Style::default().fg(color))),
+                Line::from(Span::styled(format!(" {glyph} {}", x.kind.label()), Style::default().fg(color))),
                 Line::from(Span::styled(format!(" {}", clock(x.t)), dim)),
             ]
         }
@@ -459,15 +463,7 @@ fn instant_glyph(kind: &InstantKind) -> (char, Color) {
     match kind {
         InstantKind::Compaction => ('▼', Color::Yellow),
         InstantKind::Snapshot(_) => ('◆', Color::Magenta),
-        InstantKind::Commit(_) => ('│', Color::Cyan),
-    }
-}
-
-fn instant_name(kind: &InstantKind) -> String {
-    match kind {
-        InstantKind::Compaction => "compaction".into(),
-        InstantKind::Snapshot(id) => format!("snapshot {}", id.get(..12).unwrap_or(id)),
-        InstantKind::Commit(sha) => format!("commit {}", sha.get(..7).unwrap_or(sha)),
+        InstantKind::Commit { .. } => ('│', Color::Cyan),
     }
 }
 
@@ -585,6 +581,23 @@ mod tests {
         assert!(row.contains("review the code…") && row.contains("10s") && row.contains("1 ✗"), "{row}");
         assert!(text.contains("review the code and tell me"), "the whole prompt below: {text}");
         assert!(!text.contains('█'), "no bars at the top level: {text}");
+    }
+
+    /// A commit made during a prompt is counted in the list and sits among
+    /// its calls, with its subject.
+    #[test]
+    fn a_commit_shows_in_its_trace() {
+        let mut app = app();
+        app.trace.set_commits(&[ambits::git::Commit { sha: "1f32c0b".repeat(6)[..40].to_string(), t: 1_790_503_203_500, subject: "Fix the parser".into() }]);
+        app.trace_view.close_trace();
+        let list = screen(&app).join("\n");
+        assert!(list.contains("commits"), "{list}");
+        app.trace_view.open_trace(3);
+        let lines = screen(&app);
+        let text = lines.join("\n");
+        let commit = lines.iter().position(|l| l.contains("│ commit 1f32c0b Fix the parser")).expect(&text);
+        let delegation = lines.iter().position(|l| l.contains("Agent src/a.rs")).expect(&text);
+        assert!(commit > delegation, "made after the delegation began: {text}");
     }
 
     #[test]

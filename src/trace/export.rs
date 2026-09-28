@@ -114,23 +114,34 @@ pub fn otlp(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
         .unwrap_or((0, 0));
 
     let mut spans: Vec<Value> = Vec::new();
-    let root_events: Vec<Value> = trace
-        .instants()
-        .iter()
-        .filter(|i| filter.is_none_or(|a| i.agent.as_deref().is_none_or(|ia| ia.starts_with(a))))
-        .map(|i| {
-            let (name, detail) = match &i.kind {
-                InstantKind::Compaction => ("compaction", None),
-                InstantKind::Snapshot(id) => ("snapshot", Some(("ambits.snapshot.id", id))),
-                InstantKind::Commit(sha) => ("commit", Some(("vcs.ref.head.revision", sha))),
-            };
-            let mut attrs: Vec<Value> = detail.map(|(k, v)| attr(k, json!(v))).into_iter().collect();
-            if let Some(agent) = &i.agent {
-                attrs.push(attr("gen_ai.agent.id", json!(&**agent)));
+    // Each moment is an event on the prompt it happened during, else on
+    // the session.
+    let mut root_events: Vec<Value> = Vec::new();
+    let mut events: std::collections::HashMap<usize, Vec<Value>> = std::collections::HashMap::new();
+    for i in trace.instants().iter().filter(|i| filter.is_none_or(|a| i.agent.as_deref().is_none_or(|ia| ia.starts_with(a)))) {
+        let mut attrs = Vec::new();
+        let name = match &i.kind {
+            InstantKind::Compaction => "compaction",
+            InstantKind::Snapshot(id) => {
+                attrs.push(attr("ambits.snapshot.id", json!(id)));
+                "snapshot"
             }
-            json!({"timeUnixNano": nanos(i.t), "name": name, "attributes": attrs})
-        })
-        .collect();
+            InstantKind::Commit { sha, subject } => {
+                attrs.push(attr("vcs.ref.head.revision", json!(sha)));
+                attrs.push(attr("ambits.commit.subject", json!(subject)));
+                "commit"
+            }
+        };
+        if let Some(agent) = &i.agent {
+            attrs.push(attr("gen_ai.agent.id", json!(&**agent)));
+        }
+        let event = json!({"timeUnixNano": nanos(i.t), "name": name, "attributes": attrs});
+        let during = roots.iter().find(|n| trace.spans()[n.span].kind == SpanKind::Prompt && (trace.spans()[n.span].start..=n.end).contains(&i.t));
+        match during {
+            Some(n) => events.entry(n.span).or_default().push(event),
+            None => root_events.push(event),
+        }
+    }
     spans.push(json!({
         "traceId": tid,
         "spanId": root_id,
@@ -148,7 +159,7 @@ pub fn otlp(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
         let span = &trace.spans()[node.span];
         let id = span_id(session, span, node.span);
         let status = if span.error { json!({"code": 2, "message": "tool call failed"}) } else { json!({"code": 0}) };
-        spans.push(json!({
+        let mut out = json!({
             "traceId": tid,
             "spanId": id,
             "parentSpanId": parent,
@@ -158,7 +169,11 @@ pub fn otlp(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
             "endTimeUnixNano": nanos(node.end),
             "attributes": span_attributes(span),
             "status": status,
-        }));
+        });
+        if let Some(events) = events.remove(&node.span) {
+            out["events"] = json!(events);
+        }
+        spans.push(out);
         for child in node.children.iter().rev() {
             stack.push((child, id.clone()));
         }
@@ -253,11 +268,7 @@ pub fn chrome(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
         if filter.is_some_and(|a| i.agent.as_deref().is_some_and(|ia| !ia.starts_with(a))) {
             continue;
         }
-        let name = match &i.kind {
-            InstantKind::Compaction => "compaction".to_string(),
-            InstantKind::Snapshot(id) => format!("snapshot {}", id.get(..12).unwrap_or(id)),
-            InstantKind::Commit(sha) => format!("commit {}", sha.get(..7).unwrap_or(sha)),
-        };
+        let name = i.kind.label();
         let (scope, tid) = match i.agent.as_deref().and_then(|a| tids.get(a)) {
             Some(tid) => ("t", *tid),
             None => ("g", 0),

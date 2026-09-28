@@ -159,6 +159,8 @@ pub struct TraceSummary {
     pub failed: usize,
     /// Subagents it started, at any depth.
     pub agents: usize,
+    /// Commits made while it ran.
+    pub commits: usize,
 }
 
 /// The traces, in time order; under `filter`, those in which that agent
@@ -184,6 +186,11 @@ pub fn traces(trace: &Trace, filter: Option<&str>) -> Vec<TraceSummary> {
                 calls: under.len(),
                 failed: all.iter().filter(|&&i| spans[i].error).count(),
                 agents: under.iter().filter(|&&i| spans[i].child_agent.is_some()).count(),
+                commits: trace
+                    .instants()
+                    .iter()
+                    .filter(|x| matches!(x.kind, super::InstantKind::Commit { .. }) && (spans[node.span].start..=node.end).contains(&x.t))
+                    .count(),
             })
         })
         .collect()
@@ -260,14 +267,32 @@ pub fn waterfall(trace: &Trace, filter: Option<&str>, within: Option<usize>, col
         node.children.iter().map(|c| 1 + count(c)).sum()
     }
 
-    for root in roots {
-        let start = trace.spans()[root.span].start;
-        while let Some(i) = instants.next_if(|&i| trace.instants()[i].t <= start) {
-            out.push(instant_row(trace, i));
+    if within.is_some() {
+        // One trace: its moments among the calls under its root, in time
+        // order, where they happened.
+        for root in &roots {
+            walk(trace, root, 0, collapsed, &query, &mut out);
         }
-        walk(trace, root, 0, collapsed, &query, &mut out);
+        for i in instants {
+            let t = trace.instants()[i].t;
+            let at = out
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find(|(_, r)| r.depth <= 1 && matches!(r.item, Item::Span(s) if trace.spans()[s].start > t))
+                .map_or(out.len(), |(ix, _)| ix);
+            out.insert(at, Row { depth: usize::from(!out.is_empty()), ..instant_row(trace, i) });
+        }
+    } else {
+        for root in roots {
+            let start = trace.spans()[root.span].start;
+            while let Some(i) = instants.next_if(|&i| trace.instants()[i].t <= start) {
+                out.push(instant_row(trace, i));
+            }
+            walk(trace, root, 0, collapsed, &query, &mut out);
+        }
+        out.extend(instants.map(|i| instant_row(trace, i)));
     }
-    out.extend(instants.map(|i| instant_row(trace, i)));
     if !query.is_empty() {
         out.retain(|r| matches!(r.item, Item::Span(_)));
     }
@@ -559,10 +584,12 @@ impl TraceView {
     pub fn move_row(&mut self, rows: &[Row], delta: isize) {
         let Some(last) = rows.len().checked_sub(1) else { return };
         let at = self.selected.and_then(|s| rows.iter().position(|r| r.item == s));
+        // From no selection, a step down lands on the first row, a jump on
+        // the row it reaches; a step up on the last.
         let next = match at {
             Some(i) => i.saturating_add_signed(delta).min(last),
             None if delta < 0 => last,
-            None => 0,
+            None => (delta.unsigned_abs() - 1).min(last),
         };
         self.selected = Some(rows[next].item);
     }
@@ -804,6 +831,34 @@ mod tests {
         assert_eq!(rows[pos + 1].item, Item::Span(4), "before the read at 3.5s");
     }
 
+    /// Inside one trace, a commit sits among its calls where it happened,
+    /// and the list counts it.
+    #[test]
+    fn a_commit_lands_among_the_calls_of_its_trace() {
+        let mut t = sample();
+        t.prompt(&crate::ingest::Prompt { agent_id: Arc::from("main"), timestamp: at(0), text: "do it".into() });
+        t.set_commits(&[crate::git::Commit { sha: "a".repeat(40), t: BASE + 3_200, subject: "Fix".into() }]);
+        let rows = waterfall(&t, None, Some(5), &HashSet::new(), "");
+        assert_eq!(
+            items(&rows),
+            vec![
+                (Item::Span(5), 0),
+                (Item::Span(0), 1),
+                (Item::Span(1), 1),
+                (Item::Span(2), 2),
+                (Item::Span(3), 2),
+                (Item::Instant(0), 1),
+                (Item::Span(4), 1),
+            ],
+            "after the delegation began at 2s, before the read at 3.5s"
+        );
+        assert_eq!(traces(&t, None)[0].commits, 1);
+        assert_eq!(t.instants()[0].kind.label(), format!("commit {} Fix", "a".repeat(7)));
+
+        t.set_commits(&[]);
+        assert!(t.instants().is_empty(), "a rescan replaces what the last one found");
+    }
+
     #[test]
     fn tracks_follow_the_delegation_tree_and_stack_overlaps() {
         let t = sample();
@@ -835,7 +890,7 @@ mod tests {
     fn instants_land_on_their_agents_track() {
         let mut t = sample();
         t.instant(BASE + 4_500, Some(Arc::from("x")), InstantKind::Compaction);
-        t.instant(BASE + 4_600, None, InstantKind::Commit("abc".into()));
+        t.instant(BASE + 4_600, None, InstantKind::Commit { sha: "abc".into(), subject: "s".into() });
         let tr = tracks(&t, None, None, BASE + 10_000);
         assert_eq!((tr[0].instants.clone(), tr[1].instants.clone()), (vec![1], vec![0]));
     }
@@ -845,6 +900,9 @@ mod tests {
         let t = sample();
         let rows = waterfall(&t, None, None, &HashSet::new(), "");
         let mut view = TraceView::default();
+        view.move_row(&rows, isize::MAX / 2);
+        assert_eq!(view.selected, Some(Item::Span(4)), "G from nothing selected is the last row");
+        view.selected = None;
         view.move_row(&rows, 1);
         assert_eq!(view.selected, Some(Item::Span(0)));
         view.move_row(&rows, 2);

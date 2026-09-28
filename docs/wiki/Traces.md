@@ -42,8 +42,11 @@ it is exported with zero length and marked `ambits.open`.
 A failed call, or an agent that stopped with any status but `completed`, is
 an error.
 
-Compactions are instants on the session: span events in OTLP, `ph:"i"`
-events in Chrome.
+Compactions and git commits are moments rather than spans: span events in
+OTLP — on the prompt they happened during, else on the session — and
+`ph:"i"` events in Chrome. Commits are those on local branches or `HEAD`
+whose committer time falls within the session, each with
+`vcs.ref.head.revision` and `ambits.commit.subject`.
 
 ## OTLP/JSON
 

@@ -38,6 +38,30 @@ pub struct TuiSession {
     /// Hands write events, tagged with their session, to the attribution
     /// worker (spec §1).
     write_tx: flume::Sender<(Arc<str>, ambits::ingest::WriteEvent)>,
+    /// Asks the commit worker for the commits in a time range.
+    commit_tx: flume::Sender<(u64, u64)>,
+    /// When the trace view last asked for commits.
+    last_commit_scan: Option<std::time::Instant>,
+}
+
+/// How often the open trace view looks for new commits.
+const COMMIT_SCAN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Find commits on a worker thread: the render thread runs no git. Only the
+/// latest request of any that queued up is answered, as
+/// `AppEvent::CommitsFound`.
+fn spawn_commit_scanner(project_root: PathBuf, tx: flume::Sender<AppEvent>) -> flume::Sender<(u64, u64)> {
+    let (commit_tx, commit_rx) = flume::unbounded::<(u64, u64)>();
+    std::thread::spawn(move || {
+        while let Ok(first) = commit_rx.recv() {
+            let (since, until) = commit_rx.try_iter().last().unwrap_or(first);
+            let commits = ambits::git::commits_between(&project_root, since, until);
+            if tx.send(AppEvent::CommitsFound(commits)).is_err() {
+                break;
+            }
+        }
+    });
+    commit_tx
 }
 
 /// Attribute writes on a worker thread, never the render thread (spec §1):
@@ -199,6 +223,7 @@ impl TuiSession {
         // Serena mode's tree ids need not match a tree-sitter parse, so its
         // writes are file-level (spec §2.5).
         let write_tx = spawn_write_attributor(project_path.to_path_buf(), !serena_mode, tx.clone());
+        let commit_tx = spawn_commit_scanner(project_path.to_path_buf(), tx.clone());
 
         Ok(Self {
             current_session_id: session_id,
@@ -209,7 +234,21 @@ impl TuiSession {
             _project_watcher: project_watcher,
             _log_watcher: log_watcher,
             write_tx,
+            commit_tx,
+            last_commit_scan: None,
         })
+    }
+
+    /// While the trace view is open, ask the commit worker, now and then, for
+    /// the commits made during the session.
+    fn scan_commits_if_due(&mut self, app: &App) {
+        if !app.trace_view.open || self.last_commit_scan.is_some_and(|t| t.elapsed() < COMMIT_SCAN_EVERY) {
+            return;
+        }
+        if let Some(range) = app.trace.range() {
+            let _ = self.commit_tx.send(range);
+            self.last_commit_scan = Some(std::time::Instant::now());
+        }
     }
 
     /// Handle a `Tick` event: detect new sessions, poll the tailer, and check Serena caches.
@@ -220,6 +259,8 @@ impl TuiSession {
         serena_mode: bool,
         project_path: &Path,
     ) {
+        self.scan_commits_if_due(app);
+
         // Poll the tailer first. On a session switch below, this is the old
         // session's last chance: anything it logged since the previous tick
         // (reads, writes, their results) would otherwise be dropped with the

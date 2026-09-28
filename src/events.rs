@@ -28,6 +28,9 @@ pub enum AppEvent {
         session: std::sync::Arc<str>,
         record: ambits::writes::WriteRecord,
     },
+    /// The commits made during the session, found off the render thread by
+    /// the worker `TuiSession` spawns for the trace view.
+    CommitsFound(Vec<ambits::git::Commit>),
 }
 
 /// Spawn a thread that polls crossterm key events and sends them to the channel.

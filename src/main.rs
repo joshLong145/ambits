@@ -1267,7 +1267,10 @@ fn run() -> Result<()> {
             color_eyre::eyre::bail!("no logs found for session {session}");
         }
         let events = files.iter().flat_map(|f| ingester.parse_log_file_with_root(f, &project_path));
-        let trace = ambits::trace::Trace::from_events(events, &project_path);
+        let mut trace = ambits::trace::Trace::from_events(events, &project_path);
+        if let Some((start, end)) = trace.range() {
+            trace.set_commits(&ambits::git::commits_between(&project_path, start, end));
+        }
         let agent = cli.agent.as_deref();
         let out = match format {
             TraceFormat::Otlp => ambits::trace::export::otlp(&trace, session, agent),
@@ -1693,6 +1696,7 @@ fn run_tui(
                 session.handle_tick(log_dir, app, serena_mode, project_path);
             }
             Ok(AppEvent::WriteRecorded { session, record }) => app.record_write(&session, record),
+            Ok(AppEvent::CommitsFound(commits)) => app.trace.set_commits(&commits),
             Err(flume::RecvTimeoutError::Timeout) => {}
             Err(flume::RecvTimeoutError::Disconnected) => break,
         }
@@ -1784,6 +1788,7 @@ fn suspend_for_editor(
                 session.handle_tick(log_dir, app, serena_mode, project_path);
             }
             AppEvent::WriteRecorded { session, record } => app.record_write(&session, record),
+            AppEvent::CommitsFound(commits) => app.trace.set_commits(&commits),
         }
     }
 

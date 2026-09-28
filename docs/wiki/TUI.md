@@ -101,7 +101,8 @@ before this run come from the [read journal](Configuration#the-read-journal).
 
 `t` replaces the tree with the session's **traces, one per prompt**: when
 you asked, what, how long answering took, how many tool calls it made, how
-many failed, and how many subagents it started. The selected prompt is shown
+many failed, how many subagents it started, and how many git commits were
+made while it ran. The selected prompt is shown
 in full below the list. `j` / `k` choose, `Enter` opens one, `Esc` goes back
 to the tree.
 
@@ -123,7 +124,9 @@ Two layouts, `v` to switch:
 
 Bars take the tree's colours: reads by depth, writes by whether their
 version is still there, failures red, delegations grey. `▼` marks a
-compaction. The line under the bars details the selected call: its agent,
+compaction, and `│` a git commit (hash and subject), among the calls it
+followed. Commits are found on local branches and `HEAD` by committer
+time, off the render thread, every few seconds while the view is open. The line under the bars details the selected call: its agent,
 start, end and duration, depth or write status, and where `Enter` goes.
 
 The timeline follows its trace live until you zoom; `0` goes back to that.

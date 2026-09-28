@@ -79,7 +79,19 @@ impl Span {
 pub enum InstantKind {
     Compaction,
     Snapshot(String),
-    Commit(String),
+    /// A commit made during the session, by its committer time.
+    Commit { sha: String, subject: String },
+}
+
+impl InstantKind {
+    /// `compaction`, `snapshot 3f9c…`, `commit 1f32c0b Subject`.
+    pub fn label(&self) -> String {
+        match self {
+            InstantKind::Compaction => "compaction".into(),
+            InstantKind::Snapshot(id) => format!("snapshot {}", id.get(..12).unwrap_or(id)),
+            InstantKind::Commit { sha, subject } => format!("commit {} {subject}", sha.get(..7).unwrap_or(sha)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +195,15 @@ impl Trace {
             error: false,
             child_agent: None,
         });
+    }
+
+    /// The commits made during the session, replacing any found before:
+    /// each scan sees them all.
+    pub fn set_commits(&mut self, commits: &[crate::git::Commit]) {
+        self.instants.retain(|i| !matches!(i.kind, InstantKind::Commit { .. }));
+        for c in commits {
+            self.instant(c.t, None, InstantKind::Commit { sha: c.sha.clone(), subject: c.subject.clone() });
+        }
     }
 
     pub fn instant(&mut self, t: u64, agent: Option<Arc<str>>, kind: InstantKind) {

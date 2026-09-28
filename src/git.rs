@@ -89,6 +89,35 @@ pub fn is_commit_id(s: &str) -> bool {
     matches!(s.len(), 40 | 64) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// A commit, as a trace shows one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commit {
+    pub sha: String,
+    /// Committer time: when it was made here, in milliseconds.
+    pub t: u64,
+    pub subject: String,
+}
+
+/// Commits on local branches or `HEAD` made from `since` to `until`
+/// (milliseconds), by committer time; empty outside a repository.
+pub fn commits_between(dir: &Path, since: u64, until: u64) -> Vec<Commit> {
+    let (since, until) = (format!("--since=@{}", since / 1000), format!("--until=@{}", until.div_ceil(1000)));
+    let args = [
+        "log", "--no-show-signature", "--no-color", "--no-ext-diff", "-z", "--format=%H%x1f%ct%x1f%s", "--branches", "HEAD",
+        &since, &until,
+    ];
+    let Some(out) = git(dir, &args) else { return Vec::new() };
+    String::from_utf8_lossy(&out)
+        .split('\0')
+        .filter_map(|record| {
+            let mut fields = record.trim_start_matches('\n').splitn(3, '\x1f');
+            let sha = fields.next().filter(|s| is_commit_id(s))?.to_string();
+            let t = fields.next()?.parse::<u64>().ok()? * 1000;
+            Some(Commit { sha, t, subject: fields.next().unwrap_or_default().to_string() })
+        })
+        .collect()
+}
+
 /// The repository `dir` belongs to, as far as ambits needs it.
 #[derive(Debug, Clone)]
 pub struct Repo {
@@ -165,6 +194,27 @@ mod tests {
         assert!(is_commit_id(&"0".repeat(64)));
         assert!(!is_commit_id(&"A".repeat(40)));
         assert!(!is_commit_id("HEAD"));
+    }
+
+    /// Commits by committer time within the window, subjects intact.
+    #[test]
+    fn commits_between_finds_the_commits_in_a_window() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        sh(root, &["init", "-q"]);
+        let commit = |msg: &str, at: &str| {
+            std::fs::write(root.join("f"), msg).unwrap();
+            sh(root, &["add", "."]);
+            test_git(root, &["commit", "-qm", msg], &[("GIT_COMMITTER_DATE", at), ("GIT_AUTHOR_DATE", at)]);
+        };
+        commit("first", "@1790000000 +0000");
+        commit("second: with a colon", "@1790000100 +0000");
+        commit("third", "@1790000200 +0000");
+        let found = commits_between(root, 1_790_000_050_000, 1_790_000_150_000);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!((found[0].t, found[0].subject.as_str()), (1_790_000_100_000, "second: with a colon"));
+        assert!(is_commit_id(&found[0].sha));
+        assert!(commits_between(&root.join("nowhere"), 0, u64::MAX / 2).is_empty());
     }
 
     #[test]
