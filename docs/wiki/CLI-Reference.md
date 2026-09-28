@@ -17,6 +17,7 @@ collects them in one place.
 | `ambits -p <path> snapshot` | [Record a snapshot](Snapshots) of this session |
 | `ambits -p <path> log [ref]` | [Snapshot history](Snapshots#history) |
 | `ambits -p <path> restore <ref> [--into <session>]` | [Restore a snapshot](Snapshots#restoring) into a session |
+| `ambits -p <path> trace [--format otlp\|chrome]` | [Export the session as a trace](Traces) |
 | `ambits -p <path> gc` | Delete [unreachable snapshot objects](Snapshots#garbage-collection) |
 | `ambits -p <path> --coverage` | [Coverage report](Coverage-and-Multi-Agent) |
 | `ambits -p <path> --dump` | Print the symbol tree |
@@ -117,6 +118,12 @@ prefix (7+ hex digits); the current session by default.
 `ambits -p . restore REF [--into SESSION]` — `REF` as for `log`. Without
 `--into`, a new session id is minted and printed. Distinct from
 `restore-context`, which prints what the current session has read.
+
+## `ambits trace`
+
+`ambits -p . trace [--format otlp|chrome]` — the session (`--session`, or the
+latest) and its subagents as a trace on stdout; default `otlp`. `--agent`
+keeps one agent's subtree. See [Traces](Traces).
 
 ## `ambits gc`
 

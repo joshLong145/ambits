@@ -200,6 +200,19 @@ enum Commands {
         into: Option<String>,
     },
 
+    /// Export the session as a trace: every tool call a span with its
+    /// duration, subagents nested under the call that started them.
+    ///
+    /// `otlp` is OpenTelemetry's JSON format, for Jaeger, Grafana Tempo or a
+    /// collector; `chrome` is the Chrome trace format, for Perfetto
+    /// (ui.perfetto.dev) and chrome://tracing. `--agent` narrows it to one
+    /// agent and what it delegated.
+    Trace {
+        /// Output format.
+        #[arg(long, value_enum, default_value = "otlp")]
+        format: TraceFormat,
+    },
+
     /// Show snapshot history: time, git commit, dirty files, reads, writes,
     /// parents and message.
     Log {
@@ -668,6 +681,14 @@ enum ColorWhen {
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
+enum TraceFormat {
+    /// OTLP/JSON (`resourceSpans`), for OpenTelemetry tools (default).
+    Otlp,
+    /// Chrome trace events (`traceEvents`), for Perfetto and chrome://tracing.
+    Chrome,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum TouchedFormat {
     /// The last write, and whether it is still on disk (default).
     Text,
@@ -1233,6 +1254,26 @@ fn run() -> Result<()> {
             stats.uncommitted,
             if stats.stopped_early { " (stopped at the time limit)" } else { "" }
         )?;
+        return Ok(());
+    }
+
+    // A trace needs only the session's logs.
+    if let Some(Commands::Trace { format }) = &command {
+        let Some(session) = session_id.as_deref() else {
+            color_eyre::eyre::bail!("no session to trace: pass --session, or run inside a project with Claude Code logs");
+        };
+        let files = log_dir.as_ref().map(|d| ingester.session_log_files(d, session)).unwrap_or_default();
+        if files.is_empty() {
+            color_eyre::eyre::bail!("no logs found for session {session}");
+        }
+        let events = files.iter().flat_map(|f| ingester.parse_log_file_with_root(f, &project_path));
+        let trace = ambits::trace::Trace::from_events(events, &project_path);
+        let agent = cli.agent.as_deref();
+        let out = match format {
+            TraceFormat::Otlp => ambits::trace::export::otlp(&trace, session, agent),
+            TraceFormat::Chrome => ambits::trace::export::chrome(&trace, session, agent),
+        };
+        writeln!(io::stdout().lock(), "{out}")?;
         return Ok(());
     }
 

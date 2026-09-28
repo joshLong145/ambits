@@ -15,6 +15,7 @@
 - [TUI](TUI)
 - [Coverage and Multi-Agent](Coverage-and-Multi-Agent)
 - [Snapshots](Snapshots)
+- [Traces](Traces)
 - [Configuration](Configuration)
 
 **Reference**

@@ -30,6 +30,7 @@ addresses both halves of that:
 - [TUI](TUI) — panels, keybindings, colors, opening symbols in your editor
 - [Coverage and Multi-Agent](Coverage-and-Multi-Agent) — reports, JSON, sub-agent filtering and alignment
 - [Snapshots](Snapshots) — durable, content-addressed history of a session; `snapshot`, `log`, `gc`
+- [Traces](Traces) — a session's tool calls as an OpenTelemetry or Perfetto trace; `trace`
 - [Configuration](Configuration) — the read journal, scope filters, `tools.toml`, backends, logging
 
 **Reference**

@@ -9,6 +9,8 @@
 //! trace. Delegations are asynchronous, so a delegation's effective end is
 //! the later of its own result and its subagent's last span.
 
+pub mod export;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -140,12 +142,16 @@ impl Trace {
         });
     }
 
-    /// A call's result arrived.
+    /// A call's result arrived. A background delegation finishes twice —
+    /// its launch, then its agent stopping — so the later end wins and an
+    /// error from either sticks.
     pub fn finish(&mut self, f: &ToolFinished) {
         let Some(&ix) = self.by_id.get(&f.id) else { return };
         let span = &mut self.spans[ix];
-        span.end = crate::time::parse_rfc3339_millis(&f.timestamp).map(|t| t.max(span.start));
-        span.error = f.error;
+        if let Some(t) = crate::time::parse_rfc3339_millis(&f.timestamp) {
+            span.end = Some(span.end.unwrap_or(0).max(t).max(span.start));
+        }
+        span.error |= f.error;
         if f.child_agent.is_some() {
             span.child_agent = f.child_agent.clone();
         }
@@ -279,6 +285,21 @@ mod tests {
         assert_eq!(t.spans()[delegation.span].kind, SpanKind::Delegate);
         assert_eq!(delegation.children.len(), 1);
         assert_eq!(delegation.end, crate::time::parse_rfc3339_millis(T9).unwrap());
+    }
+
+    /// A background delegation finishes at launch and again when its agent
+    /// stops: the stop is its end, whatever order the two arrive in.
+    #[test]
+    fn a_background_delegation_ends_when_its_agent_stops() {
+        let mut t = Trace::default();
+        t.start(&call("main", "d", "Agent", T0), Path::new("/p"));
+        t.finish(&done("main", "d", T1, Some("x")));
+        t.finish(&ToolFinished { error: true, ..done("main", "d", T9, Some("x")) });
+        t.finish(&done("main", "d", T5, None));
+        let span = &t.spans()[0];
+        assert_eq!(span.end, crate::time::parse_rfc3339_millis(T9));
+        assert!(span.error, "a failed stop marks the delegation");
+        assert_eq!(span.child_agent.as_deref(), Some("x"));
     }
 
     #[test]

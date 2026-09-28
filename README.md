@@ -77,6 +77,14 @@ ambits -p . --coverage --format json | jq '.totals.full_percent'
 ```
 → [Coverage and Multi-Agent](https://github.com/joshLong145/ambits/wiki/Coverage-and-Multi-Agent)
 
+**Traces**: every tool call a span, subagents nested under their delegation, for any OpenTelemetry backend or Perfetto:
+
+```bash
+ambits -p . trace > session.otlp.json
+ambits -p . trace --format chrome > session.trace.json   # open in ui.perfetto.dev
+```
+→ [Traces](https://github.com/joshLong145/ambits/wiki/Traces)
+
 ## Languages
 
 | Backend | Languages |

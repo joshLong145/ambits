@@ -287,6 +287,9 @@ pub enum ParsedLine {
     /// (and its `toolUseResult` detail) reaches us. Correlated with the call
     /// by [`WriteCorrelator`].
     ToolResults(Vec<ToolResult>),
+    /// `type:"queue-operation"` enqueuing a `<task-notification>`: a
+    /// background agent stopped, long after its call's own result.
+    AgentStopped { tool_use_id: Arc<str>, agent: Arc<str>, timestamp: String, error: bool },
     Ignored,
 }
 
@@ -552,7 +555,7 @@ impl LineFeed {
                         .as_ref()
                         .and_then(|d| d.get("agentId"))
                         .and_then(|v| v.as_str())
-                        .map(|id| Arc::from(format!("agent-{id}").as_str()));
+                        .map(Arc::from);
                     out.push(SessionEvent::ToolFinished(super::ToolFinished {
                         id: r.tool_use_id.clone(),
                         agent_id: Arc::from(self.default_id.as_str()),
@@ -572,6 +575,15 @@ impl LineFeed {
                 metadata: self.pending_metadata.take(),
             }),
             ParsedLine::SessionCleared => out.push(SessionEvent::SessionCleared),
+            ParsedLine::AgentStopped { tool_use_id, agent, timestamp, error } => {
+                out.push(SessionEvent::ToolFinished(super::ToolFinished {
+                    id: tool_use_id,
+                    agent_id: Arc::from(self.default_id.as_str()),
+                    timestamp,
+                    error,
+                    child_agent: Some(agent),
+                }))
+            }
             ParsedLine::Ignored => {}
         }
     }
@@ -590,6 +602,28 @@ fn parse_compact_metadata(meta: &Value) -> Option<CompactionMetadata> {
     })
 }
 
+/// A `<task-notification>` as Claude Code enqueues it when a background
+/// agent stops. Only the enqueue counts: its timestamp is the stop, and the
+/// later `remove` is just the main agent picking it up.
+fn parse_agent_stopped(obj: &Value) -> Option<ParsedLine> {
+    if obj.get("operation")?.as_str()? != "enqueue" {
+        return None;
+    }
+    let content = obj.get("content")?.as_str()?;
+    let tag = |name: &str| {
+        let (open, close) = (format!("<{name}>"), format!("</{name}>"));
+        let start = content.find(&open)? + open.len();
+        Some(content[start..].split_once(&close)?.0.trim())
+    };
+    tag("task-notification")?;
+    Some(ParsedLine::AgentStopped {
+        tool_use_id: Arc::from(tag("tool-use-id")?),
+        agent: Arc::from(tag("task-id")?),
+        timestamp: obj.get("timestamp")?.as_str()?.to_string(),
+        error: tag("status") != Some("completed"),
+    })
+}
+
 /// Parse a single JSONL line from a Claude Code session log.
 /// Returns a `ParsedLine` indicating tool call events, a session clear signal, or nothing.
 pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCallMapper) -> ParsedLine {
@@ -599,6 +633,10 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
     };
 
     let msg_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    if msg_type == "queue-operation" {
+        return parse_agent_stopped(&obj).unwrap_or(ParsedLine::Ignored);
+    }
 
     // Detect the compaction boundary marker (precedes the summary by one line).
     if msg_type == "system"
@@ -1908,6 +1946,7 @@ description  = "UserTool {target}"
                 ParsedLine::CompactBoundary { .. } => "CompactBoundary",
                 ParsedLine::SessionCleared => "SessionCleared",
                 ParsedLine::ToolResults(_) => "ToolResults",
+                ParsedLine::AgentStopped { .. } => "AgentStopped",
                 ParsedLine::Ignored => "Ignored",
             }),
         }
@@ -2357,7 +2396,31 @@ mod write_tests {
             .collect();
         assert_eq!(finished.len(), 2);
         assert!(finished[0].error);
-        assert_eq!(finished[1].child_agent.as_deref(), Some("agent-a2f"));
+        assert_eq!(finished[1].child_agent.as_deref(), Some("a2f"));
+    }
+
+    /// A background agent's stop is enqueued as a task notification: it ends
+    /// the delegation that launched it. The pickup (`remove`) does not.
+    #[test]
+    fn an_enqueued_task_notification_ends_the_delegation() {
+        let config = ToolMappingConfig::builtin().expect("builtin config");
+        let line = |op: &str, status: &str| {
+            serde_json::json!({
+                "type": "queue-operation",
+                "operation": op,
+                "timestamp": "2026-09-26T19:39:16.480Z",
+                "content": format!("<task-notification>\n<task-id>a03c</task-id>\n<tool-use-id>toolu_9</tool-use-id>\n<status>{status}</status>\n</task-notification>"),
+            })
+            .to_string()
+        };
+        match parse_jsonl_line(&line("enqueue", "completed"), "d", &config) {
+            ParsedLine::AgentStopped { tool_use_id, agent, timestamp, error } => {
+                assert_eq!((&*tool_use_id, &*agent, timestamp.as_str(), error), ("toolu_9", "a03c", "2026-09-26T19:39:16.480Z", false));
+            }
+            _ => panic!("expected AgentStopped"),
+        }
+        assert!(matches!(parse_jsonl_line(&line("enqueue", "failed"), "d", &config), ParsedLine::AgentStopped { error: true, .. }));
+        assert!(matches!(parse_jsonl_line(&line("remove", "completed"), "d", &config), ParsedLine::Ignored));
     }
 
     /// A partial patch would under-report the change, so any defect makes
