@@ -31,6 +31,7 @@ leave the tree rather than lingering until you quit.
 - **Sortable tree** — alphabetical, or grouped by coverage to surface half-read files first
 - **Search** — `/` to jump to a symbol by name
 - **Compaction history** — `C` for this session's compaction boundaries
+- **Trace panel** — in the trace view, the right-hand panel sums up the selected trace or call, and its rows lead to files, calls and commits (see [below](#the-trace-panel))
 - **Trace view** — `t` lists the session's prompts; `Enter` puts one prompt's tool calls on a time axis, as an OpenTelemetry waterfall or Perfetto-style agent tracks (see [below](#trace-view))
 - **Sub-agent alignment** — `d` compares two agents file by file: where they read the same code, and where only one looked (see [Coverage and Multi-Agent](Coverage-and-Multi-Agent))
 
@@ -39,25 +40,39 @@ While it runs, the TUI is also the sole writer of the
 
 ## Keybindings
 
+Keys go to the focused panel — the left one (the tree, or the trace view in
+its place), the right one, or the activity feed — whose border is cyan and
+whose keys the status bar lists. These work everywhere:
+
 | Key | Action |
 |---|---|
-| `j` / `k`, `↓` / `↑` | Move down / up (tree, or agent list when Stats is focused) |
+| `Tab` / `Shift+Tab` | Move focus: left panel, right panel, feed (when shown) |
+| `[` / `]` | Previous / next agent filter (the compaction overlay uses them to page) |
+| `Esc` | From the right panel or feed, focus back to the left; on the left, up a level |
+| `i` | Inspector / session pane on the right |
+| `f` | Show or hide the activity feed |
+| `q`, `Ctrl+C` | Quit |
+
+In the tree:
+
+| Key | Action |
+|---|---|
+| `j` / `k`, `↓` / `↑` | Move down / up |
 | `h` / `l`, `←` / `→` | Collapse / expand tree nodes |
-| `Enter` | Expand a node with children; on a leaf, [open it in your editor](#opening-a-symbol-in-your-editor); selects an agent when Stats is focused |
-| `Tab` | Cycle focus: tree, inspector (or session pane), activity feed when shown. In the inspector, `j` / `k` choose a trace and `Enter` opens it |
-| `Shift+Tab` | Cycle agent filter backward |
+| `Enter` | Expand a node with children; on a leaf, [open it in your editor](#opening-a-symbol-in-your-editor) |
 | `/` | Search symbols |
 | `s` | Toggle sort (alphabetical / coverage) |
-| `a` / `A` | Cycle agent filter forward / backward |
+| `a` / `A` | Next / previous agent filter, as `]` / `[` |
 | `d` | Sub-agent alignment view |
-| `i` | Inspector / session pane |
-| `f` | Show or hide the activity feed |
 | `t` | [Trace view](#trace-view) in place of the tree |
 | `C` | Compaction history (`[` / `]` to page) |
 | `g` / `G` | Jump to first / last |
 | `PgUp` / `PgDn` | Scroll by page |
 | `Esc` | Close the alignment view, or cancel a search |
-| `q`, `Ctrl+C` | Quit |
+
+In the right panel: `j` / `k` choose a row, `Enter` opens it — in the
+inspector, a trace that touched the row; in the session pane, an agent to
+filter by; in the trace view, [what the row points at](#the-trace-panel).
 
 ## Reading the tree
 
@@ -124,9 +139,8 @@ focuses the inspector, `j` / `k` choose, `Enter` opens that
 `t` replaces the tree with the session's **traces, one per prompt**: when
 you asked, what, how long answering took, how many tool calls it made, how
 many failed, how many subagents it started, and how many git commits were
-made while it ran. The selected prompt is shown
-in full below the list. `j` / `k` choose, `Enter` opens one, `Esc` goes back
-to the tree.
+made while it ran. The right-hand panel sums up the selected one. `j` / `k`
+choose, `Enter` opens one, `Esc` goes back to the tree.
 
 An open trace is that prompt's tool calls on a time axis: the prompt is the
 root span, every call made answering it a sub-span, each subagent's calls
@@ -148,8 +162,9 @@ Bars take the tree's colours: reads by depth, writes by whether their
 version is still there, failures red, delegations grey. `▼` marks a
 compaction, and `│` a git commit (hash and subject), among the calls it
 followed. Commits are found on local branches and `HEAD` by committer
-time, off the render thread, every few seconds while the view is open. The line under the bars details the selected call: its agent,
-start, end and duration, depth or write status, and where `Enter` goes.
+time, off the render thread, every few seconds while the view is open. The
+line under the bars names the selected call — agent, duration, and why it
+failed — and the right-hand panel has the rest.
 
 The timeline follows its trace live until you zoom; `0` goes back to that.
 Its keys are modal, as in Perfetto:
@@ -165,12 +180,51 @@ Its keys are modal, as in Perfetto:
 | `Enter` | On a delegation, into its agent's calls; on a read or write, to its symbol or file in the tree |
 | `/` | Waterfall: list only calls whose name contains the text (`Esc` clears) |
 | `e` | Next failed call |
-| `Tab` / `Shift+Tab` | Cycle the agent filter (`a` pans here) |
 | `v` | Waterfall / tracks |
 | `Esc` | Back to the list of traces |
 | `t` | Back to the tree |
 
 The mouse wheel zooms at the pointer, a drag pans, a click selects.
+
+### The trace panel
+
+In the trace view the right-hand panel follows the selection.
+
+**A trace** (on the list, or its prompt selected):
+
+```
+ lets now move on to ui-7
+ 09-28 00:54 · 17m21s · 29 calls · main + 1 agent(s)
+ Read 12 · Bash 9 · Edit 6 · Agent 2
+ 1 failed · 2 commit(s)
+
+ files                          read wrote
+ › src/trace/view.rs               4     3  ✎ still there
+   src/app.rs                      6     2  ✎ changed
+ agents
+   Expert review of phase 3  7m57s · 17 calls
+ failed
+   ✗ Edit src/ui/mod.rs — String to replace not found in file.
+ commits
+   commit 7fc8b45 Trace view: the layout core
+```
+
+The prompt in full, when and how long, calls by tool, the files it read and
+wrote — and whether its writes are still there, changed or gone — its
+agents, its failed calls with the reason, and the commits made meanwhile.
+
+**A call**: who made it, when and for how long, in which trace; why it
+failed (the error's own line: a traceback's last, a compiler's first
+`error`, "rejected by the user"); what it read and the symbol's depth now;
+what it wrote, symbol by symbol, with whether each still stands; the
+command it ran, in full; what an agent it started did; and the other calls
+on its file, before and after it.
+
+`Tab` to the panel, `j` / `k` to a row, `Enter` to open it: a file shows in
+the tree; an agent, a failure, a related call or a commit is selected in
+the timeline (the trace opened, and unfolded down to it). Focus stays on
+the panel, so you can keep following the trail. `Esc` returns to the
+timeline.
 
 ## Opening a symbol in your editor
 
