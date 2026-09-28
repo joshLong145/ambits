@@ -638,6 +638,11 @@ cap on entries per object.
 length only. A canary test asserts an edited file's marker string appears
 nowhere in the journal, objects, links or notes.
 
+The TUI shows a call's content — a write's patch, a read's text, a command's
+output — by reading it back from the agent's own log when the call is
+selected (`ingest::content`). It is held in memory for display and never
+written, logged or sent.
+
 ---
 
 ## 10. Privacy: what leaves the machine

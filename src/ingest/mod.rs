@@ -3,6 +3,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 pub mod claude;
+pub mod content;
 pub mod tool_config;
 
 use crate::tracking::ReadDepth;
@@ -283,6 +284,13 @@ pub trait SessionIngester: Send + Sync {
     /// fresh tailer from each file's current end.
     fn resume_tailer(&self, handoff: Handoff) -> Box<dyn EventTailer> {
         self.new_tailer(handoff.files.into_iter().map(|(file, _)| file).collect())
+    }
+
+    /// What call `id` read or wrote, from the session's log `files`, for
+    /// display only: never persisted (spec §9.6). Default: not available.
+    fn call_content(&self, files: &[PathBuf], id: &str, kind: content::ContentKind) -> Option<content::CallContent> {
+        let _ = (files, id, kind);
+        None
     }
 }
 

@@ -183,6 +183,7 @@ fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, width: usize) -> Vec<
     if s.file.is_none() && s.kind != SpanKind::Delegate {
         out.extend(wrapped("ran", &s.description, Color::Gray, width, 6));
     }
+    out.extend(super::content::preview(app, i, width));
     out
 }
 
@@ -446,6 +447,44 @@ mod tests {
         let at = lines.iter().position(|l| l.contains(" › ")).unwrap_or_else(|| panic!("the selected row is drawn: {text}"));
         assert!(lines[at].contains("src/m19.rs"), "{text}");
         assert!(lines[at + 1].contains("read  ● full body"), "with what it shows under it: {text}");
+    }
+
+    /// A call's content: asked for once, previewed in the panel, and `o`
+    /// shows it in full, scrolled by hunk.
+    #[test]
+    fn a_calls_content_is_previewed_and_opens_in_full() {
+        use ambits::ingest::content::{CallContent, DiffLine, Hunk};
+        use crossterm::event::KeyCode;
+        let mut app = app();
+        app.trace_view.open_trace(0);
+        app.trace_view.selected = Some(ambits::trace::view::Item::Span(2));
+        let (key, kind) = app.content_request().expect("the edit's content is wanted");
+        assert_eq!((&*key.id, kind), ("e1", ambits::ingest::content::ContentKind::Write));
+        assert!(app.content_request().is_none(), "asked once");
+        assert!(screen(&app).contains("loading…"));
+
+        let hunk = |at: u32| Hunk { old_start: Some(at), new_start: Some(at), lines: (0..10).map(|n| DiffLine::Added(format!("line {n}"))).collect() };
+        app.set_call_content(key, Some(CallContent::Change { hunks: vec![hunk(1), hunk(50)], exact: true }));
+        let text = screen(&app);
+        for want in ["@@ -1,0 +1,10 @@", " 1 + line 0", "… 10 more · o opens in full"] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+
+        press(&mut app, KeyCode::Char('o'));
+        assert!(app.content_view.is_some());
+        let full = crate::ui::test_render::lines(80, 20, |f| crate::ui::render(f, &app)).join("\n");
+        for want in ["Edit src/a.rs · main", "@@ -1,0 +1,10 @@", "   1 + line 0", "o/Esc close"] {
+            assert!(full.contains(want), "{want}: {full}");
+        }
+        app.content_view.as_ref().unwrap().height.set(5);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.content_view.as_ref().unwrap().scroll, 11, "the second hunk");
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.content_view.as_ref().unwrap().scroll, 12);
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.content_view.as_ref().unwrap().scroll, 22 - 5, "the last page");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.content_view.is_none());
     }
 
     #[test]

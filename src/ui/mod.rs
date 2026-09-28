@@ -8,6 +8,7 @@ pub mod alignment;
 pub mod trace_view;
 pub mod inspector;
 pub mod trace_panel;
+mod content;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -46,6 +47,9 @@ pub fn render(f: &mut Frame, app: &App) {
         (RightPane::Session, _) => stats::render(f, app, main[1]),
         (RightPane::Inspector, Some(frame)) => trace_panel::render(f, app, main[1], frame),
         (RightPane::Inspector, None) => inspector::render(f, app, main[1]),
+    }
+    if app.content_view.is_some() {
+        content::render_view(f, app, outer[1]);
     }
     if app.show_activity {
         activity::render(f, app, outer[2]);
@@ -183,12 +187,13 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     } else {
         let mut spans = vec![Span::raw(" ")];
         spans.extend(match (app.focus, app.trace_view.open, app.trace_view.focus.is_some()) {
-            (FocusPanel::Right, true, _) => keys(&[("[j/k]", "row "), ("[enter]", "open "), ("[esc]", "back ")]),
+            _ if app.content_view.is_some() => keys(&[("[j/k]", "scroll "), ("[n/N]", "hunk "), ("[g/G]", "ends "), ("[o]/[esc]", "close ")]),
+            (FocusPanel::Right, true, _) => keys(&[("[j/k]", "row "), ("[enter]", "open "), ("[o]", "content "), ("[esc]", "back ")]),
             (FocusPanel::Right, false, _) => keys(&[("[j/k]", "row "), ("[enter]", "open "), ("[esc]", "back "), ("[i]", "switch ")]),
             (FocusPanel::Feed, ..) => keys(&[("[j/k]", "scroll "), ("[G]", "latest "), ("[esc]", "back ")]),
             (FocusPanel::Left, true, true) => keys(&[
                 ("[esc]", "traces "), ("[t]", "ree "), ("[v]", "layout "), ("[w/s]", "zoom "), ("[a/d]", "pan "), ("[0]", "fit "),
-                ("[j/k]", "row "), ("[h/l]", "fold/step "), ("[enter]", "follow "), ("[/]", "find "), ("[e]", "rror "),
+                ("[j/k]", "row "), ("[h/l]", "fold/step "), ("[enter]", "follow "), ("[o]", "content "), ("[/]", "find "), ("[e]", "rror "),
             ]),
             (FocusPanel::Left, true, false) => keys(&[("[j/k]", "trace "), ("[enter]", "open "), ("[v]", "layout "), ("[t]/[esc]", "tree ")]),
             (FocusPanel::Left, false, _) => {

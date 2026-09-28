@@ -1928,9 +1928,11 @@ fn run_tui(
             }
             Ok(AppEvent::WriteRecorded { session, record }) => app.record_write(&session, *record),
             Ok(AppEvent::CommitsFound(commits)) => app.trace.set_commits(&commits),
+            Ok(AppEvent::ContentLoaded { key, content }) => app.set_call_content(key, content),
             Err(flume::RecvTimeoutError::Timeout) => {}
             Err(flume::RecvTimeoutError::Disconnected) => break,
         }
+        session.request_content(app);
 
         if let Some((path, line)) = app.pending_editor_request.take() {
             let template = app.editor_template.clone();
@@ -2020,6 +2022,7 @@ fn suspend_for_editor(
             }
             AppEvent::WriteRecorded { session, record } => app.record_write(&session, *record),
             AppEvent::CommitsFound(commits) => app.trace.set_commits(&commits),
+            AppEvent::ContentLoaded { key, content } => app.set_call_content(key, content),
         }
     }
 

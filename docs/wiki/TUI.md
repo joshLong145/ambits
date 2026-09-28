@@ -180,6 +180,7 @@ Its keys are modal, as in Perfetto:
 | `Enter` | On a delegation, into its agent's calls; on a read or write, to its symbol or file in the tree |
 | `/` | Waterfall: list only calls whose name contains the text (`Esc` clears) |
 | `e` | Next failed call |
+| `o` | The selected call's [content](#what-a-call-read-or-wrote), full-width |
 | `v` | Waterfall / tracks |
 | `Esc` | Back to the list of traces |
 | `t` | Back to the tree |
@@ -230,14 +231,44 @@ what it shows under it, in view.
 failed (the error's own line: a traceback's last, a compiler's first
 `error`, "rejected by the user"); what it read and the symbol's depth now;
 what it wrote, symbol by symbol, with whether each still stands; the
-command it ran, in full; what an agent it started did; and the other calls
-on its file, before and after it.
+command it ran, in full; what an agent it started did; a preview of [what
+it read or wrote](#what-a-call-read-or-wrote); and the other calls on its
+file, before and after it.
 
 `Tab` to the panel, `j` / `k` to a row, `Enter` to open it: a file shows in
 the tree; an agent, a failure, a related call or a commit is selected in
 the timeline (the trace opened, and unfolded down to it). Focus stays on
 the panel, so you can keep following the trail. `Esc` returns to the
 timeline.
+
+### What a call read or wrote
+
+The panel previews a call's content, and `o` opens it over the timeline and
+panel:
+
+```
+┌ Edit src/ingest/claude.rs · main · 16:02:11.4 ─────────────────────┐
+│ @@ -552,7 +552,7 @@                                                │
+│ 552 552                          .and_then(|v| v.as_str())         │
+│ 553     -                        .map(|id| Arc::from(format!(…     │
+│     553 +                        .map(Arc::from);                  │
+│ 554 554                      out.push(SessionEvent::ToolFinished(… │
+└ j/k scroll · n/N hunk · g/G ends · o/Esc close ────────────────────┘
+```
+
+- **A write** is a diff: the tool's own patch, with line numbers in the file
+  before and after. A write that failed shows what it tried (`✗ not
+  applied`); one whose tool records no patch (Serena's, say) shows what it
+  asked for.
+- **A read** is the text the agent saw, numbered from the line it started.
+- **Anything else** — a command, a search, an agent — is what it returned.
+
+`j` / `k` scroll, `PgUp` / `PgDn` or `Space` by page, `n` / `N` step between
+hunks, `g` / `G` to either end; `o` or `Esc` closes it.
+
+The content comes from the agent's own log, read when you select the call —
+off the screen's thread — and held in memory only. ambits never writes it
+anywhere, and it never [leaves the machine](Sharing#what-leaves-the-machine).
 
 ## Opening a symbol in your editor
 

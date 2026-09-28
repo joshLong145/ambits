@@ -69,6 +69,42 @@ impl TreeRow {
     }
 }
 
+/// One load of a call's content: the call, and whether it had ended. Its
+/// result reaches the log when it ends, so what was loaded while it ran is
+/// asked for again once it has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentKey {
+    pub id: Arc<str>,
+    pub ended: bool,
+}
+
+/// The selected call's content, loaded off the render thread from its
+/// agent's log and held in memory only: never written (spec §9.6).
+#[derive(Debug, Default)]
+pub struct CallContents {
+    loaded: Option<(ContentKey, Option<Arc<crate::ingest::content::CallContent>>)>,
+    asked: Option<ContentKey>,
+}
+
+/// Where a call's content stands.
+#[derive(Debug, Clone, Copy)]
+pub enum ContentState<'a> {
+    Loading,
+    /// The log has none: no id, no log, or not there.
+    Missing,
+    Loaded(&'a crate::ingest::content::CallContent),
+}
+
+/// The full-width view of a call's content (`o`).
+#[derive(Debug)]
+pub struct ContentView {
+    pub span: usize,
+    /// The first row shown.
+    pub scroll: usize,
+    /// Rows the view last had room for, set while rendering.
+    pub height: std::cell::Cell<usize>,
+}
+
 /// Where the trace view drew its time axis and rows, so a mouse position
 /// maps to a moment and a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +265,10 @@ pub struct App {
     /// The row selected in the right-hand panel (the inspector's traces,
     /// the trace panel's rows).
     pub panel_index: usize,
+    /// The selected call's content, for the trace panel and `o`.
+    pub contents: CallContents,
+    /// The call's content full-width, when open (`o`).
+    pub content_view: Option<ContentView>,
 
     /// Path filter restricting which files are tracked, if any. Shared with
     /// the TUI re-parse paths (file watcher, Serena cache rescan) so that
@@ -290,6 +330,8 @@ impl App {
             right_pane: RightPane::Inspector,
             show_activity: false,
             panel_index: 0,
+            contents: CallContents::default(),
+            content_view: None,
             filter: None,
             editor_template: None,
             pending_editor_request: None,
@@ -485,6 +527,8 @@ impl App {
         self.session_slug = None;
         self.compaction_history.clear();
         self.trace.clear();
+        self.contents = CallContents::default();
+        self.content_view = None;
         self.trace_view.reset();
         self.compaction_call_count = 0;
         self.show_alignment_overlay = false;
@@ -683,6 +727,10 @@ impl App {
             self.handle_trace_key(key);
             return;
         }
+        if self.content_view.is_some() {
+            self.handle_content_key(key);
+            return;
+        }
         // The same in every view.
         let overlay = self.show_compaction_overlay || self.show_alignment_overlay;
         match key.code {
@@ -699,6 +747,7 @@ impl App {
                 };
                 return;
             }
+            KeyCode::Char('o') if self.trace_view.open && !overlay => return self.open_content_view(),
             KeyCode::Char('f') => {
                 self.show_activity = !self.show_activity;
                 if !self.show_activity && self.focus == FocusPanel::Feed {
@@ -857,6 +906,10 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // The content view covers the timeline: a click is not meant for it.
+        if self.content_view.is_some() {
+            return;
+        }
         if self.trace_view.open {
             self.handle_trace_mouse(mouse);
             return;
@@ -894,6 +947,105 @@ impl App {
             Some(Item::Span(i)) => PanelSubject::Call(i),
             Some(Item::Instant(i)) => PanelSubject::Instant(i),
             None => PanelSubject::Trace(root),
+        }
+    }
+
+    /// The call whose content is wanted: the one open full-width, else the
+    /// one the trace panel shows.
+    fn content_span(&self) -> Option<usize> {
+        if let Some(view) = &self.content_view {
+            return Some(view.span);
+        }
+        match self.trace_panel_subject() {
+            PanelSubject::Call(i) if self.trace_view.open => Some(i),
+            _ => None,
+        }
+    }
+
+    /// What content a call has: a read's text, a write's change, anything
+    /// else's output — nothing for a prompt.
+    pub fn content_kind(&self, span: usize) -> Option<crate::ingest::content::ContentKind> {
+        use crate::ingest::content::ContentKind;
+        use crate::trace::SpanKind;
+        match self.trace.spans().get(span)?.kind {
+            SpanKind::Read(_) => Some(ContentKind::Read),
+            SpanKind::Write => Some(ContentKind::Write),
+            SpanKind::Delegate | SpanKind::Other => Some(ContentKind::Other),
+            SpanKind::Prompt => None,
+        }
+    }
+
+    fn content_key(&self, span: usize) -> Option<ContentKey> {
+        let s = self.trace.spans().get(span)?;
+        Some(ContentKey { id: s.id.clone()?, ended: s.end.is_some() })
+    }
+
+    /// The load to ask the content worker for, if the wanted call's content
+    /// is neither loaded nor asked for yet; marks it asked.
+    pub fn content_request(&mut self) -> Option<(ContentKey, crate::ingest::content::ContentKind)> {
+        let span = self.content_span()?;
+        let kind = self.content_kind(span)?;
+        let key = self.content_key(span)?;
+        let have = self.contents.loaded.as_ref().is_some_and(|(k, _)| *k == key);
+        if have || self.contents.asked.as_ref() == Some(&key) {
+            return None;
+        }
+        self.contents.asked = Some(key.clone());
+        Some((key, kind))
+    }
+
+    /// The content worker's answer.
+    pub fn set_call_content(&mut self, key: ContentKey, content: Option<crate::ingest::content::CallContent>) {
+        self.contents.loaded = Some((key, content.map(Arc::new)));
+    }
+
+    /// Where `span`'s content stands. A call still running shows what was
+    /// loaded while it ran until the load after it ended arrives.
+    pub fn content_state(&self, span: usize) -> ContentState<'_> {
+        let Some(key) = self.content_key(span).filter(|_| self.content_kind(span).is_some()) else { return ContentState::Missing };
+        match &self.contents.loaded {
+            Some((k, content)) if k.id == key.id && (*k == key || content.is_some()) => {
+                content.as_deref().map_or(ContentState::Missing, ContentState::Loaded)
+            }
+            _ => ContentState::Loading,
+        }
+    }
+
+    /// `o`: the selected call's content, full-width.
+    fn open_content_view(&mut self) {
+        if let PanelSubject::Call(span) = self.trace_panel_subject() {
+            if self.content_kind(span).is_some() {
+                self.content_view = Some(ContentView { span, scroll: 0, height: std::cell::Cell::new(0) });
+            }
+        }
+    }
+
+    /// The content view's keys: scroll, step between hunks, close.
+    fn handle_content_key(&mut self, key: KeyEvent) {
+        let Some(view) = &self.content_view else { return };
+        let (rows, hunks) = match self.content_state(view.span) {
+            ContentState::Loaded(c) => (c.rows().len(), c.hunk_rows()),
+            _ => (0, Vec::new()),
+        };
+        let page = view.height.get().max(1);
+        let last = rows.saturating_sub(page);
+        let at = view.scroll.min(last);
+        let to = match key.code {
+            KeyCode::Char('q') => return self.should_quit = true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return self.should_quit = true,
+            KeyCode::Esc | KeyCode::Char('o') => return self.content_view = None,
+            KeyCode::Char('j') | KeyCode::Down => at + 1,
+            KeyCode::Char('k') | KeyCode::Up => at.saturating_sub(1),
+            KeyCode::PageDown | KeyCode::Char(' ') => at + page,
+            KeyCode::PageUp => at.saturating_sub(page),
+            KeyCode::Char('g') => 0,
+            KeyCode::Char('G') => last,
+            KeyCode::Char('n') => hunks.iter().copied().find(|&h| h > at).unwrap_or(at),
+            KeyCode::Char('N') => hunks.iter().copied().rev().find(|&h| h < at).unwrap_or(0),
+            _ => at,
+        };
+        if let Some(view) = &mut self.content_view {
+            view.scroll = to.min(last);
         }
     }
 

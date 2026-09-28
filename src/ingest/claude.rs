@@ -6,6 +6,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use crate::tracking::ReadDepth;
 use super::{AgentToolCall, CompactionMetadata, Effect, EventTailer, FileReplay, Handoff, Hunk, SessionEvent, SessionIngester, TailedCompaction, TailerOutput, ToolCallMapper, WriteEvent, WriteSource};
+use super::content::{CallContent, ContentKind};
 use super::tool_config::ToolMappingConfig;
 
 /// Derive the Claude Code log directory for a given project path.
@@ -481,17 +482,158 @@ fn parse_tool_results(obj: &mut Value) -> Vec<ToolResult> {
         .collect()
 }
 
+/// A `tool_result`'s content as text: a string, or its text blocks joined.
+fn content_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(blocks) => Some(blocks.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n")),
+        _ => None,
+    }
+}
+
+/// What call `id` read or wrote, from its lines in `files` (the session's
+/// logs): its `tool_use` input and its `tool_result`. `None` when the log
+/// has neither yet. Only lines naming `id` are parsed; nothing is kept but
+/// what is returned, and nothing is logged (spec §9.6).
+pub fn call_content(files: &[PathBuf], id: &str, kind: ContentKind) -> Option<CallContent> {
+    let mut input: Option<Value> = None;
+    let mut result: Option<(Value, Option<Value>, bool)> = None;
+    let mut buf = Vec::new();
+    for path in files {
+        let Ok(file) = fs::File::open(path) else { continue };
+        let mut reader = BufReader::new(file);
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let Ok(line) = std::str::from_utf8(&buf) else { continue };
+            if !line.contains(id) {
+                continue;
+            }
+            let Ok(mut obj) = serde_json::from_str::<Value>(line) else { continue };
+            let detail = obj.get_mut("toolUseResult").map(Value::take);
+            let Some(Value::Array(blocks)) = obj.pointer_mut("/message/content") else { continue };
+            for block in blocks.iter_mut() {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("tool_use") if block.get("id").and_then(Value::as_str) == Some(id) => input = block.get_mut("input").map(Value::take),
+                    Some("tool_result") if block.get("tool_use_id").and_then(Value::as_str) == Some(id) => {
+                        let error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false) || detail.as_ref().is_some_and(Value::is_string);
+                        let content = block.get_mut("content").map(Value::take).unwrap_or(Value::Null);
+                        result = Some((content, detail.clone().filter(Value::is_object), error));
+                    }
+                    _ => {}
+                }
+            }
+            if input.is_some() && result.is_some() {
+                break;
+            }
+        }
+        if input.is_some() || result.is_some() {
+            break;
+        }
+    }
+    build_content(kind, input.as_ref(), result.as_ref().map(|(c, d, e)| (c, d.as_ref(), *e)))
+}
+
+/// A call's content from its input and its result (content, `toolUseResult`
+/// object, failed).
+fn build_content(kind: ContentKind, input: Option<&Value>, result: Option<(&Value, Option<&Value>, bool)>) -> Option<CallContent> {
+    use super::content::{DiffLine, Hunk as Change};
+    let output = |content: &Value| {
+        let (lines, cut) = CallContent::capped(&content_text(content)?);
+        Some(CallContent::Output { lines, cut })
+    };
+    match kind {
+        ContentKind::Write => {
+            // The tool's own patch, when it succeeded and recorded one.
+            if let Some((_, Some(detail), false)) = result {
+                let exact = |hunks: &Option<Vec<Hunk>>| {
+                    hunks.as_ref().filter(|h| !h.is_empty()).map(|h| CallContent::Change { hunks: h.iter().map(Change::from).collect(), exact: true })
+                };
+                match write_source(detail) {
+                    WriteSource::Edit { hunks, .. } => {
+                        if let Some(c) = exact(&hunks) {
+                            return Some(c);
+                        }
+                    }
+                    WriteSource::Write { content, create: true, .. } => {
+                        let lines = content.lines().map(|l| DiffLine::Added(l.to_string())).collect();
+                        return Some(CallContent::Change { hunks: vec![Change { old_start: Some(0), new_start: Some(1), lines }], exact: true });
+                    }
+                    WriteSource::Write { hunks, .. } => {
+                        if let Some(c) = exact(&hunks) {
+                            return Some(c);
+                        }
+                    }
+                    WriteSource::Opaque => {}
+                }
+            }
+            // Else what it asked for.
+            let input = input?;
+            let text = |k: &str| input.get(k).and_then(Value::as_str);
+            let asked = |old: &str, new: &str| Change {
+                old_start: None,
+                new_start: None,
+                lines: old.lines().map(|l| DiffLine::Removed(l.to_string())).chain(new.lines().map(|l| DiffLine::Added(l.to_string()))).collect(),
+            };
+            let hunks = if let (Some(old), Some(new)) = (text("old_string"), text("new_string")) {
+                vec![asked(old, new)]
+            } else if let Some(Value::Array(edits)) = input.get("edits") {
+                edits
+                    .iter()
+                    .filter_map(|e| Some(asked(e.get("old_string")?.as_str()?, e.get("new_string")?.as_str()?)))
+                    .collect()
+            } else if let Some(new) = text("content").or_else(|| text("body")).or_else(|| text("new_source")) {
+                vec![asked("", new)]
+            } else {
+                return result.and_then(|(content, _, _)| output(content));
+            };
+            Some(CallContent::Change { hunks, exact: false })
+        }
+        ContentKind::Read => {
+            let (content, detail, error) = result?;
+            if !error {
+                if let Some(file) = detail.and_then(|d| d.get("file")) {
+                    if let Some(text) = file.get("content").and_then(Value::as_str) {
+                        let start = file.get("startLine").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(1);
+                        let (lines, cut) = CallContent::capped(text);
+                        return Some(CallContent::Read { start, lines, cut });
+                    }
+                }
+            }
+            output(content)
+        }
+        ContentKind::Other => output(result?.0),
+    }
+}
+
+impl From<&Hunk> for super::content::Hunk {
+    /// A `structuredPatch` hunk: its prefixed lines as diff lines (a `\`
+    /// annotation, "No newline at end of file", is dropped).
+    fn from(h: &Hunk) -> Self {
+        use super::content::DiffLine;
+        let lines = h
+            .lines
+            .iter()
+            .filter_map(|l| match l.split_at(l.len().min(1)) {
+                ("+", rest) => Some(DiffLine::Added(rest.to_string())),
+                ("-", rest) => Some(DiffLine::Removed(rest.to_string())),
+                (" ", rest) => Some(DiffLine::Same(rest.to_string())),
+                _ => None,
+            })
+            .collect();
+        Self { old_start: Some(h.old_start), new_start: Some(h.new_start), lines }
+    }
+}
+
 /// Why a tool failed, from its result's content, in one line of at most 200
 /// characters: a rejection named as one, `<tool_use_error>` tags dropped,
 /// and a bare `Exit code N` joined with the first line of output after it.
 /// Only this line is kept, never the rest of the output.
 pub fn error_summary(content: &Value) -> Option<String> {
-    let text = match content {
-        Value::String(s) => s.clone(),
-        Value::Array(blocks) => blocks.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"),
-        _ => return None,
-    };
-    let text = text.replace("<tool_use_error>", "").replace("</tool_use_error>", "");
+    let text = content_text(content)?.replace("<tool_use_error>", "").replace("</tool_use_error>", "");
     let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
     let first = lines.next()?;
     let first = first.strip_prefix("Error: ").unwrap_or(first);
@@ -1259,6 +1401,9 @@ impl SessionIngester for ClaudeIngester {
     fn resume_tailer(&self, handoff: Handoff) -> Box<dyn EventTailer> {
         Box::new(LogTailer::resume(handoff, Arc::clone(&self.mapper)))
     }
+    fn call_content(&self, files: &[PathBuf], id: &str, kind: ContentKind) -> Option<CallContent> {
+        call_content(files, id, kind)
+    }
 }
 
 impl EventTailer for LogTailer {
@@ -1274,6 +1419,70 @@ impl EventTailer for LogTailer {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// A log of one call and its result, for `call_content`.
+    fn content_log(dir: &Path, name: &str, input: &str, result: &str, detail: &str) -> PathBuf {
+        let path = dir.join(name);
+        let call = format!(r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_1","name":"Edit","input":{input}}}]}}}}"#);
+        let other = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"unrelated"}]}}"#;
+        let res = format!(r#"{{"type":"user","toolUseResult":{detail},"message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":{result}}}]}}}}"#);
+        std::fs::write(&path, format!("{other}\n{call}\n{other}\n{res}\n")).unwrap();
+        path
+    }
+
+    /// `AMBITS_LOG=<file> AMBITS_ID=<tool_use_id> cargo test --lib -- --ignored
+    /// --nocapture content_from_a_real_log`: how long a lookup takes.
+    #[test]
+    #[ignore]
+    fn content_from_a_real_log() {
+        let (Ok(log), Ok(id)) = (std::env::var("AMBITS_LOG"), std::env::var("AMBITS_ID")) else { return };
+        for kind in [ContentKind::Write, ContentKind::Read] {
+            let t = std::time::Instant::now();
+            let got = call_content(&[PathBuf::from(&log)], &id, kind);
+            eprintln!("{kind:?}: {:?} in {:?}", got.map(|c| c.rows().len()), t.elapsed());
+        }
+    }
+
+    #[test]
+    fn an_edit_shows_its_own_patch() {
+        use super::super::content::{DiffLine, Hunk as Change};
+        let dir = tempfile::tempdir().unwrap();
+        let log = content_log(
+            dir.path(),
+            "a.jsonl",
+            r#"{"file_path":"/p/a.rs","old_string":"x","new_string":"y"}"#,
+            r#""ok""#,
+            r#"{"oldString":"x","newString":"y","structuredPatch":[{"oldStart":3,"oldLines":2,"newStart":3,"newLines":2,"lines":[" a","-x","+y","\\ No newline at end of file"]}]}"#,
+        );
+        let got = call_content(&[log], "toolu_1", ContentKind::Write).unwrap();
+        let hunk = Change { old_start: Some(3), new_start: Some(3), lines: vec![DiffLine::Same("a".into()), DiffLine::Removed("x".into()), DiffLine::Added("y".into())] };
+        assert_eq!(got, CallContent::Change { hunks: vec![hunk], exact: true });
+    }
+
+    #[test]
+    fn a_failed_edit_shows_what_it_tried() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = content_log(dir.path(), "a.jsonl", r#"{"file_path":"/p/a.rs","old_string":"x\ny","new_string":"z"}"#, r#""String to replace not found""#, r#""Error: String to replace not found""#);
+        let CallContent::Change { hunks, exact } = call_content(&[log], "toolu_1", ContentKind::Write).unwrap() else { panic!("a change") };
+        assert!(!exact);
+        assert_eq!(hunks[0].header(), "@@ -2 +1 lines @@");
+    }
+
+    #[test]
+    fn a_read_shows_the_text_it_saw_from_its_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = content_log(dir.path(), "a.jsonl", r#"{"file_path":"/p/a.rs"}"#, r#""40\tfn a() {}""#, r#"{"type":"text","file":{"filePath":"/p/a.rs","content":"fn a() {}\n}","startLine":40}}"#);
+        let got = call_content(&[log], "toolu_1", ContentKind::Read).unwrap();
+        assert_eq!(got, CallContent::Read { start: 40, lines: vec!["fn a() {}".into(), "}".into()], cut: 0 });
+        assert!(call_content(&[dir.path().join("a.jsonl")], "toolu_2", ContentKind::Read).is_none(), "another call's");
+    }
+
+    #[test]
+    fn a_command_shows_its_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = content_log(dir.path(), "a.jsonl", r#"{"command":"ls"}"#, r#"[{"type":"text","text":"a\nb"}]"#, "null");
+        assert_eq!(call_content(&[log], "toolu_1", ContentKind::Other), Some(CallContent::Output { lines: vec!["a".into(), "b".into()], cut: 0 }));
+    }
 
     /// Convenience: unwrap `ParsedLine::Events` for tests that don't care about clear detection.
     fn parse_events(line: &str, agent_id: &str) -> Vec<AgentToolCall> {

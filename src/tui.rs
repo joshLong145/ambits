@@ -42,6 +42,8 @@ pub struct TuiSession {
     commit_tx: flume::Sender<(u64, u64)>,
     /// When the trace view last asked for commits.
     last_commit_scan: Option<std::time::Instant>,
+    /// Asks the content worker for a call's content.
+    content_tx: flume::Sender<ContentJob>,
 }
 
 /// How often the open trace view looks for new commits.
@@ -62,6 +64,31 @@ fn spawn_commit_scanner(project_root: PathBuf, tx: flume::Sender<AppEvent>) -> f
         }
     });
     commit_tx
+}
+
+/// A request for a call's content: the session whose logs hold it, which
+/// call, and what to make of it.
+type ContentJob = (Option<String>, ambits::app::ContentKey, ambits::ingest::content::ContentKind);
+
+/// Read calls' content from their logs on a worker thread: a log can be
+/// tens of megabytes. Only the latest request of any that queued up — the
+/// selection moving on — is answered, as `AppEvent::ContentLoaded`.
+fn spawn_content_loader(ingester: Arc<dyn SessionIngester>, log_dir: Option<PathBuf>, tx: flume::Sender<AppEvent>) -> flume::Sender<ContentJob> {
+    let (job_tx, job_rx) = flume::unbounded::<ContentJob>();
+    std::thread::spawn(move || {
+        while let Ok(first) = job_rx.recv() {
+            let (session, key, kind) = job_rx.try_iter().last().unwrap_or(first);
+            let files = match (&log_dir, &session) {
+                (Some(dir), Some(session)) => ingester.session_log_files(dir, session),
+                _ => Vec::new(),
+            };
+            let content = ingester.call_content(&files, &key.id, kind);
+            if tx.send(AppEvent::ContentLoaded { key, content }).is_err() {
+                break;
+            }
+        }
+    });
+    job_tx
 }
 
 /// Attribute writes on a worker thread, never the render thread (spec §1):
@@ -224,6 +251,7 @@ impl TuiSession {
         // writes are file-level (spec §2.5).
         let write_tx = spawn_write_attributor(project_path.to_path_buf(), !serena_mode, tx.clone());
         let commit_tx = spawn_commit_scanner(project_path.to_path_buf(), tx.clone());
+        let content_tx = spawn_content_loader(Arc::clone(&ingester), log_dir.clone(), tx.clone());
 
         Ok(Self {
             current_session_id: session_id,
@@ -236,7 +264,16 @@ impl TuiSession {
             write_tx,
             commit_tx,
             last_commit_scan: None,
+            content_tx,
         })
+    }
+
+    /// Ask the content worker for the selected call's content, if the app
+    /// wants it and has not asked yet.
+    pub fn request_content(&mut self, app: &mut App) {
+        if let Some((key, kind)) = app.content_request() {
+            let _ = self.content_tx.send((self.current_session_id.clone(), key, kind));
+        }
     }
 
     /// While the trace view is open, ask the commit worker, now and then, for

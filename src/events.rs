@@ -31,6 +31,12 @@ pub enum AppEvent {
     /// The commits made during the session, found off the render thread by
     /// the worker `TuiSession` spawns for the trace view.
     CommitsFound(Vec<ambits::git::Commit>),
+    /// A call's content, read from its log off the render thread by the
+    /// worker `TuiSession` spawns. Held in memory only (spec §9.6).
+    ContentLoaded {
+        key: ambits::app::ContentKey,
+        content: Option<ambits::ingest::content::CallContent>,
+    },
 }
 
 /// Spawn a thread that polls crossterm key events and sends them to the channel.
