@@ -44,27 +44,6 @@ fn root_span_id(session: &str) -> String {
     derive(&["root", session], 8)
 }
 
-/// The roots to export under `filter`: every root, or the subtrees whose
-/// span belongs to that agent (prefix match, as `--agent` is elsewhere).
-fn selected<'a>(trace: &Trace, tree: &'a [Node], filter: AgentFilter<'_>) -> Vec<&'a Node> {
-    match filter {
-        None => tree.iter().collect(),
-        Some(agent) => {
-            let mut out = Vec::new();
-            let mut stack: Vec<&Node> = tree.iter().collect();
-            while let Some(node) = stack.pop() {
-                if trace.spans()[node.span].agent.starts_with(agent) {
-                    out.push(node);
-                } else {
-                    stack.extend(node.children.iter());
-                }
-            }
-            out.sort_by_key(|n| (trace.spans()[n.span].start, n.span));
-            out
-        }
-    }
-}
-
 fn attr(key: &str, value: Value) -> Value {
     let value = match value {
         Value::Bool(b) => json!({"boolValue": b}),
@@ -122,7 +101,7 @@ fn nanos(millis: u64) -> String {
 /// The trace as OTLP/JSON (`ExportTraceServiceRequest`).
 pub fn otlp(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
     let tree = trace.tree();
-    let roots = selected(trace, &tree, filter);
+    let roots = trace.roots(&tree, filter);
     let tid = trace_id(session);
     let root_id = root_span_id(session);
     let (start, end) = roots
@@ -198,7 +177,7 @@ pub fn otlp(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
 /// The trace as Chrome trace events (`{"traceEvents": […]}`).
 pub fn chrome(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
     let tree = trace.tree();
-    let roots = selected(trace, &tree, filter);
+    let roots = trace.roots(&tree, filter);
     let mut nodes: Vec<&Node> = Vec::new();
     let mut stack: Vec<&Node> = roots.clone();
     while let Some(n) = stack.pop() {

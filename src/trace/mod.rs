@@ -10,6 +10,7 @@
 //! the later of its own result and its subagent's last span.
 
 pub mod export;
+pub mod view;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -219,6 +220,24 @@ impl Trace {
             Node { span: ix, end, children: kids }
         }
         roots.into_iter().map(|r| build(r, self, &children)).collect()
+    }
+
+    /// The roots under an agent filter: every root, or the subtrees whose
+    /// span belongs to that agent (prefix match, as `--agent` is
+    /// elsewhere), in start order.
+    pub fn roots<'a>(&self, tree: &'a [Node], filter: Option<&str>) -> Vec<&'a Node> {
+        let Some(agent) = filter else { return tree.iter().collect() };
+        let mut out = Vec::new();
+        let mut stack: Vec<&Node> = tree.iter().collect();
+        while let Some(node) = stack.pop() {
+            if self.spans[node.span].agent.starts_with(agent) {
+                out.push(node);
+            } else {
+                stack.extend(node.children.iter());
+            }
+        }
+        out.sort_by_key(|n| (self.spans[n.span].start, n.span));
+        out
     }
 }
 
