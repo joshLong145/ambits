@@ -696,6 +696,36 @@ pub struct Journal {
     warnings: Vec<String>,
 }
 
+/// Append `records` to `session`'s `shard` (`<session>.<shard>.ndjson`),
+/// in order; an error names the shard if any cannot be written. For the
+/// writers that add a batch at once — restore, pull.
+pub fn append_shard(
+    project_root: &Path,
+    session: &str,
+    shard: &str,
+    records: &[Record],
+    manifest: impl FnOnce() -> EnvironmentManifest,
+) -> color_eyre::Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let mut journal = Journal::open_shard(project_root, session, shard, Duration::ZERO, manifest);
+    for record in records {
+        if !journal.append(record) {
+            color_eyre::eyre::bail!("cannot write the {shard} shard {}", journal.path().display());
+        }
+    }
+    Ok(())
+}
+
+impl JournalContents {
+    /// Whether `agent` already has `symbol` at `hash`, at `depth` or deeper:
+    /// a read that would add nothing.
+    pub fn knows_read(&self, symbol: &str, agent: &str, hash: &[u8; 32], depth: ReadDepth) -> bool {
+        self.agent_reads.get(&(symbol.to_string(), agent.to_string())).is_some_and(|(h, d)| h == hash && *d >= depth)
+    }
+}
+
 impl Journal {
     /// Open (or create) the journal for `session_id` under `project_root`.
     ///

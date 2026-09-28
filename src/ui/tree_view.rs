@@ -199,9 +199,7 @@ mod tests {
     /// Find the foreground color of the first cell in `row` that contains part of `text`.
     fn fg_color_of(backend: &TestBackend, row: u16, text: &str) -> Option<Color> {
         let buf = backend.buffer();
-        let row_str: String = (0..buf.area.width)
-            .map(|x| buf[(x, row)].symbol().to_string())
-            .collect::<String>();
+        let row_str = crate::ui::test_render::row(backend, row);
         // A column, not a byte offset: the border and the expand icons are
         // multi-byte.
         let col = row_str[..row_str.find(text)?].chars().count() as u16;
@@ -292,8 +290,7 @@ mod tests {
 
     /// Row text of `row` in the rendered buffer.
     fn row_text(backend: &TestBackend, row: u16) -> String {
-        let buf = backend.buffer();
-        (0..buf.area.width).map(|x| buf[(x, row)].symbol().to_string()).collect()
+        crate::ui::test_render::row(backend, row)
     }
 
     /// An app whose only file holds `Parent` with two children, file

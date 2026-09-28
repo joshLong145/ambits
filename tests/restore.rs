@@ -38,30 +38,18 @@ impl Project {
         let p = Self { _dir: dir, root, registry: ParserRegistry::new() };
 
         let tree = p.registry.scan_project(&p.root, None).unwrap();
-        let mut lines = String::new();
-        for (_, sym) in tree.walk() {
-            let read = ambits::journal::Record::Read {
+        let mut records: Vec<ambits::journal::Record> = tree
+            .walk()
+            .into_iter()
+            .map(|(_, sym)| ambits::journal::Record::Read {
                 symbol_id: sym.id.clone(),
                 hash: ambits::journal::encode_hash(&sym.content_hash),
                 depth: ambits::journal::DepthDto::FullBody,
                 agent: Some("agent-1".into()),
-            };
-            lines.push_str(&serde_json::to_string(&read).unwrap());
-            lines.push('\n');
-        }
-        let write = ambits::writes::WriteRecord {
-            op: "toolu_1".into(),
-            a: "agent-1".into(),
-            t: "2026-09-26T10:00:00Z".into(),
-            tool: "Edit".into(),
-            file: "src/a.rs".into(),
-            ..Default::default()
-        };
-        lines.push_str(&serde_json::to_string(&ambits::journal::Record::Write(Box::new(write))).unwrap());
-        lines.push('\n');
-        let dir = p.root.join(".ambits/coverage");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{SOURCE}.ndjson")), lines).unwrap();
+            })
+            .collect();
+        records.push(ambits::journal::Record::Write(Box::new(common::write_record("toolu_1", "src/a.rs"))));
+        common::append_journal(&p.root, SOURCE, &records);
         p
     }
 

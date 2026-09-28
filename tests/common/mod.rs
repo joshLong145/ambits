@@ -32,3 +32,36 @@ pub fn run_ambits(root: &Path, args: &[&str]) -> String {
     assert!(out.status.success(), "ambits {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8(out.stdout).expect("utf-8 output")
 }
+
+/// A write record for fixtures: `op` changing `file`, by `agent-1` with
+/// `Edit`, at a fixed time; anything else by struct update.
+#[allow(dead_code)]
+pub fn write_record(op: &str, file: &str) -> ambits::writes::WriteRecord {
+    ambits::writes::WriteRecord {
+        op: op.into(),
+        av: ambits::writes::ATTRIBUTION_VERSION,
+        a: "agent-1".into(),
+        t: "2026-09-27T10:00:00Z".into(),
+        tool: "Edit".into(),
+        file: file.into(),
+        ..Default::default()
+    }
+}
+
+/// Append `records` to `session`'s primary journal under `root`.
+#[allow(dead_code)]
+pub fn append_journal(root: &Path, session: &str, records: &[ambits::journal::Record]) {
+    use std::io::Write as _;
+    let dir = root.join(".ambits/coverage");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{session}.ndjson"))).unwrap();
+    for record in records {
+        writeln!(file, "{}", serde_json::to_string(record).unwrap()).unwrap();
+    }
+}
+
+/// [`append_journal`] of one write.
+#[allow(dead_code)]
+pub fn journal_write(root: &Path, session: &str, write: ambits::writes::WriteRecord) {
+    append_journal(root, session, &[ambits::journal::Record::Write(Box::new(write))]);
+}

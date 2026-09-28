@@ -73,8 +73,40 @@ pub fn rfc3339(secs: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
+/// `MM-DD HH:MM`, UTC, for milliseconds since the epoch: a compact
+/// when-was-it for lists.
+pub fn day_minute(ms: u64) -> String {
+    let t = rfc3339(ms / 1000);
+    format!("{} {}", &t[5..10], &t[11..16])
+}
+
+/// `HH:MM:SS.d`, UTC, for milliseconds since the epoch: a time of day to
+/// the tenth of a second.
+pub fn clock(ms: u64) -> String {
+    let t = rfc3339(ms / 1000);
+    format!("{}.{}", &t[11..19], ms % 1000 / 100)
+}
+
+/// A recorded RFC 3339 time (`2026-09-27T10:05:33.103Z`) as
+/// `2026-09-27 10:05Z`; anything else as it is.
+pub fn short(t: &str) -> String {
+    match t.get(..16) {
+        Some(minute) if t.len() > 16 => format!("{}Z", minute.replace('T', " ")),
+        _ => t.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn display_forms() {
+        let ms = super::parse_rfc3339_millis("2026-09-27T10:05:33.450Z").unwrap();
+        assert_eq!(super::day_minute(ms), "09-27 10:05");
+        assert_eq!(super::clock(ms), "10:05:33.4");
+        assert_eq!(super::short("2026-09-27T10:05:33.103Z"), "2026-09-27 10:05Z");
+        assert_eq!(super::short("yesterday"), "yesterday");
+    }
+
     use super::*;
 
     #[test]

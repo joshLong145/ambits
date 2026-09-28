@@ -19,10 +19,10 @@ pub mod transfer;
 use std::collections::HashSet;
 use std::path::Path;
 
-use color_eyre::eyre::{bail, eyre, Result, WrapErr};
+use color_eyre::eyre::{bail, Result, WrapErr};
 use serde_json::Value;
 
-use crate::journal::{self, EnvironmentManifest, Journal, Record};
+use crate::journal::{self, EnvironmentManifest, Record};
 use crate::objects::refs::{self, RefName};
 use crate::objects::graph::Graph;
 use crate::objects::snapshot::Snapshot;
@@ -50,6 +50,18 @@ fn check_owner(remote: &Store) -> Result<()> {
     #[cfg(not(unix))]
     let _ = remote;
     Ok(())
+}
+
+/// Remote `name` (or the default one), refused if another user owns it.
+pub fn open(project_root: &Path, name: Option<&str>) -> Result<(String, Store)> {
+    let (name, remote) = config::resolve(project_root, name)?;
+    check_owner(&remote)?;
+    Ok((name, remote))
+}
+
+/// Take `remote`'s ref lock in this store's name.
+fn lock_remote(project_root: &Path, remote: &Store) -> Result<lock::RemoteLock> {
+    lock::RemoteLock::acquire(remote, &config::Config::store_id(project_root)?)
 }
 
 /// What `push` should do.
@@ -89,8 +101,7 @@ pub enum PushOutcome {
 /// Push `req.session`'s history to a remote (§12.2).
 pub fn push(req: &PushRequest<'_>) -> Result<PushOutcome> {
     let local = Store::at(req.project_root);
-    let (remote_name, remote) = config::resolve(req.project_root, req.remote)?;
-    check_owner(&remote)?;
+    let (remote_name, remote) = open(req.project_root, req.remote)?;
     let name = RefName::session(req.session)?;
     let tracking = RefName::tracking(&remote_name, req.session)?;
     let Some(tip) = refs::read(&local, &name)? else {
@@ -107,13 +118,11 @@ pub fn push(req: &PushRequest<'_>) -> Result<PushOutcome> {
         if graph.is_ancestor(&remote, tip, r)? {
             // Links land after snapshots (the post-commit hook resolves
             // them), so they must travel without a new one.
-            let links = pushable_links(req.project_root, req.session, req.ignore)?;
-            let have: HashSet<String> = crate::linkage::links_of(remote.root())?.into_iter().map(|(k, _)| k).collect();
-            let new: Vec<_> = links.into_iter().filter(|(k, _)| !have.contains(k)).collect();
+            let new = links_to_send(req.project_root, req.session, req.ignore, &remote)?;
             let links = if new.is_empty() || req.dry_run {
                 new.len()
             } else {
-                let _lock = lock::RemoteLock::acquire(&remote, &config::Config::store_id(req.project_root)?)?;
+                let _lock = lock_remote(req.project_root, &remote)?;
                 crate::linkage::add_links(remote.root(), new, Durability::Fsync)?
             };
             // Nothing to send is no reason to skip a full check: re-verify
@@ -146,7 +155,7 @@ pub fn push(req: &PushRequest<'_>) -> Result<PushOutcome> {
 
     let history = transfer::missing(&mut graph, &local, &remote, tip, req.verify)?;
     let ours: HashSet<ObjectId> = history.iter().map(|s| s.id).collect();
-    let links = pushable_links(req.project_root, req.session, req.ignore)?;
+    let links = links_to_send(req.project_root, req.session, req.ignore, &remote)?;
     let other_ignore = history.iter().filter(|s| s.inputs.ignore != req.ignore.digest()).count();
     if req.dry_run {
         let missing = history
@@ -163,7 +172,7 @@ pub fn push(req: &PushRequest<'_>) -> Result<PushOutcome> {
     // notes, links and — last — the ref.
     let stats = transfer::transfer(&local, &remote, &history)?;
     let links = {
-        let _lock = lock::RemoteLock::acquire(&remote, &config::Config::store_id(req.project_root)?)?;
+        let _lock = lock_remote(req.project_root, &remote)?;
         refs::copy_notes(&local, &remote, &ours)?;
         let links = crate::linkage::add_links(remote.root(), links, Durability::Fsync)?;
         refs::update(&remote, &name, remote_tip, tip, if fast_forward { "push" } else { "push (forced)" })
@@ -175,15 +184,16 @@ pub fn push(req: &PushRequest<'_>) -> Result<PushOutcome> {
     Ok(PushOutcome::Pushed { remote: remote_name, from: remote_tip, to: tip, objects: stats.copied, links, forced: !fast_forward, other_ignore })
 }
 
-/// The links of `session`'s writes whose file and target the ignore
+/// The links of `session`'s writes that `remote` lacks and the ignore
 /// filter lets leave the machine (§3.2, §10, D18) — not the whole index,
 /// which holds sessions never pushed. The session's writes come from its
 /// journal, which every snapshot of it was made from: no object is read.
-fn pushable_links(project_root: &Path, session: &str, ignore: &SyncIgnore) -> Result<Vec<(String, crate::linkage::Link)>> {
+fn links_to_send(project_root: &Path, session: &str, ignore: &SyncIgnore, remote: &Store) -> Result<Vec<(String, crate::linkage::Link)>> {
     let ops = journal::read_session_writes(&journal::journal_dir(project_root), session);
+    let have: HashSet<String> = crate::linkage::links_of(remote.root())?.into_iter().map(|(k, _)| k).collect();
     Ok(crate::linkage::links_of(&project_root.join(crate::state_dir::STATE_DIR))?
         .into_iter()
-        .filter(|(_, l)| ops.contains_key(&l.op))
+        .filter(|(k, l)| ops.contains_key(&l.op) && !have.contains(k))
         .filter(|(_, l)| !ignore.is_ignored(&l.path) && !ignore.ignores_symbol(&l.target) && !ignore.is_ignored(&l.target))
         .collect())
 }
@@ -218,11 +228,10 @@ pub struct FetchReport {
 /// others still come.
 pub fn fetch(project_root: &Path, remote: Option<&str>, verify: transfer::Verify) -> Result<FetchReport> {
     let local = Store::at(project_root);
-    let (remote_name, remote) = config::resolve(project_root, remote)?;
+    let (remote_name, remote) = open(project_root, remote)?;
     if !remote.root().is_dir() {
         bail!("remote {remote_name} ({}) does not exist yet; push to it first", remote.root().display());
     }
-    check_owner(&remote)?;
     let _gc = gc::GcLock::shared(&local)?;
     let mut report = FetchReport { remote: remote_name.clone(), ..Default::default() };
     let mut ids = HashSet::new();
@@ -352,10 +361,9 @@ pub fn pull(req: &PullRequest<'_>) -> Result<PullReport> {
         let hash = journal::encode_hash(&read.hash);
         match verdicts.get(&(read.symbol.as_str(), read.hash)) {
             Some(crate::objects::restore::Verdict::Valid { symbol }) => {
-                let known = existing.agent_reads.get(&(symbol.clone(), read.agent.clone())).is_some_and(|(h, d)| *h == read.hash && *d >= read.depth);
-                if !known {
+                if !existing.knows_read(symbol, &read.agent, &read.hash, read.depth) {
                     appended_reads += 1;
-                    records.push(Record::Read { symbol_id: symbol.clone(), hash, depth: read.depth.into(), agent: Some(read.agent.clone()) });
+                    records.push(read.record_at(symbol));
                 }
             }
             _ => {
@@ -363,12 +371,9 @@ pub fn pull(req: &PullRequest<'_>) -> Result<PullReport> {
                     continue;
                 }
                 stale += 1;
-                let mut rest = serde_json::Map::new();
-                rest.insert("sym".into(), read.symbol.clone().into());
-                rest.insert("h".into(), hash.into());
-                rest.insert("d".into(), serde_json::to_value(journal::DepthDto::from(read.depth))?);
-                rest.insert("a".into(), read.agent.clone().into());
-                rest.insert("origin".into(), remote_name.clone().into());
+                let rest = serde_json::from_value(serde_json::json!({
+                    "sym": read.symbol, "h": hash, "d": journal::DepthDto::from(read.depth), "a": read.agent, "origin": remote_name,
+                }))?;
                 records.push(Record::History { of: "read".into(), rest });
             }
         }
@@ -419,16 +424,9 @@ pub fn pull(req: &PullRequest<'_>) -> Result<PullReport> {
     if !existing.merges.contains(&theirs.hex()) {
         records.push(Record::Merge { remote: remote_name.clone(), tip: theirs.hex() });
     }
-    if !records.is_empty() {
-        let mut shard = Journal::open_shard(req.project_root, req.session, "pull", std::time::Duration::ZERO, || {
-            EnvironmentManifest::capture(req.tree, req.backend, req.filter.clone())
-        });
-        for record in &records {
-            if !shard.append(record) {
-                return Err(eyre!("cannot write the pull shard {}", shard.path().display()));
-            }
-        }
-    }
+    journal::append_shard(req.project_root, req.session, "pull", &records, || {
+        EnvironmentManifest::capture(req.tree, req.backend, req.filter.clone())
+    })?;
     Ok(PullReport {
         fetch,
         outcome: PullOutcome::Merged { tip: theirs, reads: appended_reads, stale, writes: appended_writes, conflicts, rejected },

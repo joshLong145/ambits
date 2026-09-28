@@ -37,6 +37,10 @@ impl Line {
     }
 }
 
+fn graph_file(store: &Store) -> FlatLog {
+    FlatLog::at(store.root().join(crate::state_dir::CACHE).join(crate::state_dir::GRAPH))
+}
+
 /// The ancestry this store knows, and what it learned since loading.
 pub struct Graph {
     file: FlatLog,
@@ -48,7 +52,7 @@ impl Graph {
     /// The cache of the project store `local` (best-effort: an unreadable
     /// cache is an empty one).
     pub fn load(local: &Store) -> Self {
-        let file = FlatLog::at(local.root().join(crate::state_dir::CACHE).join(crate::state_dir::GRAPH));
+        let file = graph_file(local);
         let parents = file.read::<Line>().unwrap_or_default().iter().filter_map(Line::verified).collect();
         Self { file, parents, learned: Vec::new() }
     }
@@ -170,7 +174,7 @@ mod tests {
         let a = snapshot_id(&[1; 32], &[]);
         let b = snapshot_id(&[2; 32], &[a]);
         let c = snapshot_id(&[3; 32], &[b]);
-        let file = FlatLog::at(store.root().join("cache/graph.ndjson"));
+        let file = graph_file(&store);
         let lock = file.lock().unwrap();
         file.append(&lock, &[line(a, [1; 32], &[]), line(b, [2; 32], &[a]), line(c, [3; 32], &[b])], Durability::NoSync).unwrap();
         drop(lock);

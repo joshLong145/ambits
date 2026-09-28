@@ -969,14 +969,7 @@ impl App {
     /// named by `symbol`, expanding what hides it. `false` when the file is
     /// not in the tree.
     pub fn reveal(&mut self, file: &str, symbol: Option<&str>) -> bool {
-        let Some(tree_file) = self
-            .project_tree
-            .files
-            .iter()
-            .find(|f| crate::objects::normalize_path(&f.file_path.to_string_lossy()) == file)
-        else {
-            return false;
-        };
+        let Some(tree_file) = self.project_tree.file(file) else { return false };
         let file_id = tree_file.file_path.to_string_lossy().into_owned();
         let target = symbol.map(normalize_name_path).and_then(|name| {
             let nodes = tree_file.walk();
@@ -1004,12 +997,7 @@ impl App {
     pub fn write_statuses(&self) -> std::collections::HashMap<&str, (&crate::writes::WriteRecord, crate::writes::Status)> {
         let mut out = std::collections::HashMap::new();
         for (file, writes) in self.writes.by_file(None) {
-            let now = self
-                .project_tree
-                .files
-                .iter()
-                .find(|f| crate::objects::normalize_path(&f.file_path.to_string_lossy()) == file)
-                .map(crate::writes::FileContents::from_symbols);
+            let now = self.project_tree.file(file).map(crate::writes::FileContents::from_symbols);
             for w in writes {
                 let status = match &now {
                     Some(now) => now.file_status(w),

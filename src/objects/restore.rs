@@ -12,14 +12,14 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use color_eyre::eyre::{bail, eyre, Result};
+use color_eyre::eyre::{eyre, Result};
 use serde_json::Value;
 
 use super::refs::{self, RefName};
 use super::snapshot::{self, Snapshot};
 use super::store::Store;
 use super::{Kind, ObjectId};
-use crate::journal::{self, DepthDto, EnvironmentManifest, Journal, Record};
+use crate::journal::{self, DepthDto, EnvironmentManifest, Record};
 use crate::restore::{classify, ReadSet};
 use crate::symbols::ProjectTree;
 use crate::tracking::ReadDepth;
@@ -74,6 +74,14 @@ pub(crate) struct CoverageRead {
     pub(crate) hash: [u8; 32],
     pub(crate) depth: ReadDepth,
     pub(crate) agent: String,
+}
+
+impl CoverageRead {
+    /// This read as a journal record, at `symbol` — its address now, which
+    /// a move may have changed.
+    pub(crate) fn record_at(&self, symbol: &str) -> Record {
+        Record::Read { symbol_id: symbol.to_string(), hash: journal::encode_hash(&self.hash), depth: self.depth.into(), agent: Some(self.agent.clone()) }
+    }
 }
 
 pub(crate) fn coverage_reads(payload: &Value) -> Result<Vec<CoverageRead>> {
@@ -132,15 +140,8 @@ pub fn restore(req: &Request<'_>) -> Result<Report> {
             Some(Verdict::Valid { symbol }) => {
                 report.verified += 1;
                 report.moved += usize::from(symbol != &read.symbol);
-                let key = (symbol.clone(), read.agent.clone());
-                let known = existing.agent_reads.get(&key).is_some_and(|(h, d)| *h == read.hash && *d >= read.depth);
-                if !known {
-                    new_records.push(Record::Read {
-                        symbol_id: symbol.clone(),
-                        hash: journal::encode_hash(&read.hash),
-                        depth: read.depth.into(),
-                        agent: Some(read.agent.clone()),
-                    });
+                if !existing.knows_read(symbol, &read.agent, &read.hash, read.depth) {
+                    new_records.push(read.record_at(symbol));
                 }
             }
             _ if dirty.contains(file) => report.unverifiable += 1,
@@ -159,16 +160,9 @@ pub fn restore(req: &Request<'_>) -> Result<Report> {
     }
     let writes_appended = new_records.len() - reads_appended;
 
-    if !new_records.is_empty() {
-        let mut shard = Journal::open_shard(req.project_root, &session, "restore", std::time::Duration::ZERO, || {
-            EnvironmentManifest::capture(req.tree, req.backend, req.filter.clone())
-        });
-        for record in &new_records {
-            if !shard.append(record) {
-                bail!("cannot write the restore shard {}", shard.path().display());
-            }
-        }
-    }
+    journal::append_shard(req.project_root, &session, "restore", &new_records, || {
+        EnvironmentManifest::capture(req.tree, req.backend, req.filter.clone())
+    })?;
 
     // 4. The target's next snapshot descends from the restored one.
     let current = refs::read(&store, &target)?;

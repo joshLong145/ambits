@@ -217,6 +217,12 @@ pub struct ProjectTree {
 }
 
 impl ProjectTree {
+    /// The file whose project-relative path is `rel`, as records name files
+    /// (normalized, `/`-separated).
+    pub fn file(&self, rel: &str) -> Option<&FileSymbols> {
+        self.files.iter().find(|f| crate::objects::normalize_path(&f.file_path.to_string_lossy()) == rel)
+    }
+
     /// Every symbol in the tree, depth-first, paired with its owning file.
     ///
     /// The single descent through `SymbolNode::children`. Four had accumulated

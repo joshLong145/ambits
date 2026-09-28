@@ -1138,6 +1138,11 @@ fn days_flag(n: u64, flag: &str) -> Result<Duration> {
 }
 
 /// `ambits log`: the history of `reference`, or of the current session.
+/// The session a command works on, or an error saying how to name one.
+fn require_session<'a>(session: Option<&'a str>, to: &str) -> Result<&'a str> {
+    session.ok_or_else(|| color_eyre::eyre::eyre!("no session to {to}: pass --session, or run inside a project with Claude Code logs"))
+}
+
 fn run_remote(project_path: &Path, command: &RemoteCommands) -> Result<()> {
     use ambits::remote::config;
     let mut out = io::stdout().lock();
@@ -1439,9 +1444,7 @@ fn run() -> Result<()> {
 
     // A trace needs only the session's logs.
     if let Some(Commands::Trace { format }) = &command {
-        let Some(session) = session_id.as_deref() else {
-            color_eyre::eyre::bail!("no session to trace: pass --session, or run inside a project with Claude Code logs");
-        };
+        let session = require_session(session_id.as_deref(), "trace")?;
         let files = log_dir.as_ref().map(|d| ingester.session_log_files(d, session)).unwrap_or_default();
         if files.is_empty() {
             color_eyre::eyre::bail!("no logs found for session {session}");
@@ -1464,11 +1467,9 @@ fn run() -> Result<()> {
         return run_remote(&project_path, command);
     }
     if let Some(Commands::Push { remote, force_with_lease, dry_run, break_lock, verify_all }) = &command {
-        let Some(session) = session_id.as_deref() else {
-            color_eyre::eyre::bail!("no session to push: pass --session, or run inside a project with Claude Code logs");
-        };
+        let session = require_session(session_id.as_deref(), "push")?;
         if *break_lock {
-            let (_, store) = ambits::remote::config::resolve(&project_path, remote.as_deref())?;
+            let (_, store) = ambits::remote::open(&project_path, remote.as_deref())?;
             let id = ambits::remote::config::Config::store_id(&project_path)?;
             if let ambits::remote::lock::Broken::Broken(h) = ambits::remote::lock::break_lock(&store, &id, confirm)? {
                 eprintln!("broke the remote lock held by pid {} since {}", h.pid, ambits::time::rfc3339(h.start));
@@ -1606,9 +1607,7 @@ fn run() -> Result<()> {
 
     if let Some(Commands::Pull { remote, verify_all }) = &command {
         report_warnings(&config_warnings);
-        let Some(session) = session_id.as_deref() else {
-            color_eyre::eyre::bail!("no session to pull into: pass --session, or run inside a project with Claude Code logs");
-        };
+        let session = require_session(session_id.as_deref(), "pull into")?;
         let report = ambits::remote::pull(&ambits::remote::PullRequest {
             project_root: &project_path,
             remote: remote.as_deref(),
@@ -1624,9 +1623,7 @@ fn run() -> Result<()> {
 
     if let Some(Commands::Snapshot { message, require_clean }) = &command {
         report_warnings(&config_warnings);
-        let Some(session) = session_id.as_deref() else {
-            color_eyre::eyre::bail!("no session to snapshot: pass --session, or run inside a project with Claude Code logs");
-        };
+        let session = require_session(session_id.as_deref(), "snapshot")?;
         let outcome = ambits::objects::snapshot::snapshot(&ambits::objects::snapshot::Request {
             project_root: &project_path,
             session,

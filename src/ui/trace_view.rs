@@ -29,7 +29,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         Layout::Waterfall => "waterfall",
         Layout::Tracks => "tracks",
     };
-    let who = app.agent_filter.as_deref().map_or("all agents".to_string(), |a| app_agent(app, a).to_string());
+    let who = app.agent_filter.as_deref().map_or("all agents".to_string(), |a| app.agent_name(a).to_string());
     let title = match tv.focus {
         Some(root) => format!(" Trace — {} · {who} · {layout} ", super::fit(&app.trace.spans()[root].name(), 48)),
         None => format!(" Traces — {who} "),
@@ -113,7 +113,7 @@ fn render_list(f: &mut Frame, app: &App, inner: Rect) {
         let agents = if t.agents > 0 { t.agents.to_string() } else { String::new() };
         let commits = if t.commits > 0 { t.commits.to_string() } else { String::new() };
         lines.push(Line::from(vec![
-            Span::styled(format!(" {:<11} ", day_clock(t.start)), style.fg(Color::DarkGray)),
+            Span::styled(format!(" {:<11} ", ambits::time::day_minute(t.start)), style.fg(Color::DarkGray)),
             Span::styled(format!("{what}{}", " ".repeat(pad)), style.fg(Color::White)),
             Span::styled(format!(" {:>7}", view::duration(t.end - t.start)), style.fg(Color::Gray)),
             Span::styled(format!(" {:>9}", t.calls), style.fg(Color::Gray)),
@@ -138,12 +138,6 @@ fn render_list(f: &mut Frame, app: &App, inner: Rect) {
     }
     f.render_widget(Paragraph::new(lines), inner);
     app.trace_geometry.set(Some(TraceGeometry { bars_x: inner.x, bars_width: 0, rows_y: inner.y + 2, rows: rows_h, first_row: first }));
-}
-
-/// `MM-DD HH:MM` UTC.
-fn day_clock(ms: u64) -> String {
-    let t = ambits::time::rfc3339(ms / 1000);
-    format!("{} {}", t.get(5..10).unwrap_or(""), t.get(11..16).unwrap_or(""))
 }
 
 /// `12m04s · 1,204 calls · 3 failed · 0s–12m04s shown`
@@ -365,8 +359,8 @@ fn details(app: &App, statuses: &Statuses) -> Vec<Line<'static>> {
             // A prompt or delegation lasts as long as what it started.
             let end = view::effective_ends(&app.trace.tree()).get(&i).copied().filter(|_| s.end.is_some());
             let when = match end {
-                Some(end) => format!("{} → {} ({})", clock(s.start), clock(end), view::duration(end - s.start)),
-                None => format!("{} → running", clock(s.start)),
+                Some(end) => format!("{} → {} ({})", ambits::time::clock(s.start), ambits::time::clock(end), view::duration(end - s.start)),
+                None => format!("{} → running", ambits::time::clock(s.start)),
             };
             let mut facts: Vec<String> = Vec::new();
             match s.kind {
@@ -392,7 +386,7 @@ fn details(app: &App, statuses: &Statuses) -> Vec<Line<'static>> {
             }
             vec![
                 Line::from(Span::styled(format!(" {}", span_name(app, i)), Style::default().fg(span_color(app, statuses, i)).add_modifier(Modifier::BOLD))),
-                Line::from(Span::styled(format!(" {} · {when}", app_agent(app, &s.agent)), dim)),
+                Line::from(Span::styled(format!(" {} · {when}", app.agent_name(&s.agent)), dim)),
                 Line::from(Span::styled(format!(" {}", facts.join(" · ")), dim)),
             ]
         }
@@ -401,7 +395,7 @@ fn details(app: &App, statuses: &Statuses) -> Vec<Line<'static>> {
             let (glyph, color) = instant_glyph(&x.kind);
             vec![
                 Line::from(Span::styled(format!(" {glyph} {}", x.kind.label()), Style::default().fg(color))),
-                Line::from(Span::styled(format!(" {}", clock(x.t)), dim)),
+                Line::from(Span::styled(format!(" {}", ambits::time::clock(x.t)), dim)),
             ]
         }
         None => vec![Line::from(Span::styled(" j/k to select a call", dim))],
@@ -423,13 +417,8 @@ fn span_name(app: &App, i: usize) -> String {
 fn track_name(app: &App, track: &view::Track) -> String {
     match track.delegation.map(|d| app.trace.spans()[d].description.trim_start_matches("Agent: ").trim()) {
         Some(what) if !what.is_empty() => what.to_string(),
-        _ => app_agent(app, &track.agent).to_string(),
+        _ => app.agent_name(&track.agent).to_string(),
     }
-}
-
-/// `main` for the session's own agent.
-fn app_agent<'a>(app: &App, id: &'a str) -> &'a str {
-    if app.session_id.as_deref() == Some(id) { "main" } else { id }
 }
 
 /// Reads in their depth colour, writes by whether they still stand,
@@ -471,19 +460,11 @@ fn selected_style() -> Style {
     Style::default().bg(colors::HIGHLIGHT_BG).fg(colors::HIGHLIGHT_FG).add_modifier(Modifier::BOLD)
 }
 
-/// `HH:MM:SS.s` UTC.
-fn clock(ms: u64) -> String {
-    let t = ambits::time::rfc3339(ms / 1000);
-    format!("{}.{}", t.get(11..19).unwrap_or(&t), ms % 1000 / 100)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ambits::ingest::ToolFinished;
     use ambits::symbols::ProjectTree;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -531,10 +512,7 @@ mod tests {
     }
 
     fn screen(app: &App) -> Vec<String> {
-        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
-        terminal.draw(|f| render(f, app, f.area())).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect()).collect()
+        crate::ui::test_render::lines(100, 16, |f| render(f, app, f.area()))
     }
 
     #[test]

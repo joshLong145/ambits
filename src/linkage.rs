@@ -19,6 +19,7 @@ use color_eyre::eyre::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::git::{git, is_commit_id, Repo};
+use crate::objects::flat::FlatLog;
 use crate::objects::valid_record_path;
 use crate::parser::ParserRegistry;
 use crate::writes::{FileContents, Level, WriteRecord};
@@ -247,12 +248,12 @@ impl Resolver {
         })
     }
 
-    fn links_file(&self) -> crate::objects::flat::FlatLog {
-        crate::objects::flat::FlatLog::at(self.state.join(crate::state_dir::LINKS))
+    fn links_file(&self) -> FlatLog {
+        links_file(&self.state)
     }
 
-    fn never_file(&self) -> crate::objects::flat::FlatLog {
-        crate::objects::flat::FlatLog::at(self.state.join(crate::state_dir::CACHE).join(crate::state_dir::NEVER_LANDED))
+    fn never_file(&self) -> FlatLog {
+        never_file(&self.state)
     }
 
     /// Read both caches, once.
@@ -581,11 +582,21 @@ impl Drop for Resolver {
     }
 }
 
+/// The links index of the store rooted at `root`.
+fn links_file(root: &Path) -> FlatLog {
+    FlatLog::at(root.join(crate::state_dir::LINKS))
+}
+
+/// The never-landed cache of the store rooted at `root` (local only).
+fn never_file(root: &Path) -> FlatLog {
+    FlatLog::at(root.join(crate::state_dir::CACHE).join(crate::state_dir::NEVER_LANDED))
+}
+
 /// The links index of the store at `root` (a project's `.ambits`, or a
 /// remote): every unit's live link, by key.
 pub fn links_of(root: &Path) -> Result<Vec<(String, Link)>> {
     let mut folded = HashMap::new();
-    fold_links(crate::objects::flat::FlatLog::at(root.join(crate::state_dir::LINKS)).read()?, &mut folded);
+    fold_links(links_file(root).read()?, &mut folded);
     let mut out: Vec<(String, Link)> = folded.into_iter().filter_map(|(k, l)| Some((k, l?))).collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
@@ -594,7 +605,7 @@ pub fn links_of(root: &Path) -> Result<Vec<(String, Link)>> {
 /// Add to the links index at `root` whichever of `links` it lacks — not
 /// overriding a tombstone's key with an older link. How many were added.
 pub fn add_links(root: &Path, links: Vec<(String, Link)>, durability: crate::objects::store::Durability) -> Result<usize> {
-    let file = crate::objects::flat::FlatLog::at(root.join(crate::state_dir::LINKS));
+    let file = links_file(root);
     let lock = file.lock()?;
     let mut have = HashMap::new();
     fold_links(file.read()?, &mut have);
@@ -832,7 +843,7 @@ mod tests {
                 assert_eq!(r.landing(w, &units(w)[0]).unwrap(), Landing::Uncommitted);
             }
         }
-        let file = crate::objects::flat::FlatLog::at(root.join(".ambits/cache/never-landed.ndjson"));
+        let file = never_file(&root.join(".ambits"));
         let lines: Vec<NeverLine> = file.read().unwrap();
         assert_eq!(lines.iter().filter(|l| l.list.is_some()).count(), 1, "one tip list");
         assert_eq!(lines.iter().filter(|l| l.k.is_some()).count(), 3);
@@ -855,7 +866,7 @@ mod tests {
             r.tips.sort();
             r.landing(w, unit).unwrap();
         }
-        let lines = crate::objects::flat::FlatLog::at(root.join(".ambits/cache/never-landed.ndjson")).line_count();
+        let lines = never_file(&root.join(".ambits")).line_count();
         assert!(lines <= 70, "compacted, not 160 lines: {lines}");
     }
 

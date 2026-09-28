@@ -219,10 +219,7 @@ fn touched_shows_the_landing_commit() {
     let repo = Repo::new();
     repo.write_file("src/a.rs", EDITED);
     let w = write("toolu_1", Level::Symbol, vec![("src/a.rs::alpha", hash_of(EDITED, "alpha"))], None);
-    let dir = repo.root.join(".ambits/coverage");
-    std::fs::create_dir_all(&dir).unwrap();
-    let line = serde_json::to_string(&ambits::journal::Record::Write(Box::new(w))).unwrap();
-    std::fs::write(dir.join(format!("{SESSION}.ndjson")), format!("{line}\n")).unwrap();
+    common::journal_write(&repo.root, SESSION, w);
     let commit = repo.commit_all("edit alpha");
 
     let run = |args: &[&str]| run_ambits(&repo.root, args);
@@ -350,10 +347,7 @@ fn the_git_hook_records_links() {
     let repo = Repo::new();
     repo.write_file("src/a.rs", EDITED);
     let w = write("toolu_1", Level::Symbol, vec![("src/a.rs::alpha", hash_of(EDITED, "alpha"))], None);
-    let dir = repo.root.join(".ambits/coverage");
-    std::fs::create_dir_all(&dir).unwrap();
-    let line = serde_json::to_string(&ambits::journal::Record::Write(Box::new(w))).unwrap();
-    std::fs::write(dir.join(format!("{SESSION}.ndjson")), format!("{line}\n")).unwrap();
+    common::journal_write(&repo.root, SESSION, w);
     ambits::git_hook::install(&repo.root, Path::new(env!("CARGO_BIN_EXE_ambits"))).unwrap();
     assert!(hooks_dir(&repo.root).join("post-commit").exists());
 

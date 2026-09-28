@@ -271,3 +271,23 @@ mod tests {
         assert_eq!(fit("anything", 0), "");
     }
 }
+
+/// Rendering to text, for the panels' tests.
+#[cfg(test)]
+pub(crate) mod test_render {
+    use ratatui::backend::TestBackend;
+    use ratatui::{Frame, Terminal};
+
+    /// Row `row` of `backend`'s buffer, as text.
+    pub fn row(backend: &TestBackend, row: u16) -> String {
+        let buf = backend.buffer();
+        (0..buf.area.width).map(|x| buf[(x, row)].symbol().to_string()).collect()
+    }
+
+    /// Every row of what `draw` renders in a `width` × `height` terminal.
+    pub fn lines(width: u16, height: u16, draw: impl FnOnce(&mut Frame)) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(draw).unwrap();
+        (0..height).map(|y| row(terminal.backend(), y)).collect()
+    }
+}

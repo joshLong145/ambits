@@ -124,7 +124,7 @@ fn written(app: &App, row: &ambits::app::TreeRow, lines: &mut Vec<Line<'static>>
         lines.push(fact("written", vec![text("not this session", Color::Gray)]));
         return;
     };
-    let when = w.t.get(..16).map_or(w.t.clone(), |t| format!("{}Z", t.replace('T', " ")));
+    let when = ambits::time::short(&w.t);
     let times = if mark.count > 1 { format!(" · {} writes", mark.count) } else { String::new() };
     let color = tree_view::write_color(mark.status);
     lines.push(fact("written", vec![text("✎ ", color), text(format!("{when} by {} ({}){times}", app.agent_name(&w.a), w.tool), Color::White)]));
@@ -154,8 +154,7 @@ fn traces(app: &App, focused: bool, room: usize, width: usize) -> Vec<Line<'stat
         };
         let pick = focused && ix == selected;
         let style = if pick { Style::default().bg(colors::HIGHLIGHT_BG).fg(colors::HIGHLIGHT_FG).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Gray) };
-        let when = ambits::time::rfc3339(root.start / 1000);
-        let when = format!("{} {}", when.get(5..10).unwrap_or(""), when.get(11..16).unwrap_or(""));
+        let when = ambits::time::day_minute(root.start);
         let lead = format!(" {} {when} ", if pick { "›" } else { " " });
         let what = format!("{what:<11} ");
         let room = width.saturating_sub(super::width(&lead) + what.len());
@@ -173,8 +172,6 @@ mod tests {
     use super::*;
     use ambits::ingest::{Prompt, ToolFinished};
     use ambits::symbols::{FileSymbols, ProjectTree, SymbolCategory, SymbolNode};
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -210,10 +207,7 @@ mod tests {
     }
 
     fn screen(app: &App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(70, 16)).unwrap();
-        terminal.draw(|f| render(f, app, f.area())).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()).collect::<Vec<_>>().join("\n")
+        crate::ui::test_render::lines(70, 16, |f| render(f, app, f.area())).join("\n")
     }
 
     #[test]

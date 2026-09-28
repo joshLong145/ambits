@@ -13,7 +13,7 @@ use ambits::objects::sync_ignore::SyncIgnore;
 use ambits::objects::ObjectId;
 use ambits::parser::ParserRegistry;
 use ambits::remote::{self, PullOutcome, PushOutcome};
-use common::{git, run_ambits};
+use common::{append_journal, git, journal_write, run_ambits, write_record};
 
 const SESSION: &str = "0b7e9d3a-1c2f-4e5a-9b8c-7d6e5f4a3b2c";
 const SOURCE: &str = "fn alpha() {}\nfn beta() {}\n";
@@ -57,13 +57,7 @@ impl Clone {
             depth: ambits::journal::DepthDto::FullBody,
             agent: Some(agent.into()),
         };
-        let dir = self.root.join(".ambits/coverage");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("{session}.ndjson"));
-        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
-        text.push_str(&serde_json::to_string(&record).unwrap());
-        text.push('\n');
-        std::fs::write(path, text).unwrap();
+        append_journal(&self.root, session, &[record]);
     }
 
     fn snap(&self) -> Outcome {
@@ -368,19 +362,7 @@ fn fetched_links_are_kept_only_when_proven() {
 #[test]
 fn links_resolved_later_are_pushed_without_a_new_snapshot() {
     let (_dir, remote, a, _b) = pair();
-    let write = ambits::writes::WriteRecord {
-        op: "toolu_late".into(),
-        av: ambits::writes::ATTRIBUTION_VERSION,
-        a: "agent-1".into(),
-        t: "2026-09-27T10:00:00Z".into(),
-        tool: "Edit".into(),
-        file: "src/a.rs".into(),
-        ..Default::default()
-    };
-    let dir = a.root.join(".ambits/coverage");
-    std::fs::create_dir_all(&dir).unwrap();
-    let line = serde_json::to_string(&ambits::journal::Record::Write(Box::new(write))).unwrap();
-    std::fs::write(dir.join(format!("{SESSION}.ndjson")), format!("{line}\n")).unwrap();
+    journal_write(&a.root, SESSION, write_record("toolu_late", "src/a.rs"));
     a.snap();
     a.push(false).unwrap();
     let link = serde_json::json!({"k": "toolu_late", "link": {"op": "toolu_late", "target": "src/a.rs", "hash": null, "commit": "0".repeat(40), "verified": false, "path": "src/a.rs"}});
@@ -394,19 +376,7 @@ fn links_resolved_later_are_pushed_without_a_new_snapshot() {
 #[test]
 fn a_push_sends_only_its_own_links() {
     let (_dir, remote, a, _b) = pair();
-    let write = |op: &str| ambits::writes::WriteRecord {
-        op: op.into(),
-        av: ambits::writes::ATTRIBUTION_VERSION,
-        a: "agent-1".into(),
-        t: "2026-09-27T10:00:00Z".into(),
-        tool: "Edit".into(),
-        file: "src/a.rs".into(),
-        ..Default::default()
-    };
-    let dir = a.root.join(".ambits/coverage");
-    std::fs::create_dir_all(&dir).unwrap();
-    let line = serde_json::to_string(&ambits::journal::Record::Write(Box::new(write("toolu_mine")))).unwrap();
-    std::fs::write(dir.join(format!("{SESSION}.ndjson")), format!("{line}\n")).unwrap();
+    journal_write(&a.root, SESSION, write_record("toolu_mine", "src/a.rs"));
     a.snap();
     let link = |op: &str| serde_json::json!({"k": op, "link": {"op": op, "target": "src/a.rs", "hash": null, "commit": "0".repeat(40), "verified": false, "path": "src/a.rs"}});
     std::fs::write(a.root.join(".ambits/links.ndjson"), format!("{}\n{}\n", link("toolu_mine"), link("toolu_other_session"))).unwrap();
@@ -519,20 +489,8 @@ fn verify_all_repairs_what_the_frontier_does_not_look_at() {
 #[test]
 fn a_write_conflict_keeps_ours_and_records_theirs_once() {
     let (_dir, _remote, a, b) = pair();
-    let write = |file: &str| ambits::writes::WriteRecord {
-        op: "toolu_1".into(),
-        av: ambits::writes::ATTRIBUTION_VERSION,
-        a: "agent-1".into(),
-        t: "2026-09-27T10:00:00Z".into(),
-        tool: "Edit".into(),
-        file: file.into(),
-        ..Default::default()
-    };
     for (clone, file) in [(&a, "src/a.rs"), (&b, "src/b.rs")] {
-        let dir = clone.root.join(".ambits/coverage");
-        std::fs::create_dir_all(&dir).unwrap();
-        let line = serde_json::to_string(&ambits::journal::Record::Write(Box::new(write(file)))).unwrap();
-        std::fs::write(dir.join(format!("{SESSION}.ndjson")), format!("{line}\n")).unwrap();
+        journal_write(&clone.root, SESSION, write_record("toolu_1", file));
     }
     a.snap();
     a.push(false).unwrap();
@@ -586,19 +544,7 @@ fn crash_then_gc_then_fetch_recovers() {
 #[test]
 fn touched_names_the_remote_a_write_came_from() {
     let (_dir, _remote, a, b) = pair();
-    let write = ambits::writes::WriteRecord {
-        op: "toolu_1".into(),
-        av: ambits::writes::ATTRIBUTION_VERSION,
-        a: "agent-1".into(),
-        t: "2026-09-27T10:00:00Z".into(),
-        tool: "Edit".into(),
-        file: "src/a.rs".into(),
-        ..Default::default()
-    };
-    let dir = a.root.join(".ambits/coverage");
-    std::fs::create_dir_all(&dir).unwrap();
-    let line = serde_json::to_string(&ambits::journal::Record::Write(Box::new(write))).unwrap();
-    std::fs::write(dir.join(format!("{SESSION}.ndjson")), format!("{line}\n")).unwrap();
+    journal_write(&a.root, SESSION, write_record("toolu_1", "src/a.rs"));
     a.snap();
     a.push(false).unwrap();
     assert!(matches!(b.pull(), PullOutcome::Merged { writes: 1, .. }));
