@@ -773,7 +773,7 @@ impl App {
         };
         if self.trace_view.focus.is_none() {
             let root = match item {
-                Item::Span(i) => crate::trace::summary::root_of(&self.trace, i),
+                Item::Span(i) => crate::trace::summary::TraceIndex::new(&self.trace).root_of(i),
                 Item::Instant(_) => self.trace_view.list,
             };
             let Some(root) = root.or_else(|| self.trace_view.list_index(&self.trace_list()).map(|i| self.trace_list()[i].root)) else { return };
@@ -902,10 +902,15 @@ impl App {
 
     /// The trace panel's rows, as `Enter` sees them.
     pub fn trace_panel_targets(&self) -> Vec<crate::trace::summary::Target> {
+        self.trace_panel_targets_in(&crate::trace::summary::TraceIndex::new(&self.trace))
+    }
+
+    /// [`Self::trace_panel_targets`] over an index already worked out.
+    pub fn trace_panel_targets_in(&self, index: &crate::trace::summary::TraceIndex) -> Vec<crate::trace::summary::Target> {
         use crate::trace::summary;
         match self.trace_panel_subject() {
-            PanelSubject::Trace(root) => summary::detail(&self.trace, root).map(|d| d.targets()).unwrap_or_default(),
-            PanelSubject::Call(i) => summary::call_targets(&self.trace, i),
+            PanelSubject::Trace(root) => summary::detail(&self.trace, index, root).map(|d| d.targets()).unwrap_or_default(),
+            PanelSubject::Call(i) => summary::call_targets(&self.trace, index, i),
             PanelSubject::Instant(_) | PanelSubject::Nothing => Vec::new(),
         }
     }

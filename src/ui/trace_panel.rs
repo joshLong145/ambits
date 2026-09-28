@@ -10,18 +10,17 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use ambits::app::{App, FocusPanel, PanelSubject};
-use ambits::trace::summary::{self, TraceDetail};
+use ambits::trace::summary::{self, TraceDetail, TraceIndex};
 use ambits::trace::view;
 use ambits::trace::SpanKind;
 use ambits::writes::Status;
 
 use super::inspector::{depth_word, fact, text};
-use super::trace_view::{instant_glyph, span_color, span_name, Statuses};
+use super::trace_view::{instant_glyph, span_color, span_name, Statuses, TraceFrame};
 use super::{colors, fit, tree_view};
 
-pub fn render(f: &mut Frame, app: &App, area: Rect) {
+pub(super) fn render(f: &mut Frame, app: &App, area: Rect, frame: &TraceFrame<'_>) {
     let focused = app.focus == FocusPanel::Right;
-    let statuses = app.write_statuses();
     let subject = app.trace_panel_subject();
     let title = match subject {
         PanelSubject::Trace(root) => format!(" \"{}\" ", app.trace.spans()[root].name()),
@@ -39,11 +38,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let width = inner.width as usize;
     let rows = Rows { selected: focused.then_some(app.panel_index), next: 0, width };
     let lines = match subject {
-        PanelSubject::Trace(root) => match summary::detail(&app.trace, root) {
-            Some(d) => trace_lines(app, &d, &statuses, rows),
+        PanelSubject::Trace(root) => match summary::detail(&app.trace, &frame.index, root) {
+            Some(d) => trace_lines(app, &d, &frame.statuses, rows),
             None => vec![Line::from(text(" nothing here", Color::DarkGray))],
         },
-        PanelSubject::Call(i) => call_lines(app, i, &statuses, rows),
+        PanelSubject::Call(i) => call_lines(app, i, frame, rows),
         PanelSubject::Instant(i) => {
             let x = &app.trace.instants()[i];
             let (glyph, color) = instant_glyph(&x.kind);
@@ -198,20 +197,17 @@ fn trace_lines(app: &App, d: &TraceDetail, statuses: &Statuses, mut rows: Rows) 
 
 /// One call: who, when, how long, in which trace; why it failed; what it
 /// read, wrote or ran; and the other calls on its file.
-fn call_lines(app: &App, i: usize, statuses: &Statuses, mut rows: Rows) -> Vec<Line<'static>> {
+fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, mut rows: Rows) -> Vec<Line<'static>> {
     let s = &app.trace.spans()[i];
-    let count = summary::call_targets(&app.trace, i).len();
-    let end = view::effective_ends(&app.trace.tree()).get(&i).copied().filter(|_| s.end.is_some());
-    let when = match end {
-        Some(end) => format!("{} → {} ({})", ambits::time::clock(s.start), ambits::time::clock(end), view::duration(end - s.start)),
-        None => format!("{} → running", ambits::time::clock(s.start)),
-    };
+    let (index, statuses): (&TraceIndex, &Statuses) = (&frame.index, &frame.statuses);
+    let count = summary::call_targets(&app.trace, index, i).len();
+    let when = frame.timing(app, i);
     let mut out = vec![
         Line::from(Span::styled(format!(" {}", span_name(app, i)), Style::default().fg(span_color(app, statuses, i)).add_modifier(Modifier::BOLD))),
         fact("agent", vec![text(app.agent_name(&s.agent).to_string(), Color::Gray)]),
         fact("when", vec![text(when, Color::Gray)]),
     ];
-    if let Some(root) = summary::root_of(&app.trace, i).filter(|r| *r != i) {
+    if let Some(root) = index.root_of(i).filter(|r| *r != i) {
         out.push(fact("in", vec![text(fit(&format!("\"{}\"", app.trace.spans()[root].name()), rows.width.saturating_sub(12)), Color::Gray)]));
     }
     if s.error {
@@ -247,7 +243,7 @@ fn call_lines(app: &App, i: usize, statuses: &Statuses, mut rows: Rows) -> Vec<L
             None => out.push(fact("wrote", vec![text("not attributed (no journal entry)", Color::DarkGray)])),
         },
         SpanKind::Delegate => {
-            if let Some(d) = summary::root_of(&app.trace, i).and_then(|r| summary::detail(&app.trace, r)) {
+            if let Some(d) = index.root_of(i).and_then(|r| summary::detail(&app.trace, index, r)) {
                 if let Some(run) = d.agents.iter().find(|a| a.delegation == i) {
                     out.push(fact("agent", vec![text(format!("{} · {} calls · {}", run.agent, run.calls, view::duration(run.duration)), Color::White)]));
                     if run.failed > 0 {
@@ -269,7 +265,7 @@ fn call_lines(app: &App, i: usize, statuses: &Statuses, mut rows: Rows) -> Vec<L
         out.push(Line::from(""));
         out.push(section("on this file"));
         out.push(rows.row(vec![text(fit(file, rows.width.saturating_sub(16)), Color::White), text("  → tree", Color::DarkGray)], count));
-        for j in summary::related(&app.trace, i) {
+        for j in summary::related(&app.trace, index, i) {
             let other = &app.trace.spans()[j];
             let mark = if j < i { "before" } else { "after " };
             let line = vec![
@@ -331,7 +327,7 @@ mod tests {
     }
 
     fn screen(app: &App) -> String {
-        crate::ui::test_render::lines(60, 24, |f| render(f, app, f.area())).join("\n")
+        crate::ui::test_render::lines(60, 24, |f| render(f, app, f.area(), &TraceFrame::new(app))).join("\n")
     }
 
     #[test]

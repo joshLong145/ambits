@@ -33,17 +33,18 @@ pub fn render(f: &mut Frame, app: &App) {
         .split(outer[1]);
 
     render_header(f, app, outer[0]);
-    if app.trace_view.open {
-        trace_view::render(f, app, main[0]);
-    } else {
-        tree_view::render(f, app, main[0]);
+    // The trace's structure and write statuses, once for both panels.
+    let frame = app.trace_view.open.then(|| trace_view::TraceFrame::new(app));
+    match &frame {
+        Some(frame) => trace_view::render(f, app, main[0], frame),
+        None => tree_view::render(f, app, main[0]),
     }
     // The right-hand panel follows the left: the trace view's own panel,
     // else the inspector; `i` swaps in the session pane from either.
-    match (app.right_pane, app.trace_view.open) {
+    match (app.right_pane, &frame) {
         (RightPane::Session, _) => stats::render(f, app, main[1]),
-        (RightPane::Inspector, true) => trace_panel::render(f, app, main[1]),
-        (RightPane::Inspector, false) => inspector::render(f, app, main[1]),
+        (RightPane::Inspector, Some(frame)) => trace_panel::render(f, app, main[1], frame),
+        (RightPane::Inspector, None) => inspector::render(f, app, main[1]),
     }
     if app.show_activity {
         activity::render(f, app, outer[2]);

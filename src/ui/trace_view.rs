@@ -18,13 +18,41 @@ use super::colors;
 /// Each write's record and status by op, computed once per frame.
 pub(super) type Statuses<'a> = std::collections::HashMap<&'a str, (&'a ambits::writes::WriteRecord, ambits::writes::Status)>;
 
+/// What one frame of the trace view works out once, for the timeline and
+/// the right-hand panel alike: the trace's structure, and every write's
+/// status.
+pub(super) struct TraceFrame<'a> {
+    pub index: ambits::trace::summary::TraceIndex,
+    pub statuses: Statuses<'a>,
+}
+
+impl<'a> TraceFrame<'a> {
+    pub fn new(app: &'a App) -> Self {
+        Self { index: ambits::trace::summary::TraceIndex::new(&app.trace), statuses: app.write_statuses() }
+    }
+
+    /// `10:00:01.2 → 10:00:03.9 (2.7s)`, or `10:00:01.2 → running`.
+    pub fn timing(&self, app: &App, span: usize) -> String {
+        let s = &app.trace.spans()[span];
+        match self.index.end_of(&app.trace, span) {
+            Some(end) => format!("{} → {} ({})", ambits::time::clock(s.start), ambits::time::clock(end), view::duration(end - s.start)),
+            None => format!("{} → running", ambits::time::clock(s.start)),
+        }
+    }
+
+    /// How long `span` took, or `running`.
+    pub fn took(&self, app: &App, span: usize) -> String {
+        self.index.end_of(&app.trace, span).map_or("running".to_string(), |e| view::duration(e - app.trace.spans()[span].start))
+    }
+}
+
 /// Lines the summary strip takes at the bottom; the right-hand panel has
 /// the rest (`trace_panel`).
 const DETAILS: u16 = 1;
 /// Columns between ticks on the ruler.
 const TICK_GAP: usize = 12;
 
-pub fn render(f: &mut Frame, app: &App, area: Rect) {
+pub(super) fn render(f: &mut Frame, app: &App, area: Rect, frame: &TraceFrame<'_>) {
     let tv = &app.trace_view;
     let layout = match tv.layout {
         Layout::Waterfall => "waterfall",
@@ -64,15 +92,14 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let rows_h = inner.height - 3 - DETAILS;
 
     let mut lines = vec![summary(app, range), ruler(&vp, bars_w, range.0, label_w + dur_w + 1)];
-    let statuses = app.write_statuses();
     let (body, first_row) = match tv.layout {
-        Layout::Waterfall => waterfall_lines(app, &statuses, &vp, label_w, bars_w, rows_h as usize),
-        Layout::Tracks => track_lines(app, &statuses, &vp, label_w, bars_w, rows_h as usize),
+        Layout::Waterfall => waterfall_lines(app, &frame.statuses, &vp, label_w, bars_w, rows_h as usize),
+        Layout::Tracks => track_lines(app, frame, &vp, label_w, bars_w, rows_h as usize),
     };
     lines.extend(body);
     lines.resize(2 + rows_h as usize, Line::from(""));
     lines.push(Line::from(Span::styled("─".repeat(inner.width as usize), Style::default().fg(Color::DarkGray))));
-    lines.extend(details(app, &statuses));
+    lines.extend(details(app, frame));
     f.render_widget(Paragraph::new(lines), inner);
 
     app.trace_geometry.set(Some(TraceGeometry { bars_x, bars_width: bars_w as u16, rows_y, rows: rows_h, first_row }));
@@ -243,7 +270,7 @@ fn waterfall_lines(app: &App, statuses: &Statuses, vp: &Viewport, label_w: usize
     (lines, first)
 }
 
-fn track_lines(app: &App, statuses: &Statuses, vp: &Viewport, label_w: usize, bars_w: usize, height: usize) -> (Vec<Line<'static>>, usize) {
+fn track_lines(app: &App, frame: &TraceFrame<'_>, vp: &Viewport, label_w: usize, bars_w: usize, height: usize) -> (Vec<Line<'static>>, usize) {
     let (tracks, rows) = app.trace_tracks();
     let selected_row = app.trace_view.track_row.min(rows.len().saturating_sub(1));
     let first = scroll(app, Some(selected_row), rows.len(), height);
@@ -252,7 +279,7 @@ fn track_lines(app: &App, statuses: &Statuses, vp: &Viewport, label_w: usize, ba
         Some(Item::Span(i)) => Some(i),
         _ => None,
     };
-    let ends = view::effective_ends(&app.trace.tree());
+    let statuses = &frame.statuses;
     let lines = rows
         .iter()
         .enumerate()
@@ -286,7 +313,7 @@ fn track_lines(app: &App, statuses: &Statuses, vp: &Viewport, label_w: usize, ba
                 Some(_) => {
                     for &i in &on_row {
                         let s = &app.trace.spans()[i];
-                        let end = ends.get(&i).copied().or(s.end).unwrap_or(open_end).max(s.start);
+                        let end = frame.index.effective_end(i).or(s.end).unwrap_or(open_end).max(s.start);
                         let (from, to) = (vp.col(s.start, bars_w), vp.col(end, bars_w));
                         let color = span_color(app, statuses, i);
                         let mut style = Style::default().fg(color);
@@ -350,13 +377,13 @@ fn cells_line(cols: usize, cells: impl IntoIterator<Item = (usize, char, Style)>
 }
 
 /// The selected item in one line; the right-hand panel has the rest.
-fn details(app: &App, statuses: &Statuses) -> Vec<Line<'static>> {
+fn details(app: &App, frame: &TraceFrame<'_>) -> Vec<Line<'static>> {
+    let statuses = &frame.statuses;
     let dim = Style::default().fg(Color::DarkGray);
     let line = match app.trace_view.selected {
         Some(Item::Span(i)) => {
             let Some(s) = app.trace.spans().get(i) else { return Vec::new() };
-            let end = view::effective_ends(&app.trace.tree()).get(&i).copied().filter(|_| s.end.is_some());
-            let took = end.map_or("running".to_string(), |e| view::duration(e - s.start));
+            let took = frame.took(app, i);
             let mut spans = vec![
                 Span::styled(format!(" {}", span_name(app, i)), Style::default().fg(span_color(app, statuses, i)).add_modifier(Modifier::BOLD)),
                 Span::styled(format!(" · {} · {took}", app.agent_name(&s.agent)), dim),
@@ -486,7 +513,7 @@ mod tests {
     }
 
     fn screen(app: &App) -> Vec<String> {
-        crate::ui::test_render::lines(100, 16, |f| render(f, app, f.area()))
+        crate::ui::test_render::lines(100, 16, |f| render(f, app, f.area(), &TraceFrame::new(app)))
     }
 
     #[test]

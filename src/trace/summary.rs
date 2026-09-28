@@ -4,8 +4,49 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::view::subtree;
-use super::{InstantKind, SpanKind, Trace};
+use super::view::{effective_ends, subtree};
+use super::{InstantKind, Node, SpanKind, Trace};
+
+/// A trace's structure, worked out once and asked many times (a frame asks
+/// dozens of questions of it): the span tree, which trace each span belongs
+/// to, and each span's effective end.
+#[derive(Debug, Clone)]
+pub struct TraceIndex {
+    pub tree: Vec<Node>,
+    roots: HashMap<usize, usize>,
+    ends: HashMap<usize, u64>,
+}
+
+impl TraceIndex {
+    pub fn new(trace: &Trace) -> Self {
+        let tree = trace.tree();
+        let roots = super::roots_by_span(&tree);
+        let ends = effective_ends(&tree);
+        Self { tree, roots, ends }
+    }
+
+    /// The trace `span` belongs to: its root span.
+    pub fn root_of(&self, span: usize) -> Option<usize> {
+        self.roots.get(&span).copied()
+    }
+
+    /// When `span` ended — a prompt or delegation, once what it started
+    /// did — or `None` while it runs.
+    pub fn end_of(&self, trace: &Trace, span: usize) -> Option<u64> {
+        trace.spans().get(span)?.end?;
+        self.ends.get(&span).copied()
+    }
+
+    /// `span`'s effective end, running or not: what bars are drawn to.
+    pub fn effective_end(&self, span: usize) -> Option<u64> {
+        self.ends.get(&span).copied()
+    }
+
+    /// The node for `span`.
+    pub fn node(&self, span: usize) -> Option<&Node> {
+        subtree(&self.tree, span)
+    }
+}
 
 /// One file's share of a trace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,9 +95,8 @@ pub struct TraceDetail {
 
 /// The trace rooted at span `root`, summed up; `None` for a span that is
 /// not a root.
-pub fn detail(trace: &Trace, root: usize) -> Option<TraceDetail> {
-    let tree = trace.tree();
-    let node = tree.iter().find(|n| n.span == root)?;
+pub fn detail(trace: &Trace, index: &TraceIndex, root: usize) -> Option<TraceDetail> {
+    let node = index.tree.iter().find(|n| n.span == root)?;
     let spans = trace.spans();
     let mut under: Vec<usize> = node.spans().into_iter().filter(|&i| i != root).collect();
     under.sort_by_key(|&i| (spans[i].start, i));
@@ -89,8 +129,8 @@ pub fn detail(trace: &Trace, root: usize) -> Option<TraceDetail> {
             }
         }
         if let (SpanKind::Delegate, Some(agent)) = (s.kind, &s.child_agent) {
-            let run = subtree(&tree, i).map(|n| n.spans()).unwrap_or_default();
-            let end = subtree(&tree, i).map_or(s.start, |n| n.end);
+            let run = index.node(i).map(|n| n.spans()).unwrap_or_default();
+            let end = index.node(i).map_or(s.start, |n| n.end);
             agents.push(AgentRun {
                 delegation: i,
                 agent: agent.clone(),
@@ -139,27 +179,21 @@ impl TraceDetail {
 }
 
 /// A call's rows: its file, then the other calls on that file in its trace.
-pub fn call_targets(trace: &Trace, span: usize) -> Vec<Target> {
+pub fn call_targets(trace: &Trace, index: &TraceIndex, span: usize) -> Vec<Target> {
     let file = trace.spans().get(span).and_then(|s| s.file.clone()).map(Target::File);
-    file.into_iter().chain(related(trace, span).into_iter().map(Target::Span)).collect()
+    file.into_iter().chain(related(trace, index, span).into_iter().map(Target::Span)).collect()
 }
 
 /// The other calls in `span`'s trace on the same file, in time order.
-pub fn related(trace: &Trace, span: usize) -> Vec<usize> {
+pub fn related(trace: &Trace, index: &TraceIndex, span: usize) -> Vec<usize> {
     let spans = trace.spans();
     let Some(file) = spans.get(span).and_then(|s| s.file.as_deref()) else { return Vec::new() };
-    let root_of = super::roots_by_span(&trace.tree());
-    let root = root_of.get(&span).copied();
+    let root = index.root_of(span);
     let mut out: Vec<usize> = (0..spans.len())
-        .filter(|&i| i != span && spans[i].file.as_deref() == Some(file) && root_of.get(&i).copied() == root)
+        .filter(|&i| i != span && spans[i].file.as_deref() == Some(file) && index.root_of(i) == root)
         .collect();
     out.sort_by_key(|&i| (spans[i].start, i));
     out
-}
-
-/// The trace `span` belongs to: its root span.
-pub fn root_of(trace: &Trace, span: usize) -> Option<usize> {
-    super::roots_by_span(&trace.tree()).get(&span).copied()
 }
 
 #[cfg(test)]
@@ -208,7 +242,7 @@ mod tests {
     #[test]
     fn a_trace_is_summed_up_by_tool_file_agent_failure_and_commit() {
         let t = sample();
-        let d = detail(&t, 0).unwrap();
+        let d = detail(&t, &TraceIndex::new(&t), 0).unwrap();
         assert_eq!(d.calls, 7);
         assert_eq!(d.by_tool.iter().map(|(t, n)| (t.as_ref(), *n)).collect::<Vec<_>>(), vec![("Read", 4), ("Edit", 2), ("Agent", 1)]);
         let a = &d.files[0];
@@ -219,13 +253,13 @@ mod tests {
         let run = &d.agents[0];
         assert_eq!((&*run.agent, run.calls, run.failed, run.duration), ("x", 2, 0, 11_000));
         assert_eq!(d.commits, vec![0]);
-        assert!(detail(&t, 1).is_none(), "not a root");
+        assert!(detail(&t, &TraceIndex::new(&t), 1).is_none(), "not a root");
     }
 
     #[test]
     fn rows_point_at_files_calls_and_commits_in_panel_order() {
         let t = sample();
-        let d = detail(&t, 0).unwrap();
+        let d = detail(&t, &TraceIndex::new(&t), 0).unwrap();
         assert_eq!(
             d.targets(),
             vec![
@@ -237,14 +271,16 @@ mod tests {
                 Target::Instant(0),
             ]
         );
-        assert_eq!(call_targets(&t, 1), vec![Target::File("src/a.rs".into()), Target::Span(2), Target::Span(3), Target::Span(6), Target::Span(7)]);
+        assert_eq!(call_targets(&t, &TraceIndex::new(&t), 1), vec![Target::File("src/a.rs".into()), Target::Span(2), Target::Span(3), Target::Span(6), Target::Span(7)]);
     }
 
     #[test]
     fn related_calls_share_the_file_and_the_trace_in_time_order() {
         let t = sample();
-        assert_eq!(related(&t, 1), vec![2, 3, 6, 7]);
-        assert_eq!(related(&t, 4), Vec::<usize>::new(), "nothing else on b.rs");
-        assert_eq!(root_of(&t, 7), Some(0));
+        let index = TraceIndex::new(&t);
+        assert_eq!(related(&t, &index, 1), vec![2, 3, 6, 7]);
+        assert_eq!(related(&t, &index, 4), Vec::<usize>::new(), "nothing else on b.rs");
+        assert_eq!(index.root_of(7), Some(0));
+        assert_eq!(index.end_of(&t, 5), Some(crate::time::parse_rfc3339_millis("2026-09-27T10:00:20Z").unwrap()), "a delegation ends with its agent");
     }
 }
