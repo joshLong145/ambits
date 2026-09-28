@@ -10,6 +10,7 @@
 //! the later of its own result and its subagent's last span.
 
 pub mod export;
+pub mod summary;
 pub mod touch;
 pub mod view;
 
@@ -324,6 +325,24 @@ pub struct Node {
     pub span: usize,
     pub end: u64,
     pub children: Vec<Node>,
+}
+
+impl Node {
+    /// This node's span and every span under it, depth first.
+    pub fn spans(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            out.push(node.span);
+            stack.extend(node.children.iter().rev());
+        }
+        out
+    }
+}
+
+/// Span index → the root of its tree: which trace each span belongs to.
+pub fn roots_by_span(tree: &[Node]) -> HashMap<usize, usize> {
+    tree.iter().flat_map(|root| root.spans().into_iter().map(move |s| (s, root.span))).collect()
 }
 
 #[cfg(test)]

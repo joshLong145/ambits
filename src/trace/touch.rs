@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use super::{Node, SpanKind, Trace};
+use super::{SpanKind, Trace};
 use crate::symbols::{nested_in, split_id};
 use crate::write_index::WriteIndex;
 
@@ -29,7 +29,7 @@ pub struct Touch {
 /// write touches the file only).
 pub fn touches(trace: &Trace, file: &str, symbol: Option<&str>, writes: &WriteIndex) -> Vec<Touch> {
     let tree = trace.tree();
-    let root_of = roots_by_span(&tree);
+    let root_of = super::roots_by_span(&tree);
     let name = symbol.map(|id| split_id(id).1);
     let mut by_root: Vec<Touch> = Vec::new();
     let mut index: HashMap<usize, usize> = HashMap::new();
@@ -72,21 +72,6 @@ pub fn touches(trace: &Trace, file: &str, symbol: Option<&str>, writes: &WriteIn
     }
     by_root.sort_by_key(|t| (trace.spans()[t.root].start, t.root));
     by_root
-}
-
-/// Span index → the root of its tree.
-fn roots_by_span(tree: &[Node]) -> HashMap<usize, usize> {
-    fn walk(node: &Node, root: usize, out: &mut HashMap<usize, usize>) {
-        out.insert(node.span, root);
-        for child in &node.children {
-            walk(child, root, out);
-        }
-    }
-    let mut out = HashMap::new();
-    for node in tree {
-        walk(node, node.span, &mut out);
-    }
-    out
 }
 
 #[cfg(test)]

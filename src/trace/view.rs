@@ -171,8 +171,7 @@ pub fn traces(trace: &Trace, filter: Option<&str>) -> Vec<TraceSummary> {
         .tree()
         .iter()
         .filter_map(|node| {
-            let mut all = Vec::new();
-            collect(node, &mut all);
+            let all = node.spans();
             if let Some(f) = filter {
                 if !all.iter().any(|&i| spans[i].agent.starts_with(f)) {
                     return None;
@@ -194,14 +193,6 @@ pub fn traces(trace: &Trace, filter: Option<&str>) -> Vec<TraceSummary> {
             })
         })
         .collect()
-}
-
-/// `node` and everything under it, depth first.
-fn collect(node: &Node, out: &mut Vec<usize>) {
-    out.push(node.span);
-    for child in &node.children {
-        collect(child, out);
-    }
 }
 
 /// The node for span `root`, wherever it sits in `tree`.
@@ -329,11 +320,7 @@ pub fn tracks(trace: &Trace, filter: Option<&str>, within: Option<usize>, open_e
     // Within one trace, only its spans. A prompt is the trace itself, not a
     // call on a track.
     let mut shown: Vec<usize> = match within.and_then(|r| subtree(&tree, r)) {
-        Some(node) => {
-            let mut all = Vec::new();
-            collect(node, &mut all);
-            all
-        }
+        Some(node) => node.spans(),
         None if within.is_some() => Vec::new(),
         None => (0..spans.len()).collect(),
     };
