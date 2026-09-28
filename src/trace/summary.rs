@@ -83,12 +83,15 @@ pub struct FileActivity {
 
 impl FileActivity {
     /// What its reads saw: each symbol once, at the deepest it was read,
-    /// in the order first read. `None` is the whole file.
-    pub fn symbols_read(&self, trace: &Trace) -> Vec<(Option<String>, ReadDepth)> {
-        let mut out: Vec<(Option<String>, ReadDepth)> = Vec::new();
+    /// in the order first read; `None` for a read that failed and saw
+    /// nothing (listed only when no read of it succeeded). A `None` symbol
+    /// is the whole file.
+    pub fn symbols_read(&self, trace: &Trace) -> Vec<(Option<String>, Option<ReadDepth>)> {
+        let mut out: Vec<(Option<String>, Option<ReadDepth>)> = Vec::new();
         for &i in &self.reads {
             let s = &trace.spans()[i];
             let SpanKind::Read(depth) = s.kind else { continue };
+            let depth = (!s.error).then_some(depth);
             let name = s.symbol_name();
             match out.iter_mut().find(|(n, _)| *n == name) {
                 Some((_, d)) => *d = (*d).max(depth),
@@ -325,7 +328,7 @@ mod tests {
         assert_eq!(d.by_tool.iter().map(|(t, n)| (t.as_ref(), *n)).collect::<Vec<_>>(), vec![("Read", 4), ("Edit", 2), ("Agent", 1)]);
         let a = &d.files[0];
         assert_eq!((a.file.as_str(), a.reads.clone(), a.writes.clone()), ("src/a.rs", vec![1, 2, 6, 7], vec![3]));
-        assert_eq!(a.symbols_read(&t), vec![(None, ReadDepth::FullBody)], "four whole-file reads, once");
+        assert_eq!(a.symbols_read(&t), vec![(None, Some(ReadDepth::FullBody))], "four whole-file reads, once");
         assert_eq!(d.files[1].file, "src/b.rs");
         assert_eq!(d.failed, vec![4]);
         assert_eq!(d.agents.len(), 1);
@@ -339,16 +342,28 @@ mod tests {
     fn a_files_reads_are_each_symbol_once_at_its_deepest() {
         let mut t = Trace::default();
         t.prompt(&Prompt { agent_id: Arc::from("main"), timestamp: "2026-09-27T10:00:00Z".into(), text: "go".into() });
-        for (id, symbol, depth) in [("r1", Some("impl App/fn run"), ReadDepth::Signature), ("r2", None, ReadDepth::Overview), ("r3", Some("App/run"), ReadDepth::FullBody)] {
+        let reads = [
+            ("r1", Some("impl App/fn run"), ReadDepth::Signature, false),
+            ("r2", None, ReadDepth::Overview, false),
+            ("r3", Some("App/run"), ReadDepth::FullBody, false),
+            ("r4", Some("App/stop"), ReadDepth::FullBody, true),
+            ("r5", None, ReadDepth::FullBody, true),
+        ];
+        for (id, symbol, depth, error) in reads {
             let mut c = crate::helpers::tool_call("Read", "/p/src/a.rs", depth);
             c.agent_id = Arc::from("main");
             c.tool_use_id = Some(Arc::from(id));
             c.timestamp_str = "2026-09-27T10:00:01Z".into();
             c.target_symbol = symbol.map(String::from);
             t.start(&c, Path::new("/p"));
+            t.finish(&ToolFinished { id: Arc::from(id), agent_id: Arc::from("main"), timestamp: "2026-09-27T10:00:02Z".into(), error, message: None, child_agent: None });
         }
         let d = detail(&t, &TraceIndex::new(&t), 0).unwrap();
-        assert_eq!(d.files[0].symbols_read(&t), vec![(Some("App/run".into()), ReadDepth::FullBody), (None, ReadDepth::Overview)]);
+        assert_eq!(
+            d.files[0].symbols_read(&t),
+            vec![(Some("App/run".into()), Some(ReadDepth::FullBody)), (None, Some(ReadDepth::Overview)), (Some("App/stop".into()), None)],
+            "a failed read saw nothing, and does not deepen one that succeeded"
+        );
     }
 
     #[test]

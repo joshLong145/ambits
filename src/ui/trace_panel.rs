@@ -3,6 +3,8 @@
 //! Its rows — files, agents, failures, commits, related calls — are what
 //! `Enter` opens when the panel has focus (`App::trace_panel_targets`).
 
+use std::ops::Range;
+
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -13,7 +15,7 @@ use ambits::app::{App, FocusPanel, PanelSubject};
 use ambits::trace::summary::{self, FileActivity, Row, TraceDetail};
 use ambits::trace::view;
 use ambits::trace::SpanKind;
-use ambits::writes::{Status, WriteRecord};
+use ambits::writes::{FileContents, Status, WriteRecord};
 
 use super::inspector::{depth_spans, fact, text};
 use super::trace_view::{instant_glyph, span_color, span_name, TraceFrame};
@@ -41,7 +43,7 @@ pub(super) fn render(f: &mut Frame, app: &App, area: Rect, frame: &TraceFrame<'_
     let mut at = None;
     let mut with_rows = |mut out: Vec<Line<'static>>, rows: &[Row<'_>]| {
         let (lines, picked) = rows_lines(app, frame, rows, selected, width);
-        at = picked.map(|p| p + out.len());
+        at = picked.map(|p| p.start + out.len()..p.end + out.len());
         out.extend(lines);
         out
     };
@@ -62,9 +64,9 @@ pub(super) fn render(f: &mut Frame, app: &App, area: Rect, frame: &TraceFrame<'_
         PanelSubject::Nothing => vec![Line::from(text(" No traces yet.", Color::DarkGray))],
     };
     let height = inner.height as usize;
-    // Scroll only as far as the selected row needs, with a line of what
-    // follows it in view.
-    let scroll = at.map_or(0, |at| (at + 2).saturating_sub(height)).min(lines.len().saturating_sub(height));
+    // Scroll only as far as the selected row needs to show what it has
+    // under it and a line more — never past the row itself.
+    let scroll = at.map_or(0, |at| (at.end + 1).saturating_sub(height).min(at.start)).min(lines.len().saturating_sub(height));
     f.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), inner);
 }
 
@@ -141,18 +143,19 @@ fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, width: usize) -> Vec<
 
     match s.kind {
         SpanKind::Read(depth) => {
-            let mut read = depth_spans(depth);
+            let mut read = depth_spans(depth, 0);
             read.extend(s.symbol_name().map(|name| text(format!(" of {name}"), Color::Gray)));
             out.push(fact("read", read));
             if let Some(id) = s.symbol_id() {
-                out.push(fact("now", depth_spans(app.ledger.depth_of(&id))));
+                out.push(fact("now", depth_spans(app.ledger.depth_of(&id), 0)));
             }
         }
         SpanKind::Write => match s.id.as_deref().and_then(|op| statuses.get(op)) {
             Some((w, status)) => {
                 let level = if w.syms.is_empty() { "file-level".to_string() } else { format!("{} symbol(s)", w.syms.len()) };
                 out.push(fact("wrote", vec![text(level, Color::White), text("  ", Color::Gray), write_word(*status)]));
-                let syms = if w.syms.is_empty() { Vec::new() } else { symbols_written(app, w, *status) };
+                let now = app.project_tree.file(&w.file).map(FileContents::from_symbols);
+                let syms = symbols_written(now.as_ref(), w);
                 for (name, status) in syms.iter().take(8) {
                     out.push(fact("", vec![text(fit(name, width.saturating_sub(26).max(8)), Color::White), text("  ", Color::Gray), write_word(*status)]));
                 }
@@ -183,16 +186,12 @@ fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, width: usize) -> Vec<
     out
 }
 
-/// What write `w` left and whether each still stands: its symbols by name
-/// path, or — a file-level write — the whole file, at `status`.
-fn symbols_written(app: &App, w: &WriteRecord, status: Status) -> Vec<(String, Status)> {
-    if w.syms.is_empty() {
-        return vec![(WHOLE_FILE.to_string(), status)];
-    }
-    let now = app.project_tree.file(&w.file).map(ambits::writes::FileContents::from_symbols);
+/// What symbol-level write `w` left, by name path, and whether each still
+/// stands against `now`, the file as the tree holds it (`None`: gone).
+fn symbols_written(now: Option<&FileContents>, w: &WriteRecord) -> Vec<(String, Status)> {
     w.syms
         .iter()
-        .map(|(id, _)| (ambits::symbols::split_id(id).1.to_string(), now.as_ref().map_or(Status::Removed, |n| n.symbol_status(id, w))))
+        .map(|(id, _)| (ambits::symbols::split_id(id).1.to_string(), now.map_or(Status::Removed, |n| n.symbol_status(id, w))))
         .collect()
 }
 
@@ -202,36 +201,58 @@ const WHOLE_FILE: &str = "(whole file)";
 /// Detail lines a file gets under its row, at most.
 const FILE_DETAIL: usize = 6;
 
+/// The width of a detail line's state column: `still there`.
+const STATE: usize = 11;
+
+/// What became of a trace's write to a symbol, as its latest write left it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wrote {
+    /// Journaled: whether it still stands.
+    Stands(Status),
+    /// The call failed: nothing was written.
+    Failed,
+    /// It succeeded, but no journal entry says what it wrote.
+    Unattributed,
+}
+
 /// Under a trace's file row: what it read of the file, each symbol at its
 /// deepest, then what it wrote, each symbol as its latest write left it.
+/// A failed call is listed as failed, and never outranks one that worked.
 fn file_details(app: &App, frame: &TraceFrame<'_>, file: &FileActivity, width: usize) -> Vec<Line<'static>> {
-    let mut wrote: Vec<(String, Status)> = Vec::new();
+    let spans = app.trace.spans();
+    let now = (!file.writes.is_empty()).then(|| app.project_tree.file(&file.file).map(FileContents::from_symbols)).flatten();
+    let mut wrote: Vec<(String, Wrote)> = Vec::new();
+    let mut note = |name: String, what: Wrote| match wrote.iter_mut().find(|(n, _)| *n == name) {
+        Some(slot) if what != Wrote::Failed || slot.1 == Wrote::Failed => slot.1 = what,
+        Some(_) => {}
+        None => wrote.push((name, what)),
+    };
     for &i in &file.writes {
-        let Some((w, status)) = app.trace.spans()[i].id.as_deref().and_then(|op| frame.statuses.get(op)) else { continue };
-        for (name, status) in symbols_written(app, w, *status) {
-            match wrote.iter_mut().find(|(n, _)| *n == name) {
-                Some(slot) => slot.1 = status,
-                None => wrote.push((name, status)),
+        let s = &spans[i];
+        match s.id.as_deref().and_then(|op| frame.statuses.get(op)) {
+            Some((w, status)) if w.syms.is_empty() => note(WHOLE_FILE.to_string(), Wrote::Stands(*status)),
+            Some((w, _)) => symbols_written(now.as_ref(), w).into_iter().for_each(|(name, status)| note(name, Wrote::Stands(status))),
+            None => {
+                let name = s.symbol_name().unwrap_or_else(|| WHOLE_FILE.to_string());
+                note(name, if s.error { Wrote::Failed } else { Wrote::Unattributed });
             }
         }
     }
-    let name_w = width.saturating_sub(5 + 6 + 14).max(8);
+    let name_w = width.saturating_sub(5 + 6 + 2 + STATE + 1).max(8);
+    let failed = || text(format!("✗ {:<STATE$}", "failed"), Color::Red);
     let read = file.symbols_read(&app.trace).into_iter().map(|(name, depth)| {
         let mut cells = vec![text("read  ", Color::DarkGray)];
-        let mut word = depth_spans(depth);
-        if let Some(last) = word.last_mut() {
-            *last = text(format!("{:<11}", last.content), Color::Gray);
-        }
-        cells.extend(word);
-        cells.push(text(fit(name.as_deref().unwrap_or(WHOLE_FILE), name_w), Color::White));
+        cells.extend(depth.map_or_else(|| vec![failed()], |d| depth_spans(d, STATE)));
+        cells.push(text(format!(" {}", fit(name.as_deref().unwrap_or(WHOLE_FILE), name_w)), Color::White));
         cells
     });
-    let written = wrote.into_iter().map(|(name, status)| {
-        vec![
-            text("wrote ", Color::DarkGray),
-            text(format!("✎ {:<11}", status.word()), tree_view::write_color(status)),
-            text(fit(&name, name_w), Color::White),
-        ]
+    let written = wrote.into_iter().map(|(name, what)| {
+        let state = match what {
+            Wrote::Stands(status) => text(format!("✎ {:<STATE$}", status.word()), tree_view::write_color(status)),
+            Wrote::Failed => failed(),
+            Wrote::Unattributed => text(format!("? {:<STATE$}", "unjournaled"), Color::DarkGray),
+        };
+        vec![text("wrote ", Color::DarkGray), state, text(format!(" {}", fit(&name, name_w)), Color::White)]
     });
     let all: Vec<Vec<Span<'static>>> = read.chain(written).collect();
     let more = all.len().saturating_sub(FILE_DETAIL);
@@ -257,8 +278,8 @@ fn file_name_width(width: usize) -> usize {
 
 /// The panel's selectable rows, under a heading per section, the selected
 /// one marked: the same list, in the same order, that `Enter` opens. With
-/// the line the selected row is on.
-fn rows_lines(app: &App, frame: &TraceFrame<'_>, rows: &[Row<'_>], selected: Option<usize>, width: usize) -> (Vec<Line<'static>>, Option<usize>) {
+/// the lines the selected row and what it shows under it take.
+fn rows_lines(app: &App, frame: &TraceFrame<'_>, rows: &[Row<'_>], selected: Option<usize>, width: usize) -> (Vec<Line<'static>>, Option<Range<usize>>) {
     let spans = app.trace.spans();
     let picked = selected.map(|s| s.min(rows.len().saturating_sub(1)));
     let mut at = None;
@@ -307,15 +328,16 @@ fn rows_lines(app: &App, frame: &TraceFrame<'_>, rows: &[Row<'_>], selected: Opt
             ],
         };
         let pick = picked == Some(n);
-        if pick {
-            at = Some(out.len());
-        }
+        let first = out.len();
         let mut line = vec![Span::styled(if pick { " › " } else { "   " }, Style::default().fg(colors::HIGHLIGHT_FG))];
         line.extend(cells);
         let line = Line::from(line);
         out.push(if pick { line.style(Style::default().bg(colors::HIGHLIGHT_BG).add_modifier(Modifier::BOLD)) } else { line });
         if let Row::File(file) = row {
             out.extend(file_details(app, frame, file, width));
+        }
+        if pick {
+            at = Some(first..out.len());
         }
     }
     (out, at)
@@ -385,12 +407,28 @@ mod tests {
             ..Default::default()
         });
         let text = screen(&app);
-        for want in ["read  ● full body  (whole file)", "wrote ✎ gone       App/run"] {
+        for want in ["read  ● full body   (whole file)", "wrote ✎ gone        App/run", "wrote ✗ failed      (whole file)"] {
             assert!(text.contains(want), "{want}: {text}");
         }
         let lines: Vec<&str> = text.lines().collect();
         let a = lines.iter().position(|l| l.contains("src/a.rs")).unwrap();
         assert!(lines[a + 1].contains("read") && lines[a + 2].contains("wrote"), "under src/a.rs: {text}");
+    }
+
+    /// A read that failed saw nothing: it says so, and a write no journal
+    /// entry explains is not passed off as one.
+    #[test]
+    fn failed_and_unjournaled_calls_say_so() {
+        let mut app = app();
+        call(&mut app, "r2", "Read", "src/c.rs", "2026-09-27T10:00:07Z", "2026-09-27T10:00:08Z", Some("File does not exist."));
+        call(&mut app, "e3", "Edit", "src/c.rs", "2026-09-27T10:00:09Z", "2026-09-27T10:00:10Z", None);
+        let text = screen(&app);
+        for want in ["read  ✗ failed      (whole file)", "wrote ? unjournaled (whole file)"] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let c = lines.iter().position(|l| l.contains("src/c.rs")).unwrap();
+        assert!(lines[c + 1].contains("✗ failed") && !lines[c + 1].contains("full body"), "not passed off as a read: {text}");
     }
 
     /// With more rows than room, the panel scrolls to the selected one.
@@ -401,9 +439,13 @@ mod tests {
             call(&mut app, &format!("m{n}"), "Read", &format!("src/m{n:02}.rs"), "2026-09-27T10:00:07Z", "2026-09-27T10:00:08Z", None);
         }
         app.focus = FocusPanel::Right;
+        // Rows: a.rs, b.rs, m00–m19, the failure.
         app.panel_index = 21;
         let text = screen(&app);
-        assert!(text.contains(" › "), "the selected row is drawn: {text}");
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines.iter().position(|l| l.contains(" › ")).unwrap_or_else(|| panic!("the selected row is drawn: {text}"));
+        assert!(lines[at].contains("src/m19.rs"), "{text}");
+        assert!(lines[at + 1].contains("read  ● full body"), "with what it shows under it: {text}");
     }
 
     #[test]

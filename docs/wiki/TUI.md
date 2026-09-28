@@ -200,8 +200,8 @@ In the trace view the right-hand panel follows the selection.
 
  files                          read wrote
  › src/trace/view.rs               4     3  ✎ still there
-     read  ● full body  (whole file)
-     read  ◐ signature  TraceView/zoom
+     read  ● full body   (whole file)
+     read  ◐ signature   TraceView/zoom
      wrote ✎ still there TraceView/fit
      wrote ✎ changed     Viewport
      … 3 more
@@ -220,8 +220,11 @@ agents, its failed calls with the reason, and the commits made meanwhile.
 
 Under each file, what the trace read of it — each symbol once, at the
 deepest it was read, `(whole file)` for a read of all of it — then what it
-wrote, each symbol as its latest write in the trace left it. Up to six
-lines a file; the panel scrolls to keep the selected row in view.
+wrote, each symbol as its latest write in the trace left it. A call that
+failed says `✗ failed` — a failed read saw nothing, and never outranks one
+that worked — and a write no journal entry explains says `? unjournaled`.
+Up to six lines a file; the panel scrolls to keep the selected row, and
+what it shows under it, in view.
 
 **A call**: who made it, when and for how long, in which trace; why it
 failed (the error's own line: a traceback's last, a compiler's first

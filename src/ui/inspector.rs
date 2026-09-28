@@ -65,9 +65,11 @@ pub(super) fn depth_word(depth: ReadDepth) -> &'static str {
     }
 }
 
-/// `● full body`: a read depth's glyph, in its colour, and its word.
-pub(super) fn depth_spans(depth: ReadDepth) -> Vec<Span<'static>> {
-    vec![text(format!("{} ", tree_view::depth_glyph(depth)), tree_view::depth_color(depth, false)), text(depth_word(depth), Color::White)]
+/// `● full body`: a read depth's glyph, in its colour, and its word,
+/// padded to `pad` for a column (0 for none).
+pub(super) fn depth_spans(depth: ReadDepth, pad: usize) -> Vec<Span<'static>> {
+    let word = format!("{:<pad$}", depth_word(depth));
+    vec![text(format!("{} ", tree_view::depth_glyph(depth)), tree_view::depth_color(depth, false)), text(word, Color::White)]
 }
 
 fn symbol_facts(app: &App, row: &ambits::app::TreeRow) -> Vec<Line<'static>> {
@@ -75,7 +77,7 @@ fn symbol_facts(app: &App, row: &ambits::app::TreeRow) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     // Read: the depth, and who read it how deeply.
-    let mut read = depth_spans(depth);
+    let mut read = depth_spans(depth, 0);
     if let Some(entry) = app.ledger.entries.get(&row.symbol_id).filter(|_| depth.is_seen()) {
         let mut by: Vec<(String, ReadDepth)> =
             entry.agent_depths.iter().filter(|(_, d)| d.is_seen()).map(|(a, d)| (app.agent_name(a).to_string(), *d)).collect();
