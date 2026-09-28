@@ -11,7 +11,7 @@ use ambits::writes::Status;
 use super::colors;
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let border_style = if app.focus == FocusPanel::Tree {
+    let border_style = if app.focus == FocusPanel::Left {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)

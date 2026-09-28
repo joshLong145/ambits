@@ -19,7 +19,7 @@ use super::{colors, tree_view};
 const LABEL: usize = 9;
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let focused = app.focus == FocusPanel::Stats;
+    let focused = app.focus == FocusPanel::Right;
     let border = if focused { Color::Cyan } else { Color::DarkGray };
     let Some(row) = app.tree_rows.get(app.selected_index) else {
         let block = Block::default().title(" Inspector ").borders(Borders::ALL).border_style(Style::default().fg(border));
@@ -141,7 +141,7 @@ fn traces(app: &App, focused: bool, room: usize, width: usize) -> Vec<Line<'stat
     let hint = if focused { " · Enter opens" } else { " · Tab to choose" };
     let n = touches.len();
     let mut lines = vec![fact("traces", vec![text(format!("{n} prompt{}{hint}", if n == 1 { "" } else { "s" }), Color::White)])];
-    let selected = app.inspector_index.min(touches.len() - 1);
+    let selected = app.panel_index.min(touches.len() - 1);
     let rows = room.saturating_sub(1).max(1);
     let first = selected.saturating_sub(rows - 1);
     for (ix, t) in touches.iter().enumerate().skip(first).take(rows) {
@@ -243,6 +243,6 @@ mod tests {
         assert!(app.show_activity);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.focus, FocusPanel::Activity, "the feed takes focus once shown");
+        assert_eq!(app.focus, FocusPanel::Feed, "the feed takes focus once shown");
     }
 }

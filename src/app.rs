@@ -94,9 +94,12 @@ pub enum RightPane {
 /// Which panel is focused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPanel {
-    Tree,
-    Stats,
-    Activity,
+    /// The file tree, or the trace view in its place.
+    Left,
+    /// The inspector, the session pane, or the trace panel.
+    Right,
+    /// The activity feed, when shown.
+    Feed,
 }
 
 /// How the TUI journals a session (see [`App::attach_journal`]).
@@ -211,8 +214,9 @@ pub struct App {
     pub right_pane: RightPane,
     /// Whether the activity feed is shown (`f`).
     pub show_activity: bool,
-    /// The trace selected in the inspector's list.
-    pub inspector_index: usize,
+    /// The row selected in the right-hand panel (the inspector's traces,
+    /// the trace panel's rows).
+    pub panel_index: usize,
 
     /// Path filter restricting which files are tracked, if any. Shared with
     /// the TUI re-parse paths (file watcher, Serena cache rescan) so that
@@ -249,7 +253,7 @@ impl App {
             agent_tree: AgentTree::new(),
             agent_filter: None,
             agent_selection_index: 0,
-            focus: FocusPanel::Tree,
+            focus: FocusPanel::Left,
             sort_mode: SortMode::Alphabetical,
             search_mode: false,
             search_query: String::new(),
@@ -273,7 +277,7 @@ impl App {
             trace_drag: None,
             right_pane: RightPane::Inspector,
             show_activity: false,
-            inspector_index: 0,
+            panel_index: 0,
             filter: None,
             editor_template: None,
             pending_editor_request: None,
@@ -663,44 +667,83 @@ impl App {
             self.handle_search_key(key);
             return;
         }
-        if self.trace_view.open {
+        if self.trace_view.typing {
             self.handle_trace_key(key);
             return;
         }
-
+        // The same in every view.
+        let overlay = self.show_compaction_overlay || self.show_alignment_overlay;
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true;
+            KeyCode::Char('q') => return self.should_quit = true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return self.should_quit = true,
+            KeyCode::Tab => return self.cycle_focus(true),
+            KeyCode::BackTab => return self.cycle_focus(false),
+            KeyCode::Char('[') if !overlay => return self.cycle_agent_filter_backward(),
+            KeyCode::Char(']') if !overlay => return self.cycle_agent_filter(),
+            KeyCode::Char('i') => {
+                self.right_pane = match self.right_pane {
+                    RightPane::Inspector => RightPane::Session,
+                    RightPane::Session => RightPane::Inspector,
+                };
+                return;
             }
-            KeyCode::Char('j') | KeyCode::Down if self.inspecting() => self.inspector_index += 1,
-            KeyCode::Char('k') | KeyCode::Up if self.inspecting() => self.inspector_index = self.inspector_index.saturating_sub(1),
-            KeyCode::Enter if self.inspecting() => self.open_inspected_trace(),
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.focus == FocusPanel::Stats {
-                    self.move_agent_selection(1);
-                } else {
-                    self.move_selection(1);
+            KeyCode::Char('f') => {
+                self.show_activity = !self.show_activity;
+                if !self.show_activity && self.focus == FocusPanel::Feed {
+                    self.focus = FocusPanel::Left;
+                }
+                return;
+            }
+            KeyCode::Esc if self.focus != FocusPanel::Left && !overlay => return self.focus = FocusPanel::Left,
+            _ => {}
+        }
+        match self.focus {
+            FocusPanel::Right => self.handle_right_key(key),
+            FocusPanel::Feed => self.handle_feed_key(key),
+            FocusPanel::Left if self.trace_view.open => {
+                let before = (self.trace_view.selected, self.trace_view.list, self.trace_view.focus);
+                self.handle_trace_key(key);
+                if (self.trace_view.selected, self.trace_view.list, self.trace_view.focus) != before {
+                    self.panel_index = 0;
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if self.focus == FocusPanel::Stats {
-                    self.move_agent_selection(-1);
-                } else {
-                    self.move_selection(-1);
-                }
+            FocusPanel::Left => self.handle_tree_key(key),
+        }
+    }
+
+    /// The right-hand panel's keys: its rows, and what `Enter` opens.
+    fn handle_right_key(&mut self, key: KeyEvent) {
+        match (self.trace_view.open, self.right_pane, key.code) {
+            (_, _, KeyCode::Char('j') | KeyCode::Down) if self.trace_view.open || self.right_pane == RightPane::Inspector => self.panel_index += 1,
+            (_, _, KeyCode::Char('k') | KeyCode::Up) if self.trace_view.open || self.right_pane == RightPane::Inspector => {
+                self.panel_index = self.panel_index.saturating_sub(1)
             }
-            KeyCode::Char('l') | KeyCode::Right => {
-                if self.focus == FocusPanel::Stats {
-                    self.apply_agent_selection();
-                } else {
-                    self.toggle_expand();
-                }
-            }
+            (false, RightPane::Inspector, KeyCode::Enter) => self.open_inspected_trace(),
+            (false, RightPane::Session, KeyCode::Char('j') | KeyCode::Down) => self.move_agent_selection(1),
+            (false, RightPane::Session, KeyCode::Char('k') | KeyCode::Up) => self.move_agent_selection(-1),
+            (false, RightPane::Session, KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter) => self.apply_agent_selection(),
+            _ => {}
+        }
+    }
+
+    /// The activity feed's keys: scroll it.
+    fn handle_feed_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('k') | KeyCode::Up => self.activity_scroll_offset = self.activity_scroll_offset.saturating_add(1),
+            KeyCode::Char('j') | KeyCode::Down => self.activity_scroll_offset = self.activity_scroll_offset.saturating_sub(1),
+            KeyCode::Char('G') => self.activity_scroll_offset = 0,
+            _ => {}
+        }
+    }
+
+    /// The file tree's keys.
+    fn handle_tree_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+            KeyCode::Char('l') | KeyCode::Right => self.toggle_expand(),
             KeyCode::Enter => {
-                if self.focus == FocusPanel::Stats {
-                    self.apply_agent_selection();
-                } else if self.selected_expandable().is_some() {
+                if self.selected_expandable().is_some() {
                     self.toggle_expand();
                 } else {
                     self.open_selected_in_editor();
@@ -739,23 +782,9 @@ impl App {
             }
             KeyCode::Char('d') => self.open_alignment_overlay(),
             KeyCode::Char('t') => self.trace_view.open = true,
-            KeyCode::Char('i') => {
-                self.right_pane = match self.right_pane {
-                    RightPane::Inspector => RightPane::Session,
-                    RightPane::Session => RightPane::Inspector,
-                };
-            }
-            KeyCode::Char('f') => {
-                self.show_activity = !self.show_activity;
-                if !self.show_activity && self.focus == FocusPanel::Activity {
-                    self.focus = FocusPanel::Tree;
-                }
-            }
             KeyCode::Esc if self.show_alignment_overlay => {
                 self.show_alignment_overlay = false;
             }
-            KeyCode::Tab => self.cycle_focus(),
-            KeyCode::BackTab => self.cycle_agent_filter_backward(),
             KeyCode::PageDown => self.move_selection(20),
             KeyCode::PageUp => self.move_selection(-20),
             _ => {}
@@ -769,18 +798,18 @@ impl App {
         }
         match mouse.kind {
             MouseEventKind::ScrollUp => match self.focus {
-                FocusPanel::Activity => {
+                FocusPanel::Feed => {
                     self.activity_scroll_offset = self.activity_scroll_offset.saturating_add(3);
                 }
-                FocusPanel::Stats => self.move_agent_selection(-1),
-                FocusPanel::Tree => self.move_selection(-3),
+                FocusPanel::Right => self.move_agent_selection(-1),
+                FocusPanel::Left => self.move_selection(-3),
             },
             MouseEventKind::ScrollDown => match self.focus {
-                FocusPanel::Activity => {
+                FocusPanel::Feed => {
                     self.activity_scroll_offset = self.activity_scroll_offset.saturating_sub(3);
                 }
-                FocusPanel::Stats => self.move_agent_selection(1),
-                FocusPanel::Tree => self.move_selection(3),
+                FocusPanel::Right => self.move_agent_selection(1),
+                FocusPanel::Left => self.move_selection(3),
             },
             _ => {}
         }
@@ -835,8 +864,6 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.should_quit = true,
             KeyCode::Char('t') => self.trace_view.open = false,
             KeyCode::Esc | KeyCode::Backspace => self.trace_view.close_trace(),
             KeyCode::Char('v') => {
@@ -883,8 +910,6 @@ impl App {
                 self.follow_selection_to_track();
             }
             KeyCode::Enter => self.follow_trace_selection(),
-            KeyCode::Tab => self.cycle_agent_filter(),
-            KeyCode::BackTab => self.cycle_agent_filter_backward(),
             _ => {}
         }
     }
@@ -895,8 +920,6 @@ impl App {
         let traces = self.trace_list();
         let tv = &mut self.trace_view;
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.should_quit = true,
             KeyCode::Char('t') | KeyCode::Esc => tv.open = false,
             KeyCode::Char('j') | KeyCode::Down => tv.move_list(&traces, 1),
             KeyCode::Char('k') | KeyCode::Up => tv.move_list(&traces, -1),
@@ -910,8 +933,6 @@ impl App {
                 }
             }
             KeyCode::Char('v') => tv.layout = if tv.layout == Layout::Waterfall { Layout::Tracks } else { Layout::Waterfall },
-            KeyCode::Tab => self.cycle_agent_filter(),
-            KeyCode::BackTab => self.cycle_agent_filter_backward(),
             _ => {}
         }
     }
@@ -960,7 +981,7 @@ impl App {
         if let Some(file) = &span.file {
             if self.reveal(file, span.symbol.as_deref()) {
                 self.trace_view.open = false;
-                self.focus = FocusPanel::Tree;
+                self.focus = FocusPanel::Left;
             }
         }
     }
@@ -1096,13 +1117,10 @@ impl App {
         }
         let new_idx = self.selected_index as i32 + delta;
         self.selected_index = new_idx.clamp(0, self.tree_rows.len() as i32 - 1) as usize;
-        self.inspector_index = 0;
+        self.panel_index = 0;
     }
 
-    /// Keys go to the inspector's trace list.
-    fn inspecting(&self) -> bool {
-        self.focus == FocusPanel::Stats && self.right_pane == RightPane::Inspector
-    }
+
 
     fn select_first(&mut self) {
         self.selected_index = 0;
@@ -1368,12 +1386,14 @@ impl App {
     }
 
     /// Tree, the right-hand pane, then the activity feed when it shows.
-    fn cycle_focus(&mut self) {
-        self.focus = match self.focus {
-            FocusPanel::Tree => FocusPanel::Stats,
-            FocusPanel::Stats if self.show_activity => FocusPanel::Activity,
-            FocusPanel::Stats | FocusPanel::Activity => FocusPanel::Tree,
-        };
+    /// Move focus forward (`Tab`) or back (`Shift+Tab`) through the left
+    /// panel, the right panel and — when shown — the feed.
+    fn cycle_focus(&mut self, forward: bool) {
+        let order: &[FocusPanel] =
+            if self.show_activity { &[FocusPanel::Left, FocusPanel::Right, FocusPanel::Feed] } else { &[FocusPanel::Left, FocusPanel::Right] };
+        let at = order.iter().position(|f| *f == self.focus).unwrap_or(0);
+        let next = if forward { (at + 1) % order.len() } else { (at + order.len() - 1) % order.len() };
+        self.focus = order[next];
     }
 
     /// The traces that touched the selected row, for the inspector.
@@ -1389,11 +1409,11 @@ impl App {
     /// Open the trace the inspector has selected, at its first call on the row.
     fn open_inspected_trace(&mut self) {
         let touches = self.inspector_touches();
-        let Some(t) = touches.get(self.inspector_index.min(touches.len().saturating_sub(1))) else { return };
+        let Some(t) = touches.get(self.panel_index.min(touches.len().saturating_sub(1))) else { return };
         self.trace_view.open = true;
         self.trace_view.open_trace(t.root);
         self.trace_view.selected = Some(crate::trace::view::Item::Span(t.span));
-        self.focus = FocusPanel::Tree;
+        self.focus = FocusPanel::Left;
     }
 
     fn jump_to_search_match(&mut self) {
@@ -2565,7 +2585,7 @@ mod tests {
 
         app.process_agent_event(e1);
         app.process_agent_event(e2);
-        app.focus = FocusPanel::Stats;
+        app.focus = FocusPanel::Right;
 
         // Start at 0 (All)
         assert_eq!(app.agent_selection_index, 0);
@@ -2617,7 +2637,7 @@ mod tests {
 
         // Step the cursor through every agent row and apply it; each row must
         // resolve to the agent rendered on that row.
-        app.focus = FocusPanel::Stats;
+        app.focus = FocusPanel::Right;
         for (i, (agent_id, _)) in flat.iter().enumerate() {
             app.move_agent_selection(1);
             app.apply_agent_selection();
@@ -2721,7 +2741,7 @@ mod tests {
         }
 
         // Focus activity panel and scroll up
-        app.focus = FocusPanel::Activity;
+        app.focus = FocusPanel::Feed;
         let scroll_up = MouseEvent {
             kind: MouseEventKind::ScrollUp,
             column: 0,
@@ -2742,7 +2762,7 @@ mod tests {
         assert_eq!(app.activity_scroll_offset, 0);
 
         // Focus tree panel — scroll should move tree selection, not activity
-        app.focus = FocusPanel::Tree;
+        app.focus = FocusPanel::Left;
         app.activity_scroll_offset = 5;
         app.handle_mouse(scroll_up);
         assert_eq!(app.activity_scroll_offset, 5); // unchanged
@@ -3648,13 +3668,61 @@ mod trace_view_tests {
     }
 
     #[test]
-    fn e_finds_the_failure_and_tab_filters_by_agent() {
+    fn e_finds_the_failure_and_brackets_filter_by_agent() {
         let mut app = app();
         key(&mut app, KeyCode::Char('e'));
         assert_eq!(app.trace_view.selected, Some(Item::Span(2)));
-        key(&mut app, KeyCode::Tab);
-        assert!(app.agent_filter.is_some(), "tab cycles the agent filter");
+        key(&mut app, KeyCode::Char(']'));
+        assert!(app.agent_filter.is_some(), "] cycles the agent filter");
+        key(&mut app, KeyCode::Char('['));
+        assert!(app.agent_filter.is_none(), "[ cycles it back");
         assert!(app.trace_view.open);
+    }
+
+    /// One focus model in every view: Tab and Shift+Tab move between the
+    /// panels, `[` `]` move the agent filter, Esc brings focus back left.
+    #[test]
+    fn tab_moves_focus_and_brackets_move_the_filter_in_every_view() {
+        let mut app = app();
+        for view in ["timeline", "list", "tree"] {
+            match view {
+                "list" => key(&mut app, KeyCode::Esc),
+                "tree" => key(&mut app, KeyCode::Char('t')),
+                _ => {}
+            }
+            assert_eq!(app.focus, FocusPanel::Left, "{view}");
+            key(&mut app, KeyCode::Tab);
+            assert_eq!(app.focus, FocusPanel::Right, "{view}: tab");
+            key(&mut app, KeyCode::Tab);
+            assert_eq!(app.focus, FocusPanel::Left, "{view}: no feed shown, so back left");
+            key(&mut app, KeyCode::BackTab);
+            assert_eq!(app.focus, FocusPanel::Right, "{view}: shift+tab");
+            key(&mut app, KeyCode::Esc);
+            assert_eq!(app.focus, FocusPanel::Left, "{view}: esc");
+            key(&mut app, KeyCode::Char(']'));
+            assert!(app.agent_filter.is_some(), "{view}: ]");
+            key(&mut app, KeyCode::Char('['));
+            assert!(app.agent_filter.is_none(), "{view}: [");
+        }
+        assert!(!app.trace_view.open, "ended on the tree");
+    }
+
+    /// With focus on the right panel, j/k move its rows and leave the
+    /// timeline's selection alone.
+    #[test]
+    fn keys_go_to_the_focused_panel() {
+        let mut app = app();
+        key(&mut app, KeyCode::Char('j'));
+        let selected = app.trace_view.selected;
+        key(&mut app, KeyCode::Tab);
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.panel_index, 2);
+        assert_eq!(app.trace_view.selected, selected);
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('j'));
+        assert_ne!(app.trace_view.selected, selected);
+        assert_eq!(app.panel_index, 0, "a new selection starts the panel over");
     }
 
     #[test]

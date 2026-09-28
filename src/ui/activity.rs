@@ -36,7 +36,7 @@ fn build_feed<'a>(app: &'a App) -> Vec<FeedEntry<'a>> {
 }
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let border_style = if app.focus == FocusPanel::Activity {
+    let border_style = if app.focus == FocusPanel::Feed {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)

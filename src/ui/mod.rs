@@ -155,94 +155,62 @@ pub(crate) fn fit(text: &str, width: usize) -> String {
     out
 }
 
+/// The keys of whatever has focus, and the ones that work everywhere.
 fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    use ambits::app::FocusPanel;
     use ratatui::style::{Color, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::Paragraph;
 
+    let keys = |pairs: &[(&'static str, &'static str)]| -> Vec<Span<'static>> {
+        pairs.iter().flat_map(|(k, what)| [Span::styled(*k, Style::default().fg(Color::DarkGray)), Span::raw(*what)]).collect()
+    };
     let status = if let Some(ref message) = app.last_editor_error {
-        Line::from(vec![Span::styled(
-            format!(" {message}"),
-            Style::default().fg(Color::Red),
-        )])
-    } else if app.trace_view.open {
-        let key = |k: &'static str, what: &'static str| [Span::styled(k, Style::default().fg(Color::DarkGray)), Span::raw(what)];
-        let mut spans = vec![Span::raw(" ")];
-        for (k, what) in [
-            ("[t]", "ree "), ("[v]", "layout "), ("[w/s]", "zoom "), ("[a/d]", "pan "), ("[0]", "fit "),
-            ("[j/k]", "row "), ("[h/l]", "fold/step "), ("[enter]", "follow "), ("[space]", "fold "),
-            ("[/]", "find "), ("[e]", "rror "), ("[tab]", "agent "),
-        ] {
-            spans.extend(key(k, what));
-        }
-        Line::from(spans)
+        Line::from(Span::styled(format!(" {message}"), Style::default().fg(Color::Red)))
     } else if app.search_mode {
         Line::from(vec![
             Span::styled(" /", Style::default().fg(Color::Yellow)),
-            Span::raw(&app.search_query),
+            Span::raw(app.search_query.clone()),
             Span::styled("_", Style::default().fg(Color::Yellow)),
         ])
     } else {
-        let mut spans = vec![
-            Span::styled(" [q]", Style::default().fg(Color::DarkGray)),
-            Span::raw("uit "),
-            Span::styled("[j/k]", Style::default().fg(Color::DarkGray)),
-            Span::raw("nav "),
-            Span::styled("[h/l]", Style::default().fg(Color::DarkGray)),
-            Span::raw("expand "),
-            Span::styled("[enter]", Style::default().fg(Color::DarkGray)),
-            Span::raw("open "),
-            Span::styled("[/]", Style::default().fg(Color::DarkGray)),
-            Span::raw("search "),
-            Span::styled("[s]", Style::default().fg(Color::DarkGray)),
-            Span::raw(match app.sort_mode {
-                SortMode::Alphabetical => "ort:A-Z ",
-                SortMode::ByCoverage => "ort:cov ",
-            }),
-            Span::styled("[a/A]", Style::default().fg(Color::DarkGray)),
-            Span::raw("gents "),
-            Span::styled("[tab]", Style::default().fg(Color::DarkGray)),
-            Span::raw("focus "),
-            Span::styled("[t]", Style::default().fg(Color::DarkGray)),
-            Span::raw("races "),
-            Span::styled("[i]", Style::default().fg(Color::DarkGray)),
-            Span::raw(match app.right_pane {
-                RightPane::Inspector => "session ",
-                RightPane::Session => "nspector ",
-            }),
-            Span::styled("[f]", Style::default().fg(Color::DarkGray)),
-            Span::raw("eed "),
-        ];
-
-        if !app.compaction_history.is_empty() {
-            spans.push(Span::styled("[C]", Style::default().fg(Color::Yellow)));
-            spans.push(Span::raw(if app.show_compaction_overlay {
-                "close "
-            } else {
-                "ompact "
-            }));
-        }
-
-        if app.agent_filter.is_some() {
-            spans.push(Span::styled("[d]", Style::default().fg(Color::DarkGray)));
-            spans.push(Span::raw("iff-align "));
-        }
-
-        // Show current agent filter
+        let mut spans = vec![Span::raw(" ")];
+        spans.extend(match (app.focus, app.trace_view.open, app.trace_view.focus.is_some()) {
+            (FocusPanel::Right, true, _) => keys(&[("[j/k]", "row "), ("[enter]", "open "), ("[esc]", "back ")]),
+            (FocusPanel::Right, false, _) => keys(&[("[j/k]", "row "), ("[enter]", "open "), ("[esc]", "back "), ("[i]", "switch ")]),
+            (FocusPanel::Feed, ..) => keys(&[("[j/k]", "scroll "), ("[G]", "latest "), ("[esc]", "back ")]),
+            (FocusPanel::Left, true, true) => keys(&[
+                ("[esc]", "traces "), ("[t]", "ree "), ("[v]", "layout "), ("[w/s]", "zoom "), ("[a/d]", "pan "), ("[0]", "fit "),
+                ("[j/k]", "row "), ("[h/l]", "fold/step "), ("[enter]", "follow "), ("[/]", "find "), ("[e]", "rror "),
+            ]),
+            (FocusPanel::Left, true, false) => keys(&[("[j/k]", "trace "), ("[enter]", "open "), ("[v]", "layout "), ("[t]/[esc]", "tree ")]),
+            (FocusPanel::Left, false, _) => {
+                let mut k = keys(&[("[j/k]", "nav "), ("[h/l]", "expand "), ("[enter]", "open "), ("[/]", "search ")]);
+                k.push(Span::styled("[s]", Style::default().fg(Color::DarkGray)));
+                k.push(Span::raw(match app.sort_mode {
+                    SortMode::Alphabetical => "ort:A-Z ",
+                    SortMode::ByCoverage => "ort:cov ",
+                }));
+                k.extend(keys(&[("[t]", "races ")]));
+                if !app.compaction_history.is_empty() {
+                    k.push(Span::styled("[C]", Style::default().fg(Color::Yellow)));
+                    k.push(Span::raw(if app.show_compaction_overlay { "close " } else { "ompact " }));
+                }
+                if app.agent_filter.is_some() {
+                    k.extend(keys(&[("[d]", "iff-align ")]));
+                }
+                k
+            }
+        });
+        // Everywhere.
+        spans.extend(keys(&[("│ [tab]", "panel "), ("[ ]", "agent "), ("[f]", "eed "), ("[q]", "uit")]));
         if let Some(ref agent_id) = app.agent_filter {
-            spans.push(Span::styled(
-                format!(" Agent: {}", stats::short_id(agent_id)),
-                Style::default().fg(Color::Yellow),
-            ));
+            spans.push(Span::styled(format!("  Agent: {}", stats::short_id(agent_id)), Style::default().fg(Color::Yellow)));
         }
-
         Line::from(spans)
     };
 
-    f.render_widget(
-        Paragraph::new(status).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
-        area,
-    );
+    f.render_widget(Paragraph::new(status).style(Style::default().bg(Color::DarkGray).fg(Color::White)), area);
 }
 
 /// Center a box of `percent_x` × `percent_y` inside `area`.
