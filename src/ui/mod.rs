@@ -6,40 +6,46 @@ pub mod activity;
 pub mod compaction;
 pub mod alignment;
 pub mod trace_view;
+pub mod inspector;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 
-use ambits::app::{App, SortMode};
+use ambits::app::{App, RightPane, SortMode};
 
 pub fn render(f: &mut Frame, app: &App) {
+    let activity_h = if app.show_activity { 8 } else { 0 };
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(10),       // top: tree + stats
-            Constraint::Length(8),     // bottom: activity feed
-            Constraint::Length(1),     // detail line
-            Constraint::Length(1),     // status bar
+            Constraint::Length(1),          // header: session and totals
+            Constraint::Min(10),            // tree | inspector
+            Constraint::Length(activity_h), // activity feed, on `f`
+            Constraint::Length(1),          // legend
+            Constraint::Length(1),          // status bar
         ])
         .split(f.area());
 
-    let top = Layout::default()
+    let main = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(62),  // tree
-            Constraint::Percentage(38),  // stats
-        ])
-        .split(outer[0]);
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(outer[1]);
 
+    render_header(f, app, outer[0]);
     if app.trace_view.open {
-        trace_view::render(f, app, top[0]);
+        trace_view::render(f, app, main[0]);
     } else {
-        tree_view::render(f, app, top[0]);
+        tree_view::render(f, app, main[0]);
     }
-    stats::render(f, app, top[1]);
-    activity::render(f, app, outer[1]);
-    render_detail_line(f, app, outer[2]);
-    render_status_bar(f, app, outer[3]);
+    match app.right_pane {
+        RightPane::Inspector => inspector::render(f, app, main[1]),
+        RightPane::Session => stats::render(f, app, main[1]),
+    }
+    if app.show_activity {
+        activity::render(f, app, outer[2]);
+    }
+    render_legend(f, outer[3]);
+    render_status_bar(f, app, outer[4]);
 
     if app.show_compaction_overlay && !app.compaction_history.is_empty() {
         compaction::render(f, app, f.area());
@@ -50,13 +56,76 @@ pub fn render(f: &mut Frame, app: &App) {
     }
 }
 
-/// The selected row's facts ([`App::detail_line`]), cut to fit.
-fn render_detail_line(f: &mut Frame, app: &App, area: Rect) {
-    use ratatui::style::{Color, Style};
+/// ` ambits · <session> · all agents    42% seen 120/284  ●90 ◕10 ◑12 ◔8  !4 ◌20  ✎12`
+fn render_header(f: &mut Frame, app: &App, area: Rect) {
+    use ambits::tracking::ReadDepth;
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
     use ratatui::widgets::Paragraph;
 
-    let text = app.detail_line().map(|line| fit(&format!(" {line}"), area.width as usize)).unwrap_or_default();
-    f.render_widget(Paragraph::new(text).style(Style::default().fg(Color::Gray)), area);
+    let filter = app.agent_filter.as_deref();
+    let (counts, seen) = match filter {
+        Some(a) => (app.ledger.count_by_depth_for_agent(a), app.ledger.total_seen_for_agent(a)),
+        None => (app.ledger.count_by_depth(), app.ledger.total_seen()),
+    };
+    let total = app.project_tree.total_symbols();
+    let pct = (seen * 100).checked_div(total).unwrap_or(0);
+    let session = app.session_slug.clone().or_else(|| app.session_id.as_ref().map(|s| s.chars().take(8).collect())).unwrap_or_else(|| "no session".into());
+    let who = filter.map_or("all agents".to_string(), |a| app.agent_name(a).to_string());
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut spans = vec![
+        Span::styled(" ambits", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" · {session} · {who}"), Style::default().fg(Color::Gray)),
+    ];
+    if let Some(p) = &app.filter {
+        spans.push(Span::styled(format!(" · {}", p.display()), dim));
+    }
+    spans.push(Span::styled(format!("    {pct}% seen", ), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+    spans.push(Span::styled(format!(" {seen}/{total} "), dim));
+    for depth in [ReadDepth::FullBody, ReadDepth::Signature, ReadDepth::Overview, ReadDepth::NameOnly] {
+        let n = counts.get(&depth).copied().unwrap_or(0);
+        spans.push(Span::styled(format!(" {}{n}", tree_view::depth_glyph(depth)), Style::default().fg(tree_view::depth_color(depth, false))));
+    }
+    let writes: usize = app.writes.by_file(filter).values().map(Vec::len).sum();
+    spans.push(Span::styled(format!("   !{}", app.ledger.total_stale()), Style::default().fg(colors::DEPTH_STALE)));
+    spans.push(Span::styled(format!(" ◌{}", app.ledger.total_restored()), Style::default().fg(colors::ACCENT_MUTED)));
+    spans.push(Span::styled(format!(" ✎{writes}"), Style::default().fg(colors::WRITE_CURRENT)));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// What every glyph in the tree means, always on screen.
+fn render_legend(f: &mut Frame, area: Rect) {
+    use ambits::tracking::ReadDepth;
+    use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut spans = vec![Span::raw(" ")];
+    for (depth, word) in [
+        (ReadDepth::FullBody, "full"),
+        (ReadDepth::Signature, "signature"),
+        (ReadDepth::Overview, "overview"),
+        (ReadDepth::NameOnly, "name"),
+        (ReadDepth::Unseen, "unseen"),
+    ] {
+        spans.push(Span::styled(tree_view::depth_glyph(depth).to_string(), Style::default().fg(tree_view::depth_color(depth, false))));
+        spans.push(Span::styled(format!(" {word}  "), dim));
+    }
+    spans.extend([
+        Span::styled("!", Style::default().fg(colors::DEPTH_STALE)),
+        Span::styled(" changed since read  ", dim),
+        Span::styled("◌", Style::default().fg(colors::ACCENT_MUTED)),
+        Span::styled(" before a compaction  ", dim),
+        Span::styled("✎", Style::default().fg(colors::WRITE_CURRENT)),
+        Span::styled(" written: ", dim),
+        Span::styled("still there", Style::default().fg(colors::WRITE_CURRENT)),
+        Span::styled(" · ", dim),
+        Span::styled("changed", Style::default().fg(colors::WRITE_CHANGED)),
+        Span::styled(" · ", dim),
+        Span::styled("gone", Style::default().fg(colors::WRITE_REMOVED)),
+    ]);
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Display columns of `text`.
@@ -135,7 +204,14 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             Span::styled("[tab]", Style::default().fg(Color::DarkGray)),
             Span::raw("focus "),
             Span::styled("[t]", Style::default().fg(Color::DarkGray)),
-            Span::raw("race "),
+            Span::raw("races "),
+            Span::styled("[i]", Style::default().fg(Color::DarkGray)),
+            Span::raw(match app.right_pane {
+                RightPane::Inspector => "session ",
+                RightPane::Session => "nspector ",
+            }),
+            Span::styled("[f]", Style::default().fg(Color::DarkGray)),
+            Span::raw("eed "),
         ];
 
         if !app.compaction_history.is_empty() {

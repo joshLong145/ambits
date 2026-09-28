@@ -10,6 +10,7 @@
 //! the later of its own result and its subagent's last span.
 
 pub mod export;
+pub mod touch;
 pub mod view;
 
 use std::collections::HashMap;

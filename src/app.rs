@@ -52,6 +52,10 @@ pub struct TreeRow {
     pub coverage_status: Option<FileCoverageStatus>,
     pub coverage_seen: usize,
     pub coverage_total: usize,
+    /// Of `coverage_total`, how many were read in full and are unchanged.
+    pub coverage_full: usize,
+    /// Of what the row summarizes, how many read symbols changed since.
+    pub stale_count: usize,
     /// How this session's agents wrote the row (the filtered agent's, when
     /// one is): a symbol through itself or anything nested in it, a file
     /// through any write to it.
@@ -75,6 +79,16 @@ pub struct TraceGeometry {
     pub rows: u16,
     /// The row index drawn first (the scroll offset).
     pub first_row: usize,
+}
+
+/// What the right-hand pane shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RightPane {
+    /// The selected row's states in words, and the traces that touched it.
+    #[default]
+    Inspector,
+    /// Session totals, agents and compactions.
+    Session,
 }
 
 /// Which panel is focused.
@@ -193,6 +207,12 @@ pub struct App {
     pub trace_geometry: std::cell::Cell<Option<TraceGeometry>>,
     /// The column a drag on the trace started from.
     trace_drag: Option<u16>,
+    /// What the right-hand pane shows (`i` switches).
+    pub right_pane: RightPane,
+    /// Whether the activity feed is shown (`f`).
+    pub show_activity: bool,
+    /// The trace selected in the inspector's list.
+    pub inspector_index: usize,
 
     /// Path filter restricting which files are tracked, if any. Shared with
     /// the TUI re-parse paths (file watcher, Serena cache rescan) so that
@@ -251,6 +271,9 @@ impl App {
             trace_view: crate::trace::view::TraceView::default(),
             trace_geometry: std::cell::Cell::new(None),
             trace_drag: None,
+            right_pane: RightPane::Inspector,
+            show_activity: false,
+            inspector_index: 0,
             filter: None,
             editor_template: None,
             pending_editor_request: None,
@@ -617,6 +640,8 @@ impl App {
                 coverage_status: Some(status),
                 coverage_seen: seen,
                 coverage_total: total,
+                coverage_full: full,
+                stale_count: count_stale(&file.symbols, &self.ledger),
                 write: file_writes.as_ref().and_then(|w| w.file_mark()),
             });
 
@@ -648,6 +673,9 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
+            KeyCode::Char('j') | KeyCode::Down if self.inspecting() => self.inspector_index += 1,
+            KeyCode::Char('k') | KeyCode::Up if self.inspecting() => self.inspector_index = self.inspector_index.saturating_sub(1),
+            KeyCode::Enter if self.inspecting() => self.open_inspected_trace(),
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.focus == FocusPanel::Stats {
                     self.move_agent_selection(1);
@@ -711,6 +739,18 @@ impl App {
             }
             KeyCode::Char('d') => self.open_alignment_overlay(),
             KeyCode::Char('t') => self.trace_view.open = true,
+            KeyCode::Char('i') => {
+                self.right_pane = match self.right_pane {
+                    RightPane::Inspector => RightPane::Session,
+                    RightPane::Session => RightPane::Inspector,
+                };
+            }
+            KeyCode::Char('f') => {
+                self.show_activity = !self.show_activity;
+                if !self.show_activity && self.focus == FocusPanel::Activity {
+                    self.focus = FocusPanel::Tree;
+                }
+            }
             KeyCode::Esc if self.show_alignment_overlay => {
                 self.show_alignment_overlay = false;
             }
@@ -1068,6 +1108,12 @@ impl App {
         }
         let new_idx = self.selected_index as i32 + delta;
         self.selected_index = new_idx.clamp(0, self.tree_rows.len() as i32 - 1) as usize;
+        self.inspector_index = 0;
+    }
+
+    /// Keys go to the inspector's trace list.
+    fn inspecting(&self) -> bool {
+        self.focus == FocusPanel::Stats && self.right_pane == RightPane::Inspector
     }
 
     fn select_first(&mut self) {
@@ -1333,12 +1379,33 @@ impl App {
         }
     }
 
+    /// Tree, the right-hand pane, then the activity feed when it shows.
     fn cycle_focus(&mut self) {
         self.focus = match self.focus {
             FocusPanel::Tree => FocusPanel::Stats,
-            FocusPanel::Stats => FocusPanel::Activity,
-            FocusPanel::Activity => FocusPanel::Tree,
+            FocusPanel::Stats if self.show_activity => FocusPanel::Activity,
+            FocusPanel::Stats | FocusPanel::Activity => FocusPanel::Tree,
         };
+    }
+
+    /// The traces that touched the selected row, for the inspector.
+    pub fn inspector_touches(&self) -> Vec<crate::trace::touch::Touch> {
+        let Some(row) = self.tree_rows.get(self.selected_index) else { return Vec::new() };
+        let (file, symbol) = match row.kind {
+            RowKind::File => (row.symbol_id.as_str(), None),
+            RowKind::Symbol => (crate::symbols::split_id(&row.symbol_id).0, Some(row.symbol_id.as_str())),
+        };
+        crate::trace::touch::touches(&self.trace, &crate::objects::normalize_path(file), symbol, &self.writes)
+    }
+
+    /// Open the trace the inspector has selected, at its first call on the row.
+    fn open_inspected_trace(&mut self) {
+        let touches = self.inspector_touches();
+        let Some(t) = touches.get(self.inspector_index.min(touches.len().saturating_sub(1))) else { return };
+        self.trace_view.open = true;
+        self.trace_view.open_trace(t.root);
+        self.trace_view.selected = Some(crate::trace::view::Item::Span(t.span));
+        self.focus = FocusPanel::Tree;
     }
 
     fn jump_to_search_match(&mut self) {
@@ -1459,38 +1526,8 @@ impl App {
         }
     }
 
-    /// The selected row's facts in one line: what was read, by whom, and
-    /// what was written and whether it still stands. `None` on an empty tree.
-    pub fn detail_line(&self) -> Option<String> {
-        let row = self.tree_rows.get(self.selected_index)?;
-        let mut parts = Vec::new();
-        if row.is_file() {
-            parts.push(format!("{}/{} symbols seen", row.coverage_seen, row.coverage_total));
-        } else if row.read_depth.is_seen() {
-            let reader = self.agent_filter.clone().or_else(|| self.ledger.entries.get(&row.symbol_id).map(|e| e.agent_id.clone()));
-            parts.push(format!("read {} by {}", row.read_depth, self.agent_name(reader.as_deref().unwrap_or("?"))));
-            if row.stale {
-                parts.push("changed since read".into());
-            }
-            if row.restored {
-                parts.push("read before a compaction".into());
-            }
-        } else {
-            parts.push("unread".into());
-        }
-        if let Some((mark, w)) = row.write.as_ref().and_then(|m| Some((m, self.writes.get(&m.latest)?))) {
-            let when = w.t.get(..16).map_or(w.t.clone(), |t| format!("{}Z", t.replace('T', " ")));
-            parts.push(format!("written {when} by {} ({})", self.agent_name(&w.a), w.tool));
-            if mark.count > 1 {
-                parts.push(format!("{} writes", mark.count));
-            }
-            parts.push(mark.status.phrase().into());
-        }
-        Some(format!("{} — {}", row.symbol_id, parts.join(" · ")))
-    }
-
     /// `main` for the session's own agent, else the agent id.
-    fn agent_name<'a>(&self, id: &'a str) -> &'a str {
+    pub fn agent_name<'a>(&self, id: &'a str) -> &'a str {
         if self.session_id.as_deref() == Some(id) { "main" } else { id }
     }
 
@@ -1703,6 +1740,14 @@ fn mark_selected_symbols(
     }
 }
 
+/// How many of `symbols`, at any depth, were read and have changed since.
+fn count_stale(symbols: &[SymbolNode], ledger: &ContextLedger) -> usize {
+    symbols
+        .iter()
+        .map(|s| usize::from(ledger.is_stale(&s.id) && ledger.depth_of(&s.id).is_seen()) + count_stale(&s.children, ledger))
+        .sum()
+}
+
 /// What every symbol row of one file is built from.
 struct RowContext<'a> {
     expansion: &'a Expansion,
@@ -1721,11 +1766,11 @@ fn flatten_symbol(sym: &SymbolNode, depth: usize, cx: &RowContext<'_>, rows: &mu
     // A collapsed symbol summarizes its descendants, as a file row does: reads
     // land on innermost symbols, so without this a method read inside
     // `impl App` leaves every visible row grey under an amber file.
-    let (coverage_status, coverage_seen, coverage_total) = if !is_expanded && !sym.children.is_empty() {
+    let (coverage_status, coverage_seen, coverage_total, coverage_full, stale_count) = if !is_expanded && !sym.children.is_empty() {
         let (total, seen, full) = count_symbols(&sym.children, ledger, agent_filter);
-        (Some(coverage_status_from_counts(total, seen, full)), seen, total)
+        (Some(coverage_status_from_counts(total, seen, full)), seen, total, full, count_stale(&sym.children, ledger))
     } else {
-        (None, 0, 0)
+        (None, 0, 0, 0, 0)
     };
 
     rows.push(TreeRow {
@@ -1744,6 +1789,8 @@ fn flatten_symbol(sym: &SymbolNode, depth: usize, cx: &RowContext<'_>, rows: &mu
         coverage_status,
         coverage_seen,
         coverage_total,
+        coverage_full,
+        stale_count,
         write: cx.writes.and_then(|w| w.symbol_mark(&sym.id)),
     });
 
@@ -3268,36 +3315,6 @@ mod write_tests {
         app.set_journal_settings(Some(JournalSettings { backend: "tree-sitter", interval: std::time::Duration::ZERO }));
         app.attach_journal();
         assert_eq!(mark(&app, "src/a.rs::S/a").map(|m| m.status), Some(crate::writes::Status::Current));
-    }
-
-    fn detail_of(app: &mut App, id: &str) -> String {
-        app.selected_index = app.tree_rows.iter().position(|r| r.symbol_id == id).expect("row");
-        app.detail_line().unwrap()
-    }
-
-    #[test]
-    fn the_detail_line_says_what_was_read_and_written() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = marked_app(dir.path());
-        assert_eq!(detail_of(&mut app, "src/a.rs::S/b"), "src/a.rs::S/b — unread");
-
-        app.ledger.record("src/a.rs::S/b".into(), ReadDepth::FullBody, [0; 32], "sess".into(), 10);
-        app.rebuild_tree_rows();
-        assert_eq!(detail_of(&mut app, "src/a.rs::S/b"), "src/a.rs::S/b — read full by main");
-
-        app.record_write("sess", wrote_a(&app));
-        assert_eq!(
-            detail_of(&mut app, "src/a.rs::S/a"),
-            "src/a.rs::S/a — unread · written 2026-09-26 10:00Z by agent-1 (Edit) · unchanged since the agent wrote it"
-        );
-
-        app.ledger.record("src/a.rs::S/a".into(), ReadDepth::Signature, [0; 32], "agent-1".into(), 10);
-        app.record_write("sess", WriteRecord { op: "toolu_2".into(), t: "2026-09-26T10:05:00Z".into(), ..wrote_a(&app) });
-        assert_eq!(
-            detail_of(&mut app, "src/a.rs::S/a"),
-            "src/a.rs::S/a — read signature by agent-1 · written 2026-09-26 10:05Z by agent-1 (Edit) · 2 writes · unchanged since the agent wrote it"
-        );
-        assert!(detail_of(&mut app, "src/a.rs").starts_with("src/a.rs — 2/3 symbols seen · written"), "{}", detail_of(&mut app, "src/a.rs"));
     }
 
     #[test]

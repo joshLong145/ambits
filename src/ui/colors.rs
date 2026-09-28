@@ -11,11 +11,9 @@ pub const DEPTH_SIGNATURE: Color = Color::Rgb(80, 140, 255);
 pub const DEPTH_FULL_BODY: Color = Color::Rgb(80, 220, 120);
 pub const DEPTH_STALE: Color = Color::Rgb(230, 160, 60);
 
-// ── File coverage colors (file header level) ────────────────────────
+// ── Alignment overlay ───────────────────────────────────────────────
 pub const FILE_FULLY_COVERED: Color = Color::Rgb(80, 220, 120);
-pub const FILE_ALL_SEEN: Color = Color::Rgb(180, 220, 80);
 pub const FILE_PARTIALLY_COVERED: Color = Color::Rgb(255, 180, 50);
-pub const FILE_NOT_COVERED: Color = Color::White;
 
 // ── Write marks (✎): whether the agent's version is still there ─────
 pub const WRITE_CURRENT: Color = Color::Rgb(80, 220, 120);

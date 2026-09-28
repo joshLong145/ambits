@@ -6,9 +6,13 @@ ambits -p .
 
 ![screenshot](https://raw.githubusercontent.com/joshLong145/ambits/main/images/screenshot.png)
 
-Tails the session log and updates live. Three panels — symbol tree, coverage
-stats, activity feed — cycled with `Tab`. Edits appear in the activity feed
-marked `(write)`; they are journaled as [writes](Agent-Writes), not reads.
+Tails the session log and updates live. A header line gives the session,
+the agent filter and its totals; below it, the file tree on the left and the
+**inspector** on the right, with `Tab` moving between them. `i` swaps the
+inspector for the session pane (coverage by depth, agents, compactions), `f`
+shows the activity feed, where edits appear marked `(write)` — they are
+journaled as [writes](Agent-Writes), not reads. A legend line explains every
+glyph.
 
 Files start collapsed, including ones created while the TUI is running;
 expanding a file shows its full outline. A file you expanded stays expanded
@@ -21,18 +25,14 @@ without that, a build tool writing into `target/` (rust-analyzer running
 `cargo check`, say) pushes rows in for files you never wrote. Deleted files
 leave the tree rather than lingering until you quit.
 
-- **Depth-aware coloring** — every symbol shaded by how deeply it was read
-- **Write marks** — `✎` on what this session's agents changed, coloured by whether their version is still there
-- **Detail line** — above the status bar, the selected row's facts: how deeply it was read and by whom, and its latest write, by whom, and whether it still stands
-- **Per-file counts** — `seen/total` on each file header, so partial coverage shows without expanding
+- **A state gutter** — every symbol's read depth, freshness and writes as glyphs in fixed columns (see [the legend](#reading-the-tree))
+- **File bars** — each file's symbols as a bar of read in full, partly read and unseen, with `seen/total`, `!` and `✎` counts, so coverage shows without expanding
+- **Inspector** — the selected row's states in words, and the prompts whose calls read or wrote it; `Tab` to it, `Enter` opens that trace at the call
 - **Sortable tree** — alphabetical, or grouped by coverage to surface half-read files first
 - **Search** — `/` to jump to a symbol by name
 - **Compaction history** — `C` for this session's compaction boundaries
 - **Trace view** — `t` lists the session's prompts; `Enter` puts one prompt's tool calls on a time axis, as an OpenTelemetry waterfall or Perfetto-style agent tracks (see [below](#trace-view))
 - **Sub-agent alignment** — `d` compares two agents file by file: where they read the same code, and where only one looked (see [Coverage and Multi-Agent](Coverage-and-Multi-Agent))
-
-Symbols carried over from before a compaction render dimmed — the read
-happened, but it is no longer in the agent's live context.
 
 While it runs, the TUI is also the sole writer of the
 [read journal](Configuration#the-read-journal).
@@ -44,12 +44,14 @@ While it runs, the TUI is also the sole writer of the
 | `j` / `k`, `↓` / `↑` | Move down / up (tree, or agent list when Stats is focused) |
 | `h` / `l`, `←` / `→` | Collapse / expand tree nodes |
 | `Enter` | Expand a node with children; on a leaf, [open it in your editor](#opening-a-symbol-in-your-editor); selects an agent when Stats is focused |
-| `Tab` | Cycle panel focus (Tree / Stats / Activity) |
+| `Tab` | Cycle focus: tree, inspector (or session pane), activity feed when shown. In the inspector, `j` / `k` choose a trace and `Enter` opens it |
 | `Shift+Tab` | Cycle agent filter backward |
 | `/` | Search symbols |
 | `s` | Toggle sort (alphabetical / coverage) |
 | `a` / `A` | Cycle agent filter forward / backward |
 | `d` | Sub-agent alignment view |
+| `i` | Inspector / session pane |
+| `f` | Show or hide the activity feed |
 | `t` | [Trace view](#trace-view) in place of the tree |
 | `C` | Compaction history (`[` / `]` to page) |
 | `g` / `G` | Jump to first / last |
@@ -57,45 +59,65 @@ While it runs, the TUI is also the sole writer of the
 | `Esc` | Close the alignment view, or cancel a search |
 | `q`, `Ctrl+C` | Quit |
 
-## Color legend
+## Reading the tree
 
-**Symbols**, by read depth:
+Each symbol row starts with three columns, one state each:
 
-| Color | Meaning |
-|---|---|
-| Dark gray | Unseen |
-| Lavender | Name only (appeared in a glob, a listing, or a `callers` / `show --no-body` result) |
-| Pale blue | Overview (grep match, symbol listing) |
-| Blue | Signature seen |
-| Green | Full body read |
+```
+    ●!✎ fn render        L12-80 ~310 tok
+    ◑   fn move_selection
+    ◔◌  fn old
+▶ src/app.rs    ███▓▓░░░░░  42/120  !4  ✎3
+```
 
-**File headers**, by coverage — and a **collapsed symbol**, by the coverage of
-what is nested inside it, with the same `seen/total` count (its name keeps its
-own depth color when it was itself read):
+| Column | Glyph | Meaning |
+|---|---|---|
+| Read depth | `●` | Full body read |
+| | `◕` | Signature seen |
+| | `◑` | Overview (grep match, symbol listing) |
+| | `◔` | Name only (a glob, a listing, a `callers` or `show --no-body` result) |
+| | `·` | Unseen |
+| Freshness | `!` | Changed since it was read: what the agent knows is out of date |
+| | `◌` | Read before a compaction: no longer in the agent's context |
+| Write | `✎` green | Written this session, and the agent's version is still there |
+| | `✎` amber / red | Changed since, or gone |
+| | `✎` cyan | A file-level write: nothing in memory to compare it with |
 
-| Color | Meaning |
-|---|---|
-| White | Nothing seen |
-| Amber | Partially covered |
-| Yellow-green | All symbols seen, not all at full depth |
-| Green | Every symbol read in full |
+Names are white once read, grey before. A folded symbol shows `seen/total`
+for what it hides, as a file does. A written symbol is marked through
+itself or anything nested in it — the agent filter's writes, when one is
+set — by the same rule as [`ambits touched`](Agent-Writes#ambits-touched),
+judged against the tree as it is now, so an edit of yours turns it amber at
+once. Writes made before this run come from the
+[read journal](Configuration#the-read-journal).
 
-**Write marks**: a `✎` after the name of anything this session's agents
-changed ([Agent Writes](Agent-Writes)) — the filtered agent's, when one is.
-A symbol is marked through itself or anything nested in it; a file header
-shows `✎N`, its number of writes. The colour is the latest write's status,
-by the same rule as [`ambits touched`](Agent-Writes#ambits-touched), judged
-against the tree as it is now, so an edit of yours turns it amber at once:
+A file row's bar is its symbols in proportion: `█` read in full (and
+unchanged), `▓` read less deeply, `░` unseen. Then `seen/total`, `!N` read
+symbols changed since, and `✎N` writes, coloured by the latest.
 
-| Color | Meaning |
-|---|---|
-| Green | The agent's version is still there |
-| Amber | Changed since |
-| Red | Removed since |
-| Cyan | A file-level write: nothing in memory to compare it with |
+## The inspector
 
-The Stats panel counts the session's writes (`✎ Written`). Writes made
-before this run come from the [read journal](Configuration#the-read-journal).
+The selected row in words:
+
+```
+ read     ● full body · main, a03cd45 (name only)
+ context  live
+ changed  no
+ written  ✎ 2026-09-27 10:05Z by main (Edit) · 2 writes
+          unchanged since the agent wrote it
+ size     L577-661 · ~900 tokens
+
+ traces   3 prompts · Enter opens
+ › 09-27 14:02 read, wrote  "lets fix the blockers…"
+   09-27 15:20 read         "lets now move on to ui-7"
+```
+
+A file shows its coverage, how many read symbols changed since, its latest
+write and its size. **traces** lists the prompts whose calls read or wrote
+the row — a read of the whole file, or of the symbol, something inside it
+or something it is inside; a write attributed to it — oldest first. `Tab`
+focuses the inspector, `j` / `k` choose, `Enter` opens that
+[trace](#trace-view) with the call selected.
 
 ## Trace view
 

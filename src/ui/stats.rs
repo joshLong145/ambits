@@ -17,7 +17,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let block = Block::default()
-        .title(" Coverage Stats ")
+        .title(" Session · i: inspector ")
         .borders(Borders::ALL)
         .border_style(border_style);
 

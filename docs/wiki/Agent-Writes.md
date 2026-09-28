@@ -63,7 +63,7 @@ is still on disk: `current`, `changed`, `removed` (still absent — a symbol
 that came back after the agent deleted it is `changed`), or `unknown` for a
 file-level edit with no hash to compare.
 
-The [TUI](TUI#color-legend) marks the current session's writes with the same
+The [TUI](TUI#reading-the-tree) marks the current session's writes with the same
 rule: `✎` on each written symbol, its parents and its file.
 
 ## Which commit it landed in

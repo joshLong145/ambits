@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 
-use ambits::app::{App, FileCoverageStatus, FocusPanel};
+use ambits::app::{App, FocusPanel};
 use ambits::tracking::ReadDepth;
 use ambits::writes::Status;
 
@@ -18,77 +18,13 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let block = Block::default()
-        .title(" Symbol Tree ")
+        .title(" Files ")
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    let items: Vec<ListItem> = app
-        .tree_rows
-        .iter()
-        .map(|row| {
-            let indent = "  ".repeat(row.depth);
-            let icon = if row.is_file() {
-                if row.is_expanded { "▼ " } else { "▶ " }
-            } else if row.has_children {
-                if row.is_expanded { "▾ " } else { "▸ " }
-            } else {
-                "  "
-            };
-
-            let color = depth_color(row.read_depth, row.stale);
-
-            let mut spans = vec![
-                Span::raw(indent),
-                Span::styled(icon, Style::default().fg(Color::DarkGray)),
-            ];
-
-            if row.is_file() {
-                let file_color = file_coverage_color(row.coverage_status);
-                spans.push(Span::styled(
-                    &row.display_name,
-                    Style::default().fg(file_color).add_modifier(Modifier::BOLD),
-                ));
-                if row.coverage_total > 0 {
-                    spans.push(coverage_count(row, file_color));
-                }
-                if let Some(mark) = &row.write {
-                    spans.push(Span::styled(format!(" ✎{}", mark.count), Style::default().fg(write_color(mark.status))));
-                }
-                spans.push(Span::styled(
-                    format!("  ({})", row.line_range),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            } else {
-                spans.push(Span::styled(
-                    format!("{} ", row.label),
-                    Style::default().fg(Color::DarkGray),
-                ));
-                // A collapsed symbol with read descendants: color an unread
-                // name by their coverage, and show how many, like a file row.
-                let inner = row
-                    .coverage_status
-                    .filter(|_| row.coverage_seen > 0)
-                    .map(|status| file_coverage_color(Some(status)));
-                let name_color = match inner {
-                    Some(c) if !row.read_depth.is_seen() => c,
-                    _ => color,
-                };
-                spans.push(Span::styled(&row.display_name, symbol_style(name_color, row.restored)));
-                if let Some(c) = inner {
-                    spans.push(coverage_count(row, c));
-                }
-                if let Some(mark) = &row.write {
-                    spans.push(Span::styled(" ✎", Style::default().fg(write_color(mark.status))));
-                }
-                spans.push(Span::styled(
-                    format!("  [{}] ~{} tok", row.line_range, row.token_count),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
+    // File bars line up in a column after the longest path, within reason.
+    let align = app.tree_rows.iter().filter(|r| r.is_file()).map(|r| super::width(&r.display_name)).max().unwrap_or(0).min(48);
+    let items: Vec<ListItem> = app.tree_rows.iter().map(|row| ListItem::new(row_line(row, align))).collect();
 
     let mut state = ListState::default();
     state.select(Some(app.selected_index));
@@ -105,20 +41,101 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-/// `  seen/total` for a row that summarizes symbols it does not show.
-fn coverage_count(row: &ambits::app::TreeRow, color: Color) -> Span<'static> {
-    Span::styled(format!("  {}/{}", row.coverage_seen, row.coverage_total), Style::default().fg(color))
+/// One tree row. A symbol reads left to right as a gutter of states —
+/// read depth, freshness, write — then its name:
+///
+/// `  ●!✎ fn render   L12-80 ~310 tok`
+///
+/// A file shows a bar of its symbols (full, partly read, unseen) and counts:
+///
+/// `▾ src/app.rs  ███▓▓░░░░░  42/120  !4  ✎3`
+pub(super) fn row_line(row: &ambits::app::TreeRow, align: usize) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let indent = "  ".repeat(row.depth);
+    let fold = match (row.is_file(), row.has_children, row.is_expanded) {
+        (true, _, true) => "▼ ",
+        (true, _, false) => "▶ ",
+        (false, true, true) => "▾ ",
+        (false, true, false) => "▸ ",
+        _ => "  ",
+    };
+    let mut spans = vec![Span::raw(indent), Span::styled(fold, dim)];
+
+    if row.is_file() {
+        spans.push(Span::styled(row.display_name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        if row.coverage_total > 0 {
+            spans.push(Span::raw(" ".repeat(2 + align.saturating_sub(super::width(&row.display_name)))));
+            spans.extend(coverage_bar(row.coverage_full, row.coverage_seen, row.coverage_total, 10));
+            spans.push(Span::styled(format!("  {}/{}", row.coverage_seen, row.coverage_total), Style::default().fg(Color::Gray)));
+        }
+        spans.extend(counts(row));
+        spans.push(Span::styled(format!("  ({})", row.line_range), dim));
+        return Line::from(spans);
+    }
+
+    let depth = if row.read_depth.is_seen() { row.read_depth } else { ReadDepth::Unseen };
+    let freshness = if row.stale && depth.is_seen() {
+        Span::styled("!", Style::default().fg(colors::DEPTH_STALE))
+    } else if row.restored && depth.is_seen() {
+        Span::styled("◌", Style::default().fg(colors::ACCENT_MUTED))
+    } else {
+        Span::raw(" ")
+    };
+    let write = match &row.write {
+        Some(mark) => Span::styled("✎", Style::default().fg(write_color(mark.status))),
+        None => Span::raw(" "),
+    };
+    spans.push(Span::styled(depth_glyph(depth).to_string(), Style::default().fg(depth_color(depth, false))));
+    spans.push(freshness);
+    spans.push(write);
+    // `impl Status` already says what it is.
+    let label = if row.display_name.starts_with(&format!("{} ", row.label)) { String::from(" ") } else { format!(" {} ", row.label) };
+    spans.push(Span::styled(label, dim));
+    let name_color = if depth.is_seen() { Color::White } else { Color::Gray };
+    spans.push(Span::styled(row.display_name.clone(), Style::default().fg(name_color)));
+    // A folded symbol summarizes what it hides, as a file does.
+    if row.coverage_status.is_some() && row.coverage_total > 0 {
+        spans.push(Span::styled(format!("  {}/{}", row.coverage_seen, row.coverage_total), Style::default().fg(Color::Gray)));
+        spans.extend(counts(row).into_iter().filter(|s| s.content.contains('!')));
+    }
+    spans.push(Span::styled(format!("  {} ~{} tok", row.line_range, row.token_count), dim));
+    Line::from(spans)
 }
 
-/// Restored reads keep their depth color but render dimmed, so pre-compaction
-/// coverage stays visible without looking like it is still in the model's
-/// context.
-fn symbol_style(color: Color, restored: bool) -> Style {
-    let style = Style::default().fg(color);
-    if restored {
-        style.add_modifier(Modifier::DIM)
-    } else {
-        style
+/// `  !4  ✎3`: changed-since-read and write counts, when there are any.
+fn counts(row: &ambits::app::TreeRow) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    if row.stale_count > 0 {
+        out.push(Span::styled(format!("  !{}", row.stale_count), Style::default().fg(colors::DEPTH_STALE)));
+    }
+    if let Some(mark) = &row.write {
+        out.push(Span::styled(format!("  ✎{}", mark.count), Style::default().fg(write_color(mark.status))));
+    }
+    out
+}
+
+/// `width` cells in proportion: `█` read in full, `▓` partly read, `░` unseen.
+pub(super) fn coverage_bar(full: usize, seen: usize, total: usize, width: usize) -> Vec<Span<'static>> {
+    let cells = |n: usize| (n * width + total / 2).checked_div(total).unwrap_or(0);
+    // Anything read shows at least one cell.
+    let full_cells = if full > 0 { cells(full).max(1) } else { 0 };
+    let seen_cells = if seen > 0 { cells(seen).max(full_cells + usize::from(seen > full)).min(width) } else { 0 };
+    vec![
+        Span::styled("█".repeat(full_cells), Style::default().fg(colors::DEPTH_FULL_BODY)),
+        Span::styled("▓".repeat(seen_cells - full_cells), Style::default().fg(colors::DEPTH_OVERVIEW)),
+        Span::styled("░".repeat(width - seen_cells), Style::default().fg(colors::DEPTH_UNSEEN)),
+    ]
+}
+
+/// `●` full, `◕` signature, `◑` overview, `◔` name, `·` unseen: fuller
+/// is deeper.
+pub(super) fn depth_glyph(depth: ReadDepth) -> char {
+    match depth {
+        ReadDepth::Unseen => '·',
+        ReadDepth::NameOnly => '◔',
+        ReadDepth::Overview => '◑',
+        ReadDepth::Signature => '◕',
+        ReadDepth::FullBody => '●',
     }
 }
 
@@ -149,14 +166,6 @@ pub(super) fn write_color(status: Status) -> Color {
     }
 }
 
-fn file_coverage_color(status: Option<FileCoverageStatus>) -> Color {
-    match status {
-        Some(FileCoverageStatus::FullyCovered) => colors::FILE_FULLY_COVERED,
-        Some(FileCoverageStatus::AllSeen) => colors::FILE_ALL_SEEN,
-        Some(FileCoverageStatus::PartiallyCovered) => colors::FILE_PARTIALLY_COVERED,
-        _ => colors::FILE_NOT_COVERED,
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -197,15 +206,6 @@ mod tests {
         // multi-byte.
         let col = row_str[..row_str.find(text)?].chars().count() as u16;
         Some(buf[(col, row)].fg)
-    }
-
-    #[test]
-    fn file_coverage_color_variants() {
-        assert_eq!(file_coverage_color(Some(FileCoverageStatus::FullyCovered)), colors::FILE_FULLY_COVERED);
-        assert_eq!(file_coverage_color(Some(FileCoverageStatus::AllSeen)), colors::FILE_ALL_SEEN);
-        assert_eq!(file_coverage_color(Some(FileCoverageStatus::PartiallyCovered)), colors::FILE_PARTIALLY_COVERED);
-        assert_eq!(file_coverage_color(Some(FileCoverageStatus::NotCovered)), colors::FILE_NOT_COVERED);
-        assert_eq!(file_coverage_color(None), colors::FILE_NOT_COVERED);
     }
 
     #[test]
@@ -254,78 +254,40 @@ mod tests {
         assert_eq!(fg_color_of(terminal.backend(), 3, "✎"), None, "beta was not written");
     }
 
-    #[test]
-    fn render_uncovered_files_are_white() {
-        let mut app = test_app();
-        // Select row 2 so row 1 (a.rs) isn't highlighted.
-        app.selected_index = 1;
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, &app, f.area())).unwrap();
-
-        let color = fg_color_of(terminal.backend(), 1, "mock/a.rs").unwrap();
-        assert_eq!(color, colors::FILE_NOT_COVERED);
+    fn text_of(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    /// The bar is in proportion, and anything read shows.
     #[test]
-    fn render_fully_covered_file_is_green() {
-        let mut app = test_app();
-        app.selected_index = 1;
-        app.ledger.record("a1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
-        app.ledger.record("a2".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
-        app.rebuild_tree_rows();
-
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, &app, f.area())).unwrap();
-
-        let color = fg_color_of(terminal.backend(), 1, "mock/a.rs").unwrap();
-        assert_eq!(color, colors::FILE_FULLY_COVERED);
+    fn the_file_bar_shows_full_partial_and_unseen() {
+        let bar = |full, seen, total| coverage_bar(full, seen, total, 10).iter().map(|s| s.content.to_string()).collect::<String>();
+        assert_eq!(bar(0, 0, 10), "░░░░░░░░░░");
+        assert_eq!(bar(5, 8, 10), "█████▓▓▓░░");
+        assert_eq!(bar(10, 10, 10), "██████████");
+        assert_eq!(bar(1, 2, 1000), "█▓░░░░░░░░", "one read in a thousand still shows");
+        assert_eq!(bar(0, 0, 0), "░░░░░░░░░░");
     }
 
+    /// Each state is a glyph in its own column: depth, freshness, write.
     #[test]
-    fn render_all_seen_file_is_yellow_green() {
+    fn a_symbol_row_spells_its_states_in_the_gutter() {
         let mut app = test_app();
-        app.ledger.record("b1".into(), ReadDepth::NameOnly, [0; 32], "ag".into(), 10);
-        app.rebuild_tree_rows();
-
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, &app, f.area())).unwrap();
-
-        let color = fg_color_of(terminal.backend(), 2, "mock/b.rs").unwrap();
-        assert_eq!(color, colors::FILE_ALL_SEEN);
-    }
-
-    #[test]
-    fn render_partially_covered_file_is_amber() {
-        let mut app = test_app();
-        app.selected_index = 1;
-        app.ledger.record("a1".into(), ReadDepth::NameOnly, [0; 32], "ag".into(), 10);
-        app.rebuild_tree_rows();
-
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, &app, f.area())).unwrap();
-
-        let color = fg_color_of(terminal.backend(), 1, "mock/a.rs").unwrap();
-        assert_eq!(color, colors::FILE_PARTIALLY_COVERED);
-    }
-
-    #[test]
-    fn render_expanded_symbol_has_depth_color() {
-        let mut app = test_app();
-        app.selected_index = 2;
         app.set_expanded("mock/a.rs", ambits::expansion::RowKind::File, true);
         app.ledger.record("a1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+        app.ledger.mark_stale("a1");
+        app.ledger.record("a2".into(), ReadDepth::NameOnly, [0; 32], "ag".into(), 10);
         app.rebuild_tree_rows();
+        let rows: Vec<String> = app.tree_rows.iter().map(|r| text_of(&row_line(r, 0))).collect();
+        assert!(rows[0].starts_with("▼ mock/a.rs  ") && rows[0].contains("2/2") && rows[0].contains("!1"), "{}", rows[0]);
+        assert!(rows[1].starts_with("    ●!  fn alpha"), "{}", rows[1]);
+        assert!(rows[2].starts_with("    ◔   fn beta"), "{}", rows[2]);
+        assert!(rows[3].starts_with("▶ mock/b.rs  ░░░░░░░░░░  0/1"), "{}", rows[3]);
 
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, &app, f.area())).unwrap();
-
-        let color = fg_color_of(terminal.backend(), 2, "alpha").unwrap();
-        assert_eq!(color, colors::DEPTH_FULL_BODY);
+        app.ledger.mark_all_restored();
+        app.rebuild_tree_rows();
+        assert!(text_of(&row_line(&app.tree_rows[2], 0)).starts_with("    ◔◌  fn beta"));
+        assert!(text_of(&row_line(&app.tree_rows[3], 12)).starts_with("▶ mock/b.rs     ░"), "bars align after the longest path");
     }
 
     /// Row text of `row` in the rendered buffer.
@@ -358,26 +320,26 @@ mod tests {
         terminal
     }
 
-    /// Reads land on innermost symbols. A collapsed parent must show that
-    /// something inside it was read, or an amber file expands to all grey.
+    /// Reads land on innermost symbols. A collapsed parent shows how many
+    /// of its children were read, or an unread parent would hide them.
     #[test]
     fn a_collapsed_parent_shows_its_read_children() {
         let app = app_with_a_read_child();
         let terminal = draw(&app);
-        assert_eq!(fg_color_of(terminal.backend(), 2, "Parent"), Some(colors::FILE_PARTIALLY_COVERED));
-        assert!(row_text(terminal.backend(), 2).contains("1/2"), "{}", row_text(terminal.backend(), 2));
+        let row = row_text(terminal.backend(), 2);
+        assert!(row.contains("▸ ·   fn Parent  1/2"), "{row}");
     }
 
     /// Expanded, the children speak for themselves.
     #[test]
-    fn an_expanded_parent_keeps_its_own_color() {
+    fn an_expanded_parent_leaves_it_to_its_children() {
         let mut app = app_with_a_read_child();
         app.set_expanded("p", ambits::expansion::RowKind::Symbol, true);
         app.rebuild_tree_rows();
         let terminal = draw(&app);
-        assert_eq!(fg_color_of(terminal.backend(), 2, "Parent"), Some(colors::DEPTH_UNSEEN));
         assert!(!row_text(terminal.backend(), 2).contains("1/2"));
-        assert_eq!(fg_color_of(terminal.backend(), 3, "a  [L"), Some(colors::DEPTH_FULL_BODY));
+        assert!(row_text(terminal.backend(), 3).contains("●   fn a"), "{}", row_text(terminal.backend(), 3));
+        assert_eq!(fg_color_of(terminal.backend(), 3, "●"), Some(colors::DEPTH_FULL_BODY));
     }
 
     /// A name-only read must not look unread.
