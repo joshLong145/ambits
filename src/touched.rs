@@ -156,13 +156,7 @@ pub fn run(project_root: &Path, arg: &str, json: bool) -> Result<()> {
     };
     writeln!(out, "{arg} — last written {} by {} ({})", w.t, w.a, w.tool)?;
     writeln!(out, "  session {session}, write {}", w.op)?;
-    let status_line = match status {
-        Status::Current => "unchanged since the agent wrote it",
-        Status::Changed => "changed since the agent wrote it",
-        Status::Removed => "no longer exists",
-        Status::Unknown => "unknown: a file-level write carries no hash to compare",
-    };
-    writeln!(out, "  {status_line}")?;
+    writeln!(out, "  {}", status.phrase())?;
     if let Some(landed) = &landed {
         writeln!(out, "  {}", landed_line(landed))?;
     }

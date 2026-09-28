@@ -30,6 +30,10 @@ impl WriteIndex {
         self.records.into_values()
     }
 
+    pub fn get(&self, op: &str) -> Option<&WriteRecord> {
+        self.records.get(op)
+    }
+
     pub fn clear(&mut self) {
         self.records.clear();
     }
@@ -51,11 +55,13 @@ impl WriteIndex {
     }
 }
 
-/// How a row was written: the status of its latest write, and how many
-/// writes touched it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How a row was written: the status of its latest write, which that is,
+/// and how many writes touched it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteMark {
     pub status: Status,
+    /// The latest write's op, for [`WriteIndex::get`].
+    pub latest: String,
     pub count: usize,
 }
 
@@ -74,14 +80,14 @@ impl<'a> FileWrites<'a> {
     /// Every write to the file, symbol- or file-level.
     pub fn file_mark(&self) -> Option<WriteMark> {
         let latest = self.writes.first()?;
-        Some(WriteMark { status: self.now.file_status(latest), count: self.writes.len() })
+        Some(WriteMark { status: self.now.file_status(latest), latest: latest.op.clone(), count: self.writes.len() })
     }
 
     /// The symbol-level writes that touched `id` or anything nested in it.
     pub fn symbol_mark(&self, id: &str) -> Option<WriteMark> {
         let mut touching = self.writes.iter().filter(|w| w.touches_symbol(id));
         let latest = touching.next()?;
-        Some(WriteMark { status: self.now.symbol_status(id, latest), count: 1 + touching.count() })
+        Some(WriteMark { status: self.now.symbol_status(id, latest), latest: latest.op.clone(), count: 1 + touching.count() })
     }
 }
 
@@ -143,7 +149,7 @@ mod tests {
         index.insert(write("t2", "2026-09-27T10:00:01Z", "main", vec![("S/b", hash(&file, "S/b"))]));
         let by_file = index.by_file(None);
         let marks = FileWrites::new(by_file["src/lib.rs"].clone(), &file);
-        assert_eq!(marks.symbol_mark("src/lib.rs::S"), Some(WriteMark { status: Status::Current, count: 2 }));
+        assert_eq!(marks.symbol_mark("src/lib.rs::S"), Some(WriteMark { status: Status::Current, latest: "t2".into(), count: 2 }));
         assert_eq!(marks.symbol_mark("src/lib.rs::S/a").map(|m| m.status), Some(Status::Changed));
         assert_eq!(marks.file_mark().map(|m| m.count), Some(2));
     }
@@ -157,7 +163,7 @@ mod tests {
         index.insert(write("t1", "2026-09-27T10:00:00Z", "main", vec![]));
         let by_file = index.by_file(None);
         let marks = FileWrites::new(by_file["src/lib.rs"].clone(), &file);
-        assert_eq!(marks.file_mark(), Some(WriteMark { status: Status::Unknown, count: 1 }));
+        assert_eq!(marks.file_mark(), Some(WriteMark { status: Status::Unknown, latest: "t1".into(), count: 1 }));
         assert_eq!(marks.symbol_mark("src/lib.rs::S"), None);
     }
 

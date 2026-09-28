@@ -23,6 +23,7 @@ leave the tree rather than lingering until you quit.
 
 - **Depth-aware coloring** — every symbol shaded by how deeply it was read
 - **Write marks** — `✎` on what this session's agents changed, coloured by whether their version is still there
+- **Detail line** — above the status bar, the selected row's facts: how deeply it was read and by whom, and its latest write, by whom, and whether it still stands
 - **Per-file counts** — `seen/total` on each file header, so partial coverage shows without expanding
 - **Sortable tree** — alphabetical, or grouped by coverage to surface half-read files first
 - **Search** — `/` to jump to a symbol by name

@@ -109,6 +109,18 @@ pub enum Status {
     Unknown,
 }
 
+impl Status {
+    /// How `touched` and the TUI say it.
+    pub fn phrase(self) -> &'static str {
+        match self {
+            Status::Current => "unchanged since the agent wrote it",
+            Status::Changed => "changed since the agent wrote it",
+            Status::Removed => "no longer exists",
+            Status::Unknown => "unknown: a file-level write carries no hash to compare",
+        }
+    }
+}
+
 impl WriteRecord {
     /// Whether this write changed symbol `id`, through itself or anything
     /// nested in it: writes record innermost symbols only (D11), so an edit

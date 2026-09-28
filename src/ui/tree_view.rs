@@ -51,7 +51,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 if row.coverage_total > 0 {
                     spans.push(coverage_count(row, file_color));
                 }
-                if let Some(mark) = row.write {
+                if let Some(mark) = &row.write {
                     spans.push(Span::styled(format!(" ✎{}", mark.count), Style::default().fg(write_color(mark.status))));
                 }
                 spans.push(Span::styled(
@@ -77,7 +77,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 if let Some(c) = inner {
                     spans.push(coverage_count(row, c));
                 }
-                if let Some(mark) = row.write {
+                if let Some(mark) = &row.write {
                     spans.push(Span::styled(" ✎", Style::default().fg(write_color(mark.status))));
                 }
                 spans.push(Span::styled(

@@ -62,6 +62,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "unicode-normalization",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

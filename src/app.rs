@@ -1126,6 +1126,41 @@ impl App {
         }
     }
 
+    /// The selected row's facts in one line: what was read, by whom, and
+    /// what was written and whether it still stands. `None` on an empty tree.
+    pub fn detail_line(&self) -> Option<String> {
+        let row = self.tree_rows.get(self.selected_index)?;
+        let mut parts = Vec::new();
+        if row.is_file() {
+            parts.push(format!("{}/{} symbols seen", row.coverage_seen, row.coverage_total));
+        } else if row.read_depth.is_seen() {
+            let reader = self.agent_filter.clone().or_else(|| self.ledger.entries.get(&row.symbol_id).map(|e| e.agent_id.clone()));
+            parts.push(format!("read {} by {}", row.read_depth, self.agent_name(reader.as_deref().unwrap_or("?"))));
+            if row.stale {
+                parts.push("changed since read".into());
+            }
+            if row.restored {
+                parts.push("read before a compaction".into());
+            }
+        } else {
+            parts.push("unread".into());
+        }
+        if let Some((mark, w)) = row.write.as_ref().and_then(|m| Some((m, self.writes.get(&m.latest)?))) {
+            let when = w.t.get(..16).map_or(w.t.clone(), |t| format!("{}Z", t.replace('T', " ")));
+            parts.push(format!("written {when} by {} ({})", self.agent_name(&w.a), w.tool));
+            if mark.count > 1 {
+                parts.push(format!("{} writes", mark.count));
+            }
+            parts.push(mark.status.phrase().into());
+        }
+        Some(format!("{} — {}", row.symbol_id, parts.join(" · ")))
+    }
+
+    /// `main` for the session's own agent, else the agent id.
+    fn agent_name<'a>(&self, id: &'a str) -> &'a str {
+        if self.session_id.as_deref() == Some(id) { "main" } else { id }
+    }
+
     /// Process an agent tool call event and update the ledger.
     pub fn process_agent_event(&mut self, event: AgentToolCall) {
         self.trace.start(&event, &self.project_root);
@@ -2825,7 +2860,7 @@ mod write_tests {
     }
 
     fn mark(app: &App, id: &str) -> Option<crate::write_index::WriteMark> {
-        app.tree_rows.iter().find(|r| r.symbol_id == id).expect("row").write
+        app.tree_rows.iter().find(|r| r.symbol_id == id).expect("row").write.clone()
     }
 
     fn wrote_a(app: &App) -> WriteRecord {
@@ -2845,7 +2880,7 @@ mod write_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = marked_app(dir.path());
         app.record_write("sess", wrote_a(&app));
-        let current = Some(crate::write_index::WriteMark { status: Status::Current, count: 1 });
+        let current = Some(crate::write_index::WriteMark { status: Status::Current, latest: "toolu_1".into(), count: 1 });
         assert_eq!(mark(&app, "src/a.rs::S/a"), current);
         assert_eq!(mark(&app, "src/a.rs::S"), current, "a parent rolls up");
         assert_eq!(mark(&app, "src/a.rs::S/b"), None);
@@ -2900,6 +2935,36 @@ mod write_tests {
         app.set_journal_settings(Some(JournalSettings { backend: "tree-sitter", interval: std::time::Duration::ZERO }));
         app.attach_journal();
         assert_eq!(mark(&app, "src/a.rs::S/a").map(|m| m.status), Some(crate::writes::Status::Current));
+    }
+
+    fn detail_of(app: &mut App, id: &str) -> String {
+        app.selected_index = app.tree_rows.iter().position(|r| r.symbol_id == id).expect("row");
+        app.detail_line().unwrap()
+    }
+
+    #[test]
+    fn the_detail_line_says_what_was_read_and_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = marked_app(dir.path());
+        assert_eq!(detail_of(&mut app, "src/a.rs::S/b"), "src/a.rs::S/b — unread");
+
+        app.ledger.record("src/a.rs::S/b".into(), ReadDepth::FullBody, [0; 32], "sess".into(), 10);
+        app.rebuild_tree_rows();
+        assert_eq!(detail_of(&mut app, "src/a.rs::S/b"), "src/a.rs::S/b — read full by main");
+
+        app.record_write("sess", wrote_a(&app));
+        assert_eq!(
+            detail_of(&mut app, "src/a.rs::S/a"),
+            "src/a.rs::S/a — unread · written 2026-09-26 10:00Z by agent-1 (Edit) · unchanged since the agent wrote it"
+        );
+
+        app.ledger.record("src/a.rs::S/a".into(), ReadDepth::Signature, [0; 32], "agent-1".into(), 10);
+        app.record_write("sess", WriteRecord { op: "toolu_2".into(), t: "2026-09-26T10:05:00Z".into(), ..wrote_a(&app) });
+        assert_eq!(
+            detail_of(&mut app, "src/a.rs::S/a"),
+            "src/a.rs::S/a — read signature by agent-1 · written 2026-09-26 10:05Z by agent-1 (Edit) · 2 writes · unchanged since the agent wrote it"
+        );
+        assert!(detail_of(&mut app, "src/a.rs").starts_with("src/a.rs — 2/3 symbols seen · written"), "{}", detail_of(&mut app, "src/a.rs"));
     }
 
     #[test]
