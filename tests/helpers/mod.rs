@@ -104,6 +104,7 @@ pub fn tool_call(tool: &str, path: &str, depth: ReadDepth) -> AgentToolCall {
         tool_use_id: None,
         effect: crate::ingest::Effect::Read,
         summary: None,
+        result_depth: None,
     }
 }
 

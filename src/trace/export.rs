@@ -301,7 +301,7 @@ mod tests {
     }
 
     fn done(agent: &str, id: &str, at: &str, child: Option<&str>, error: bool) -> ToolFinished {
-        ToolFinished { id: Arc::from(id), agent_id: Arc::from(agent), timestamp: at.into(), error, message: None, child_agent: child.map(Arc::from) }
+        ToolFinished { id: Arc::from(id), agent_id: Arc::from(agent), timestamp: at.into(), error, message: None, child_agent: child.map(Arc::from), shown: Vec::new() }
     }
 
     /// main reads, delegates to agent-x (which reads and fails an edit),

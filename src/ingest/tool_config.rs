@@ -92,6 +92,8 @@ pub struct ToolMapping {
     pub target_lines: Option<TargetLinesSpec>,
     #[serde(default)]
     pub target_selectors: Option<TargetSelectorSpec>,
+    #[serde(default)]
+    pub result_selectors: Option<ResultSelectorSpec>,
     /// Name of a built-in stanza to inherit fields from.
     #[serde(default)]
     pub extends: Option<String>,
@@ -286,7 +288,8 @@ pub struct TargetSelectorSpec {
     ///
     /// Without it, `ambits rg 'src/app.rs::App'` credited a full read of that
     /// symbol. A search pattern is a regex over file content, not a request for
-    /// a definition, and `find` already journals precisely what it displayed.
+    /// a definition; what a search displayed is credited from its output
+    /// instead, at name depth (see [`ResultSelectorSpec`]).
     /// Optional, so a tool whose every invocation returns definitions needs no
     /// such marker.
     #[serde(default)]
@@ -300,6 +303,37 @@ pub struct TargetSelectorSpec {
     /// symbol exists and where it is, not what it says.
     #[serde(default)]
     pub shallow_depth: Option<ReadDepthDe>,
+}
+
+/// Symbols a command's *output* names, credited when its result arrives:
+/// `ambits rg` and `ambits grep` print each match as
+/// `path:line:col:[depth Name/path] text`, naming the symbol the line sits in.
+///
+/// The output is what the agent saw, recorded in the log as it saw it, so
+/// crediting from it needs no second search — which would read today's
+/// files, not the ones searched.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResultSelectorSpec {
+    /// Input key holding the command string (`command` for Bash).
+    pub key: String,
+    /// Substring each invocation starts with (`ambits`).
+    pub requires: String,
+    /// Subcommands whose output names symbols.
+    pub subcommands: Vec<String>,
+    /// Depth each named symbol earns: a matching line, not a definition.
+    pub depth: ReadDepthDe,
+}
+
+impl ResultSelectorSpec {
+    /// The depth this command's output earns: some invocation in it is one
+    /// of `subcommands`. An invocation ends at a pipe or a command separator,
+    /// so `ambits show X | rg y` is not a search.
+    pub fn applies(&self, input: &serde_json::Value) -> Option<ReadDepth> {
+        let cmd = input.get(&self.key)?.as_str()?;
+        let invocations = cmd.split(&self.requires).skip(1).map(|segment| segment.split(['|', ';', '&', '\n']).next().unwrap_or(""));
+        let searches = invocations.into_iter().any(|inv| inv.split_whitespace().any(|t| self.subcommands.iter().any(|s| s == t)));
+        searches.then(|| ReadDepth::from(self.depth))
+    }
 }
 
 impl TargetSelectorSpec {
@@ -608,6 +642,9 @@ impl ToolMappingConfig {
                     if stanza.target_selectors.is_none() {
                         stanza.target_selectors = base_stanza.target_selectors.clone();
                     }
+                    if stanza.result_selectors.is_none() {
+                        stanza.result_selectors = base_stanza.result_selectors.clone();
+                    }
                 }
                 // base_name not found: skip silently
             }
@@ -762,6 +799,18 @@ mod tests {
 
     fn bash_input(cmd: &str) -> serde_json::Value {
         serde_json::json!({ "command": cmd })
+    }
+
+    #[test]
+    fn an_ambits_search_is_credited_from_its_output_and_nothing_else_is() {
+        let cfg = ToolMappingConfig::builtin().unwrap();
+        let spec = cfg.tools[cfg.index["Bash"]].result_selectors.as_ref().expect("Bash carries a result spec");
+        for cmd in ["ambits -p . rg 'fn run' src", "cd x && ambits grep -rn TODO docs/ | head", "ambits show a::b && ambits -p . rg x"] {
+            assert_eq!(spec.applies(&bash_input(cmd)), Some(ReadDepth::NameOnly), "{cmd}");
+        }
+        for cmd in ["rg 'fn run' src", "ambits -p . show 'src/a.rs::App' | rg run", "ambits -p . show x; grep y z"] {
+            assert_eq!(spec.applies(&bash_input(cmd)), None, "{cmd}");
+        }
     }
 
     fn selector_spec(cfg: &ToolMappingConfig) -> &TargetSelectorSpec {

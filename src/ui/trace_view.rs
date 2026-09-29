@@ -471,6 +471,7 @@ mod tests {
             timestamp: at.into(),
             error,
             message: None, child_agent: child.map(Arc::from),
+            shown: Vec::new(),
         };
         app.trace.start(&call("sess", "r1", "Read", "2026-09-27T10:00:00.000Z"), &app.project_root.clone());
         app.trace.finish(&finish("r1", "2026-09-27T10:00:02.000Z", None, false));

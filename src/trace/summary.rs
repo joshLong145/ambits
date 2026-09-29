@@ -297,7 +297,7 @@ mod tests {
             c.read_depth = crate::tracking::ReadDepth::Unseen;
         }
         t.start(&c, Path::new("/p"));
-        t.finish(&ToolFinished { id: Arc::from(id), agent_id: Arc::from(agent), timestamp: end.into(), error, message: None, child_agent: child.map(Arc::from) });
+        t.finish(&ToolFinished { id: Arc::from(id), agent_id: Arc::from(agent), timestamp: end.into(), error, message: None, child_agent: child.map(Arc::from), shown: Vec::new() });
     }
 
     /// A prompt (0) with: two reads and an edit of a.rs, a failed edit of
@@ -357,7 +357,7 @@ mod tests {
             c.timestamp_str = "2026-09-27T10:00:01Z".into();
             c.target_symbol = symbol.map(String::from);
             t.start(&c, Path::new("/p"));
-            t.finish(&ToolFinished { id: Arc::from(id), agent_id: Arc::from("main"), timestamp: "2026-09-27T10:00:02Z".into(), error, message: None, child_agent: None });
+            t.finish(&ToolFinished { id: Arc::from(id), agent_id: Arc::from("main"), timestamp: "2026-09-27T10:00:02Z".into(), error, message: None, child_agent: None, shown: Vec::new() });
         }
         let d = detail(&t, &TraceIndex::new(&t), 0).unwrap();
         assert_eq!(

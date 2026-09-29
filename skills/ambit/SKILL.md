@@ -80,8 +80,9 @@ Each match is `file:line:column:[depth symbol] line`:
 
 | Bracket | Meaning |
 |---|---|
-| `[full name]`, `[signature name]`, … | You have read this symbol, at that depth: no need to `show` it |
-| `[— name]` | You have **not** read it |
+| `[full name]` | You have read this symbol in full: no need to `show` it |
+| `[signature name]`, `[overview name]`, `[name name]` | Seen at that depth — `name` is what an earlier search earns — but not its body: `show` it before relying on it |
+| `[— name]` | You have **not** seen it |
 | `[name]` | No coverage journal loaded: *unknown*, not unread |
 | `[-]` | Not inside any symbol — a `use` line, or a file no parser handles |
 
@@ -155,12 +156,16 @@ put in front of you:
 |---|---|
 | `show <id>` | Each symbol named, as read in **full** |
 | `show --no-body <id>` | Each symbol named, at **name** depth only |
-| `rg` / `grep` | Nothing per symbol — a search shows lines, not definitions |
+| `rg` / `grep` | Each symbol a printed match sits in, at **name** depth — seen, not read |
 
-So after a search, `show` what you need rather than reasoning from the matched
-lines: it is both the complete definition and the credit for having read it.
-Run `show --no-body` as its own command — a command containing `--no-body` is
-credited at name depth for every selector in it.
+A search counts toward Seen%, never Full%: after one, `show` what you need
+rather than reasoning from the matched lines — it is both the complete
+definition and the credit for having read it. `-l`, `-c` and `-q` print no
+symbols and credit nothing.
+
+Each `ambits` invocation in a command is credited on its own (`ambits show A
+--no-body && ambits show B` reads `B` in full), found by the word `ambits` —
+so call it by that name, not through a shell variable.
 
 ### Finding callers
 

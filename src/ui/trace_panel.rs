@@ -372,6 +372,7 @@ mod tests {
             error: message.is_some(),
             child_agent: None,
             message: message.map(String::from),
+            shown: Vec::new(),
         });
     }
 

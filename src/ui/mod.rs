@@ -283,6 +283,7 @@ pub(crate) mod test_render {
             tool_use_id: Some(Arc::from(id)),
             effect: ambits::ingest::Effect::Read,
             summary: None,
+            result_depth: None,
         }
     }
 

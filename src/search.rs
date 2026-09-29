@@ -676,6 +676,51 @@ fn render_symbol(symbol: Option<&SymbolHit>, have_journal: bool) -> String {
     }
 }
 
+/// The symbols a search's printed output names, as ids `show` takes: what
+/// [`render_symbol`] wrote on each match line (`src/a.rs:3:5:[— App/run]`,
+/// `src/a.rs:3:[full App/run]`, `src/a.rs:[App/run]`), or `symbol.id` on
+/// each `--json` match event. Context lines, `[-]` and anything else name
+/// nothing. For crediting a search from its logged output: this reads what
+/// was shown, so nothing is searched again.
+pub fn shown_selectors(output: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let id = if line.starts_with('{') {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .filter(|v| v["type"] == "match")
+                .and_then(|v| v["data"]["symbol"]["id"].as_str().map(String::from))
+        } else {
+            line_symbol(line)
+        };
+        if let Some(id) = id.filter(|id| !out.contains(id)) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// The symbol id a match line names: `path` and the name path in its
+/// bracket, which follows the path and its numbers (`:12`, `:12:5`).
+fn line_symbol(line: &str) -> Option<String> {
+    let open = line.find(":[")?;
+    let (path, numbers) = line[..open].split_once(':').unwrap_or((&line[..open], ""));
+    if path.is_empty() || !numbers.split(':').all(|n| n.is_empty() || n.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let inner = &line[open + 2..open + 2 + line[open + 2..].find(']')?];
+    if inner == NO_SYMBOL {
+        return None;
+    }
+    // `[depth name]` with a journal, `[name]` without one.
+    let depths = ["unseen", "name", "overview", "signature", "full", UNREAD];
+    let name = match inner.split_once(' ') {
+        Some((first, rest)) if depths.contains(&first) && !rest.is_empty() => rest,
+        _ => inner,
+    };
+    Some(format!("{path}::{name}"))
+}
+
 /// Clip to `max` bytes on a character boundary, reporting whether it cut.
 fn clip(text: &str, max: usize) -> (String, bool) {
     if max == 0 || text.len() <= max {
@@ -1114,6 +1159,35 @@ fn print_results(
         OutputMode::Quiet => unreachable!("run returns before printing"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod shown_selector_tests {
+    use super::*;
+
+    #[test]
+    fn every_printed_form_of_a_match_names_its_symbol() {
+        let output = "src/a.rs:3:5:[— App/run]     fn run() {}
+src/a.rs:9:[full App/stop] fn stop() {}
+docs/a.md:[Guide/What leaves the machine] text
+docs/a.md-10-context line [not a match]
+src/b.rs:1:1:[-] use std::fmt;
+src/a.rs:4:2:[— App/run] again
+{\"type\":\"match\",\"data\":{\"symbol\":{\"id\":\"src/c.rs::C/new\"}}}
+{\"type\":\"summary\",\"data\":{}}
+… 20 more matches withheld (--head-limit 0 for all)";
+        assert_eq!(shown_selectors(output), vec!["src/a.rs::App/run", "src/a.rs::App/stop", "docs/a.md::Guide/What leaves the machine", "src/c.rs::C/new"]);
+    }
+
+    #[test]
+    fn what_render_symbol_writes_reads_back() {
+        let hit = SymbolHit { id: "src/a.rs::App/run".into(), name_path: "App/run".into(), label: "fn", lines: [1, 2], depth: Some(ReadDepth::Signature), content_hash: [0; 32], estimated_tokens: 1 };
+        for (sym, journal) in [(Some(&hit), true), (Some(&hit), false)] {
+            let line = format!("src/a.rs:1:1:{} fn run", render_symbol(sym, journal));
+            assert_eq!(shown_selectors(&line), vec!["src/a.rs::App/run"], "{line}");
+        }
+        assert!(shown_selectors(&format!("src/a.rs:1:1:{} use x;", render_symbol(None, true))).is_empty());
+    }
 }
 
 #[cfg(test)]

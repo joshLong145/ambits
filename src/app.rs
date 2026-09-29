@@ -1743,6 +1743,10 @@ impl App {
     /// A tool call's result arrived: close its span in the trace.
     pub fn process_tool_finished(&mut self, finished: &crate::ingest::ToolFinished) {
         self.trace.finish(finished);
+        if !finished.shown.is_empty() {
+            apply_shown(&self.project_tree, finished, &mut self.ledger, &mut self.depth_cache);
+            self.rebuild_tree_rows();
+        }
     }
 
     /// A prompt starts a turn: the trace nests the calls that follow under it.
@@ -1841,7 +1845,7 @@ impl App {
 /// `target_selectors` — so without this both columns printed `-` even though
 /// real data existed. `target` falls back to the joined selector tokens;
 /// `path` falls back to [`resolve_selector_path`], which looks the first
-/// selector up in the tree the same way [`mark_selected_symbols`] already
+/// selector up in the tree the same way [`mark_selectors`] already
 /// does. A tool call with none of the above (e.g. an untracked tool) still
 /// prints `-` for both — there is nothing to hydrate from.
 fn event_log_path_and_target(tree: &ProjectTree, event: &AgentToolCall) -> (String, String) {
@@ -1866,7 +1870,7 @@ fn event_log_path_and_target(tree: &ProjectTree, event: &AgentToolCall) -> (Stri
 }
 
 /// The file path of the first `target_selectors` entry that resolves to a
-/// symbol in `tree`, matched the same way [`mark_selected_symbols`] matches
+/// symbol in `tree`, matched the same way [`mark_selectors`] matches
 /// by id or content-hash prefix. `None` if there are no selectors, or none of
 /// them resolve.
 ///
@@ -1942,7 +1946,7 @@ pub fn apply_tool_call(
     }
 
     if !event.target_selectors.is_empty() {
-        mark_selected_symbols(tree, event, ledger, depth_cache);
+        mark_selectors(tree, &event.target_selectors, &event.agent_id, ledger, depth_cache);
     }
 
     let Some(ref file_path) = event.file_path else {
@@ -1961,7 +1965,22 @@ pub fn apply_tool_call(
     }
 }
 
-/// Mark every symbol named by `event.target_selectors`.
+/// Credit the symbols a call's output showed (`ToolFinished::shown`: the
+/// matches an `ambits rg` printed), as the agent that made the call.
+pub fn apply_shown(
+    tree: &ProjectTree,
+    finished: &crate::ingest::ToolFinished,
+    ledger: &mut ContextLedger,
+    depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
+) {
+    if !finished.shown.is_empty() {
+        mark_selectors(tree, &finished.shown, &finished.agent_id, ledger, depth_cache);
+    }
+}
+
+/// Mark every symbol named by `selectors` (ids or content hashes), as read
+/// by `agent` at the depth each carries: `ambits show`'s arguments, or the
+/// symbols a search printed.
 ///
 /// Ambiguity is credited in full rather than resolved: an id like
 /// `src/app.rs::App` names both `struct App` and `impl App`, and a lookup that
@@ -1972,16 +1991,17 @@ pub fn apply_tool_call(
 /// A selector matching nothing is silently ignored. The command may have been
 /// a miss, or may name a symbol that has since changed; either way there is
 /// no read to record.
-fn mark_selected_symbols(
+fn mark_selectors(
     tree: &ProjectTree,
-    event: &AgentToolCall,
+    selectors: &[(String, ReadDepth)],
+    agent: &str,
     ledger: &mut ContextLedger,
     depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
 ) {
     // Split once rather than re-parsing each selector per symbol.
     let mut hashes: Vec<(String, ReadDepth)> = Vec::new();
     let mut ids: Vec<(&str, ReadDepth)> = Vec::new();
-    for (sel, depth) in &event.target_selectors {
+    for (sel, depth) in selectors {
         match crate::lookup::parse_selector(sel) {
             crate::lookup::Selector::Hash(h) => hashes.push((h, *depth)),
             crate::lookup::Selector::Id(_) => ids.push((sel.as_str(), *depth)),
@@ -2007,10 +2027,10 @@ fn mark_selected_symbols(
                 sym.id.clone(),
                 depth,
                 sym.content_hash,
-                event.agent_id.to_string(),
+                agent.to_string(),
                 sym.estimated_tokens as usize,
             );
-            depth_cache.record(&sym.id, &event.agent_id, depth);
+            depth_cache.record(&sym.id, agent, depth);
         }
     }
 }
@@ -2661,6 +2681,31 @@ mod tests {
             ReadDepth::Unseen,
             "only the named symbol is credited"
         );
+    }
+
+    /// What a search printed is credited when its result arrives — at the
+    /// depth it carries, never lowering a deeper read.
+    #[test]
+    fn a_search_result_credits_what_it_showed() {
+        let syms = vec![sym("mock/f.rs::alpha", "alpha"), sym("mock/f.rs::beta", "beta"), sym("mock/f.rs::gamma", "gamma")];
+        let mut app = test_app(vec![file("mock/f.rs", syms)]);
+        let mut read = tool_call("Bash", "", ReadDepth::FullBody);
+        read.file_path = None;
+        read.target_selectors = vec![("mock/f.rs::beta".into(), ReadDepth::FullBody)];
+        app.process_agent_event(read);
+
+        app.process_tool_finished(&crate::ingest::ToolFinished {
+            id: Arc::from("s1"),
+            agent_id: Arc::from("main"),
+            timestamp: "2026-09-29T10:00:00Z".into(),
+            error: false,
+            child_agent: None,
+            message: None,
+            shown: vec![("mock/f.rs::alpha".into(), ReadDepth::NameOnly), ("mock/f.rs::beta".into(), ReadDepth::NameOnly)],
+        });
+        assert_eq!(app.ledger.depth_of("mock/f.rs::alpha"), ReadDepth::NameOnly, "seen, not read");
+        assert_eq!(app.ledger.depth_of("mock/f.rs::beta"), ReadDepth::FullBody, "a full read stays full");
+        assert_eq!(app.ledger.depth_of("mock/f.rs::gamma"), ReadDepth::Unseen, "not shown");
     }
 
     /// Selectors carry their own location, so one command can legitimately
@@ -3465,6 +3510,7 @@ mod tests {
             tool_use_id: None,
             effect: crate::ingest::Effect::Read,
             summary: None,
+            result_depth: None,
         };
         app.process_agent_event(event);
 
@@ -3858,6 +3904,7 @@ mod trace_view_tests {
                 timestamp: end.into(),
                 error,
                 message: None, child_agent: child.map(Arc::from),
+                shown: Vec::new(),
             });
         }
         // Read after its calls, as a tailer poll can deliver it; its time

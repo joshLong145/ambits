@@ -105,6 +105,9 @@ pub struct AgentToolCall {
     /// What the call is for, in the agent's own words, when its tool takes
     /// one: Bash's `description`. Names it in the trace view.
     pub summary: Option<String>,
+    /// When its output names symbols it showed (`ambits rg`), the depth
+    /// each earns once the result arrives (see `ResultSelectorSpec`).
+    pub result_depth: Option<ReadDepth>,
 }
 
 /// Point-in-time ledger snapshot captured at a compaction boundary.
@@ -185,6 +188,9 @@ pub struct ToolFinished {
     pub child_agent: Option<Arc<str>>,
     /// Why it failed, in one line (see `claude::error_summary`).
     pub message: Option<String>,
+    /// Symbols its output showed, and the depth each earns: an `ambits rg`
+    /// match names the symbol it sits in (see `ResultSelectorSpec`).
+    pub shown: Vec<(String, ReadDepth)>,
 }
 
 /// A compaction event surfaced by the incremental tailer (no ledger snapshot

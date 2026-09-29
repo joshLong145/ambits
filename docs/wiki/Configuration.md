@@ -93,6 +93,7 @@ description   = "MyCustomReader {path}"
 | `description` | Activity-feed line; `{key}` interpolates an input value |
 | `extends` | Name of a built-in stanza to inherit unset fields from |
 | `target_symbol`, `target_lines`, `target_selectors` | Narrow the read to specific symbols rather than the whole file; see the built-ins |
+| `result_selectors` | Credit the symbols a command's **output** names, when its result arrives: `{ key, requires, subcommands, depth }`. The built-in `Bash` stanza credits `ambits rg`/`grep` matches at `NameOnly` |
 
 A tool that **changes** files is declared a write instead of given a depth:
 

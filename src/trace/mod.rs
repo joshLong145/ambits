@@ -404,6 +404,7 @@ mod tests {
             timestamp: at.to_string(),
             error: false,
             message: None, child_agent: child.map(Arc::from),
+            shown: Vec::new(),
         }
     }
 

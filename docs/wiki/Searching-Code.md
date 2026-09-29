@@ -94,15 +94,23 @@ Flags it cannot honour say so rather than pretending:
 `--json` emits ripgrep's JSON Lines events with an added `symbol` field; see
 the [CLI Reference](CLI-Reference#ambits-rg) for the full flag list.
 
-## Searching is not reading
+## Searching is seeing, not reading
 
-A search prints matching lines, not definitions, so it earns no coverage for
-the symbols those lines sit in. To read what a search found, fetch it with
-[`ambits show`](Reading-by-Symbol) — the id is the file and the bracket's name
-path, `src/symbols/mod.rs::FileSymbols/enclosing` — which is credited as a full
-read of each symbol it names (`--no-body`, as name-level only). A command that
-contains `--no-body` is credited at name level for every selector in it, so
-run it on its own.
+A search prints matching lines, not definitions. Each symbol a printed match
+sits in is credited at **name** depth — seen, so it counts toward Seen%, but
+never toward Full% and never lowering a deeper read. Matches past
+`--head-limit`, context lines, and modes that print no symbols (`-l`, `-c`,
+`-q`) credit nothing; `--json` credits each match's `symbol.id`.
+
+The credit is taken from the search's output as the session log recorded it
+— what the agent was shown — so nothing is searched again, and a `cat` of
+text that looks like search output credits nothing: only an `ambits rg` or
+`ambits grep` invocation's result is read this way.
+
+To read what a search found, fetch it with [`ambits show`](Reading-by-Symbol)
+— the id is the file and the bracket's name path,
+`src/symbols/mod.rs::FileSymbols/enclosing` — which is credited as a full read
+(`--no-body`: name level).
 
 Credit is recorded from the session log while the TUI is running for the
 session — see [Configuration → The read journal](Configuration#the-read-journal).

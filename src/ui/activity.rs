@@ -172,6 +172,7 @@ mod tests {
             tool_use_id: None,
             effect: ambits::ingest::Effect::Read,
             summary: None,
+            result_depth: None,
         });
 
         let backend = TestBackend::new(60, 10);

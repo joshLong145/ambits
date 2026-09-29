@@ -286,7 +286,7 @@ pub enum ParsedLine {
     SessionCleared,
     /// `type:"user"` line carrying tool results — how a write tool's outcome
     /// (and its `toolUseResult` detail) reaches us. Correlated with the call
-    /// by [`WriteCorrelator`].
+    /// by [`ResultCorrelator`].
     ToolResults(Vec<ToolResult>),
     /// `type:"queue-operation"` enqueuing a `<task-notification>`: a
     /// background agent stopped, long after its call's own result.
@@ -309,9 +309,17 @@ pub struct ToolResult {
     pub timestamp: String,
     /// For a failed call, why, in one line.
     pub message: Option<String>,
+    /// The block's `content`, taken rather than copied, until the
+    /// correlator has read what it needs from it.
+    pub content: Option<Value>,
+    /// Symbols the output names, filled in by the correlator for a call
+    /// whose output credits them (`ambits rg`).
+    pub shown: Vec<(String, ReadDepth)>,
 }
 
-/// Pairs write tool calls with their results (spec §1).
+/// Pairs the calls whose results matter with those results: a write's, to
+/// attribute it (spec §1); a search's, to credit the symbols its output
+/// named.
 ///
 /// A result line names only its `tool_use_id`; the tool, path and agent live
 /// on the earlier `tool_use` line. So the pairing is stateful: callers that
@@ -324,13 +332,13 @@ pub struct ToolResult {
 /// the oldest call is forgotten, and its write, if it ever completes, is
 /// not journaled.
 #[derive(Debug, Default)]
-pub struct WriteCorrelator {
+pub struct ResultCorrelator {
     /// Each pending call with the order it was noted in.
     pending: std::collections::HashMap<Arc<str>, (u64, AgentToolCall)>,
     next_seq: u64,
 }
 
-impl WriteCorrelator {
+impl ResultCorrelator {
     /// Far above the handful of writes that can be in flight at once.
     pub const MAX_PENDING: usize = 1024;
 
@@ -342,10 +350,11 @@ impl WriteCorrelator {
         pending.into_iter().map(|(_, call)| call).collect()
     }
 
-    /// Remember write calls until their results arrive.
+    /// Remember write and search calls until their results arrive.
     pub fn note_calls(&mut self, calls: &[AgentToolCall]) {
         for call in calls {
-            if call.effect != Effect::Write || call.file_path.is_none() {
+            let write = call.effect == Effect::Write && call.file_path.is_some();
+            if !write && call.result_depth.is_none() {
                 continue;
             }
             let Some(id) = &call.tool_use_id else { continue };
@@ -361,24 +370,32 @@ impl WriteCorrelator {
         }
     }
 
-    /// Turn results for pending write calls into write events. Failed or
-    /// rejected writes are dropped: nothing changed on disk.
-    pub fn resolve(&mut self, results: Vec<ToolResult>) -> Vec<WriteEvent> {
+    /// Settle the pending calls these results answer: a search's names the
+    /// symbols its output showed (in `shown`), a write's becomes a write
+    /// event. Failed or rejected writes are dropped: nothing changed on disk.
+    /// A search's output is credited even when the command failed — it was
+    /// shown all the same, and an error prints no symbols.
+    pub fn resolve(&mut self, results: &mut [ToolResult]) -> Vec<WriteEvent> {
         let mut out = Vec::new();
-        for result in results {
+        for result in results.iter_mut() {
             let Some((_, call)) = self.pending.remove(&result.tool_use_id) else {
                 continue;
             };
+            if let Some(depth) = call.result_depth {
+                let text = result.content.as_ref().and_then(content_text).unwrap_or_default();
+                result.shown = crate::search::shown_selectors(&text).into_iter().map(|id| (id, depth)).collect();
+                continue;
+            }
             if result.is_error {
                 continue;
             }
             let Some(path) = call.file_path else { continue };
             out.push(WriteEvent {
-                op: result.tool_use_id,
+                op: result.tool_use_id.clone(),
                 agent_id: call.agent_id,
                 tool_name: call.tool_name,
                 path,
-                timestamp: result.timestamp,
+                timestamp: result.timestamp.clone(),
                 source: result.detail.as_ref().map(write_source).unwrap_or(WriteSource::Opaque),
             });
         }
@@ -457,32 +474,35 @@ fn result_failed(block: &Value, detail: Option<&Value>, single: bool) -> bool {
 /// or `Bash` it holds the whole output, and most results are dropped unpaired.
 fn parse_tool_results(obj: &mut Value) -> Vec<ToolResult> {
     let mut detail = obj.get_mut("toolUseResult").map(Value::take);
-    let Some(Value::Array(blocks)) = obj.pointer("/message/content") else {
+    let timestamp = obj.get("timestamp").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let Some(Value::Array(blocks)) = obj.pointer_mut("/message/content") else {
         return Vec::new();
     };
-    let timestamp = obj.get("timestamp").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let results: Vec<&Value> = blocks
-        .iter()
-        .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_result"))
-        .collect();
+    let is_result = |b: &Value| b.get("type").and_then(|v| v.as_str()) == Some("tool_result");
     // `toolUseResult` is one per line; it can only be attributed to a block
     // when there is exactly one.
-    let single = results.len() == 1;
+    let single = blocks.iter().filter(|b| is_result(b)).count() == 1;
     // A string `toolUseResult` is the tool's own error message.
     let detail_text = detail.clone().filter(|d| single && d.is_string());
-    results
-        .into_iter()
+    blocks
+        .iter_mut()
+        .filter(|b| is_result(b))
         .filter_map(|b| {
             let id = b.get("tool_use_id")?.as_str()?;
             let is_error = result_failed(b, detail.as_ref(), single);
+            let tool_use_id = Arc::from(id);
+            // Moved out, not copied: a `Read`'s holds the whole file.
+            let content = b.get_mut("content").map(Value::take);
             Some(ToolResult {
-                tool_use_id: Arc::from(id),
+                tool_use_id,
                 is_error,
                 detail: detail.take().filter(|d| single && d.is_object()),
                 timestamp: timestamp.clone(),
                 // The content has the error and the output that explains it
                 // (a bare "Error: Exit code 1" in `toolUseResult` does not).
-                message: is_error.then(|| b.get("content").and_then(error_summary).or_else(|| detail_text.as_ref().and_then(error_summary))).flatten(),
+                message: is_error.then(|| content.as_ref().and_then(error_summary).or_else(|| detail_text.as_ref().and_then(error_summary))).flatten(),
+                content,
+                shown: Vec::new(),
             })
         })
         .collect()
@@ -692,7 +712,7 @@ fn replay_log_file(path: &Path, mapper: &dyn ToolCallMapper, project_root: Optio
     };
     let mut reader = BufReader::new(file);
     let mut feed = LineFeed::for_file(path, project_root);
-    let mut writes = WriteCorrelator::default();
+    let mut writes = ResultCorrelator::default();
     let mut events: Vec<SessionEvent> = Vec::new();
     let mut offset = 0u64;
     let mut line = String::new();
@@ -735,7 +755,7 @@ impl LineFeed {
     }
 
     /// Feed one line, appending whatever events it completes to `out`.
-    fn feed(&mut self, line: &str, mapper: &dyn ToolCallMapper, writes: &mut WriteCorrelator, out: &mut Vec<SessionEvent>) {
+    fn feed(&mut self, line: &str, mapper: &dyn ToolCallMapper, writes: &mut ResultCorrelator, out: &mut Vec<SessionEvent>) {
         match parse_jsonl_line(line.trim(), &self.default_id, mapper) {
             ParsedLine::Events(mut calls) => {
                 for call in &mut calls {
@@ -747,8 +767,10 @@ impl LineFeed {
                 writes.note_calls(&calls);
                 out.extend(calls.into_iter().map(SessionEvent::ToolCall));
             }
-            ParsedLine::ToolResults(results) => {
-                for r in &results {
+            ParsedLine::ToolResults(mut results) => {
+                // A write's path comes from its call, remapped above.
+                let written = writes.resolve(&mut results);
+                for r in &mut results {
                     let child_agent = r
                         .detail
                         .as_ref()
@@ -762,10 +784,10 @@ impl LineFeed {
                         error: r.is_error,
                         child_agent,
                         message: r.message.clone(),
+                        shown: std::mem::take(&mut r.shown),
                     }));
                 }
-                // A write's path comes from its call, remapped above.
-                out.extend(writes.resolve(results).into_iter().map(SessionEvent::Write));
+                out.extend(written.into_iter().map(SessionEvent::Write));
             }
             ParsedLine::CompactBoundary { metadata, .. } => self.pending_metadata = Some(metadata),
             ParsedLine::Compacted { summary, timestamp } => out.push(SessionEvent::Compacted {
@@ -785,6 +807,7 @@ impl LineFeed {
                     error,
                     child_agent: Some(agent),
                     message: error.then(|| format!("ended: {}", crate::objects::printable(&status))),
+                    shown: Vec::new(),
                 }))
             }
             ParsedLine::Prompt { agent, text, timestamp } => out.push(SessionEvent::Prompt(super::Prompt {
@@ -1008,6 +1031,7 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
                     tool_use_id: None,
                     effect: Effect::Read,
                     summary: None,
+                    result_depth: None,
                 }
             }
         };
@@ -1236,6 +1260,7 @@ pub fn map_tool_call(
         target_lines,
         target_selectors,
         label: agent_arc,
+        result_depth: mapping.result_selectors.as_ref().and_then(|spec| spec.applies(input)),
         // Set by `parse_jsonl_line`, which sees the tool_use block's id.
         tool_use_id: None,
         effect,
@@ -1271,7 +1296,7 @@ pub struct LogTailer {
     project_root: Option<PathBuf>,
     /// Write calls awaiting their results, kept across polls: a result can
     /// land in a later poll than its call.
-    writes: WriteCorrelator,
+    writes: ResultCorrelator,
 }
 
 impl LogTailer {
@@ -1290,13 +1315,13 @@ impl LogTailer {
             let start = fs::metadata(f).map(|m| m.len()).unwrap_or(0);
             positions.insert(f.clone(), start);
         }
-        Self { files, positions, mapper, feeds: Default::default(), project_root: None, writes: WriteCorrelator::default() }
+        Self { files, positions, mapper, feeds: Default::default(), project_root: None, writes: ResultCorrelator::default() }
     }
 
     /// Continue exactly where a batch replay stopped: each file from its
     /// replay offset, still awaiting the replay's unresolved write calls.
     pub fn resume(handoff: Handoff, mapper: Arc<dyn ToolCallMapper>) -> Self {
-        let mut writes = WriteCorrelator::default();
+        let mut writes = ResultCorrelator::default();
         writes.note_calls(&handoff.awaiting);
         let files = handoff.files.iter().map(|(f, _)| f.clone()).collect();
         let positions = handoff.files.into_iter().collect();
@@ -2500,6 +2525,52 @@ mod write_tests {
         })
     }
 
+    fn bash(id: &str, command: &str) -> String {
+        serde_json::json!({
+            "type": "assistant", "sessionId": "s1", "timestamp": "2026-09-26T10:00:00Z",
+            "message": {"content": [{"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}]}
+        })
+        .to_string()
+    }
+
+    fn output(id: &str, text: &str) -> String {
+        serde_json::json!({
+            "type": "user", "timestamp": "2026-09-26T10:00:01Z",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": [{"type": "text", "text": text}]}]},
+            "toolUseResult": {"stdout": text, "stderr": ""}
+        })
+        .to_string()
+    }
+
+    /// A search's result names the symbols it printed, at name depth; the
+    /// same lines in anything else's output (a `cat` of these docs) name
+    /// nothing.
+    #[test]
+    fn a_search_credits_the_symbols_its_output_named() {
+        let printed = "src/a.rs:3:5:[— App/run]     fn run() {}\nsrc/a.rs:1:1:[-] use x;\nsrc/a.rs:9:2:[full App/stop]  stop()";
+        let lines = [
+            bash("s1", "ambits -p . rg 'run|stop' src | head -20"),
+            output("s1", printed),
+            bash("c1", "cat docs/wiki/Searching-Code.md"),
+            output("c1", printed),
+            bash("p1", "ambits -p . show 'src/a.rs::App' | rg run"),
+            output("p1", printed),
+        ];
+        let shown: Vec<(String, Vec<(String, ReadDepth)>)> = parse(&lines)
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::ToolFinished(f) => Some((f.id.to_string(), f.shown)),
+                _ => None,
+            })
+            .collect();
+        let name = |id: &str| (id.to_string(), ReadDepth::NameOnly);
+        assert_eq!(shown, vec![
+            ("s1".to_string(), vec![name("src/a.rs::App/run"), name("src/a.rs::App/stop")]),
+            ("c1".to_string(), vec![]),
+            ("p1".to_string(), vec![]),
+        ]);
+    }
+
     fn parse(lines: &[String]) -> Vec<SessionEvent> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s1.jsonl");
@@ -2682,17 +2753,17 @@ mod write_tests {
         }
     }
 
-    fn pending_ids(c: WriteCorrelator) -> Vec<String> {
+    fn pending_ids(c: ResultCorrelator) -> Vec<String> {
         c.into_pending().into_iter().map(|c| c.tool_use_id.unwrap().to_string()).collect()
     }
 
     #[test]
     fn the_correlator_forgets_the_oldest_call_past_its_cap() {
-        let mut c = WriteCorrelator::default();
-        let calls: Vec<_> = (0..=WriteCorrelator::MAX_PENDING).map(|i| write_call(&format!("t{i}"))).collect();
+        let mut c = ResultCorrelator::default();
+        let calls: Vec<_> = (0..=ResultCorrelator::MAX_PENDING).map(|i| write_call(&format!("t{i}"))).collect();
         c.note_calls(&calls);
         let ids = pending_ids(c);
-        assert_eq!(ids.len(), WriteCorrelator::MAX_PENDING);
+        assert_eq!(ids.len(), ResultCorrelator::MAX_PENDING);
         assert_eq!(ids[0], "t1", "t0 was the oldest");
     }
 
@@ -2700,12 +2771,12 @@ mod write_tests {
     /// evicts anything.
     #[test]
     fn resolved_calls_do_not_count_toward_the_cap() {
-        let mut c = WriteCorrelator::default();
-        for i in 0..3 * WriteCorrelator::MAX_PENDING {
+        let mut c = ResultCorrelator::default();
+        for i in 0..3 * ResultCorrelator::MAX_PENDING {
             let id = format!("t{i}");
             c.note_calls(&[write_call(&id)]);
-            let done = ToolResult { tool_use_id: Arc::from(id.as_str()), is_error: false, detail: None, timestamp: String::new(), message: None };
-            assert_eq!(c.resolve(vec![done]).len(), 1);
+            let done = ToolResult { tool_use_id: Arc::from(id.as_str()), is_error: false, detail: None, timestamp: String::new(), message: None, content: None, shown: Vec::new() };
+            assert_eq!(c.resolve(&mut [done]).len(), 1);
         }
         c.note_calls(&[write_call("last")]);
         assert_eq!(pending_ids(c), vec!["last"]);
@@ -2713,7 +2784,7 @@ mod write_tests {
 
     #[test]
     fn a_call_noted_twice_is_pending_once() {
-        let mut c = WriteCorrelator::default();
+        let mut c = ResultCorrelator::default();
         c.note_calls(&[write_call("t1"), write_call("t1")]);
         assert_eq!(pending_ids(c), vec!["t1"]);
     }

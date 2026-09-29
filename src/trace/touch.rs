@@ -92,7 +92,7 @@ mod tests {
             c.read_depth = crate::tracking::ReadDepth::Unseen;
         }
         t.start(&c, Path::new("/p"));
-        t.finish(&ToolFinished { id: Arc::from(id), agent_id: Arc::from("main"), timestamp: at.into(), error: false, message: None, child_agent: None });
+        t.finish(&ToolFinished { id: Arc::from(id), agent_id: Arc::from("main"), timestamp: at.into(), error: false, message: None, child_agent: None, shown: Vec::new() });
     }
 
     fn prompt(t: &mut Trace, at: &str, text: &str) {
