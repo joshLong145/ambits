@@ -145,8 +145,10 @@ by `--max-bytes` is flagged `"truncated": true`, as it is no longer valid source
 
 **Ambiguity is reported, not resolved.** `matches` is an array: ids are not
 unique (a type may have several inherent impl blocks in one file). Prefer the
-hash when you need exactly one. An empty `matches` means no such symbol;
-`"selector": "unrecognized"` means the query was neither an id nor a hash.
+hash when you need exactly one. An empty `matches` means no such symbol, and
+for an id comes with `suggestions` — the ids you likely meant (generics like
+`ContentRow<'a>` and a Markdown heading's full path forgiven): `show` one of
+them. `"selector": "unrecognized"` means the query was neither an id nor a hash.
 
 ### What counts as reading
 

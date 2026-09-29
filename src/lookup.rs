@@ -127,6 +127,64 @@ struct ResultDto<'a> {
     /// Every symbol matching the query, sorted by file then line. Empty means
     /// no match.
     matches: Vec<MatchDto<'a>>,
+    /// For an id that matched nothing, ids close to it (see [`suggest`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    suggestions: Vec<&'a str>,
+}
+
+/// Suggestions for an id that matched nothing, at most.
+const SUGGESTIONS: usize = 5;
+
+/// A name-path segment as a guess would spell it: without generics
+/// (`ContentRow<'a>` is `ContentRow`), without an `impl ` prefix, in any case.
+fn loosely(segment: &str) -> String {
+    let segment = segment.trim().strip_prefix("impl ").unwrap_or(segment.trim());
+    let mut depth = 0usize;
+    let bare: String = segment
+        .chars()
+        .filter(|c| {
+            match c {
+                '<' => depth += 1,
+                '>' => depth = depth.saturating_sub(1),
+                _ => return depth == 0,
+            }
+            false
+        })
+        .collect();
+    bare.trim().to_lowercase()
+}
+
+/// Ids near `id`, which matched nothing: in its file — or a file whose path
+/// ends with the one given — those whose name path ends with its segments,
+/// then those sharing its last one, compared [`loosely`]. So
+/// `ContentRow/new` finds `ContentRow<'a>/new`, and a heading's title finds
+/// its section however deep it sits (`Guide/Setup/Install` for `Install`).
+fn suggest<'a>(all: &[(&Path, &'a SymbolNode)], id: &str) -> Vec<&'a str> {
+    let (path, name) = crate::symbols::split_id(id);
+    let want: Vec<String> = name.split('/').map(loosely).filter(|s| !s.is_empty()).collect();
+    let Some(last) = want.last() else { return Vec::new() };
+    let in_file = |file: &str| file == path || file.ends_with(&format!("/{path}"));
+    let (mut ends, mut shares) = (Vec::new(), Vec::new());
+    for (_, sym) in all {
+        let (file, name) = crate::symbols::split_id(&sym.id);
+        if !in_file(file) {
+            continue;
+        }
+        let segments: Vec<String> = name.split('/').map(loosely).collect();
+        if segments.ends_with(&want) {
+            ends.push(sym.id.as_str());
+        } else if segments.last() == Some(last) {
+            shares.push(sym.id.as_str());
+        }
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for id in ends.into_iter().chain(shares) {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out.truncate(SUGGESTIONS);
+    out
 }
 
 /// Present only when a coverage journal was loaded. Its absence is what tells
@@ -305,6 +363,7 @@ fn resolve<'a>(
                 .then_with(|| a.1.id.cmp(&b.1.id))
         });
 
+        let hits_empty = hits.is_empty();
         let matches = hits
             .into_iter()
             .map(|(file, node)| {
@@ -321,7 +380,12 @@ fn resolve<'a>(
             })
             .collect();
 
+        let suggestions = match (&selector, hits_empty) {
+            (Selector::Id(id), true) => suggest(&all, id),
+            _ => Vec::new(),
+        };
         results.push(ResultDto {
+            suggestions,
             query,
             selector: match selector {
                 Selector::Hash(_) => "hash",
@@ -416,6 +480,22 @@ mod tests {
     fn show(root: &Path, tree: &ProjectTree, q: &[&str], body: bool) -> serde_json::Value {
         let queries: Vec<String> = q.iter().map(|s| s.to_string()).collect();
         serde_json::to_value(resolve(root, tree, &queries, body, None, None)).unwrap()
+    }
+
+    /// An id that matched nothing is answered with the ids it most likely
+    /// meant: generics and a shortened heading path forgiven.
+    #[test]
+    fn a_near_miss_suggests_the_ids_it_meant() {
+        let (dir, tree) = tmp_project(&[
+            ("a.rs", "struct Row<'a>(&'a str);\nimpl<'a> Row<'a> {\n    fn new(s: &'a str) -> Self { Row(s) }\n}\nfn new() {}\n"),
+            ("g.md", "# Guide\n\n## Setup\n\n### Install\n\ntext\n"),
+        ]);
+        let got = show(dir.path(), &tree, &["a.rs::Row/new", "g.md::Install", "a.rs::Row<'a>/new", "a.rs::Nothing/here"], false);
+        let suggestions = |i: usize| got["results"][i]["suggestions"].as_array().map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect::<Vec<_>>());
+        assert_eq!(suggestions(0), Some(vec!["a.rs::Row<'a>/new".to_string(), "a.rs::new".to_string()]), "the method first, then the same name");
+        assert_eq!(suggestions(1), Some(vec!["g.md::Guide/Setup/Install".to_string()]));
+        assert_eq!(suggestions(2), None, "a match needs none");
+        assert_eq!(suggestions(3), None, "nothing close");
     }
 
     /// The definition must be the exact source span, not an approximation

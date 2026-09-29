@@ -95,7 +95,13 @@ And leaves out what is about something else:
 type several inherent `impl` blocks in one file, and nothing in the name
 distinguishes them. A content hash always names exactly one symbol.
 
-- Empty `matches` — no such symbol.
+- Empty `matches` — no such symbol. For an id, `suggestions` then lists up to
+  five ids it likely meant, from the same file (or one whose path ends with
+  the path given): those whose name path ends with the query's, then those
+  sharing its last segment, ignoring generics, an `impl ` prefix and case.
+  So `ContentRow/new` suggests `ContentRow<'a>/new`, and a heading's title
+  suggests its full path (`Guide/Setup/Install` for `Install`). A suggestion
+  is not a match: `show` it to read it.
 - `"selector": "unrecognized"` — the query was neither an id nor a hash.
 
 The command exits `0` either way: "nothing matches" is an answer, not a
