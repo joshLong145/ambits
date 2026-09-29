@@ -47,7 +47,8 @@ use crate::symbols::{nested_in, split_id, FileSymbols, SymbolId, SymbolNode};
 ///
 /// 2: a write is symbol-level only when its hunks reproduce the file exactly;
 /// a missing or malformed patch is file-level.
-pub const ATTRIBUTION_VERSION: u32 = 2;
+/// 3: a symbol-level write also says which of its symbols it created.
+pub const ATTRIBUTION_VERSION: u32 = 3;
 
 /// How precisely a write was attributed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +89,10 @@ pub struct WriteRecord {
     /// Innermost symbols the write deleted.
     #[serde(default)]
     pub removed: Vec<String>,
+    /// Those of `syms` the write created: no symbol had the id before it.
+    /// Empty for a record from before [`ATTRIBUTION_VERSION`] 3.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub created: Vec<String>,
     /// For a `Write`, BLAKE3 of the new content, so even a file-level `Write`
     /// can later be matched to the commit it landed in. Hashing is allowed;
     /// storing contents is not (spec §9.6).
@@ -295,7 +300,7 @@ pub fn build_record(
             _ => None,
         });
 
-    let (level, outside_symbols, syms, removed) = match attribution {
+    let (level, outside_symbols, syms, removed, created) = match attribution {
         Some(a) => (
             Level::Symbol,
             a.outside_symbols,
@@ -304,8 +309,9 @@ pub fn build_record(
                 .map(|(id, h)| (id.clone(), crate::journal::encode_hash(h)))
                 .collect(),
             a.removed,
+            a.created,
         ),
-        None => (Level::File, false, Vec::new(), Vec::new()),
+        None => (Level::File, false, Vec::new(), Vec::new(), Vec::new()),
     };
 
     Some(WriteRecord {
@@ -319,6 +325,7 @@ pub fn build_record(
         outside_symbols,
         syms,
         removed,
+        created,
         fh,
         origin: None,
     })
@@ -344,6 +351,9 @@ pub struct Attribution {
     /// Innermost symbols the write deleted: present before, no symbol with
     /// that id after. Sorted and deduplicated.
     pub removed: Vec<SymbolId>,
+    /// Those of `touched` the write created: after it, but no symbol with
+    /// that id before. Sorted and deduplicated.
+    pub created: Vec<SymbolId>,
     /// Some changed line fell inside no symbol.
     pub outside_symbols: bool,
 }
@@ -414,8 +424,11 @@ pub fn attribute(
                 !after_lines[line as usize - 1].trim().is_empty()
                     && innermost_at(&after_syms, line).is_none()
             });
+            // A new file: everything in it is new.
+            let created = touched.iter().map(|(id, _)| id.clone()).collect::<BTreeSet<_>>().into_iter().collect();
             return Some(Attribution {
                 touched: touched.into_iter().collect(),
+                created,
                 outside_symbols,
                 ..Attribution::default()
             });
@@ -474,9 +487,11 @@ pub fn attribute(
         }
     }
 
+    let created: BTreeSet<SymbolId> = touched.iter().filter(|(id, _)| with_id(&before_syms, id).is_empty()).map(|(id, _)| id.clone()).collect();
     Some(Attribution {
         touched: touched.into_iter().collect(),
         removed: removed.into_iter().collect(),
+        created: created.into_iter().collect(),
         outside_symbols,
     })
 }
@@ -640,6 +655,19 @@ fn gamma() {
         assert_eq!(a.removed, vec!["src/lib.rs::beta".to_string()]);
         assert!(a.touched.is_empty(), "{:?}", a.touched);
         assert!(a.outside_symbols, "the removed blank line sat between symbols");
+    }
+
+    /// A symbol no id named before the write was created by it; one edited
+    /// in place was not. Every symbol of a new file was.
+    #[test]
+    fn a_new_symbol_is_created_and_an_edited_one_is_not() {
+        let after = format!("{}\nfn delta() {{}}\n", BEFORE.replace("let a = 1;", "let a = 9;"));
+        let hunks = [hunk(2, 2, &["-    let a = 1;", "+    let a = 9;"]), hunk(11, 11, &[" }", "+", "+fn delta() {}"])];
+        let a = run(BEFORE, &after, Diff::Hunks(&hunks));
+        assert_eq!(a.created, vec!["src/lib.rs::delta".to_string()]);
+        assert!(a.touched.iter().any(|(id, _)| id == "src/lib.rs::alpha"), "{:?}", a.touched);
+        let new_file = run("", BEFORE, Diff::Created);
+        assert_eq!(new_file.created.len(), new_file.touched.len());
     }
 
     /// A method edit touches the method, not the impl block containing it.

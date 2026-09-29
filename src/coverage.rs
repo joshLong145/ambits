@@ -644,7 +644,9 @@ pub fn run_report(
                         compactions.clear();
                     }
                     // Writes grant no read credit (spec D9).
-                    SessionEvent::ToolFinished(f) => crate::app::apply_shown(project_tree, &f, &mut ledger, &mut depth_cache),
+                    SessionEvent::ToolFinished(f) => {
+                    crate::app::apply_shown(project_tree, &f, &mut ledger, &mut depth_cache);
+                }
                     SessionEvent::Write(_) | SessionEvent::Prompt(_) => {}
                 }
             }

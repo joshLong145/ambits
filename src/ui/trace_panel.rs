@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use ambits::app::{App, FocusPanel, PanelSubject};
-use ambits::trace::summary::{self, FileActivity, Row, TraceDetail};
+use ambits::trace::summary::{self, FileActivity, Row, SymbolChange, TraceDetail};
 use ambits::trace::view;
 use ambits::trace::SpanKind;
 use ambits::writes::{FileContents, Status, WriteRecord};
@@ -41,18 +41,21 @@ pub(super) fn render(f: &mut Frame, app: &App, area: Rect, frame: &TraceFrame<'_
     let selected = focused.then_some(app.panel_index);
     // The line the selected row is on, to keep in view.
     let mut at = None;
-    let mut with_rows = |mut out: Vec<Line<'static>>, rows: &[Row<'_>]| {
-        let (lines, picked) = rows_lines(app, frame, rows, selected, width);
+    let mut with_rows = |mut out: Vec<Line<'static>>, rows: &[Row<'_>], write: Option<&WriteRecord>| {
+        let (lines, picked) = rows_lines(app, frame, rows, write, selected, width);
         at = picked.map(|p| p.start + out.len()..p.end + out.len());
         out.extend(lines);
         out
     };
     let lines = match subject {
         PanelSubject::Trace(root) => match summary::detail(&app.trace, &frame.index, root) {
-            Some(d) => with_rows(trace_lines(app, &d, width), &d.rows()),
+            Some(d) => with_rows(trace_lines(app, &d, width), &d.rows(), None),
             None => vec![Line::from(text(" nothing here", Color::DarkGray))],
         },
-        PanelSubject::Call(i) => with_rows(call_lines(app, i, frame, width), &summary::call_rows(&app.trace, &frame.index, i)),
+        PanelSubject::Call(i) => {
+            let write = app.write_of(i);
+            with_rows(call_lines(app, i, frame, width), &summary::call_rows(&app.trace, &frame.index, i, write), write)
+        }
         PanelSubject::Instant(i) => {
             let x = &app.trace.instants()[i];
             let (glyph, color) = instant_glyph(&x.kind);
@@ -149,17 +152,13 @@ fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, width: usize) -> Vec<
             }
         }
         SpanKind::Write => match s.id.as_deref().and_then(|op| statuses.get(op)) {
+            // What it did in a line; the symbols themselves are rows below.
             Some((w, status)) => {
-                let level = if w.syms.is_empty() { "file-level".to_string() } else { format!("{} symbol(s)", w.syms.len()) };
+                let created = w.created.len();
+                let counts = [(w.syms.len() - created, "edited"), (created, "created"), (w.removed.len(), "deleted")];
+                let did: Vec<String> = counts.iter().filter(|(n, _)| *n > 0).map(|(n, what)| format!("{n} {what}")).collect();
+                let level = if did.is_empty() { "file-level".to_string() } else { did.join(" · ") };
                 out.push(fact("wrote", vec![text(level, Color::White), text("  ", Color::Gray), write_word(*status)]));
-                let now = app.file_contents(&w.file);
-                let syms = symbols_written(now.as_deref(), w);
-                for (name, status) in syms.iter().take(8) {
-                    out.push(fact("", vec![text(fit(name, width.saturating_sub(26).max(8)), Color::White), text("  ", Color::Gray), write_word(*status)]));
-                }
-                if syms.len() > 8 {
-                    out.push(fact("", vec![text(format!("… {} more", syms.len() - 8), Color::DarkGray)]));
-                }
             }
             None => out.push(fact("wrote", vec![text("not attributed (no journal entry)", Color::DarkGray)])),
         },
@@ -276,6 +275,19 @@ fn file_details(app: &App, frame: &TraceFrame<'_>, file: &FileActivity, width: u
     out
 }
 
+/// A symbol row's name path, then — dimmed, as far as `room` allows — the
+/// file it is in: one call can read symbols of the same name in several.
+fn symbol_cells(id: &str, room: usize) -> Vec<Span<'static>> {
+    let (file, name) = ambits::symbols::split_id(id);
+    let name = fit(name, room.max(8));
+    let rest = room.saturating_sub(super::width(&name) + 2);
+    let mut cells = vec![text(format!(" {name}"), Color::White)];
+    if rest >= 6 {
+        cells.push(text(format!("  {}", fit(file, rest)), Color::DarkGray));
+    }
+    cells
+}
+
 /// The width of a files row's name column: what the counts leave.
 fn file_name_width(width: usize) -> usize {
     width.saturating_sub(3 + 12 + 14).max(8)
@@ -284,7 +296,7 @@ fn file_name_width(width: usize) -> usize {
 /// The panel's selectable rows, under a heading per section, the selected
 /// one marked: the same list, in the same order, that `Enter` opens. With
 /// the lines the selected row and what it shows under it take.
-fn rows_lines(app: &App, frame: &TraceFrame<'_>, rows: &[Row<'_>], selected: Option<usize>, width: usize) -> (Vec<Line<'static>>, Option<Range<usize>>) {
+fn rows_lines(app: &App, frame: &TraceFrame<'_>, rows: &[Row<'_>], write: Option<&WriteRecord>, selected: Option<usize>, width: usize) -> (Vec<Line<'static>>, Option<Range<usize>>) {
     let spans = app.trace.spans();
     let picked = selected.map(|s| s.min(rows.len().saturating_sub(1)));
     let mut at = None;
@@ -327,6 +339,26 @@ fn rows_lines(app: &App, frame: &TraceFrame<'_>, rows: &[Row<'_>], selected: Opt
             }
             Row::Commit(i) => vec![text(fit(&app.trace.instants()[i].kind.label(), width.saturating_sub(4)), Color::Cyan)],
             Row::ThisFile(file) => vec![text(fit(file, width.saturating_sub(16)), Color::White), text("  → tree", Color::DarkGray)],
+            Row::Read { id, depth } => {
+                let mut cells = depth_spans(depth, STATE);
+                cells.extend(symbol_cells(id, width.saturating_sub(STATE + 6)));
+                cells
+            }
+            Row::Wrote { id, change, file } => {
+                let (mark, color) = match change {
+                    SymbolChange::Created => ("+ created", tree_view::write_color(Status::Current)),
+                    SymbolChange::Edited => ("~ edited", colors::DEPTH_STALE),
+                    SymbolChange::Deleted => ("− deleted", tree_view::write_color(Status::Removed)),
+                };
+                // Whether what it wrote is still there; a deleted symbol's
+                // status is its deletion.
+                let now = (change != SymbolChange::Deleted).then(|| write.map(|w| (app.file_contents(file), w))).flatten();
+                let stands = now.map(|(now, w)| now.map_or(Status::Removed, |n| n.symbol_status(id, w)));
+                let mut cells = vec![text(format!("{mark:<STATE$}"), color)];
+                cells.extend(symbol_cells(id, width.saturating_sub(STATE + 18)));
+                cells.extend(stands.map(|s| text(format!("  {}", s.word()), tree_view::write_color(s))));
+                cells
+            }
             Row::Related { span: j, before } => vec![
                 text(format!("{} {} ", if before { "before" } else { "after " }, ambits::time::clock(spans[j].start)), Color::DarkGray),
                 text(fit(&app.trace.spans()[j].name(), width.saturating_sub(24).max(8)), span_color(app, &frame.statuses, j)),
@@ -503,6 +535,65 @@ mod tests {
         assert_eq!(app.content_view.as_ref().unwrap().scroll, 34 - 5, "the last page");
         press(&mut app, KeyCode::Esc);
         assert!(app.content_view.is_none());
+    }
+
+    /// `src/a.rs` holding `App` with `run` in it, lines 3-5.
+    fn app_with_symbols() -> App {
+        use ambits::symbols::{FileSymbols, SymbolCategory, SymbolNode};
+        let node = |id: &str, name: &str, lines: std::ops::Range<u32>, children: Vec<SymbolNode>| SymbolNode {
+            id: id.into(), name: name.into(), category: SymbolCategory::Function, label: "fn",
+            file_path: Arc::new(PathBuf::from("src/a.rs")), byte_range: 0..10, line_range: lines,
+            content_hash: [1; 32], merkle_hash: [1; 32], children, estimated_tokens: 5,
+        };
+        let run = node("src/a.rs::App/run", "run", 3..5, vec![]);
+        let tree = ProjectTree { root: PathBuf::from("/test"), files: vec![FileSymbols { file_path: "src/a.rs".into(), symbols: vec![node("src/a.rs::App", "App", 1..6, vec![run])], total_lines: 6 }] };
+        let mut app = App::new(tree, PathBuf::from("/test"));
+        app.set_session_id(Some("sess".into()));
+        app.process_prompt(&Prompt { agent_id: Arc::from("sess"), timestamp: "2026-09-27T10:00:00Z".into(), text: "go".into() });
+        app
+    }
+
+    /// A read lists the symbols it read, and Enter on one opens its
+    /// definition in the editor.
+    #[test]
+    fn a_read_lists_its_symbols_and_enter_opens_one() {
+        use crossterm::event::KeyCode;
+        let mut app = app_with_symbols();
+        let mut c = crate::ui::test_render::tool_call("sess", "r1", "Read", "src/a.rs", "2026-09-27T10:00:01Z");
+        c.target_symbol = Some("App/run".into());
+        app.process_agent_event(c);
+        app.trace_view.open = true;
+        app.trace_view.open_trace(0);
+        app.trace_view.selected = Some(ambits::trace::view::Item::Span(1));
+        let text = crate::ui::test_render::lines(60, 30, |f| render(f, &app, f.area(), &TraceFrame::new(&app))).join("\n");
+        for want in ["symbols read", "● full body   App/run"] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.pending_editor_request, Some((PathBuf::from("/test/src/a.rs"), 3)), "run's definition, at its line");
+    }
+
+    /// A write lists what it did to each symbol: edited, created, deleted.
+    #[test]
+    fn a_write_lists_what_it_did_to_each_symbol() {
+        let mut app = app_with_symbols();
+        call(&mut app, "e1", "Edit", "src/a.rs", "2026-09-27T10:00:01Z", "2026-09-27T10:00:02Z", None);
+        app.record_write("sess", ambits::writes::WriteRecord {
+            op: "e1".into(), a: "sess".into(), t: "2026-09-27T10:00:02Z".into(), tool: "Edit".into(), file: "src/a.rs".into(),
+            level: ambits::writes::Level::Symbol,
+            syms: vec![("src/a.rs::App".into(), ambits::journal::encode_hash(&[1; 32])), ("src/a.rs::App/run".into(), ambits::journal::encode_hash(&[1; 32]))],
+            created: vec!["src/a.rs::App/run".into()],
+            removed: vec!["src/a.rs::App/old".into()],
+            ..Default::default()
+        });
+        app.trace_view.open = true;
+        app.trace_view.open_trace(0);
+        app.trace_view.selected = Some(ambits::trace::view::Item::Span(1));
+        let text = crate::ui::test_render::lines(70, 30, |f| render(f, &app, f.area(), &TraceFrame::new(&app))).join("\n");
+        for want in ["1 edited · 1 created · 1 deleted", "symbols written", "~ edited    App", "+ created   App/run", "− deleted   App/old"] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
     }
 
     #[test]

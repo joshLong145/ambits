@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use super::view::{effective_ends, subtree};
 use super::{InstantKind, Node, SpanKind, Trace};
+use crate::writes::WriteRecord;
 use crate::tracking::ReadDepth;
 
 /// A trace's structure, worked out once and asked many times (a frame asks
@@ -203,6 +204,19 @@ pub enum Target {
     Span(usize),
     /// A commit or compaction: selected in the timeline.
     Instant(usize),
+    /// A symbol, by id: its definition opened in the editor.
+    Symbol(String),
+}
+
+/// What a write did to a symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolChange {
+    /// No symbol had its id before.
+    Created,
+    /// It was there, and the write changed it.
+    Edited,
+    /// The write took it out.
+    Deleted,
 }
 
 /// A selectable row of the trace panel: what it shows, and so where
@@ -223,6 +237,11 @@ pub enum Row<'a> {
     /// Another call on that file, in the same trace, and whether it came
     /// before the call.
     Related { span: usize, before: bool },
+    /// A symbol the call read, and how deeply.
+    Read { id: &'a str, depth: ReadDepth },
+    /// A symbol the call wrote, and what it did to it; `file` is where a
+    /// deleted one was.
+    Wrote { id: &'a str, change: SymbolChange, file: &'a str },
 }
 
 impl Row<'_> {
@@ -234,6 +253,8 @@ impl Row<'_> {
             Row::Failed(_) => "failed",
             Row::Commit(_) => "commits",
             Row::ThisFile(_) | Row::Related { .. } => "on this file",
+            Row::Read { .. } => "symbols read",
+            Row::Wrote { .. } => "symbols written",
         }
     }
 
@@ -244,6 +265,9 @@ impl Row<'_> {
             Row::Agent(a) => Target::Span(a.delegation),
             Row::Failed(i) | Row::Related { span: i, .. } => Target::Span(i),
             Row::Commit(i) => Target::Instant(i),
+            // A deleted symbol has no definition left to open: its file.
+            Row::Wrote { change: SymbolChange::Deleted, file, .. } => Target::File(file.to_string()),
+            Row::Read { id, .. } | Row::Wrote { id, .. } => Target::Symbol(id.to_string()),
         }
     }
 }
@@ -259,11 +283,28 @@ impl TraceDetail {
     }
 }
 
-/// A call's rows: its file, then the other calls on that file in its trace.
-pub fn call_rows<'t>(trace: &'t Trace, index: &TraceIndex, span: usize) -> Vec<Row<'t>> {
-    let file = trace.spans().get(span).and_then(|s| s.file.as_deref()).map(Row::ThisFile);
+/// A call's rows: the symbols it read, or — `write`, its write record —
+/// wrote; its file; then the other calls on that file in its trace.
+pub fn call_rows<'t>(trace: &'t Trace, index: &TraceIndex, span: usize, write: Option<&'t WriteRecord>) -> Vec<Row<'t>> {
+    let Some(s) = trace.spans().get(span) else { return Vec::new() };
+    let read = s.read.iter().map(|(id, depth)| Row::Read { id, depth: *depth });
+    let wrote = write.map(written).unwrap_or_default();
+    let file = s.file.as_deref().map(Row::ThisFile);
     let related = related(trace, index, span).into_iter().map(|j| Row::Related { span: j, before: j < span });
-    file.into_iter().chain(related).collect()
+    read.chain(wrote).chain(file).chain(related).collect()
+}
+
+/// A write's symbols, each with what it did: edited, then created, then
+/// deleted.
+fn written(w: &WriteRecord) -> Vec<Row<'_>> {
+    let created = |id: &str| w.created.iter().any(|c| c == id);
+    let (made, edited): (Vec<&str>, Vec<&str>) = w.syms.iter().map(|(id, _)| id.as_str()).partition(|id| created(id));
+    edited
+        .into_iter()
+        .map(|id| Row::Wrote { id, change: SymbolChange::Edited, file: &w.file })
+        .chain(made.into_iter().map(|id| Row::Wrote { id, change: SymbolChange::Created, file: &w.file }))
+        .chain(w.removed.iter().map(|id| Row::Wrote { id, change: SymbolChange::Deleted, file: &w.file }))
+        .collect()
 }
 
 /// The other calls in `span`'s trace on the same file, in time order.
@@ -384,7 +425,17 @@ mod tests {
         );
         let index = TraceIndex::new(&t);
         assert_eq!(index.ancestors(6), vec![0, 5], "the prompt, then the delegation");
-        assert_eq!(call_rows(&t, &index, 1).iter().map(Row::target).collect::<Vec<_>>(), vec![Target::File("src/a.rs".into()), Target::Span(2), Target::Span(3), Target::Span(6), Target::Span(7)]);
+        let w = WriteRecord { file: "src/a.rs".into(), syms: vec![("src/a.rs::e".into(), String::new()), ("src/a.rs::n".into(), String::new())], created: vec!["src/a.rs::n".into()], removed: vec!["src/a.rs::d".into()], ..Default::default() };
+        let wrote: Vec<(String, SymbolChange)> = call_rows(&t, &index, 3, Some(&w))
+            .into_iter()
+            .filter_map(|r| match r {
+                Row::Wrote { id, change, .. } => Some((id.to_string(), change)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(wrote, vec![("src/a.rs::e".into(), SymbolChange::Edited), ("src/a.rs::n".into(), SymbolChange::Created), ("src/a.rs::d".into(), SymbolChange::Deleted)]);
+        assert_eq!(Row::Wrote { id: "src/a.rs::d", change: SymbolChange::Deleted, file: "src/a.rs" }.target(), Target::File("src/a.rs".into()), "a deleted symbol opens its file");
+        assert_eq!(call_rows(&t, &index, 1, None).iter().map(Row::target).collect::<Vec<_>>(), vec![Target::File("src/a.rs".into()), Target::Span(2), Target::Span(3), Target::Span(6), Target::Span(7)]);
     }
 
     #[test]

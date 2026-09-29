@@ -199,6 +199,9 @@ over-attribute):
   match counts), else **removed**;
 - ` ` (context) → nothing.
 
+A touched symbol no symbol in *before* has the id of is **created** (every
+symbol of a new file is).
+
 A changed line inside no symbol (a `use` line, a gap, a detached comment) sets
 `outside_symbols` on the record (§2.6) — never a silent drop.
 
@@ -231,7 +234,8 @@ Tree ids come from the LSP cache and may not match a tree-sitter parse, so
 ```json
 {"kind":"write","op":"toolu_01…","av":1,"a":"agent-3f9c","t":"2026-09-26T14:02:11Z","tool":"Edit",
  "file":"src/app.rs","level":"symbol","outside_symbols":false,
- "syms":[["src/app.rs::App/handle_key","b3:…"]],"removed":["src/app.rs::App/old_fn"],"fh":null}
+ "syms":[["src/app.rs::App/handle_key","b3:…"]],"removed":["src/app.rs::App/old_fn"],
+ "created":["src/app.rs::App/new_fn"],"fh":null}
 ```
 
 - **`level`**: `symbol` (attributed from the log) or `file` (fallback).
@@ -242,8 +246,9 @@ Tree ids come from the LSP cache and may not match a tree-sitter parse, so
 - **Keying**: one record per `(session, op)`, `op` = the tool call's
   `tool_use_id`. The fold keeps the **highest `av`** (attribution version),
   so re-attribution after an upgrade replaces rather than duplicates. `av` 2
-  adds the completeness rule (§2.3); the next replay replaces v1 records. Symbol
-  entries carry their hash because ids are not unique.
+  adds the completeness rule (§2.3); the next replay replaces v1 records. `av`
+  3 adds **`created`** — those of `syms` the write created — left out when
+  empty. Symbol entries carry their hash because ids are not unique.
 - **`history` records** (defined here, used from phase 2): `{"kind":"history",
   "of":"read"|"write", …}` — kept in the journal, **ignored by the fold**,
   **local-only**: never copied into `coverage`/`writes` objects.

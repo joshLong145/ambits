@@ -230,18 +230,40 @@ what it shows under it, in view.
 **A call**: which agent made it (a subagent by the task it was started
 for), when and for how long, in which trace; why it failed (the error's own
 line: a traceback's last, a compiler's first `error`, "rejected by the
-user"); what it read and the symbol's depth now; what it wrote, symbol by
-symbol, with whether each still stands; what an agent it started did; [its
+user"); what it read and the symbol's depth now; what it wrote, counted
+(`2 edited · 1 created · 1 deleted`); what an agent it started did; [its
 arguments, and what it read, wrote or returned](#a-calls-arguments-and-content);
-and the other calls on its file, before and after it.
+the symbols it read or wrote; and the other calls on its file, before and
+after it.
+
+```
+ symbols read
+ › ● full body   App/run  src/app.rs
+   ◔ name only   tests/write  src/touched.rs
+ symbols written
+   ~ edited      App/handle_key  src/app.rs  still there
+   + created     App/open_in_editor  src/app.rs  still there
+   − deleted     App/find  src/app.rs
+```
+
+**Symbols read** are the ones ambits credited for the call, at the depth it
+credited: a whole-file read lists the file's top-level symbols (what is
+inside them was read with them), a `Read` of a line range the symbols it
+covered, an `ambits show` the ones it named, an `ambits rg` the ones its
+matches sat in. **Symbols written** say what the write did to each —
+edited, created (no symbol had its id before), deleted — and, unless
+deleted, whether its version is still there. A write recorded before
+ambits knew created from edited lists every symbol it touched as edited.
 
 A call is named by what the agent said it was for, when its tool takes a
 `description` — `Bash · Run the remote tests`, `Agent · Expert review of
 phase 6` — else by its symbol or file.
 
-`Tab` to the panel, `j` / `k` to a row, `Enter` to open it: a file shows in
-the tree; an agent, a failure, a related call or a commit is selected in
-the timeline (the trace opened, and unfolded down to it). Focus stays on
+`Tab` to the panel, `j` / `k` to a row, `Enter` to open it: a symbol opens
+at its definition in your [editor](#opening-a-symbol-in-your-editor) (a
+deleted one shows its file in the tree); a file shows in the tree; an agent,
+a failure, a related call or a commit is selected in the timeline (the trace
+opened, and unfolded down to it). Focus stays on
 the panel, so you can keep following the trail. `Esc` returns to the
 timeline.
 

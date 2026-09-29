@@ -25,6 +25,7 @@ For each successful write, from the tool's result in the session log:
 | file | Project-relative path. Writes outside the project are not recorded |
 | symbols | The innermost symbols whose lines changed, with their hash **after** the write |
 | removed | Symbols the write deleted |
+| created | Those of the symbols the write created: no symbol had the id before it |
 | level | `symbol` when the log carried enough to attribute lines to symbols; otherwise `file` |
 | agent, time, tool | Who, when, with what |
 

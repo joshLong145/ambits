@@ -60,6 +60,9 @@ pub struct Span {
     pub child_agent: Option<Arc<str>>,
     /// What the call is for, in the agent's words (Bash's `description`).
     pub summary: Option<String>,
+    /// The symbols the call read, as they were credited: outermost only,
+    /// each at its depth (see `app::Credit::outermost`).
+    pub read: Vec<(String, crate::tracking::ReadDepth)>,
 }
 
 impl Span {
@@ -191,6 +194,7 @@ impl Trace {
             message: None,
             child_agent: None,
             summary: call.summary.clone(),
+            read: Vec::new(),
         });
     }
 
@@ -210,6 +214,17 @@ impl Trace {
         if let Some(child) = &f.child_agent {
             span.child_agent = Some(child.clone());
             self.by_child.insert(child.clone(), ix);
+        }
+    }
+
+    /// Call `id` read these symbols — when it was made, or, for a search,
+    /// when its output arrived.
+    pub fn note_read(&mut self, id: &str, read: Vec<(String, crate::tracking::ReadDepth)>) {
+        if read.is_empty() {
+            return;
+        }
+        if let Some(&ix) = self.by_id.get(id) {
+            self.spans[ix].read.extend(read);
         }
     }
 
@@ -236,6 +251,7 @@ impl Trace {
             message: None,
             child_agent: None,
             summary: None,
+            read: Vec::new(),
         });
     }
 

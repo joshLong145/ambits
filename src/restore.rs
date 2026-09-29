@@ -356,13 +356,9 @@ pub fn replay_session_logs(
     for log_file in ingester.session_log_files(log_dir, session_id) {
         for event in ingester.parse_log_file_with_root(&log_file, project_root) {
             match event {
-                SessionEvent::ToolCall(tc) => crate::app::apply_tool_call(
-                    project_tree,
-                    project_root,
-                    &tc,
-                    &mut ledger,
-                    &mut depth_cache,
-                ),
+                SessionEvent::ToolCall(tc) => {
+                    crate::app::apply_tool_call(project_tree, project_root, &tc, &mut ledger, &mut depth_cache);
+                }
                 // A `/clear` is a voluntary discard — resurrecting that
                 // context would mislead, so it is the one boundary we honor.
                 SessionEvent::SessionCleared => {
@@ -371,7 +367,9 @@ pub fn replay_session_logs(
                 }
                 SessionEvent::Compacted { .. } => {}
                 // What a search printed (`ambits rg`) was seen.
-                SessionEvent::ToolFinished(f) => crate::app::apply_shown(project_tree, &f, &mut ledger, &mut depth_cache),
+                SessionEvent::ToolFinished(f) => {
+                    crate::app::apply_shown(project_tree, &f, &mut ledger, &mut depth_cache);
+                }
                 // Writes grant no read credit (spec D9).
                 SessionEvent::Write(_) | SessionEvent::Prompt(_) => {}
             }

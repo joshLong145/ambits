@@ -834,6 +834,7 @@ impl App {
                 }
                 return;
             }
+            Target::Symbol(id) => return self.open_in_editor(&id),
             Target::Span(i) => Item::Span(i),
             Target::Instant(i) => Item::Instant(i),
         };
@@ -1073,7 +1074,7 @@ impl App {
         use crate::trace::summary;
         match self.trace_panel_subject() {
             PanelSubject::Trace(root) => summary::detail(&self.trace, index, root).map(|d| d.rows().iter().map(summary::Row::target).collect()).unwrap_or_default(),
-            PanelSubject::Call(i) => summary::call_rows(&self.trace, index, i).iter().map(summary::Row::target).collect(),
+            PanelSubject::Call(i) => summary::call_rows(&self.trace, index, i, self.write_of(i)).iter().map(summary::Row::target).collect(),
             PanelSubject::Instant(_) | PanelSubject::Nothing => Vec::new(),
         }
     }
@@ -1478,16 +1479,24 @@ impl App {
             return;
         }
 
-        let Some((path, sym)) = self
-            .project_tree
-            .walk()
-            .into_iter()
-            .find(|(_, sym)| sym.id == row.symbol_id)
-        else {
-            return;
-        };
-        self.pending_editor_request =
-            Some((self.project_root.join(path), sym.line_range.start));
+        let id = row.symbol_id.clone();
+        self.open_in_editor(&id);
+    }
+
+    /// Ask for symbol `id`'s definition in the editor, at its first line —
+    /// the first, when ids collide. A no-op for a symbol no longer in the
+    /// tree.
+    fn open_in_editor(&mut self, id: &str) {
+        let (file, _) = crate::symbols::split_id(id);
+        let Some(tree_file) = self.project_tree.file(file) else { return };
+        if let Some(sym) = tree_file.walk().into_iter().find(|sym| sym.id == id) {
+            self.pending_editor_request = Some((self.project_root.join(&tree_file.file_path), sym.line_range.start));
+        }
+    }
+
+    /// Call `span`'s write record, when it is a write the journal has.
+    pub fn write_of(&self, span: usize) -> Option<&crate::writes::WriteRecord> {
+        self.trace.spans().get(span)?.id.as_deref().and_then(|op| self.writes.get(op))
     }
 
     /// The agent ids the stats panel lists, in the order it lists them.
@@ -1773,7 +1782,8 @@ impl App {
     pub fn process_tool_finished(&mut self, finished: &crate::ingest::ToolFinished) {
         self.trace.finish(finished);
         if !finished.shown.is_empty() {
-            apply_shown(&self.project_tree, finished, &mut self.ledger, &mut self.depth_cache);
+            let read = apply_shown(&self.project_tree, finished, &mut self.ledger, &mut self.depth_cache);
+            self.trace.note_read(&finished.id, read);
             self.rebuild_tree_rows();
         }
     }
@@ -1845,13 +1855,16 @@ impl App {
         self.compaction_call_count += 1;
         self.register_agent(&event.agent_id, &event.label);
 
-        apply_tool_call(
+        let read = apply_tool_call(
             &self.project_tree,
             &self.project_root,
             &event,
             &mut self.ledger,
             &mut self.depth_cache,
         );
+        if let Some(id) = &event.tool_use_id {
+            self.trace.note_read(id, read);
+        }
 
         // Only push tracked events to the activity feed: reads, and writes —
         // which carry no read depth (D9) but are exactly what the feed should
@@ -1939,7 +1952,52 @@ fn resolve_selector_path(tree: &ProjectTree, event: &AgentToolCall) -> Option<St
     })
 }
 
-/// Apply one tool call to the ledger.
+/// Where a call's reads go as they are credited: the ledger and the depth
+/// cache, as `agent`'s — and a note of each, so the trace can say which
+/// symbols the call read.
+pub struct Credit<'a> {
+    ledger: &'a mut ContextLedger,
+    depth_cache: &'a mut crate::tracking::alignment::DepthOrdinalCache,
+    agent: &'a str,
+    read: Vec<(String, ReadDepth)>,
+}
+
+impl<'a> Credit<'a> {
+    pub fn new(ledger: &'a mut ContextLedger, depth_cache: &'a mut crate::tracking::alignment::DepthOrdinalCache, agent: &'a str) -> Self {
+        Credit { ledger, depth_cache, agent, read: Vec::new() }
+    }
+
+    fn record(&mut self, sym: &SymbolNode, depth: ReadDepth) {
+        self.ledger.record(sym.id.clone(), depth, sym.content_hash, self.agent.to_string(), sym.estimated_tokens as usize);
+        self.depth_cache.record(&sym.id, self.agent, depth);
+        self.read.push((sym.id.clone(), depth));
+    }
+
+    /// The symbols credited, outermost only — one inside another read with
+    /// it (a method of an impl read whole) goes without saying — each once,
+    /// at the deepest it was credited, in the order first credited.
+    pub fn outermost(self) -> Vec<(String, ReadDepth)> {
+        let ids: std::collections::HashSet<&str> = self.read.iter().map(|(id, _)| id.as_str()).collect();
+        let inside_another = |id: &str| {
+            let (file, name) = crate::symbols::split_id(id);
+            name.match_indices('/').any(|(at, _)| ids.contains(format!("{file}::{}", &name[..at]).as_str()))
+        };
+        let mut out: Vec<(String, ReadDepth)> = Vec::new();
+        for (id, depth) in &self.read {
+            if inside_another(id) {
+                continue;
+            }
+            match out.iter_mut().find(|(seen, _)| seen == id) {
+                Some((_, d)) => *d = (*d).max(*depth),
+                None => out.push((id.clone(), *depth)),
+            }
+        }
+        out
+    }
+}
+
+/// Apply one tool call to the ledger, and say which symbols it read
+/// (outermost: see [`Credit::outermost`]).
 ///
 /// The single place that decides how a tool call becomes symbol reads. It had
 /// been open-coded at three call sites — the TUI, `coverage::run_report`, and
@@ -1951,7 +2009,7 @@ pub fn apply_tool_call(
     event: &AgentToolCall,
     ledger: &mut ContextLedger,
     depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
-) {
+) -> Vec<(String, ReadDepth)> {
     // The one structured line per tool call — the activity record. Replaces
     // both the old hand-rolled `<session>.log` writer and the separate
     // debug-level dispatch logs this function used to carry per branch below;
@@ -1971,40 +2029,42 @@ pub fn apply_tool_call(
     // Only a read that saw something changes read state: a write is not a
     // read (D9), and an Unseen read saw nothing.
     if event.effect == crate::ingest::Effect::Write || !event.read_depth.is_seen() {
-        return;
+        return Vec::new();
     }
+    let mut credit = Credit::new(ledger, depth_cache, &event.agent_id);
 
     if !event.target_selectors.is_empty() {
-        mark_selectors(tree, &event.target_selectors, &event.agent_id, ledger, depth_cache);
+        mark_selectors(tree, &event.target_selectors, &mut credit);
     }
 
-    let Some(ref file_path) = event.file_path else {
-        return;
-    };
-    let tool_rel = normalize_tool_path(file_path, project_root);
-    for file in &tree.files {
-        if file.file_path != tool_rel {
-            continue;
-        }
-        if event.target_symbol.is_some() || event.target_lines.is_some() {
-            mark_targeted_symbols(&file.symbols, event, ledger, depth_cache);
-        } else {
-            mark_file_symbols(&file.symbols, event, ledger, depth_cache);
+    if let Some(ref file_path) = event.file_path {
+        let tool_rel = normalize_tool_path(file_path, project_root);
+        for file in tree.files.iter().filter(|f| f.file_path == tool_rel) {
+            if event.target_symbol.is_some() || event.target_lines.is_some() {
+                mark_targeted_symbols(&file.symbols, event, &mut credit);
+            } else {
+                mark_file_symbols(&file.symbols, event.read_depth, &mut credit);
+            }
         }
     }
+    credit.outermost()
 }
 
 /// Credit the symbols a call's output showed (`ToolFinished::shown`: the
-/// matches an `ambits rg` printed), as the agent that made the call.
+/// matches an `ambits rg` printed), as the agent that made the call, and
+/// say which (outermost).
 pub fn apply_shown(
     tree: &ProjectTree,
     finished: &crate::ingest::ToolFinished,
     ledger: &mut ContextLedger,
     depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
-) {
-    if !finished.shown.is_empty() {
-        mark_selectors(tree, &finished.shown, &finished.agent_id, ledger, depth_cache);
+) -> Vec<(String, ReadDepth)> {
+    if finished.shown.is_empty() {
+        return Vec::new();
     }
+    let mut credit = Credit::new(ledger, depth_cache, &finished.agent_id);
+    mark_selectors(tree, &finished.shown, &mut credit);
+    credit.outermost()
 }
 
 /// Mark every symbol named by `selectors` (ids or content hashes), as read
@@ -2020,13 +2080,7 @@ pub fn apply_shown(
 /// A selector matching nothing is silently ignored. The command may have been
 /// a miss, or may name a symbol that has since changed; either way there is
 /// no read to record.
-fn mark_selectors(
-    tree: &ProjectTree,
-    selectors: &[(String, ReadDepth)],
-    agent: &str,
-    ledger: &mut ContextLedger,
-    depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
-) {
+fn mark_selectors(tree: &ProjectTree, selectors: &[(String, ReadDepth)], credit: &mut Credit<'_>) {
     // An id names its file, so only the files named are walked, each once;
     // a hash can be anywhere, so only a hash selector walks the whole tree
     // (and only then are symbols' hashes spelled out to compare). A search
@@ -2047,10 +2101,6 @@ fn mark_selectors(
             crate::lookup::Selector::Unrecognized(_) => {}
         }
     }
-    let mut credit = |sym: &crate::symbols::SymbolNode, depth: ReadDepth| {
-        ledger.record(sym.id.clone(), depth, sym.content_hash, agent.to_string(), sym.estimated_tokens as usize);
-        depth_cache.record(&sym.id, agent, depth);
-    };
     // One pass over the files, not a lookup per file named: finding a file
     // by path normalises every path it passes.
     let named = tree.files.iter().filter_map(|file| {
@@ -2061,7 +2111,7 @@ fn mark_selectors(
         // `impl App`), and a lookup that returned both showed both.
         for sym in file.walk() {
             if let Some(depth) = ids.get(sym.id.as_str()) {
-                credit(sym, *depth);
+                credit.record(sym, *depth);
             }
         }
     }
@@ -2069,7 +2119,7 @@ fn mark_selectors(
         for (_, sym) in tree.walk() {
             let hex = crate::journal::hash_hex(&sym.content_hash);
             if let Some(depth) = hashes.iter().filter(|(h, _)| hex.starts_with(h.as_str())).map(|(_, d)| *d).max() {
-                credit(sym, depth);
+                credit.record(sym, depth);
             }
         }
     }
@@ -2155,22 +2205,10 @@ pub fn normalize_tool_path(tool_path: &Path, project_root: &Path) -> PathBuf {
 ///
 /// Contrast with [`mark_targeted_symbols`], which narrows recording to only the
 /// symbols that match the event's `target_symbol` or `target_lines`.
-pub fn mark_file_symbols(
-    symbols: &[SymbolNode],
-    event: &AgentToolCall,
-    ledger: &mut ContextLedger,
-    depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
-) {
+pub fn mark_file_symbols(symbols: &[SymbolNode], depth: ReadDepth, credit: &mut Credit<'_>) {
     for sym in symbols {
-        ledger.record(
-            sym.id.clone(),
-            event.read_depth,
-            sym.content_hash,
-            event.agent_id.to_string(),
-            sym.estimated_tokens as usize,
-        );
-        depth_cache.record(&sym.id, &event.agent_id, event.read_depth);
-        mark_file_symbols(&sym.children, event, ledger, depth_cache);
+        credit.record(sym, depth);
+        mark_file_symbols(&sym.children, depth, credit);
     }
 }
 
@@ -2180,42 +2218,23 @@ pub fn mark_file_symbols(
 /// the tool response included the entire named symbol's body. Line-range matches
 /// (via `target_lines`) recurse precisely so that only overlapping child symbols
 /// are promoted — preventing unread siblings from being over-credited.
-pub fn mark_targeted_symbols(
-    symbols: &[SymbolNode],
-    event: &AgentToolCall,
-    ledger: &mut ContextLedger,
-    depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
-) {
+pub fn mark_targeted_symbols(symbols: &[SymbolNode], event: &AgentToolCall, credit: &mut Credit<'_>) {
     for sym in symbols {
         match classify_symbol_match(sym, event) {
             MatchKind::ByName => {
-                ledger.record(
-                    sym.id.clone(),
-                    event.read_depth,
-                    sym.content_hash,
-                    event.agent_id.to_string(),
-                    sym.estimated_tokens as usize,
-                );
-                depth_cache.record(&sym.id, &event.agent_id, event.read_depth);
+                credit.record(sym, event.read_depth);
                 // Full body was in the response — bulk-mark all descendants.
-                mark_file_symbols(&sym.children, event, ledger, depth_cache);
+                mark_file_symbols(&sym.children, event.read_depth, credit);
             }
             MatchKind::ByLineOverlap => {
-                ledger.record(
-                    sym.id.clone(),
-                    event.read_depth,
-                    sym.content_hash,
-                    event.agent_id.to_string(),
-                    sym.estimated_tokens as usize,
-                );
-                depth_cache.record(&sym.id, &event.agent_id, event.read_depth);
+                credit.record(sym, event.read_depth);
                 // Parent container overlaps the read range — recurse precisely so
                 // only children whose ranges also overlap get promoted.
-                mark_targeted_symbols(&sym.children, event, ledger, depth_cache);
+                mark_targeted_symbols(&sym.children, event, credit);
             }
             MatchKind::None => {
                 // No match at this level — keep searching in children.
-                mark_targeted_symbols(&sym.children, event, ledger, depth_cache);
+                mark_targeted_symbols(&sym.children, event, credit);
             }
         }
     }
@@ -2372,7 +2391,7 @@ mod tests {
         let mut ledger = ContextLedger::new();
         let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
 
-        mark_file_symbols(&[parent], &event, &mut ledger, &mut cache);
+        mark_file_symbols(&[parent], event.read_depth, &mut Credit::new(&mut ledger, &mut cache, &event.agent_id));
 
         assert_eq!(ledger.depth_of("mock/f.rs::parent"), ReadDepth::FullBody);
         assert_eq!(ledger.depth_of("mock/f.rs::child"), ReadDepth::FullBody);
@@ -2386,7 +2405,7 @@ mod tests {
         let mut ledger = ContextLedger::new();
         let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
 
-        mark_targeted_symbols(&[s1, s2], &event, &mut ledger, &mut cache);
+        mark_targeted_symbols(&[s1, s2], &event, &mut Credit::new(&mut ledger, &mut cache, &event.agent_id));
 
         assert_eq!(ledger.depth_of("mock/f.rs::alpha"), ReadDepth::Unseen);
         assert_eq!(ledger.depth_of("mock/f.rs::beta"), ReadDepth::FullBody);
@@ -2400,7 +2419,7 @@ mod tests {
         let mut ledger = ContextLedger::new();
         let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
 
-        mark_targeted_symbols(&[s1, s2], &event, &mut ledger, &mut cache);
+        mark_targeted_symbols(&[s1, s2], &event, &mut Credit::new(&mut ledger, &mut cache, &event.agent_id));
 
         assert_eq!(ledger.depth_of("mock/f.rs::a"), ReadDepth::Unseen);
         assert_eq!(ledger.depth_of("mock/f.rs::b"), ReadDepth::FullBody);
@@ -2530,7 +2549,7 @@ mod tests {
         let mut ledger = ContextLedger::new();
         let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
 
-        mark_targeted_symbols(&[impl_block], &event, &mut ledger, &mut cache);
+        mark_targeted_symbols(&[impl_block], &event, &mut Credit::new(&mut ledger, &mut cache, &event.agent_id));
 
         // The parent is marked (it overlaps), but method_a is NOT.
         assert_eq!(ledger.depth_of("f.rs::Foo"), ReadDepth::FullBody);
@@ -2552,7 +2571,7 @@ mod tests {
         let mut ledger = ContextLedger::new();
         let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
 
-        mark_targeted_symbols(&[impl_block], &event, &mut ledger, &mut cache);
+        mark_targeted_symbols(&[impl_block], &event, &mut Credit::new(&mut ledger, &mut cache, &event.agent_id));
 
         assert_eq!(ledger.depth_of("f.rs::Foo"), ReadDepth::FullBody);
         assert_eq!(ledger.depth_of("f.rs::Foo/method_a"), ReadDepth::FullBody);
