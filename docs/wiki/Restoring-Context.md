@@ -72,8 +72,11 @@ context.
 ambits parses `show` invocations out of the session log and credits the
 symbols they name, so reading efficiently costs nothing in coverage versus a
 plain `Read`. `--no-body` credits name-level only — the agent learned where a
-symbol is, not what it says. `rg`/`grep` credit the symbols whose matching
-lines they printed; see [Searching Code](Searching-Code#searching-is-reading).
+symbol is, not what it says. `rg`/`grep` credit nothing: they print matching
+lines, not definitions — see [Searching Code](Searching-Code#searching-is-not-reading).
+
+A command containing `--no-body` is credited at name level for every selector
+in it, so run a full `show` and a `--no-body` one as separate commands.
 
 Credit is best-effort: it is reconstructed from the logged command text, so a
 selector passed through a shell variable or command substitution is not

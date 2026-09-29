@@ -94,16 +94,31 @@ Flags it cannot honour say so rather than pretending:
 `--json` emits ripgrep's JSON Lines events with an added `symbol` field; see
 the [CLI Reference](CLI-Reference#ambits-rg) for the full flag list.
 
-## Searching is reading
+## Searching is not reading
 
-A search prints source into an agent's context, so it records what it showed:
-every symbol whose matching line was printed is journaled as read, at the hash
-it was searched at. Modes that print no source — `-q`, `-l`, `-c` — record
-nothing, and neither do matches cut past `--head-limit`. The journal is a
-record of what was *seen*, not of what the process computed.
+A search prints matching lines, not definitions, so it earns no coverage for
+the symbols those lines sit in. To read what a search found, fetch it with
+[`ambits show`](Reading-by-Symbol) — the id is the file and the bracket's name
+path, `src/symbols/mod.rs::FileSymbols/enclosing` — which is credited as a full
+read of each symbol it names (`--no-body`, as name-level only). A command that
+contains `--no-body` is credited at name level for every selector in it, so
+run it on its own.
 
-Credit is only recorded while the TUI is running for the session — see
-[Configuration → The read journal](Configuration#the-read-journal).
+Credit is recorded from the session log while the TUI is running for the
+session — see [Configuration → The read journal](Configuration#the-read-journal).
+
+## Markdown
+
+Every heading in a Markdown file is a symbol, nested under the headings above
+it, so a match in a document names its section:
+
+```
+docs/wiki/Sharing.md:53:51:[— Sharing/Push] … `ambits push --break-lock` removes it …
+```
+
+`ambits -p . show 'docs/wiki/Sharing.md::Sharing/Push'` returns that section,
+from its heading to the next of the same or a higher level; `rg '^#{1,3} '
+<file>` lists a document's outline with what has been read of it.
 
 ## The pipeline runs backwards
 

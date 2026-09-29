@@ -1,6 +1,6 @@
 ---
 name: ambit
-description: "Coverage-aware agent workflow tool. Use PROACTIVELY before modifying files, making architecture decisions, debugging, or reviewing code. Reports which symbols Claude has read (Seen%) vs read in full (Full%). Use MCP tools mcp__ambit__coverage or mcp__ambit__coverage_file when available; fall back to bash."
+description: "Coverage-aware agent workflow tool. Use PROACTIVELY to search and read code and Markdown docs — `ambits rg`/`ambits grep` find matches and name the symbol or section each lands in, `ambits show` fetches exactly that definition — and before modifying files, making architecture decisions, debugging, or reviewing code. Reports which symbols Claude has read (Seen%) vs read in full (Full%). Use MCP tools mcp__ambit__coverage or mcp__ambit__coverage_file when available; fall back to bash."
 allowed-tools: Bash(ambits *)
 ---
 
@@ -34,6 +34,145 @@ before starting; flag which ones need reading first.
 
 **When your suggestion might be wrong** — if a user pushes back, check coverage.
 You may have missed implementation details.
+
+**When looking for code or docs** — search with `ambits rg`, then `show` the
+symbol or Markdown section it found, instead of `Grep` and a whole-file `Read`
+(see [Finding and Reading Code and Docs](#finding-and-reading-code-and-docs)).
+
+## Finding and Reading Code and Docs
+
+Search, then fetch exactly what the search found — not the whole file:
+
+```bash
+ambits -p . rg 'fn enclosing'                                   # 1. find it
+# src/symbols/mod.rs:158:9:[— FileSymbols/enclosing]     pub fn enclosing(…
+ambits -p . show 'src/symbols/mod.rs::FileSymbols/enclosing'    # 2. read that symbol
+```
+
+Every match names the symbol it landed in and how deeply you have read it, so
+the search tells you what to fetch and whether you need to. `show` returns
+that one definition — a function, a type, or a section of a Markdown file —
+and **counts as reading it**; a `Read` of the whole file would cost the rest
+of the file too. Use `ambits rg` in place of your `Grep` tool and of shell
+`grep`/`rg`, and `show` in place of `Read` whenever you know the symbol.
+
+### Searching: `ambits rg`
+
+ripgrep's flags — the dialect your `Grep` tool is built on:
+
+```bash
+ambits -p . rg 'depth_of'                    # every use and definition
+ambits -p . rg -F 'Vec<(String, u32)>'       # a literal, no regex escaping
+ambits -p . rg -w -i 'journal'               # whole word, any case
+ambits -p . rg 'fn enclosing' -t rust        # one file type (-t md for Markdown)
+ambits -p . rg 'TODO' -g '!tests/**'         # globs; ! excludes
+ambits -p . rg 'Journal::open' -C 3          # context: -A after, -B before, -C both
+ambits -p . rg 'unwrap\(\)' -c               # matching lines per file
+ambits -p . rg 'Matcher' -l                  # just the files
+ambits -p . rg 'fn [a-z_]+' -o src/text.rs   # only the matched text, scoped to a path
+```
+
+Scope a broad search first (`-l`, `-c`), then narrow: output is capped at
+**200 matches** (`--head-limit 0` for all, `-m N` per file) and lines at 300
+columns (`-M 0`), and all of it lands in your context.
+
+Each match is `file:line:column:[depth symbol] line`:
+
+| Bracket | Meaning |
+|---|---|
+| `[full name]`, `[signature name]`, … | You have read this symbol, at that depth: no need to `show` it |
+| `[— name]` | You have **not** read it |
+| `[name]` | No coverage journal loaded: *unknown*, not unread |
+| `[-]` | Not inside any symbol — a `use` line, or a file no parser handles |
+
+The `show` id is the file and the bracket's name path joined by `::` —
+`src/symbols/mod.rs:158:9:[— FileSymbols/enclosing]` is
+`src/symbols/mod.rs::FileSymbols/enclosing` — or take `symbol.id` verbatim
+from `--json` (ripgrep's JSON Lines, with a `symbol` on each match and a
+`coverage` object on the summary).
+
+- **Exit codes are grep's**: `0` matched, `1` nothing matched, `2` error — safe
+  to chain with `&&`.
+- Results are sorted by path, line, column. Every text file is searched, not
+  only parseable ones: a hit in TOML is real, it just has no symbol.
+- Not supported: `-P/--pcre2`, `-r/--replace`, `-f/--file`. No backreferences
+  or lookaround — ripgrep's regex engine, and its limits.
+
+**`ambits grep`** is the same search with GNU grep's flags, for when you are
+writing grep by habit. The two give the same letters opposite meanings (`-L`,
+`-z`, `-r`), so they are separate commands. Under `grep`, line numbers are
+opt-in (`-n`), there is no column, `-h` is `--no-filename` (help is `--help`),
+and `-P` is refused rather than silently matching something else:
+
+```bash
+ambits -p . grep -rn 'break-lock' docs/
+```
+
+### Markdown: sections are symbols
+
+In a Markdown file every heading is a symbol, nested under the headings above
+it, so the same search-then-fetch works on documentation:
+
+```bash
+ambits -p . rg '^#{1,3} ' docs/wiki/Sharing.md          # its outline, with what you have read
+ambits -p . rg -t md 'break-lock'                        # which sections mention it
+# docs/wiki/Sharing.md:53:51:[— Sharing/Push] … `ambits push --break-lock` removes it …
+ambits -p . show 'docs/wiki/Sharing.md::Sharing/Push'    # that section, heading to the next
+```
+
+A section's id is the file and its heading path: `# Sharing` › `## Push` is
+`docs/wiki/Sharing.md::Sharing/Push`. Fetching the top heading returns the
+whole document, so fetch the section you need. `ambits -p . --dump --depth 2`
+outlines every file (Markdown headings included) with line ranges and token
+estimates.
+
+### Fetching: `ambits show`
+
+```bash
+ambits -p . show 'src/app.rs::App/process_compaction'
+ambits -p . show 'src/digest.rs::grouped' 'src/app.rs::App/handle_key'   # batched: one call
+ambits -p . show b3:2b6c1e45                                               # by content_hash, 8+ characters
+ambits -p . show --no-body 'docs/wiki/TUI.md::TUI'                        # where, and how big
+ambits -p . show --max-bytes 4000 'src/main.rs::main'                     # capped
+```
+
+It returns JSON: `id`, `name`, `lines`, `bytes`, `content_hash`, `label`
+(`fn`, `struct`, `h2`, …), `estimated_tokens`, and `definition` — the exact
+source span. Check a large one's size with `--no-body` first; a definition cut
+by `--max-bytes` is flagged `"truncated": true`, as it is no longer valid source.
+
+**Ambiguity is reported, not resolved.** `matches` is an array: ids are not
+unique (a type may have several inherent impl blocks in one file). Prefer the
+hash when you need exactly one. An empty `matches` means no such symbol;
+`"selector": "unrecognized"` means the query was neither an id nor a hash.
+
+### What counts as reading
+
+Coverage is credited from the session log, for what the tool calls could have
+put in front of you:
+
+| Command | Credited |
+|---|---|
+| `show <id>` | Each symbol named, as read in **full** |
+| `show --no-body <id>` | Each symbol named, at **name** depth only |
+| `rg` / `grep` | Nothing per symbol — a search shows lines, not definitions |
+
+So after a search, `show` what you need rather than reasoning from the matched
+lines: it is both the complete definition and the credit for having read it.
+Run `show --no-body` as its own command — a command containing `--no-body` is
+credited at name depth for every selector in it.
+
+### Finding callers
+
+```bash
+ambits -p . callers centered_rect
+```
+
+Each call site and the symbol containing it, as an id `show` takes. Comments
+and strings are never reported — the answer comes from parsed call nodes, not
+text — so prefer it over `rg` when you want calls specifically. Matching is by
+callee **name**: `callers new` returns calls to every `new` (`--format json`
+marks this `name_matched_only: true`).
 
 ## Decision Thresholds
 
@@ -123,124 +262,6 @@ That adds a `SessionStart` hook with `matcher: "compact"` to
 result the moment a compaction completes. It merges into existing settings and
 is safe to re-run. When there is nothing to restore it emits nothing.
 
-### Searching code
-
-Two commands, one search. **Use `ambits rg`** — it is ripgrep's flag set, which
-is what your own `Grep` tool is built on, so the dialect you already know
-applies:
-
-```bash
-ambits -p . rg 'depth_of'                  # every use and definition
-ambits -p . rg 'fn enclosing' -t rust      # one file type
-ambits -p . rg 'TODO' -g '!tests/**'       # globs; ! excludes
-ambits -p . rg 'Journal::open' -A 3        # with trailing context
-ambits -p . rg 'unwrap\(\)' -c             # matching lines per file
-ambits -p . rg 'Matcher' src/search.rs     # scoped to paths
-```
-
-`ambits grep` runs the same search with GNU grep's flags instead. It exists
-because the two tools give the same letters opposite meanings — `-L` is
-`--files-without-match` in grep and `--follow` in rg, `-z` is `--null-data`
-against `--search-zip`, `-r` is `--recursive` against `--replace` — so one
-command could not be honest about both. Reach for it only if you are writing
-grep by habit; everything below describes `rg`.
-
-Under `grep`, line numbers are opt-in (`-n`) and there is no column, as in real
-grep; `-h` is `--no-filename`, so help is `--help` only. `-P` is refused rather
-than accepted, because this engine has no lookaround and would otherwise match
-something other than what your pattern says.
-
-What makes it worth using over `Grep`: every match says which symbol it landed
-in, and how deeply you have already read that symbol.
-
-```
-src/symbols/mod.rs:158:9:[— FileSymbols/enclosing]     pub fn enclosing(&self, byte: u32) -> …
-```
-
-That is `file:line:column:` — the prefix any grep consumer expects — then
-`[depth symbol]`, then the line. The bracket has four forms:
-
-| Form | Meaning |
-|---|---|
-| `[full name]`, `[signature name]`, … | You have read this symbol, at that depth |
-| `[— name]` | You have **not** read it |
-| `[name]` | No coverage journal loaded: *unknown*, not unread |
-| `[-]` | The match is not inside any symbol — a `use` line, or a file no parser handles |
-
-Use it before reading: a match inside a symbol marked `full` needs no `show`.
-For one marked `—`, the id `show` wants is the file and the name path the line
-already gives you — `src/symbols/mod.rs::FileSymbols/enclosing` — or take it
-verbatim from `--json`.
-
-**Searching records what it showed you.** Any symbol whose matching line was
-printed is journaled as read, so your coverage reflects it and a later
-`restore-context` will hand it back. Modes that print no source — `-q`, `-l`,
-`-c` — record nothing, and neither do matches cut off by `--head-limit`.
-
-Non-obvious bits:
-
-- **Exit codes are grep's**: `0` matched, `1` nothing matched, `2` error. Safe to
-  chain with `&&`.
-- Output is capped at **200 matches** (`--head-limit 0` for all) and lines at 300
-  columns (`-M 0`). Both are deliberate: this lands in your context window.
-- Results are always sorted by path, line, column.
-- Every text file is searched, not only parseable ones. A hit in a TOML file is a
-  real hit; it just has no symbol.
-- `--json` emits ripgrep's JSON Lines events with a `symbol` field added to each
-  match and a `coverage` object on the summary.
-- Not supported: `-P/--pcre2`, `-r/--replace`, `-f/--file`. No backreferences or
-  lookaround — same regex engine as ripgrep, same limits.
-
-### Finding callers
-
-```bash
-ambits -p . callers centered_rect
-```
-
-Reports each call site and the symbol containing it, as an id you can pass to
-`show`. Comments and string literals are never reported, because the answer
-comes from parsed call nodes rather than text.
-
-Matching is by callee **name** — tree-sitter does not resolve which definition
-a call binds to. Most names are unique, but `callers new` returns calls to
-every `new`. `--format json` marks this with `name_matched_only: true`.
-
-Prefer this over a search when you want calls specifically: `rg 'centered_rect'`
-returns the definition, the doc comments mentioning it, and the call sites all
-mixed together, while `callers` returns call nodes only.
-
-### Fetching a definition
-
-To get the source of something the digest listed, without a `Read` or a
-`find_symbol` round-trip:
-
-```bash
-ambits -p . show 'src/app.rs::App/process_compaction'
-ambits -p . show 'src/digest.rs::grouped' 'src/app.rs::App/handle_key'   # batched
-```
-
-Selectors are either a symbol id (`<path>::<name-path>` — the `###` heading
-plus the entry name, which is what the digest already gives you) or a content
-hash, full or an 8+ character prefix. `--format json` on `restore-context`
-emits `content_hash` per symbol for exactly this.
-
-Returns JSON: `id`, `file`, `lines`, `bytes`, `content_hash`, `label`, and
-`definition` (the exact source span). Add `--no-body` for metadata only, or
-`--max-bytes N` to cap each definition — a capped one is flagged
-`"truncated": true`, since it is no longer valid source.
-
-Symbols fetched this way **count as read** — ambit parses the `show` command
-out of the session log and credits the selectors it names (`--no-body` credits
-name-level only, since you saw where a symbol is, not what it says). Using this
-instead of `Read` does not cost you coverage.
-
-**Ambiguity is reported, not resolved.** `matches` is an array: ids are not
-guaranteed unique, since a type may have several inherent impl blocks in one
-file.
-Prefer the hash when you need exactly one. An empty `matches` means no such
-symbol; `"selector": "unrecognized"` means the query was neither an id nor a
-hash.
-
 ### Inspecting the journal
 
 ```bash
@@ -297,16 +318,17 @@ Safe for interface-only changes; risky for behaviour changes.
 
 **Low Seen%, Low Full%** — Genuine blind spot. Read the file before touching it.
 
-**Specific symbol at 0%** — If the task involves that symbol, read it first using
-Read or Serena's `find_symbol` with `include_body: true`.
+**Specific symbol at 0%** — If the task involves that symbol, read it first:
+`ambits show <id>`, Read, or Serena's `find_symbol` with `include_body: true`.
 
 ## Coverage Improvement Loop
 
 If coverage on files you need is insufficient:
 
 1. Identify low-coverage files with `mcp__ambit__coverage_file` or `ambits --coverage`
-2. Read the specific symbols you need (`find_symbol` with `include_body: true`,
-   or `Read` for the full file)
+2. Read the specific symbols you need: `ambits show <id>` (ids from `rg`, or
+   from `restore-context`), `find_symbol` with `include_body: true`, or `Read`
+   for the full file
 3. Re-check — coverage updates immediately after each read
 4. Proceed once thresholds are met
 
