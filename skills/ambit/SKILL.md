@@ -159,10 +159,12 @@ put in front of you:
 | `show --no-body <id>` | Each symbol named, at **name** depth only |
 | `rg` / `grep` | Each symbol a printed match sits in, at **name** depth — seen, not read |
 
-**In a subagent, the brackets are not yet yours.** Coverage is the whole
-session's — the main agent's reads and every subagent's — so `[full …]` can
-mark code *you* never read. Treat the depth as a hint and `show` what you
-rely on.
+**The brackets are your own reads.** In a subagent, `[full …]` means *you*
+read it — not your parent, not another subagent. `--json` (and `show`) name
+you as `coverage.agent` and your parent as `coverage.parent_agent`; to see what
+your parent has read, ask for it: `ambits -p . --agent <parent_agent> show …`.
+If `coverage.agent` is `null`, the depths are the whole session's
+(`scope_reason` says why) — treat them as hints and `show` what you rely on.
 
 A search counts toward Seen%, never Full%: after one, `show` what you need
 rather than reasoning from the matched lines — it is both the complete
@@ -352,7 +354,7 @@ If coverage on files you need is insufficient:
 | `--coverage` | Print coverage report |
 | `--dump` | Print symbol tree |
 | `--serena` | Use Serena LSP symbols (more languages, finer detail) |
-| `--agent` | Filter to a specific agent ID |
+| `--agent` | Whose reads to report (id or prefix): `--coverage`'s filter, and for `rg`/`grep`/`show` in place of your own |
 
 ## Troubleshooting
 

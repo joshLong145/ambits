@@ -1420,7 +1420,12 @@ fn run() -> Result<()> {
         .clone()
         .or_else(|| ingester.log_dir_for_project(&project_path));
 
-    let session_id = cli.session.clone().or_else(|| {
+    // Run from a Claude Code session, the session is the one running us —
+    // named by the environment — when it is this project's; else the latest.
+    let running = std::env::var("CLAUDE_CODE_SESSION_ID").ok().filter(|sid| {
+        log_dir.as_ref().is_some_and(|d| !ingester.session_log_files(d, sid).is_empty())
+    });
+    let session_id = cli.session.clone().or(running).or_else(|| {
         log_dir
             .as_ref()
             .and_then(|d| ingester.find_latest_session(d))
@@ -1526,7 +1531,27 @@ fn run() -> Result<()> {
     // the TUI maintains, so both can report whether a symbol has already been
     // read. `None` when there is no session or no journal — which callers must
     // not confuse with "nothing has been read".
-    let coverage_index = ambits::restore::CoverageIndex::load(&project_path, session_id.as_deref());
+    //
+    // The depths are the calling agent's own reads — a subagent has not read
+    // what its parent did — found from the session's logs; `--agent` names
+    // another. When the caller cannot be told, they are the whole session's,
+    // and the JSON says why.
+    let scope = {
+        use ambits::restore::CoverageScope;
+        let looks_up = matches!(command, Some(Commands::Rg(_) | Commands::Grep(_) | Commands::Show { .. }));
+        match (&cli.agent, log_dir.as_ref(), session_id.as_deref()) {
+            (Some(prefix), ..) => CoverageScope::Named(prefix.clone()),
+            (None, Some(dir), Some(sid)) if looks_up => {
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                match ingester.calling_agent(dir, sid, &args) {
+                    ambits::ingest::Caller::Agent { id, parent } => CoverageScope::Agent { id, parent },
+                    ambits::ingest::Caller::Unknown(reason) => CoverageScope::Session { reason },
+                }
+            }
+            _ => CoverageScope::Session { reason: "no session log to tell the calling agent from".into() },
+        }
+    };
+    let coverage_index = ambits::restore::CoverageIndex::load_scoped(&project_path, session_id.as_deref(), scope);
 
     // Both search dialects run before the project-wide scan, the way `cache`
     // does. A content search reads the files it walks and parses only the ones

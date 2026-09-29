@@ -216,19 +216,63 @@ pub fn load_from_journal(
 pub struct CoverageIndex {
     reads: ReadSet,
     session_id: String,
+    /// Whose reads these are: one agent's, or — `None` — the whole
+    /// session's, for [`Self::reason`].
+    agent: Option<String>,
+    /// The agent that started `agent`, when known.
+    parent: Option<String>,
+    /// Why the reads are the whole session's rather than one agent's.
+    reason: Option<String>,
+}
+
+/// Whose reads a [`CoverageIndex`] should hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoverageScope {
+    /// The agent running this command, and the agent that started it.
+    Agent { id: String, parent: Option<String> },
+    /// An agent asked for by id, or a unique prefix of one (`--agent`).
+    Named(String),
+    /// Every agent's, and why.
+    Session { reason: String },
 }
 
 impl CoverageIndex {
-    /// Load the journal for `session_id`. `None` when there is no session, no
-    /// journal, or an empty one — all of which mean "no coverage context",
-    /// which callers must distinguish from "read nothing".
-    pub fn load(project_root: &Path, session_id: Option<&str>) -> Option<Self> {
+    /// Load the journal for `session_id`, keeping the reads `scope` asks for.
+    /// `None` when there is no session, no journal, or an empty one — all of
+    /// which mean "no coverage context", which callers must distinguish from
+    /// "read nothing". An agent that has read nothing yet has an index, and
+    /// an empty one.
+    ///
+    /// One agent's reads come from the journal's per-agent records. When
+    /// there are none (a journal from before them), or no agent matches a
+    /// `Named` one, the index holds the whole session's and says why.
+    pub fn load_scoped(project_root: &Path, session_id: Option<&str>, scope: CoverageScope) -> Option<Self> {
         let session_id = session_id?;
-        let (reads, _warnings) = load_from_journal(project_root, session_id)?;
-        Some(CoverageIndex {
-            reads,
-            session_id: session_id.to_string(),
-        })
+        let contents = crate::journal::read_journal_session(&crate::journal::journal_dir(project_root), session_id);
+        if contents.reads.is_empty() {
+            return None;
+        }
+        let session = |reason: String| CoverageIndex { reads: contents.reads.clone(), session_id: session_id.to_string(), agent: None, parent: None, reason: Some(reason) };
+        if contents.agent_reads.is_empty() && !matches!(scope, CoverageScope::Session { .. }) {
+            return Some(session("the journal records no agents: it predates per-agent reads".into()));
+        }
+        let (id, parent) = match scope {
+            CoverageScope::Session { reason } => return Some(session(reason)),
+            CoverageScope::Agent { id, parent } => (id, parent),
+            CoverageScope::Named(prefix) => {
+                let mut agents: Vec<&str> = contents.agent_reads.keys().map(|(_, a)| a.as_str()).collect();
+                agents.sort_unstable();
+                agents.dedup();
+                match agents.iter().copied().filter(|a| a.starts_with(&prefix)).collect::<Vec<_>>().as_slice() {
+                    _ if agents.contains(&prefix.as_str()) => (prefix, None),
+                    [one] => (one.to_string(), None),
+                    [] => return Some(session(format!("no agent's id starts with `{prefix}`"))),
+                    many => return Some(session(format!("{} agents' ids start with `{prefix}`", many.len()))),
+                }
+            }
+        };
+        let reads = contents.agent_reads.iter().filter(|((_, agent), _)| *agent == id).map(|((symbol, _), read)| (symbol.clone(), *read)).collect();
+        Some(CoverageIndex { reads, session_id: session_id.to_string(), agent: Some(id), parent, reason: None })
     }
 
     /// Build directly from a read set.
@@ -240,6 +284,9 @@ impl CoverageIndex {
         CoverageIndex {
             reads,
             session_id: session_id.into(),
+            agent: None,
+            parent: None,
+            reason: None,
         }
     }
 
@@ -259,6 +306,21 @@ impl CoverageIndex {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// The agent whose reads these are; `None` for the whole session's.
+    pub fn agent(&self) -> Option<&str> {
+        self.agent.as_deref()
+    }
+
+    /// The agent that started [`Self::agent`], when known.
+    pub fn parent(&self) -> Option<&str> {
+        self.parent.as_deref()
+    }
+
+    /// Why the reads are the whole session's, when they are.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
     }
 
     /// Distinct symbols with a recorded read.
@@ -691,6 +753,51 @@ pub fn refresh_staleness(ledger: &mut crate::tracking::ContextLedger, tree: &Pro
 mod tests {
     use crate::helpers::*;
     use super::*;
+
+    /// A journal of `(symbol, agent)` reads — `None` for a v1 record, which
+    /// names no agent — under `root`.
+    fn journal(root: &Path, session: &str, reads: &[(&str, Option<&str>)]) {
+        use crate::journal::{encode_hash, DepthDto, Record, JOURNAL_SUBDIR};
+        let dir = root.join(JOURNAL_SUBDIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lines: Vec<String> = reads
+            .iter()
+            .map(|(symbol, agent)| {
+                let read = Record::Read { symbol_id: (*symbol).into(), hash: encode_hash(&[1; 32]), depth: DepthDto::FullBody, agent: agent.map(String::from) };
+                serde_json::to_string(&read).unwrap()
+            })
+            .collect();
+        std::fs::write(dir.join(format!("{session}.ndjson")), lines.join("\n") + "\n").unwrap();
+    }
+
+    /// An agent's coverage is its own reads; `--agent` names another by a
+    /// prefix; a journal without agents, or a name matching none, gives the
+    /// whole session's and says why.
+    #[test]
+    fn coverage_is_the_calling_agents_own() {
+        let dir = tempfile::tempdir().unwrap();
+        journal(dir.path(), "s", &[("a.rs::main", Some("s")), ("a.rs::sub", Some("ab12")), ("a.rs::both", Some("s")), ("a.rs::both", Some("ab12"))]);
+        let load = |scope| CoverageIndex::load_scoped(dir.path(), Some("s"), scope).unwrap();
+
+        let own = load(CoverageScope::Agent { id: "ab12".into(), parent: Some("s".into()) });
+        assert_eq!((own.agent(), own.parent(), own.reason(), own.len()), (Some("ab12"), Some("s"), None, 2));
+        assert!(own.depth_of("a.rs::main").is_none(), "its parent's read is not its own");
+        let main = load(CoverageScope::Agent { id: "s".into(), parent: None });
+        assert!(main.depth_of("a.rs::sub").is_none(), "nor is a subagent's its parent's");
+        let named = load(CoverageScope::Named("ab".into()));
+        assert_eq!((named.agent(), named.len()), (Some("ab12"), 2));
+        let unmatched = load(CoverageScope::Named("zz".into()));
+        assert_eq!((unmatched.agent(), unmatched.len()), (None, 3));
+        assert!(unmatched.reason().unwrap().contains("zz"));
+        let fresh = load(CoverageScope::Agent { id: "new".into(), parent: None });
+        assert_eq!((fresh.agent(), fresh.len()), (Some("new"), 0), "an agent that has read nothing has an empty index");
+
+        journal(dir.path(), "v1", &[("a.rs::main", None)]);
+        let old = CoverageIndex::load_scoped(dir.path(), Some("v1"), CoverageScope::Agent { id: "s".into(), parent: None }).unwrap();
+        assert_eq!((old.agent(), old.len()), (None, 1));
+        assert!(old.reason().unwrap().contains("predates"));
+    }
+
     use crate::symbols::merkle::content_hash;
 
     fn reads(

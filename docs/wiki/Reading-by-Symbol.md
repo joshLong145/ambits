@@ -37,11 +37,35 @@ ambits -p . show b3:53a28842 'src/digest.rs::grouped' 'src/app.rs::App/handle_ke
 | `children` | Immediate child names, so a container can be walked without a second scan |
 | `definition` | The exact source span, sliced by byte offset rather than reconstructed from lines |
 | `truncated` | Present and `true` only when `--max-bytes` cut the definition |
-| `read_depth` | How deeply this session has read the symbol |
+| `read_depth` | How deeply the calling agent has read the symbol |
 
-The top-level `coverage` object (`session_id`, `symbols_read`) is present only
-when a coverage journal was loaded. That is what tells a consumer whether a
-missing `read_depth` means *unread* or *unknown*.
+The top-level `coverage` object is present only when a coverage journal was
+loaded. That is what tells a consumer whether a missing `read_depth` means
+*unread* or *unknown*. It says whose reads the depths are:
+
+| Field | Meaning |
+|---|---|
+| `session_id` | The session: the one Claude Code is running (`CLAUDE_CODE_SESSION_ID`), else `--session`, else the latest |
+| `agent` | The agent whose reads these are — by default the one running the command — or `null` for the whole session's |
+| `parent_agent` | The agent that started `agent`, when it is a subagent: pass it to `--agent` to see what it has read |
+| `scope_reason` | Why the depths are the whole session's: the calling agent could not be told, the journal predates per-agent reads, or `--agent` matched no agent |
+| `symbols_read` | Distinct symbols in those reads |
+
+### Whose reads
+
+A depth is **the calling agent's own**. A subagent has not read what its parent
+did, nor the parent what its subagents did, so each sees only its own — a
+subagent that trusted its parent's `full` would skip reading code it has never
+seen. `--agent <id>` (a unique prefix will do) shows another agent's reads:
+
+```bash
+ambits -p . --agent 3d455fbc show 'src/app.rs::App'   # as the parent sees it
+```
+
+The calling agent is found from the session's logs — the running call whose
+command is this one — since the environment names the session but not the
+agent. When no call matches, or several agents are running the same command at
+once, the depths are the whole session's and `scope_reason` says so.
 
 `--no-body` returns location metadata only. `--max-bytes N` caps each
 definition and flags it `"truncated": true`; it is unlimited by default,

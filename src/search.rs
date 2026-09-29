@@ -1018,7 +1018,7 @@ fn print_json(
         )?;
     }
 
-    let coverage = coverage.map(|c| json!({"session_id": c.session_id(), "symbols_read": c.len()}));
+    let coverage = coverage.map(|c| serde_json::to_value(crate::lookup::CoverageDto::of(Some(c))).unwrap_or_default());
     writeln!(
         w,
         "{}",

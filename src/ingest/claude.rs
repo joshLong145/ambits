@@ -7,6 +7,7 @@ use serde_json::Value;
 use crate::tracking::ReadDepth;
 use super::{AgentToolCall, CompactionMetadata, Effect, EventTailer, FileReplay, Handoff, Hunk, SessionEvent, SessionIngester, TailedCompaction, TailerOutput, ToolCallMapper, WriteEvent, WriteSource};
 use super::content::{CallContent, CallDetail, ContentKind};
+use super::Caller;
 use super::tool_config::ToolMappingConfig;
 
 /// Derive the Claude Code log directory for a given project path.
@@ -508,6 +509,117 @@ fn parse_tool_results(obj: &mut Value) -> Vec<ToolResult> {
         .collect()
 }
 
+/// How much of each log's end is read to find the call running this
+/// process: its `tool_use` line is written before the command runs, and is
+/// near the end — only results of calls made alongside it can follow.
+const CALLER_TAIL: u64 = 512 * 1024;
+
+/// The agent of `session_id` whose running call started this process
+/// (`args`: its arguments, without the program), found in the session's
+/// logs in `log_dir`: the main log, `<session>.jsonl`, and each subagent's,
+/// `<session>/subagents/agent-<id>.jsonl`. A call is running while its
+/// `tool_use` has no `tool_result`; it is this process when its command
+/// runs `ambits` with these arguments, in order.
+///
+/// Exactly one agent must match. None — an unfamiliar layout, a command the
+/// shell rewrote — or several — two agents running the same command at
+/// once — is not known, and says why. Nothing in the environment names the
+/// agent: Claude Code sets the session (`CLAUDE_CODE_SESSION_ID`), not the
+/// agent, and `CLAUDE_CODE_CHILD_SESSION` is set in the main agent too.
+pub fn calling_agent(log_dir: &Path, session_id: &str, args: &[String]) -> Caller {
+    let subagents = log_dir.join(session_id).join("subagents");
+    let mut logs: Vec<(PathBuf, Option<String>)> = vec![(log_dir.join(format!("{session_id}.jsonl")), None)];
+    if let Ok(entries) = fs::read_dir(&subagents) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            if let (Some(id), Some("jsonl")) = (stem.strip_prefix("agent-"), path.extension().and_then(|e| e.to_str())) {
+                logs.push((path.clone(), Some(id.to_string())));
+            }
+        }
+    }
+    let found: Vec<Option<String>> = logs.into_iter().filter(|(path, _)| runs_pending(path, args)).map(|(_, id)| id).collect();
+    match found.as_slice() {
+        [None] => Caller::Agent { id: session_id.to_string(), parent: None },
+        [Some(id)] => Caller::Agent { id: id.clone(), parent: Some(parent_of(&subagents, id, session_id)) },
+        [] => Caller::Unknown("no running call in the session's logs is this command".into()),
+        many => Caller::Unknown(format!("{} agents are running this same command", many.len())),
+    }
+}
+
+/// Whether the end of the log at `path` holds a running call whose command
+/// could have started a process with `args`.
+fn runs_pending(path: &Path, args: &[String]) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = fs::File::open(path) else { return false };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let from = len.saturating_sub(CALLER_TAIL);
+    if file.seek(SeekFrom::Start(from)).is_err() {
+        return false;
+    }
+    let mut tail = Vec::new();
+    if file.read_to_end(&mut tail).is_err() {
+        return false;
+    }
+    let tail = String::from_utf8_lossy(&tail);
+    // Past the first line when it was cut by the seek.
+    let lines = tail.lines().skip(usize::from(from > 0));
+    let mut calls: Vec<(String, String)> = Vec::new();
+    let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in lines.filter(|l| l.contains("\"tool_use\"") || l.contains("\"tool_result\"")) {
+        let Ok(obj) = serde_json::from_str::<Value>(line) else { continue };
+        let Some(Value::Array(blocks)) = obj.pointer("/message/content") else { continue };
+        for block in blocks {
+            let text = |key: &str| block.get(key).and_then(Value::as_str).map(String::from);
+            match block.get("type").and_then(Value::as_str) {
+                Some("tool_use") => {
+                    if let (Some(id), Some(command)) = (text("id"), block.pointer("/input/command").and_then(Value::as_str)) {
+                        calls.push((id, command.to_string()));
+                    }
+                }
+                Some("tool_result") => {
+                    answered.extend(text("tool_use_id"));
+                }
+                _ => {}
+            }
+        }
+    }
+    calls.iter().any(|(id, command)| !answered.contains(id) && command_runs(command, args))
+}
+
+/// Whether shell `command` could have started a process with `args`: it
+/// runs `ambits`, and holds each argument, in order. The shell has taken the
+/// quotes off the arguments, not the command, so each is found as text.
+fn command_runs(command: &str, args: &[String]) -> bool {
+    let Some(at) = command.find("ambits") else { return false };
+    let mut rest = &command[at + "ambits".len()..];
+    for arg in args {
+        match rest.find(arg.as_str()) {
+            Some(i) => rest = &rest[i + arg.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+/// The agent that started subagent `id`: the main agent, for one it
+/// started itself (`spawnDepth` 1 in its `.meta.json`); else the subagent
+/// whose log holds the call that started it.
+fn parent_of(subagents: &Path, id: &str, session_id: &str) -> String {
+    let meta: Option<Value> = fs::read_to_string(subagents.join(format!("agent-{id}.meta.json"))).ok().and_then(|m| serde_json::from_str(&m).ok());
+    let depth = meta.as_ref().and_then(|m| m.get("spawnDepth")).and_then(Value::as_u64).unwrap_or(1);
+    let started_by = meta.as_ref().and_then(|m| m.get("toolUseId")).and_then(Value::as_str).map(|t| format!("\"id\":\"{t}\""));
+    let (true, Some(needle)) = (depth > 1, started_by) else { return session_id.to_string() };
+    let Ok(entries) = fs::read_dir(subagents) else { return session_id.to_string() };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .find(|p| fs::read_to_string(p).is_ok_and(|log| log.contains(&needle)))
+        .and_then(|p| p.file_stem().and_then(|s| s.to_str()).map(|s| s.trim_start_matches("agent-").to_string()))
+        .unwrap_or_else(|| session_id.to_string())
+}
+
 /// A `tool_result`'s content as text: a string, or its text blocks joined.
 fn content_text(content: &Value) -> Option<String> {
     match content {
@@ -743,7 +855,11 @@ impl LineFeed {
     /// Set up for `path`, from its first line: the agent's label and, given
     /// the project root, whether it ran in a worktree.
     fn for_file(path: &Path, project_root: Option<&Path>) -> Self {
-        let default_id = path.file_stem().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+        // A subagent's file is `agent-<id>.jsonl`, but its lines — and the
+        // delegation that started it — name it `<id>`: the file's name is not
+        // the agent's.
+        let stem = path.file_stem().and_then(|n| n.to_str()).unwrap_or("unknown");
+        let default_id = stem.strip_prefix("agent-").unwrap_or(stem).to_string();
         let remap = project_root.and_then(|root| {
             let cwd = extract_cwd(path)?;
             (cwd != root).then(|| (cwd, root.to_path_buf()))
@@ -1442,6 +1558,9 @@ impl SessionIngester for ClaudeIngester {
     }
     fn call_detail(&self, files: &[PathBuf], id: &str, kind: ContentKind) -> Option<CallDetail> {
         call_detail(files, id, kind)
+    }
+    fn calling_agent(&self, log_dir: &Path, session_id: &str, args: &[String]) -> Caller {
+        calling_agent(log_dir, session_id, args)
     }
 }
 
@@ -2550,6 +2669,52 @@ mod write_tests {
             "toolUseResult": {"stdout": text, "stderr": ""}
         })
         .to_string()
+    }
+
+    /// A session's logs: its main log and each subagent's, with a meta file.
+    fn session_logs(dir: &Path, main: &[String], subagents: &[(&str, u64, &str, &[String])]) {
+        std::fs::write(dir.join("s.jsonl"), main.join("\n") + "\n").unwrap();
+        let sub = dir.join("s").join("subagents");
+        let _ = std::fs::remove_dir_all(&sub);
+        std::fs::create_dir_all(&sub).unwrap();
+        for (id, depth, started_by, lines) in subagents {
+            std::fs::write(sub.join(format!("agent-{id}.jsonl")), lines.join("\n") + "\n").unwrap();
+            std::fs::write(sub.join(format!("agent-{id}.meta.json")), format!(r#"{{"spawnDepth":{depth},"toolUseId":"{started_by}"}}"#)).unwrap();
+        }
+    }
+
+    /// The agent running `ambits` is the one whose call for it has no result
+    /// yet; its parent comes from its meta file, or — nested — from the log
+    /// that started it.
+    #[test]
+    fn the_calling_agent_is_the_one_waiting_on_this_command() {
+        let args: Vec<String> = ["-p", ".", "rg", "^\\s+fn run", "src"].map(String::from).to_vec();
+        let running = bash("r1", "cd x && ambits -p . rg '^\\s+fn run' src | head");
+        let done = [bash("d1", "ambits -p . rg '^\\s+fn run' src"), output("d1", "")];
+        let dir = tempfile::tempdir().unwrap();
+
+        session_logs(dir.path(), &done, &[("a1", 1, "t0", std::slice::from_ref(&running))]);
+        assert_eq!(calling_agent(dir.path(), "s", &args), Caller::Agent { id: "a1".into(), parent: Some("s".into()) });
+
+        session_logs(dir.path(), std::slice::from_ref(&running), &[("a1", 1, "t0", &[])]);
+        assert_eq!(calling_agent(dir.path(), "s", &args), Caller::Agent { id: "s".into(), parent: None }, "the main agent");
+
+        let spawn = serde_json::json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t9", "name": "Agent", "input": {"prompt": "x"}}]}}).to_string();
+        session_logs(dir.path(), &[], &[("a1", 1, "t0", &[spawn]), ("a2", 2, "t9", std::slice::from_ref(&running))]);
+        assert_eq!(calling_agent(dir.path(), "s", &args), Caller::Agent { id: "a2".into(), parent: Some("a1".into()) }, "started by a subagent");
+
+        session_logs(dir.path(), std::slice::from_ref(&running), &[("a1", 1, "t0", std::slice::from_ref(&running))]);
+        assert!(matches!(calling_agent(dir.path(), "s", &args), Caller::Unknown(why) if why.contains("2 agents")));
+        let other: Vec<String> = ["-p", ".", "rg", "other"].map(String::from).to_vec();
+        assert!(matches!(calling_agent(dir.path(), "s", &other), Caller::Unknown(_)));
+    }
+
+    #[test]
+    fn a_command_runs_ambits_with_its_arguments_in_order() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(command_runs("ambits -p . rg 'fn x' src", &args(&["-p", ".", "rg", "fn x", "src"])));
+        assert!(!command_runs("ambits -p . rg src 'fn x'", &args(&["rg", "fn x", "src"])), "out of order");
+        assert!(!command_runs("rg 'fn x' src", &args(&["rg", "fn x", "src"])), "not ambits");
     }
 
     /// A search's result names the symbols it printed, at name depth; the

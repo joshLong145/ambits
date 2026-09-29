@@ -94,6 +94,10 @@ Flags it cannot honour say so rather than pretending:
 `--json` emits ripgrep's JSON Lines events with an added `symbol` field; see
 the [CLI Reference](CLI-Reference#ambits-rg) for the full flag list.
 
+The depth in the bracket is the calling agent's own: a subagent sees what it
+has read, not its parent's reads — see
+[Reading by Symbol → Whose reads](Reading-by-Symbol#whose-reads).
+
 ## Searching is seeing, not reading
 
 A search prints matching lines, not definitions. Each symbol a printed match

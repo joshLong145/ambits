@@ -134,6 +134,13 @@ struct ResultDto<'a> {
 #[derive(Serialize)]
 pub(crate) struct CoverageDto<'a> {
     pub session_id: &'a str,
+    /// Whose reads the depths are: an agent's id, or `null` for the whole
+    /// session's — then `scope_reason` says why.
+    pub agent: Option<&'a str>,
+    /// The agent that started `agent`: pass it to `--agent` to see its reads.
+    pub parent_agent: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_reason: Option<&'a str>,
     pub symbols_read: usize,
 }
 
@@ -141,6 +148,9 @@ impl<'a> CoverageDto<'a> {
     pub fn of(index: Option<&'a crate::restore::CoverageIndex>) -> Option<Self> {
         index.map(|c| CoverageDto {
             session_id: c.session_id(),
+            agent: c.agent(),
+            parent_agent: c.parent(),
+            scope_reason: c.reason(),
             symbols_read: c.len(),
         })
     }

@@ -250,6 +250,17 @@ pub trait ToolCallMapper: Send + Sync {
     ) -> Option<AgentToolCall>;
 }
 
+/// Which agent of a session is running this process, as its logs tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Caller {
+    /// The agent whose running call is this process, by the id its reads are
+    /// journaled under, and the agent that started it (`None` for the
+    /// session's own agent).
+    Agent { id: String, parent: Option<String> },
+    /// Not known, and why.
+    Unknown(String),
+}
+
 /// Stateless session-format operations: discovery, listing, batch parsing.
 /// Implement this to add support for a new LLM session format.
 pub trait SessionIngester: Send + Sync {
@@ -293,6 +304,14 @@ pub trait SessionIngester: Send + Sync {
     /// fresh tailer from each file's current end.
     fn resume_tailer(&self, handoff: Handoff) -> Box<dyn EventTailer> {
         self.new_tailer(handoff.files.into_iter().map(|(file, _)| file).collect())
+    }
+
+    /// The agent of `session_id` running this process — whose call started
+    /// a process with `args` (its arguments, without the program) — from
+    /// the session's logs in `log_dir`. Default: not known.
+    fn calling_agent(&self, log_dir: &Path, session_id: &str, args: &[String]) -> Caller {
+        let _ = (log_dir, session_id, args);
+        Caller::Unknown("this log format does not say which agent is calling".into())
     }
 
     /// Call `id`'s arguments and what it read or wrote, from the session's
