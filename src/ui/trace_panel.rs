@@ -477,7 +477,7 @@ mod tests {
 
         let hunk = |at: u32| Hunk { old_start: Some(at), new_start: Some(at), lines: (0..10).map(|n| DiffLine::Added(format!("line {n}"))).collect() };
         let input = serde_json::json!({"file_path": "src/a.rs", "old_string": "x", "replace_all": false, "note": "a\nb\nc\nd\ne\nf"});
-        let content = CallContent::Change { hunks: vec![hunk(1), hunk(50)], exact: true };
+        let content = CallContent::Change { hunks: vec![hunk(1), hunk(50)], exact: true, cut: 0 };
         app.set_call_content(key, Some(CallDetail { args: args(&input), content: Some(content) }));
         let text = crate::ui::test_render::lines(60, 40, |f| render(f, &app, f.area(), &TraceFrame::new(&app))).join("\n");
         for want in ["arguments", "file_path    src/a.rs", "note         a", "             d", "             … 2 more lines", "replace_all  false", "old_string   1 line · in the change below", "change", "@@ -1,0 +1,10 @@", " 1 + line 0", "… 10 more · o opens in full"] {

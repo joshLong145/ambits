@@ -146,8 +146,8 @@ pub enum CallContent {
     /// A change to a file. `exact` when the hunks are the tool's own patch,
     /// with line numbers; otherwise they are what the call asked for (its
     /// input), which is all the log has when it failed or its tool records
-    /// no patch.
-    Change { hunks: Vec<Hunk>, exact: bool },
+    /// no patch. `cut` lines more were left out (see [`CallContent::change`]).
+    Change { hunks: Vec<Hunk>, exact: bool, cut: usize },
     /// Text a call read, its first line numbered `start`; `cut` lines more
     /// were left out.
     Read { start: u32, lines: Vec<String>, cut: usize },
@@ -226,6 +226,21 @@ impl Hunk {
 }
 
 impl CallContent {
+    /// A change, kept to [`MAX_LINES`] lines across its hunks, as a read or
+    /// output is: a file a write created can be any size. The hunk that
+    /// crosses the limit is cut short, and those after it dropped.
+    pub fn change(mut hunks: Vec<Hunk>, exact: bool) -> Self {
+        let (mut room, mut cut) = (MAX_LINES, 0);
+        hunks.retain_mut(|h| {
+            let keep = h.lines.len().min(room);
+            cut += h.lines.len() - keep;
+            h.lines.truncate(keep);
+            room -= keep;
+            keep > 0
+        });
+        CallContent::Change { hunks, exact, cut }
+    }
+
     /// What its rows are headed.
     pub fn title(&self) -> &'static str {
         match self {
@@ -240,7 +255,7 @@ impl CallContent {
     pub fn rows(&self) -> Vec<ContentRow<'_>> {
         let mut out = Vec::new();
         match self {
-            CallContent::Change { hunks, .. } => {
+            CallContent::Change { hunks, cut, .. } => {
                 for hunk in hunks {
                     out.push(ContentRow::new(RowKind::Hunk, None, None, hunk.header()));
                     let (mut old, mut new) = (hunk.old_start, hunk.new_start);
@@ -257,6 +272,7 @@ impl CallContent {
                         });
                     }
                 }
+                out.extend(Self::cut_note(*cut));
             }
             CallContent::Read { start, lines, cut } => {
                 out.extend(lines.iter().zip(*start..).map(|(t, n)| ContentRow::new(RowKind::Text, None, Some(n), t.as_str())));
@@ -296,6 +312,7 @@ mod tests {
                 lines: vec![DiffLine::Same("a".into()), DiffLine::Removed("b".into()), DiffLine::Added("c".into()), DiffLine::Added("d".into()), DiffLine::Same("e".into())],
             }],
             exact: true,
+            cut: 0,
         };
         let rows = c.rows();
         assert_eq!(rows[0].text, "@@ -10,3 +10,4 @@");
@@ -328,6 +345,14 @@ mod tests {
         assert_eq!(edit.iter().map(|a| (a.bulk, a.value.as_str())).collect::<Vec<_>>(), vec![
             (false, "a.rs"), (true, "2 edits · in the change below"), (true, "3 lines · in the change below"),
         ]);
+    }
+
+    #[test]
+    fn a_change_is_capped_like_a_read() {
+        let hunk = |n: usize| Hunk { old_start: Some(0), new_start: Some(1), lines: (0..n).map(|i| DiffLine::Added(i.to_string())).collect() };
+        let CallContent::Change { hunks, cut, .. } = CallContent::change(vec![hunk(MAX_LINES - 1), hunk(5), hunk(3)], true) else { unreachable!() };
+        assert_eq!((hunks.len(), hunks[1].lines.len(), cut), (2, 1, 4 + 3));
+        assert_eq!(CallContent::change(vec![hunk(MAX_LINES + 2)], true).rows().last().map(|r| r.kind), Some(RowKind::Note));
     }
 
     #[test]

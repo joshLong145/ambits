@@ -103,9 +103,15 @@ never toward Full% and never lowering a deeper read. Matches past
 `-q`) credit nothing; `--json` credits each match's `symbol.id`.
 
 The credit is taken from the search's output as the session log recorded it
-— what the agent was shown — so nothing is searched again, and a `cat` of
-text that looks like search output credits nothing: only an `ambits rg` or
-`ambits grep` invocation's result is read this way.
+— what the agent was shown — so nothing is searched again. Only the output
+of a command that runs `ambits rg` or `ambits grep` is read this way, so a
+`cat` of text that looks like search output credits nothing on its own; but
+the whole of such a command's output is read, so in `ambits rg x && cat
+notes.txt` a match line in `notes.txt` counts too.
+
+A match that starts in a line's indentation (`^\s+fn run`) is attributed to
+the item on that line, not the one around it, so an outline search names —
+and credits — each method.
 
 To read what a search found, fetch it with [`ambits show`](Reading-by-Symbol)
 — the id is the file and the bracket's name path,

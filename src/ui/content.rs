@@ -187,6 +187,7 @@ mod tests {
                 lines: vec![DiffLine::Same("keep".into()), DiffLine::Removed("\told".into()), DiffLine::Added("\tnew".into())],
             }],
             exact: true,
+            cut: 0,
         }
     }
 

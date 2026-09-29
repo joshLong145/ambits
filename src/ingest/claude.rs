@@ -342,8 +342,8 @@ impl ResultCorrelator {
     /// Far above the handful of writes that can be in flight at once.
     pub const MAX_PENDING: usize = 1024;
 
-    /// The write calls still awaiting results, oldest first, for handing to
-    /// a tailer.
+    /// The write and search calls still awaiting results, oldest first, for
+    /// handing to a tailer.
     pub fn into_pending(self) -> Vec<AgentToolCall> {
         let mut pending: Vec<_> = self.pending.into_values().collect();
         pending.sort_by_key(|(seq, _)| *seq);
@@ -483,7 +483,7 @@ fn parse_tool_results(obj: &mut Value) -> Vec<ToolResult> {
     // when there is exactly one.
     let single = blocks.iter().filter(|b| is_result(b)).count() == 1;
     // A string `toolUseResult` is the tool's own error message.
-    let detail_text = detail.clone().filter(|d| single && d.is_string());
+    let detail_text = detail.as_ref().filter(|d| single && d.is_string()).cloned();
     blocks
         .iter_mut()
         .filter(|b| is_result(b))
@@ -524,7 +524,7 @@ fn content_text(content: &Value) -> Option<String> {
 /// returned, and nothing is logged (spec §9.6).
 pub fn call_detail(files: &[PathBuf], id: &str, kind: ContentKind) -> Option<CallDetail> {
     let mut input: Option<Value> = None;
-    let mut result: Option<(Value, Option<Value>, bool)> = None;
+    let mut result: Option<ToolResult> = None;
     let mut buf = Vec::new();
     for path in files {
         let Ok(file) = fs::File::open(path) else { continue };
@@ -540,19 +540,16 @@ pub fn call_detail(files: &[PathBuf], id: &str, kind: ContentKind) -> Option<Cal
                 continue;
             }
             let Ok(mut obj) = serde_json::from_str::<Value>(line) else { continue };
-            let detail = obj.get_mut("toolUseResult").map(Value::take);
-            let Some(Value::Array(blocks)) = obj.pointer_mut("/message/content") else { continue };
-            let single = blocks.iter().filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result")).count() == 1;
-            for block in blocks.iter_mut() {
-                match block.get("type").and_then(Value::as_str) {
-                    Some("tool_use") if block.get("id").and_then(Value::as_str) == Some(id) => input = block.get_mut("input").map(Value::take),
-                    Some("tool_result") if block.get("tool_use_id").and_then(Value::as_str) == Some(id) => {
-                        let error = result_failed(block, detail.as_ref(), single);
-                        let content = block.get_mut("content").map(Value::take).unwrap_or(Value::Null);
-                        result = Some((content, detail.clone().filter(Value::is_object), error));
-                    }
-                    _ => {}
+            if let Some(Value::Array(blocks)) = obj.pointer_mut("/message/content") {
+                let call = blocks.iter_mut().find(|b| b.get("type").and_then(Value::as_str) == Some("tool_use") && b.get("id").and_then(Value::as_str) == Some(id));
+                if let Some(call) = call {
+                    input = call.get_mut("input").map(Value::take);
                 }
+            }
+            // Read as the tailer reads it, so the two agree on which result
+            // a line's `toolUseResult` belongs to, and whether it failed.
+            if let Some(r) = parse_tool_results(&mut obj).into_iter().find(|r| &*r.tool_use_id == id) {
+                result = Some(r);
             }
             if input.is_some() && result.is_some() {
                 break;
@@ -567,7 +564,7 @@ pub fn call_detail(files: &[PathBuf], id: &str, kind: ContentKind) -> Option<Cal
     }
     Some(CallDetail {
         args: input.as_ref().map(super::content::args).unwrap_or_default(),
-        content: build_content(kind, input.as_ref(), result.as_ref().map(|(c, d, e)| (c, d.as_ref(), *e))),
+        content: build_content(kind, input.as_ref(), result.as_ref().map(|r| (r.content.as_ref().unwrap_or(&Value::Null), r.detail.as_ref(), r.is_error))),
     })
 }
 
@@ -584,7 +581,7 @@ fn build_content(kind: ContentKind, input: Option<&Value>, result: Option<(&Valu
             // The tool's own patch, when it succeeded and recorded one.
             if let Some((_, Some(detail), false)) = result {
                 let exact = |hunks: &Option<Vec<Hunk>>| {
-                    hunks.as_ref().filter(|h| !h.is_empty()).map(|h| CallContent::Change { hunks: h.iter().map(Change::from).collect(), exact: true })
+                    hunks.as_ref().filter(|h| !h.is_empty()).map(|h| CallContent::change(h.iter().map(Change::from).collect(), true))
                 };
                 match write_source(detail) {
                     WriteSource::Edit { hunks, .. } => {
@@ -594,7 +591,7 @@ fn build_content(kind: ContentKind, input: Option<&Value>, result: Option<(&Valu
                     }
                     WriteSource::Write { content, create: true, .. } => {
                         let lines = content.lines().map(|l| DiffLine::Added(l.to_string())).collect();
-                        return Some(CallContent::Change { hunks: vec![Change { old_start: Some(0), new_start: Some(1), lines }], exact: true });
+                        return Some(CallContent::change(vec![Change { old_start: Some(0), new_start: Some(1), lines }], true));
                     }
                     WriteSource::Write { hunks, .. } => {
                         if let Some(c) = exact(&hunks) {
@@ -624,7 +621,7 @@ fn build_content(kind: ContentKind, input: Option<&Value>, result: Option<(&Valu
             } else {
                 return result.and_then(|(content, _, _)| output(content));
             };
-            Some(CallContent::Change { hunks, exact: false })
+            Some(CallContent::change(hunks, false))
         }
         ContentKind::Read => {
             let (content, detail, error) = result?;
@@ -1511,16 +1508,29 @@ mod tests {
         );
         let got = call_detail(&[log], "toolu_1", ContentKind::Write).unwrap().content.unwrap();
         let hunk = Change { old_start: Some(3), new_start: Some(3), lines: vec![DiffLine::Same("a".into()), DiffLine::Removed("x".into()), DiffLine::Added("y".into())] };
-        assert_eq!(got, CallContent::Change { hunks: vec![hunk], exact: true });
+        assert_eq!(got, CallContent::Change { hunks: vec![hunk], exact: true, cut: 0 });
     }
 
     #[test]
     fn a_failed_edit_shows_what_it_tried() {
         let dir = tempfile::tempdir().unwrap();
         let log = content_log(dir.path(), "a.jsonl", r#"{"file_path":"/p/a.rs","old_string":"x\ny","new_string":"z"}"#, r#""String to replace not found""#, r#""Error: String to replace not found""#);
-        let Some(CallContent::Change { hunks, exact }) = call_detail(&[log], "toolu_1", ContentKind::Write).unwrap().content else { panic!("a change") };
+        let Some(CallContent::Change { hunks, exact, .. }) = call_detail(&[log], "toolu_1", ContentKind::Write).unwrap().content else { panic!("a change") };
         assert!(!exact);
         assert_eq!(hunks[0].header(), "@@ -2 +1 lines @@");
+    }
+
+    /// A line answering two calls carries one `toolUseResult`, which cannot
+    /// be told apart: neither call shows it as its own.
+    #[test]
+    fn a_line_answering_two_calls_lends_neither_the_others_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jsonl");
+        let call = |id: &str| format!(r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Read","input":{{"file_path":"/p/{id}.rs"}}}}]}}}}"#);
+        let both = r#"{"type":"user","toolUseResult":{"type":"text","file":{"filePath":"/p/b.rs","content":"B's text","startLine":1}},"message":{"content":[{"type":"tool_result","tool_use_id":"a","content":"1\tA's text"},{"type":"tool_result","tool_use_id":"b","content":"1\tB's text"}]}}"#;
+        std::fs::write(&path, format!("{}\n{}\n{both}\n", call("a"), call("b"))).unwrap();
+        let got = call_detail(&[path], "a", ContentKind::Read).unwrap().content;
+        assert_eq!(got, Some(CallContent::Output { lines: vec!["1\tA's text".into()], cut: 0 }), "its own result, not b's detail");
     }
 
     #[test]

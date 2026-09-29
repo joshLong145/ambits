@@ -70,6 +70,7 @@ ambits -p . rg 'Journal::open' -C 3          # context: -A after, -B before, -C 
 ambits -p . rg 'unwrap\(\)' -c               # matching lines per file
 ambits -p . rg 'Matcher' -l                  # just the files
 ambits -p . rg 'fn [a-z_]+' -o src/text.rs   # only the matched text, scoped to a path
+ambits -p . rg '^\s*(pub )?fn ' src/text.rs  # a file's outline: each fn, with its id and depth
 ```
 
 Scope a broad search first (`-l`, `-c`), then narrow: output is capped at
@@ -157,6 +158,11 @@ put in front of you:
 | `show <id>` | Each symbol named, as read in **full** |
 | `show --no-body <id>` | Each symbol named, at **name** depth only |
 | `rg` / `grep` | Each symbol a printed match sits in, at **name** depth — seen, not read |
+
+**In a subagent, the brackets are not yet yours.** Coverage is the whole
+session's — the main agent's reads and every subagent's — so `[full …]` can
+mark code *you* never read. Treat the depth as a hint and `show` what you
+rely on.
 
 A search counts toward Seen%, never Full%: after one, `show` what you need
 rather than reasoning from the matched lines — it is both the complete

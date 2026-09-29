@@ -552,10 +552,24 @@ fn context_lines(buf: &[u8], hits: &[Hit], opts: &Options) -> Vec<(u32, Vec<u8>)
     out
 }
 
+/// Where a hit is attributed: its match's start — or, for a match that
+/// starts in its line's indentation (`^\s+fn run`), the line's first
+/// non-blank byte, where an item with no doc comment begins. Otherwise the
+/// match would land in the enclosing `impl`, not the method it names.
+fn attribution_byte(hit: &Hit) -> u32 {
+    let indent = hit.text.iter().take_while(|b| **b == b' ' || **b == b'\t').count();
+    let blank = hit.text.get(indent).is_none_or(|b| *b == b'\n' || *b == b'\r');
+    if hit.span.0 < indent && !blank {
+        hit.byte + (indent - hit.span.0) as u32
+    } else {
+        hit.byte
+    }
+}
+
 /// Fill in each hit's enclosing symbol and read depth.
 fn attribute(hits: &mut [Hit], symbols: &FileSymbols, coverage: Option<&CoverageIndex>) {
     for hit in hits {
-        let Some(node) = symbols.enclosing(hit.byte) else {
+        let Some(node) = symbols.enclosing(attribution_byte(hit)) else {
             continue;
         };
         hit.symbol = Some(SymbolHit {
@@ -1366,6 +1380,18 @@ mod tests {
         let mut found = vec![hit_at(50)];
         attribute(&mut found, &thing(), None);
         assert_eq!(found[0].symbol.as_ref().unwrap().id, "a.rs::Thing/method");
+    }
+
+    /// A match starting in the indentation before `fn method` names the
+    /// method, not the item around it.
+    #[test]
+    fn a_match_starting_in_indentation_names_the_item_on_its_line() {
+        let mut found = vec![Hit { line: 3, column: 1, byte: 36, text: b"    fn method() {}\n".to_vec(), span: (0, 13), symbol: None }];
+        attribute(&mut found, &thing(), None);
+        assert_eq!(found[0].symbol.as_ref().unwrap().id, "a.rs::Thing/method");
+        let mut blank = vec![Hit { line: 3, column: 1, byte: 36, text: b"    \n".to_vec(), span: (0, 2), symbol: None }];
+        attribute(&mut blank, &thing(), None);
+        assert_ne!(blank[0].symbol.as_ref().map(|s| s.id.as_str()), Some("a.rs::Thing/method"), "a blank line stays where it is");
     }
 
     /// A match in a `use` line or a file-level comment belongs to no symbol,
