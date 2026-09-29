@@ -152,8 +152,8 @@ fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, width: usize) -> Vec<
             Some((w, status)) => {
                 let level = if w.syms.is_empty() { "file-level".to_string() } else { format!("{} symbol(s)", w.syms.len()) };
                 out.push(fact("wrote", vec![text(level, Color::White), text("  ", Color::Gray), write_word(*status)]));
-                let now = app.project_tree.file(&w.file).map(FileContents::from_symbols);
-                let syms = symbols_written(now.as_ref(), w);
+                let now = app.file_contents(&w.file);
+                let syms = symbols_written(now.as_deref(), w);
                 for (name, status) in syms.iter().take(8) {
                     out.push(fact("", vec![text(fit(name, width.saturating_sub(26).max(8)), Color::White), text("  ", Color::Gray), write_word(*status)]));
                 }
@@ -225,7 +225,7 @@ enum Wrote {
 /// A failed call is listed as failed, and never outranks one that worked.
 fn file_details(app: &App, frame: &TraceFrame<'_>, file: &FileActivity, width: usize) -> Vec<Line<'static>> {
     let spans = app.trace.spans();
-    let now = (!file.writes.is_empty()).then(|| app.project_tree.file(&file.file).map(FileContents::from_symbols)).flatten();
+    let now = (!file.writes.is_empty()).then(|| app.file_contents(&file.file)).flatten();
     let mut wrote: Vec<(String, Wrote)> = Vec::new();
     let mut note = |name: String, what: Wrote| match wrote.iter_mut().find(|(n, _)| *n == name) {
         Some(slot) if what != Wrote::Failed || slot.1 == Wrote::Failed => slot.1 = what,
@@ -236,7 +236,7 @@ fn file_details(app: &App, frame: &TraceFrame<'_>, file: &FileActivity, width: u
         let s = &spans[i];
         match s.id.as_deref().and_then(|op| frame.statuses.get(op)) {
             Some((w, status)) if w.syms.is_empty() => note(WHOLE_FILE.to_string(), Wrote::Stands(*status)),
-            Some((w, _)) => symbols_written(now.as_ref(), w).into_iter().for_each(|(name, status)| note(name, Wrote::Stands(status))),
+            Some((w, _)) => symbols_written(now.as_deref(), w).into_iter().for_each(|(name, status)| note(name, Wrote::Stands(status))),
             None => {
                 let name = s.symbol_name().unwrap_or_else(|| WHOLE_FILE.to_string());
                 note(name, if s.error { Wrote::Failed } else { Wrote::Unattributed });

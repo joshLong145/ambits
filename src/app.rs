@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -270,6 +271,9 @@ pub struct App {
     pub contents: CallContents,
     /// The call's content full-width, when open (`o`).
     pub content_view: Option<ContentView>,
+    /// Each written file's symbols as write statuses compare them, kept
+    /// between frames: see [`App::file_contents`].
+    file_contents: std::cell::RefCell<HashMap<String, (blake3::Hash, Arc<crate::writes::FileContents>)>>,
 
     /// Path filter restricting which files are tracked, if any. Shared with
     /// the TUI re-parse paths (file watcher, Serena cache rescan) so that
@@ -333,6 +337,7 @@ impl App {
             panel_index: 0,
             contents: CallContents::default(),
             content_view: None,
+            file_contents: Default::default(),
             filter: None,
             editor_template: None,
             pending_editor_request: None,
@@ -1271,12 +1276,36 @@ impl App {
         true
     }
 
+    /// `file` (project-relative) as write statuses compare against it, or
+    /// `None` when it is not in the tree. Made once and kept until the file
+    /// changes — a frame asks for every written file, and making one walks
+    /// all its symbols — which its top-level symbols' merkle hashes (each
+    /// covering everything beneath it) tell, without a signal from each
+    /// place the tree is updated.
+    pub fn file_contents(&self, file: &str) -> Option<Arc<crate::writes::FileContents>> {
+        let symbols = self.project_tree.file(file)?;
+        let mut fingerprint = blake3::Hasher::new();
+        for sym in &symbols.symbols {
+            fingerprint.update(&sym.merkle_hash);
+        }
+        let fingerprint = fingerprint.finalize();
+        let mut cache = self.file_contents.borrow_mut();
+        match cache.get(file) {
+            Some((at, contents)) if *at == fingerprint => Some(contents.clone()),
+            _ => {
+                let contents = Arc::new(crate::writes::FileContents::from_symbols(symbols));
+                cache.insert(file.to_string(), (fingerprint, contents.clone()));
+                Some(contents)
+            }
+        }
+    }
+
     /// Every write of the session by op, and whether its version is still
     /// in the tree: read once per written file, for a frame to colour by.
     pub fn write_statuses(&self) -> std::collections::HashMap<&str, (&crate::writes::WriteRecord, crate::writes::Status)> {
         let mut out = std::collections::HashMap::new();
         for (file, writes) in self.writes.by_file(None) {
-            let now = self.project_tree.file(file).map(crate::writes::FileContents::from_symbols);
+            let now = self.file_contents(file);
             for w in writes {
                 let status = match &now {
                     Some(now) => now.file_status(w),
@@ -1998,39 +2027,50 @@ fn mark_selectors(
     ledger: &mut ContextLedger,
     depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
 ) {
-    // Split once rather than re-parsing each selector per symbol.
+    // An id names its file, so only the files named are walked, each once;
+    // a hash can be anywhere, so only a hash selector walks the whole tree
+    // (and only then are symbols' hashes spelled out to compare). A search
+    // result names up to 200 ids, on the event loop.
+    let mut by_file: HashMap<&str, HashMap<&str, ReadDepth>> = HashMap::new();
     let mut hashes: Vec<(String, ReadDepth)> = Vec::new();
-    let mut ids: Vec<(&str, ReadDepth)> = Vec::new();
     for (sel, depth) in selectors {
         match crate::lookup::parse_selector(sel) {
             crate::lookup::Selector::Hash(h) => hashes.push((h, *depth)),
-            crate::lookup::Selector::Id(_) => ids.push((sel.as_str(), *depth)),
+            crate::lookup::Selector::Id(_) => {
+                // A symbol named more than once takes the deepest naming;
+                // `record` is upgrade-only anyway, but this keeps the credit
+                // independent of order.
+                let depths = by_file.entry(crate::symbols::split_id(sel).0).or_default();
+                let at = depths.entry(sel.as_str()).or_insert(*depth);
+                *at = (*at).max(*depth);
+            }
             crate::lookup::Selector::Unrecognized(_) => {}
         }
     }
-
-    for (_, sym) in tree.walk() {
-        let hex = crate::journal::hash_hex(&sym.content_hash);
-        // A symbol named by more than one selector in the same command takes
-        // the deepest of them; `record` is upgrade-only anyway, but resolving
-        // it here keeps the credit independent of iteration order.
-        let by_id = ids
-            .iter()
-            .filter(|(id, _)| *id == sym.id)
-            .map(|(_, d)| *d);
-        let by_hash = hashes
-            .iter()
-            .filter(|(h, _)| hex.starts_with(h.as_str()))
-            .map(|(_, d)| *d);
-        if let Some(depth) = by_id.chain(by_hash).max() {
-            ledger.record(
-                sym.id.clone(),
-                depth,
-                sym.content_hash,
-                agent.to_string(),
-                sym.estimated_tokens as usize,
-            );
-            depth_cache.record(&sym.id, agent, depth);
+    let mut credit = |sym: &crate::symbols::SymbolNode, depth: ReadDepth| {
+        ledger.record(sym.id.clone(), depth, sym.content_hash, agent.to_string(), sym.estimated_tokens as usize);
+        depth_cache.record(&sym.id, agent, depth);
+    };
+    // One pass over the files, not a lookup per file named: finding a file
+    // by path normalises every path it passes.
+    let named = tree.files.iter().filter_map(|file| {
+        by_file.get(crate::objects::normalize_path(&file.file_path.to_string_lossy()).as_str()).map(|ids| (file, ids))
+    });
+    for (file, ids) in named {
+        // Every symbol an id names: ids are not unique (`struct App` and
+        // `impl App`), and a lookup that returned both showed both.
+        for sym in file.walk() {
+            if let Some(depth) = ids.get(sym.id.as_str()) {
+                credit(sym, *depth);
+            }
+        }
+    }
+    if !hashes.is_empty() {
+        for (_, sym) in tree.walk() {
+            let hex = crate::journal::hash_hex(&sym.content_hash);
+            if let Some(depth) = hashes.iter().filter(|(h, _)| hex.starts_with(h.as_str())).map(|(_, d)| *d).max() {
+                credit(sym, depth);
+            }
         }
     }
 }
@@ -2681,6 +2721,18 @@ mod tests {
             ReadDepth::Unseen,
             "only the named symbol is credited"
         );
+    }
+
+    /// A file's contents are made once, and made again when the file
+    /// changes: its symbols' merkle hashes say so.
+    #[test]
+    fn file_contents_are_kept_until_the_file_changes() {
+        let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::alpha", "alpha")])]);
+        let first = app.file_contents("mock/f.rs").unwrap();
+        assert!(Arc::ptr_eq(&first, &app.file_contents("mock/f.rs").unwrap()), "kept");
+        app.project_tree.files[0].symbols[0].merkle_hash = [9; 32];
+        assert!(!Arc::ptr_eq(&first, &app.file_contents("mock/f.rs").unwrap()), "made again");
+        assert!(app.file_contents("mock/absent.rs").is_none());
     }
 
     /// What a search printed is credited when its result arrives — at the
