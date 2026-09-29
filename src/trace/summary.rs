@@ -108,7 +108,8 @@ pub struct AgentRun {
     /// The delegation call.
     pub delegation: usize,
     pub agent: Arc<str>,
-    pub description: String,
+    /// What it was started for.
+    pub task: String,
     /// Milliseconds, the delegation's start to its agent's last moment.
     pub duration: u64,
     pub calls: usize,
@@ -172,7 +173,7 @@ pub fn detail(trace: &Trace, index: &TraceIndex, root: usize) -> Option<TraceDet
             agents.push(AgentRun {
                 delegation: i,
                 agent: agent.clone(),
-                description: s.description.clone(),
+                task: s.task(),
                 duration: end.saturating_sub(s.start),
                 calls: run.len().saturating_sub(1),
                 failed: run.iter().filter(|&&c| c != i && spans[c].error).count(),

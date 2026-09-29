@@ -236,7 +236,7 @@ fn waterfall_lines(app: &App, statuses: &Statuses, vp: &Viewport, label_w: usize
                         (_, true) => "▸ ",
                         (_, false) => "▾ ",
                     };
-                    let mut label = format!("{indent}{fold}{}{}", if s.error { "✗ " } else { "" }, span_name(app, i));
+                    let mut label = format!("{indent}{fold}{}{}", if s.error { "✗ " } else { "" }, app.trace.spans()[i].name());
                     if row.collapsed {
                         label.push_str(&format!(" ({} spans)", row.descendants));
                     }
@@ -322,7 +322,7 @@ fn track_lines(app: &App, frame: &TraceFrame<'_>, vp: &Viewport, label_w: usize,
                         }
                         let bar = view::bar(from, to, bars_w);
                         // The name inside the bar, when there is room.
-                        let name: Vec<char> = span_name(app, i).chars().collect();
+                        let name: Vec<char> = app.trace.spans()[i].name().chars().collect();
                         let inside: Vec<usize> = bar.iter().filter(|(_, ch)| *ch == '█').map(|(c, _)| *c).collect();
                         let text = (inside.len() > 4).then(|| name.iter().take(inside.len() - 1));
                         cells.extend(bar.iter().map(|&(c, ch)| (c, ch, style)));
@@ -385,7 +385,7 @@ fn details(app: &App, frame: &TraceFrame<'_>) -> Vec<Line<'static>> {
             let Some(s) = app.trace.spans().get(i) else { return Vec::new() };
             let took = frame.took(app, i);
             let mut spans = vec![
-                Span::styled(format!(" {}", span_name(app, i)), Style::default().fg(span_color(app, statuses, i)).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {}", app.trace.spans()[i].name()), Style::default().fg(span_color(app, statuses, i)).add_modifier(Modifier::BOLD)),
                 Span::styled(format!(" · {} · {took}", app.agent_title(&s.agent)), dim),
             ];
             if s.error {
@@ -405,10 +405,6 @@ fn details(app: &App, frame: &TraceFrame<'_>) -> Vec<Line<'static>> {
 
 /// What a span is called on screen: a delegation by its description and
 /// the agent it started.
-pub(super) fn span_name(app: &App, i: usize) -> String {
-    app.trace.spans()[i].name()
-}
-
 /// A subagent by what it was started for, the session's own agent as
 /// `main`.
 fn track_name(app: &App, track: &view::Track) -> String {

@@ -444,6 +444,13 @@ fn parse_hunks(patch: Option<&Value>) -> Option<Vec<Hunk>> {
         .collect()
 }
 
+/// Whether a `tool_result` block says its call failed: `is_error`, or the
+/// line's `toolUseResult` is a string (a rejection, "String to replace not
+/// found") — which says so only when the line holds this one result.
+fn result_failed(block: &Value, detail: Option<&Value>, single: bool) -> bool {
+    block.get("is_error").and_then(Value::as_bool).unwrap_or(false) || (single && detail.is_some_and(Value::is_string))
+}
+
 /// Every `tool_result` block on a `type:"user"` line.
 ///
 /// Takes `toolUseResult` out of `obj` rather than cloning it: for a `Read`
@@ -461,14 +468,13 @@ fn parse_tool_results(obj: &mut Value) -> Vec<ToolResult> {
     // `toolUseResult` is one per line; it can only be attributed to a block
     // when there is exactly one.
     let single = results.len() == 1;
-    let string_result = detail.as_ref().is_some_and(|d| d.is_string());
     // A string `toolUseResult` is the tool's own error message.
     let detail_text = detail.clone().filter(|d| single && d.is_string());
     results
         .into_iter()
         .filter_map(|b| {
             let id = b.get("tool_use_id")?.as_str()?;
-            let is_error = b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) || (single && string_result);
+            let is_error = result_failed(b, detail.as_ref(), single);
             Some(ToolResult {
                 tool_use_id: Arc::from(id),
                 is_error,
@@ -516,11 +522,12 @@ pub fn call_detail(files: &[PathBuf], id: &str, kind: ContentKind) -> Option<Cal
             let Ok(mut obj) = serde_json::from_str::<Value>(line) else { continue };
             let detail = obj.get_mut("toolUseResult").map(Value::take);
             let Some(Value::Array(blocks)) = obj.pointer_mut("/message/content") else { continue };
+            let single = blocks.iter().filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result")).count() == 1;
             for block in blocks.iter_mut() {
                 match block.get("type").and_then(Value::as_str) {
                     Some("tool_use") if block.get("id").and_then(Value::as_str) == Some(id) => input = block.get_mut("input").map(Value::take),
                     Some("tool_result") if block.get("tool_use_id").and_then(Value::as_str) == Some(id) => {
-                        let error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false) || detail.as_ref().is_some_and(Value::is_string);
+                        let error = result_failed(block, detail.as_ref(), single);
                         let content = block.get_mut("content").map(Value::take).unwrap_or(Value::Null);
                         result = Some((content, detail.clone().filter(Value::is_object), error));
                     }
@@ -1451,6 +1458,19 @@ mod tests {
             let got = call_detail(&[PathBuf::from(&log)], &id, kind);
             eprintln!("{kind:?}: {:?} in {:?}", got.map(|c| c.rows(100).len()), t.elapsed());
         }
+    }
+
+    /// A string `toolUseResult` fails the call only when the line holds
+    /// that one result; `is_error` always does.
+    #[test]
+    fn one_rule_says_a_result_failed() {
+        let ok = serde_json::json!({"type": "tool_result", "tool_use_id": "a"});
+        let err = serde_json::json!({"type": "tool_result", "tool_use_id": "a", "is_error": true});
+        let text = serde_json::json!("String to replace not found");
+        assert!(result_failed(&ok, Some(&text), true));
+        assert!(!result_failed(&ok, Some(&text), false), "whose message it is, is unknown");
+        assert!(!result_failed(&ok, Some(&serde_json::json!({"type": "text"})), true));
+        assert!(result_failed(&err, None, false));
     }
 
     #[test]

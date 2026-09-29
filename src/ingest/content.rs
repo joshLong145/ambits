@@ -72,41 +72,6 @@ pub fn args(input: &Value) -> Vec<Arg> {
 /// The widest an argument's key column gets; a longer key is cut.
 const KEY_MAX: usize = 16;
 
-/// `s` in lines at most `room` columns wide, broken between words; a word
-/// wider than a line is broken where it must be.
-fn wrap(s: &str, room: usize) -> Vec<String> {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-    let mut out = vec![String::new()];
-    let mut used = 0;
-    for word in s.split_inclusive(' ') {
-        let w = word.width();
-        if used + w > room && used > 0 {
-            out.push(String::new());
-            used = 0;
-        }
-        if w <= room {
-            out.last_mut().expect("never empty").push_str(word);
-            used += w;
-            continue;
-        }
-        for c in word.chars() {
-            let w = c.width().unwrap_or(0);
-            if used + w > room && used > 0 {
-                out.push(String::new());
-                used = 0;
-            }
-            out.last_mut().expect("never empty").push(c);
-            used += w;
-        }
-    }
-    out
-}
-
-/// Tabs as four spaces, other control characters as one.
-pub fn clean(s: &str) -> String {
-    s.chars().flat_map(|c| if c == '\t' { vec![' '; 4] } else if c.is_control() { vec![' '] } else { vec![c] }).collect()
-}
-
 impl CallDetail {
     /// The width of the arguments' key column.
     pub fn key_width(&self) -> usize {
@@ -114,8 +79,9 @@ impl CallDetail {
     }
 
     /// Its arguments' rows for a view `width` columns wide: each key, its
-    /// value beside it, wrapped under it.
-    pub fn arg_rows(&self, width: usize) -> Vec<ContentRow<'_>> {
+    /// value beside it, wrapped under it — at most `keep` rows of each, and
+    /// a row saying how many more there are.
+    pub fn arg_rows(&self, width: usize, keep: usize) -> Vec<ContentRow<'_>> {
         let room = width.saturating_sub(self.key_width() + 2).max(8);
         let mut out = Vec::new();
         for arg in &self.args {
@@ -123,10 +89,19 @@ impl CallDetail {
                 out.push(ContentRow { key: Some(&arg.key), ..ContentRow::new(RowKind::ArgBulk, None, None, arg.value.as_str()) });
                 continue;
             }
-            let lines: Vec<String> = arg.value.lines().chain(arg.value.is_empty().then_some("")).flat_map(|l| wrap(&clean(l), room)).collect();
-            for (n, line) in lines.into_iter().enumerate() {
+            let (mut lines, mut total) = (Vec::new(), 0);
+            for line in arg.value.lines().chain(arg.value.is_empty().then_some("")) {
+                let (made, all) = crate::text::wrap(&crate::text::clean(line), room, keep.saturating_sub(lines.len()));
+                lines.extend(made);
+                total += all;
+            }
+            for (n, line) in lines.iter().enumerate() {
                 let kind = if n == 0 { RowKind::Arg } else { RowKind::ArgMore };
-                out.push(ContentRow { key: (n == 0).then_some(arg.key.as_str()), ..ContentRow::new(kind, None, None, line) });
+                out.push(ContentRow { key: (n == 0).then_some(arg.key.as_str()), ..ContentRow::new(kind, None, None, line.clone()) });
+            }
+            if total > lines.len() {
+                let more = total - lines.len();
+                out.push(ContentRow::new(RowKind::ArgCut, None, None, format!("… {more} more line{}", if more == 1 { "" } else { "s" })));
             }
         }
         out
@@ -138,7 +113,7 @@ impl CallDetail {
         let mut out = Vec::new();
         if !self.args.is_empty() {
             out.push(ContentRow::new(RowKind::Section, None, None, "arguments"));
-            out.extend(self.arg_rows(width));
+            out.extend(self.arg_rows(width, usize::MAX));
         }
         if let Some(content) = &self.content {
             if !out.is_empty() {
@@ -150,10 +125,11 @@ impl CallDetail {
         out
     }
 
-    /// The rows each hunk starts on, for stepping between them.
-    pub fn hunk_rows(&self, width: usize) -> Vec<usize> {
-        self.rows(width).iter().enumerate().filter(|(_, r)| r.kind == RowKind::Hunk).map(|(i, _)| i).collect()
-    }
+}
+
+/// Which of `rows` start a hunk, for stepping between them.
+pub fn hunk_starts(rows: &[ContentRow<'_>]) -> Vec<usize> {
+    rows.iter().enumerate().filter(|(_, r)| r.kind == RowKind::Hunk).map(|(i, _)| i).collect()
 }
 
 /// Which content a call has, from what the trace knows of it.
@@ -212,6 +188,8 @@ pub enum RowKind {
     ArgMore,
     /// An argument holding file contents, summed up.
     ArgBulk,
+    /// How many more lines an argument has than are shown.
+    ArgCut,
     /// A heading: `arguments`, `change`, `read`, `output`.
     Section,
 }
@@ -335,7 +313,7 @@ mod tests {
         let detail = CallDetail { args: args(&serde_json::json!({"file_path": "a.rs", "old_string": "x\ny"})), content: Some(c) };
         let kinds: Vec<RowKind> = detail.rows(40).iter().map(|r| r.kind).take(6).collect();
         assert_eq!(kinds, [RowKind::Section, RowKind::Arg, RowKind::ArgBulk, RowKind::Note, RowKind::Section, RowKind::Hunk]);
-        assert_eq!(detail.hunk_rows(40), vec![5]);
+        assert_eq!(hunk_starts(&detail.rows(40)), vec![5]);
     }
 
     #[test]
@@ -355,16 +333,12 @@ mod tests {
     #[test]
     fn a_long_value_wraps_under_its_key() {
         let d = CallDetail { args: args(&serde_json::json!({"command": "abcdefghij\tk"})), content: None };
-        let rows: Vec<(RowKind, Option<&str>, String)> = d.arg_rows(7 + 2 + 8).into_iter().map(|r| (r.kind, r.key, r.text.into_owned())).collect();
-        assert_eq!(rows, vec![
+        let rows = |keep| -> Vec<(RowKind, Option<&str>, String)> { d.arg_rows(7 + 2 + 8, keep).into_iter().map(|r| (r.kind, r.key, r.text.into_owned())).collect() };
+        assert_eq!(rows(usize::MAX), vec![
             (RowKind::Arg, Some("command"), "abcdefgh".to_string()),
             (RowKind::ArgMore, None, "ij    k".to_string()),
         ]);
-    }
-
-    #[test]
-    fn values_wrap_between_words() {
-        assert_eq!(wrap("you are an expert reviewer", 12), vec!["you are an ", "expert ", "reviewer"]);
+        assert_eq!(rows(1), vec![(RowKind::Arg, Some("command"), "abcdefgh".to_string()), (RowKind::ArgCut, None, "… 1 more line".to_string())]);
     }
 
     #[test]

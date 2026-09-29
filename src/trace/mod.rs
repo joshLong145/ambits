@@ -83,6 +83,12 @@ impl Span {
         }
     }
 
+    /// What a delegation was started for: its own description, else the
+    /// one its tool's stanza made (`Agent: …`) without the tool's name.
+    pub fn task(&self) -> String {
+        self.summary.clone().unwrap_or_else(|| self.description.trim_start_matches("Agent: ").trim().to_string())
+    }
+
     /// The symbol it named, as the tree names it (`impl App/fn run` is
     /// `App/run`).
     pub fn symbol_name(&self) -> Option<String> {
@@ -129,6 +135,8 @@ pub struct Instant {
 pub struct Trace {
     spans: Vec<Span>,
     by_id: HashMap<Arc<str>, usize>,
+    /// Each subagent's delegation.
+    by_child: HashMap<Arc<str>, usize>,
     instants: Vec<Instant>,
 }
 
@@ -199,9 +207,15 @@ impl Trace {
         if f.message.is_some() {
             span.message = f.message.clone();
         }
-        if f.child_agent.is_some() {
-            span.child_agent = f.child_agent.clone();
+        if let Some(child) = &f.child_agent {
+            span.child_agent = Some(child.clone());
+            self.by_child.insert(child.clone(), ix);
         }
+    }
+
+    /// The delegation that started subagent `agent`.
+    pub fn delegation_of(&self, agent: &str) -> Option<usize> {
+        self.by_child.get(agent).copied()
     }
 
     /// A turn began. Its span's own end is its start; it lasts, in the
@@ -425,6 +439,8 @@ mod tests {
         assert_eq!(t.spans()[delegation.span].kind, SpanKind::Delegate);
         assert_eq!(delegation.children.len(), 1);
         assert_eq!(delegation.end, crate::time::parse_rfc3339_millis(T9).unwrap());
+        let child = t.spans()[delegation.span].child_agent.clone().expect("its subagent");
+        assert_eq!(t.delegation_of(&child), Some(delegation.span), "a subagent leads back to its delegation");
     }
 
     /// A background delegation finishes at launch and again when its agent

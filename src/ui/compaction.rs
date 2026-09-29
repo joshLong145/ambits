@@ -205,26 +205,7 @@ fn depth_color(d: ReadDepth) -> Color {
 }
 
 fn wrap_summary(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(20);
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        if current.is_empty() {
-            current.push_str(word);
-        } else if current.len() + 1 + word.len() > width {
-            lines.push(std::mem::take(&mut current));
-            current.push_str(word);
-        } else {
-            current.push(' ');
-            current.push_str(word);
-        }
-    }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
+    let text: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    ambits::text::wrap(&text, width.max(20), usize::MAX).0
 }
 

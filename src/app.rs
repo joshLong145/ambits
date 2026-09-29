@@ -957,8 +957,13 @@ impl App {
         if let Some(view) = &self.content_view {
             return Some(view.span);
         }
+        // Only a trace opened in the trace view has calls to select; this
+        // runs on every turn of the event loop, so it asks nothing more.
+        if !self.trace_view.open || self.trace_view.focus.is_none() {
+            return None;
+        }
         match self.trace_panel_subject() {
-            PanelSubject::Call(i) if self.trace_view.open => Some(i),
+            PanelSubject::Call(i) => Some(i),
             _ => None,
         }
     }
@@ -1025,7 +1030,10 @@ impl App {
     fn handle_content_key(&mut self, key: KeyEvent) {
         let Some(view) = &self.content_view else { return };
         let (rows, hunks) = match self.content_state(view.span) {
-            ContentState::Loaded(c) => (c.rows(view.width.get()).len(), c.hunk_rows(view.width.get())),
+            ContentState::Loaded(c) => {
+                let rows = c.rows(view.width.get());
+                (rows.len(), crate::ingest::content::hunk_starts(&rows))
+            }
             _ => (0, Vec::new()),
         };
         let page = view.height.get().max(1);
@@ -1792,9 +1800,7 @@ impl App {
     /// An agent as a reader knows it: `main`, or a subagent by the task
     /// that started it (`Expert review of phase 6`), else by its id.
     pub fn agent_title(&self, id: &str) -> String {
-        let started = self.trace.spans().iter().find(|s| s.child_agent.as_deref() == Some(id));
-        let task = started.map(|s| s.summary.clone().unwrap_or_else(|| s.description.trim_start_matches("Agent: ").trim().to_string()));
-        match task {
+        match self.trace.delegation_of(id).map(|d| self.trace.spans()[d].task()) {
             Some(task) if !task.is_empty() => task,
             _ => self.agent_name(id).to_string(),
         }

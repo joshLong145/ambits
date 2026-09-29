@@ -18,7 +18,7 @@ use ambits::trace::SpanKind;
 use ambits::writes::{FileContents, Status, WriteRecord};
 
 use super::inspector::{depth_spans, fact, text};
-use super::trace_view::{instant_glyph, span_color, span_name, TraceFrame};
+use super::trace_view::{instant_glyph, span_color, TraceFrame};
 use super::{colors, fit, tree_view};
 
 pub(super) fn render(f: &mut Frame, app: &App, area: Rect, frame: &TraceFrame<'_>) {
@@ -26,7 +26,7 @@ pub(super) fn render(f: &mut Frame, app: &App, area: Rect, frame: &TraceFrame<'_
     let subject = app.trace_panel_subject();
     let title = match subject {
         PanelSubject::Trace(root) => format!(" \"{}\" ", app.trace.spans()[root].name()),
-        PanelSubject::Call(i) => format!(" {} ", span_name(app, i)),
+        PanelSubject::Call(i) => format!(" {} ", app.trace.spans()[i].name()),
         PanelSubject::Instant(i) => format!(" {} ", app.trace.instants()[i].kind.label()),
         PanelSubject::Nothing => " Trace ".to_string(),
     };
@@ -70,20 +70,16 @@ pub(super) fn render(f: &mut Frame, app: &App, area: Rect, frame: &TraceFrame<'_
     f.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), inner);
 }
 
-/// A fact whose value wraps under its label, up to `max` lines.
+/// A fact whose value wraps under its label, up to `max` lines, the last
+/// marked `…` when there is more.
 fn wrapped(label: &str, value: &str, color: Color, width: usize, max: usize) -> Vec<Line<'static>> {
-    let wrap = width.saturating_sub(11).max(8);
-    let chars: Vec<char> = value.chars().collect();
-    let chunks: Vec<String> = chars.chunks(wrap).map(|c| c.iter().collect()).collect();
-    let cut = chunks.len() > max;
-    chunks
+    let (lines, total) = ambits::text::wrap(&ambits::text::clean(value), width.saturating_sub(12).max(8), max);
+    let cut = total > lines.len();
+    let last = lines.len().saturating_sub(1);
+    lines
         .into_iter()
-        .take(max)
         .enumerate()
-        .map(|(n, chunk)| {
-            let chunk = if cut && n + 1 == max { format!("{}…", chunk.chars().take(wrap - 1).collect::<String>()) } else { chunk };
-            fact(if n == 0 { label } else { "" }, vec![text(chunk, color)])
-        })
+        .map(|(n, line)| fact(if n == 0 { label } else { "" }, vec![text(if cut && n == last { format!("{line} …") } else { line }, color)]))
         .collect()
 }
 
@@ -98,9 +94,8 @@ fn trace_lines(app: &App, d: &TraceDetail, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     // The prompt in full, up to four lines.
     let prompt: String = app.trace.spans()[d.root].description.split_whitespace().collect::<Vec<_>>().join(" ");
-    let chars: Vec<char> = prompt.chars().collect();
-    for chunk in chars.chunks(width.saturating_sub(2).max(1)).take(4) {
-        out.push(Line::from(text(format!(" {}", chunk.iter().collect::<String>()), Color::White)));
+    for line in ambits::text::wrap(&prompt, width.saturating_sub(2), 4).0 {
+        out.push(Line::from(text(format!(" {line}"), Color::White)));
     }
     let agents = if d.agents.is_empty() { String::new() } else { format!(" · main + {} agent(s)", d.agents.len()) };
     out.push(Line::from(text(
@@ -129,8 +124,11 @@ fn trace_lines(app: &App, d: &TraceDetail, width: usize) -> Vec<Line<'static>> {
 fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, width: usize) -> Vec<Line<'static>> {
     let s = &app.trace.spans()[i];
     let (index, statuses) = (&frame.index, &frame.statuses);
+    // Its arguments and content, as far as they are loaded.
+    let state = app.content_state(i);
+    let has_args = matches!(state, ambits::app::ContentState::Loaded(d) if !d.args.is_empty());
     let mut out = vec![
-        Line::from(Span::styled(format!(" {}", span_name(app, i)), Style::default().fg(span_color(app, statuses, i)).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(format!(" {}", s.name()), Style::default().fg(span_color(app, statuses, i)).add_modifier(Modifier::BOLD))),
         fact("agent", vec![text(fit(&app.agent_title(&s.agent), width.saturating_sub(12)), Color::Gray)]),
         fact("when", vec![text(frame.timing(app, i), Color::Gray)]),
     ];
@@ -176,8 +174,8 @@ fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, width: usize) -> Vec<
                 }
             }
             // Its task is among its arguments, once they are loaded.
-            if !super::content::has_args(app, i) {
-                out.extend(wrapped("task", s.description.trim_start_matches("Agent: "), Color::Gray, width, 4));
+            if !has_args {
+                out.extend(wrapped("task", &s.task(), Color::Gray, width, 4));
             }
         }
         SpanKind::Other | SpanKind::Prompt => {}
@@ -186,10 +184,10 @@ fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, width: usize) -> Vec<
     // six lines: a shell command can read (by naming symbols) as well.
     // Until its arguments are loaded, what it ran — a command or search
     // not about one file — in one line.
-    if s.file.is_none() && s.kind != SpanKind::Delegate && !super::content::has_args(app, i) {
+    if s.file.is_none() && s.kind != SpanKind::Delegate && !has_args {
         out.extend(wrapped("ran", &s.description, Color::Gray, width, 6));
     }
-    out.extend(super::content::preview(app, i, width));
+    out.extend(super::content::preview(app, i, state, width));
     out
 }
 
@@ -300,7 +298,7 @@ fn rows_lines(app: &App, frame: &TraceFrame<'_>, rows: &[Row<'_>], selected: Opt
                 _ => row.section().to_string(),
             };
             out.push(Line::from(""));
-            out.push(Line::from(Span::styled(format!(" {title}"), Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD))));
+            out.push(super::heading(format!(" {title}")));
         }
         let cells = match *row {
             Row::File(file) => {
@@ -317,7 +315,7 @@ fn rows_lines(app: &App, frame: &TraceFrame<'_>, rows: &[Row<'_>], selected: Opt
             }
             Row::Agent(run) => {
                 let failed = if run.failed > 0 { format!(" · {} ✗", run.failed) } else { String::new() };
-                let what = run.description.trim_start_matches("Agent: ").to_string();
+                let what = run.task.clone();
                 vec![
                     text(fit(&what, width.saturating_sub(26).max(8)), Color::White),
                     text(format!("  {} · {} calls{failed}", view::duration(run.duration), run.calls), Color::Gray),
@@ -325,13 +323,13 @@ fn rows_lines(app: &App, frame: &TraceFrame<'_>, rows: &[Row<'_>], selected: Opt
             }
             Row::Failed(i) => {
                 let why = spans[i].message.as_deref().unwrap_or("failed");
-                vec![text(fit(&format!("✗ {} — {why}", span_name(app, i)), width.saturating_sub(4)), Color::Red)]
+                vec![text(fit(&format!("✗ {} — {why}", app.trace.spans()[i].name()), width.saturating_sub(4)), Color::Red)]
             }
             Row::Commit(i) => vec![text(fit(&app.trace.instants()[i].kind.label(), width.saturating_sub(4)), Color::Cyan)],
             Row::ThisFile(file) => vec![text(fit(file, width.saturating_sub(16)), Color::White), text("  → tree", Color::DarkGray)],
             Row::Related { span: j, before } => vec![
                 text(format!("{} {} ", if before { "before" } else { "after " }, ambits::time::clock(spans[j].start)), Color::DarkGray),
-                text(fit(&span_name(app, j), width.saturating_sub(24).max(8)), span_color(app, &frame.statuses, j)),
+                text(fit(&app.trace.spans()[j].name(), width.saturating_sub(24).max(8)), span_color(app, &frame.statuses, j)),
             ],
         };
         let pick = picked == Some(n);
@@ -465,16 +463,23 @@ mod tests {
         app.trace_view.open_trace(0);
         app.trace_view.selected = Some(ambits::trace::view::Item::Span(2));
         let (key, kind) = app.content_request().expect("the edit's content is wanted");
+        assert!(app.content_request().is_none(), "asked once");
+        app.trace_view.close_trace();
+        app.contents = ambits::app::CallContents::default();
+        assert!(app.content_request().is_none(), "no trace open, nothing wanted");
+        app.trace_view.open_trace(0);
+        app.trace_view.selected = Some(ambits::trace::view::Item::Span(2));
+        assert_eq!(app.content_request().map(|(k, _)| k), Some(key.clone()));
         assert_eq!((&*key.id, kind), ("e1", ambits::ingest::content::ContentKind::Write));
         assert!(app.content_request().is_none(), "asked once");
         assert!(screen(&app).contains("loading…"));
 
         let hunk = |at: u32| Hunk { old_start: Some(at), new_start: Some(at), lines: (0..10).map(|n| DiffLine::Added(format!("line {n}"))).collect() };
-        let input = serde_json::json!({"file_path": "src/a.rs", "old_string": "x", "replace_all": false});
+        let input = serde_json::json!({"file_path": "src/a.rs", "old_string": "x", "replace_all": false, "note": "a\nb\nc\nd\ne\nf"});
         let content = CallContent::Change { hunks: vec![hunk(1), hunk(50)], exact: true };
         app.set_call_content(key, Some(CallDetail { args: args(&input), content: Some(content) }));
         let text = crate::ui::test_render::lines(60, 40, |f| render(f, &app, f.area(), &TraceFrame::new(&app))).join("\n");
-        for want in ["arguments", "file_path    src/a.rs", "replace_all  false", "old_string   1 line · in the change below", "change", "@@ -1,0 +1,10 @@", " 1 + line 0", "… 10 more · o opens in full"] {
+        for want in ["arguments", "file_path    src/a.rs", "note         a", "             d", "             … 2 more lines", "replace_all  false", "old_string   1 line · in the change below", "change", "@@ -1,0 +1,10 @@", " 1 + line 0", "… 10 more · o opens in full"] {
             assert!(text.contains(want), "{want}: {text}");
         }
 
@@ -485,16 +490,16 @@ mod tests {
             assert!(full.contains(want), "{want}: {full}");
         }
         app.content_view.as_ref().unwrap().height.set(5);
-        // Rows: arguments (a heading, three), a blank, change (a heading,
-        // two hunks of eleven): 28.
+        // Rows: arguments (a heading, three, six of the note), a blank,
+        // change (a heading, two hunks of eleven): 34.
         press(&mut app, KeyCode::Char('n'));
-        assert_eq!(app.content_view.as_ref().unwrap().scroll, 6, "the first hunk");
+        assert_eq!(app.content_view.as_ref().unwrap().scroll, 12, "the first hunk");
         press(&mut app, KeyCode::Char('n'));
-        assert_eq!(app.content_view.as_ref().unwrap().scroll, 17, "the second");
+        assert_eq!(app.content_view.as_ref().unwrap().scroll, 23, "the second");
         press(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.content_view.as_ref().unwrap().scroll, 18);
+        assert_eq!(app.content_view.as_ref().unwrap().scroll, 24);
         press(&mut app, KeyCode::Char('G'));
-        assert_eq!(app.content_view.as_ref().unwrap().scroll, 28 - 5, "the last page");
+        assert_eq!(app.content_view.as_ref().unwrap().scroll, 34 - 5, "the last page");
         press(&mut app, KeyCode::Esc);
         assert!(app.content_view.is_none());
     }

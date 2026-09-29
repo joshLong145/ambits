@@ -31,6 +31,7 @@ pub mod restore;
 pub mod search;
 pub mod state_dir;
 pub mod symbols;
+pub mod text;
 pub mod time;
 pub mod touched;
 pub mod trace;

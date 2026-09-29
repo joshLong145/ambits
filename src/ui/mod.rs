@@ -140,6 +140,12 @@ fn render_legend(f: &mut Frame, area: Rect) {
 }
 
 /// Display columns of `text`.
+/// A section's heading, as the panels head their parts: dim and bold.
+pub(crate) fn heading(text: impl Into<String>) -> ratatui::text::Line<'static> {
+    use ratatui::style::{Color, Modifier, Style};
+    ratatui::text::Line::from(ratatui::text::Span::styled(text.into(), Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)))
+}
+
 pub(crate) fn width(text: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(text)
 }

@@ -9,10 +9,10 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use ambits::app::{App, ContentState};
-use ambits::ingest::content::{clean, CallContent, CallDetail, ContentRow, RowKind};
+use ambits::ingest::content::{CallContent, CallDetail, ContentRow, RowKind};
+use ambits::text::clean;
 
 use super::inspector::text;
-use super::trace_view::span_name;
 use super::fit;
 
 /// Rows of content the trace panel previews.
@@ -61,11 +61,12 @@ fn row_line(row: &ContentRow<'_>, cols: Columns, width: usize) -> Line<'static> 
     let dim = Color::DarkGray;
     let key = |k: Option<&str>| format!("{:<w$}  ", fit(k.unwrap_or(""), cols.key), w = cols.key);
     let (lead, sign, color) = match row.kind {
-        RowKind::Section => return Line::from(Span::styled(row.text.to_string(), Style::default().fg(dim).add_modifier(Modifier::BOLD))),
+        RowKind::Section => return super::heading(row.text.to_string()),
         RowKind::Hunk => return Line::from(text(fit(&row.text, width), Color::Cyan)),
         RowKind::Note => return Line::from(text(fit(&row.text, width), dim)),
         RowKind::Arg | RowKind::ArgMore => return Line::from(vec![text(key(row.key), Color::Cyan), text(row.text.to_string(), Color::White)]),
         RowKind::ArgBulk => return Line::from(vec![text(key(row.key), Color::Cyan), text(fit(&row.text, width.saturating_sub(cols.key + 2)), dim)]),
+        RowKind::ArgCut => return Line::from(vec![text(key(None), dim), text(row.text.to_string(), dim)]),
         RowKind::Text if row.new.is_none() => return Line::from(text(fit(&clean(&row.text), width), Color::Gray)),
         RowKind::Text => (format!("{:>w$}", row.new.map_or(String::new(), |n| n.to_string()), w = cols.digits), "│", Color::Gray),
         RowKind::Same => (cols.gutter(row.old, row.new), " ", Color::Gray),
@@ -90,55 +91,39 @@ fn note(app: &App, span: usize, detail: &CallDetail) -> Option<Line<'static>> {
     }))
 }
 
-/// Whether the trace panel has `span`'s arguments to show, in place of
-/// its one-line description.
-pub(super) fn has_args(app: &App, span: usize) -> bool {
-    matches!(app.content_state(span), ContentState::Loaded(d) if !d.args.is_empty())
+/// What stands in for a call's detail while there is none to show.
+fn waiting(state: &ContentState<'_>) -> Option<&'static str> {
+    match state {
+        ContentState::Loading => Some("loading…"),
+        ContentState::Missing => Some("The log has nothing on this call."),
+        ContentState::Loaded(_) => None,
+    }
 }
 
 /// The trace panel's view of call `span` as its log recorded it: its
 /// arguments, a few lines of each, then the first rows of its content and
 /// how to see the rest. Nothing for a call the log has nothing on.
-pub(super) fn preview(app: &App, span: usize, width: usize) -> Vec<Line<'static>> {
-    let detail = match app.content_state(span) {
+pub(super) fn preview(app: &App, span: usize, state: ContentState<'_>, width: usize) -> Vec<Line<'static>> {
+    let detail = match state {
         ContentState::Loaded(d) => d,
-        ContentState::Loading => return vec![Line::from(""), Line::from(text(" loading…", Color::DarkGray))],
+        ContentState::Loading => return vec![Line::from(""), Line::from(text(format!(" {}", waiting(&state).unwrap_or_default()), Color::DarkGray))],
         ContentState::Missing => return Vec::new(),
     };
     let width = width.saturating_sub(3);
-    let heading = |name: &str| Line::from(Span::styled(format!(" {name}"), Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)));
     let mut out = Vec::new();
-    let args = detail.arg_rows(width);
-    let cols = Columns::new(Numbers::One, detail, &[]);
+    let args = detail.arg_rows(width, ARG_PREVIEW);
     if !args.is_empty() {
+        let cols = Columns::new(Numbers::One, detail, &[]);
         out.push(Line::from(""));
-        out.push(heading("arguments"));
-        // Each argument's first rows, and how many more it has.
-        let mut shown = 0;
-        let mut hidden = 0;
-        for (n, row) in args.iter().enumerate() {
-            if row.kind != RowKind::ArgMore {
-                shown = 0;
-            }
-            shown += 1;
-            if shown <= ARG_PREVIEW {
-                out.push(indent(row_line(row, cols, width)));
-            } else {
-                hidden += 1;
-            }
-            let last_of_arg = args.get(n + 1).is_none_or(|next| next.kind != RowKind::ArgMore);
-            if last_of_arg && hidden > 0 {
-                out.push(indent(Line::from(text(format!("{:w$}  … {hidden} more lines", "", w = cols.key), Color::DarkGray))));
-                hidden = 0;
-            }
-        }
+        out.push(super::heading(" arguments"));
+        out.extend(args.iter().map(|row| indent(row_line(row, cols, width))));
     }
     let mut more = 0;
     if let Some(content) = &detail.content {
         let rows = content.rows();
         let cols = Columns::new(Numbers::One, detail, &rows);
         out.push(Line::from(""));
-        out.push(heading(content.title()));
+        out.push(super::heading(format!(" {}", content.title())));
         out.extend(note(app, span, detail).map(indent));
         out.extend(rows.iter().take(PREVIEW).map(|r| indent(row_line(r, cols, width))));
         more = rows.len().saturating_sub(PREVIEW);
@@ -161,7 +146,7 @@ fn indent(line: Line<'static>) -> Line<'static> {
 pub(super) fn render_view(f: &mut Frame, app: &App, area: Rect) {
     let Some(view) = &app.content_view else { return };
     let s = &app.trace.spans()[view.span];
-    let title = format!(" {} · {} · {} ", span_name(app, view.span), app.agent_title(&s.agent), ambits::time::clock(s.start));
+    let title = format!(" {} · {} · {} ", app.trace.spans()[view.span].name(), app.agent_title(&s.agent), ambits::time::clock(s.start));
     let block = Block::default()
         .title(fit(&title, area.width.saturating_sub(4) as usize))
         .title_bottom(Line::from(text(" j/k scroll · n/N hunk · g/G ends · o/Esc close ", Color::DarkGray)))
@@ -174,10 +159,9 @@ pub(super) fn render_view(f: &mut Frame, app: &App, area: Rect) {
     let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
 
     let width = inner.width as usize;
-    let detail = match app.content_state(view.span) {
-        ContentState::Loaded(d) => d,
-        ContentState::Loading => return f.render_widget(Paragraph::new(text(" loading…", Color::DarkGray)), inner),
-        ContentState::Missing => return f.render_widget(Paragraph::new(text(" The log has nothing on this call.", Color::DarkGray)), inner),
+    let state = app.content_state(view.span);
+    let ContentState::Loaded(detail) = state else {
+        return f.render_widget(Paragraph::new(text(waiting(&state).unwrap_or_default(), Color::DarkGray)), inner);
     };
     let mut lines: Vec<Line<'static>> = note(app, view.span, detail).into_iter().collect();
     let height = (inner.height as usize).saturating_sub(lines.len());
