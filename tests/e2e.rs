@@ -409,6 +409,7 @@ fn journal_records_symbols_read_through_app() {
         label: "ag".into(),
         tool_use_id: None,
         effect: ambits::ingest::Effect::Read,
+        summary: None,
     };
     app.process_agent_event(call.clone());
     app.sync_journal();
@@ -458,6 +459,7 @@ fn journal_survives_compaction() {
         label: "ag".into(),
         tool_use_id: None,
         effect: ambits::ingest::Effect::Read,
+        summary: None,
     });
     app.process_compaction("summary".into(), "ts".into(), "ag".into(), None);
     app.sync_journal();
@@ -486,6 +488,7 @@ fn read_call(root: &std::path::Path, rel: &str) -> AgentToolCall {
         label: "ag".into(),
         tool_use_id: None,
         effect: ambits::ingest::Effect::Read,
+        summary: None,
     }
 }
 

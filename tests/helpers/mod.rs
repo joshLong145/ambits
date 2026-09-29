@@ -103,6 +103,7 @@ pub fn tool_call(tool: &str, path: &str, depth: ReadDepth) -> AgentToolCall {
         label: "agent-1".into(),
         tool_use_id: None,
         effect: crate::ingest::Effect::Read,
+        summary: None,
     }
 }
 
