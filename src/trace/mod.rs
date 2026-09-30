@@ -60,8 +60,9 @@ pub struct Span {
     pub child_agent: Option<Arc<str>>,
     /// What the call is for, in the agent's words (Bash's `description`).
     pub summary: Option<String>,
-    /// The symbols the call read, as they were credited: outermost only,
-    /// each at its depth (see `app::Credit::outermost`).
+    /// The symbols the call read, as ambits credited them, each at its depth
+    /// (see `app::Credit::listed`): what the views of a call's reads are
+    /// built from, rather than its file and a name matched loosely.
     pub read: Vec<(String, crate::tracking::ReadDepth)>,
 }
 
@@ -90,6 +91,27 @@ impl Span {
     /// one its tool's stanza made (`Agent: …`) without the tool's name.
     pub fn task(&self) -> String {
         self.summary.clone().unwrap_or_else(|| self.description.trim_start_matches("Agent: ").trim().to_string())
+    }
+
+    /// The files whose symbols the call read — for an `ambits show` or a
+    /// search, which name no file of their own, several — in first-read order.
+    pub fn read_files(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for (id, _) in &self.read {
+            let file = crate::symbols::split_id(id).0;
+            if !out.contains(&file) {
+                out.push(file);
+            }
+        }
+        out
+    }
+
+    /// The symbols the call read in `file`, by name path.
+    pub fn reads_in<'s>(&'s self, file: &'s str) -> impl Iterator<Item = (&'s str, crate::tracking::ReadDepth)> + 's {
+        self.read.iter().filter_map(move |(id, depth)| {
+            let (f, name) = crate::symbols::split_id(id);
+            (f == file).then_some((name, *depth))
+        })
     }
 
     /// The symbol it named, as the tree names it (`impl App/fn run` is

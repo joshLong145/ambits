@@ -220,7 +220,9 @@ wrote — and whether its writes are still there, changed or gone — its
 agents, its failed calls with the reason, and the commits made meanwhile.
 
 Under each file, what the trace read of it — each symbol once, at the
-deepest it was read, `(whole file)` for a read of all of it — then what it
+deepest it was read, as ambits credited the reads, so an `ambits show` or a
+search counts for the files its symbols are in; `(whole file)` for a read of
+a file with no symbols — then what it
 wrote, each symbol as its latest write in the trace left it. A call that
 failed says `✗ failed` — a failed read saw nothing, and never outranks one
 that worked — and a write no journal entry explains says `? unjournaled`.
@@ -249,8 +251,10 @@ after it.
 **Symbols read** are the ones ambits credited for the call, at the depth it
 credited: a whole-file read lists the file's top-level symbols (what is
 inside them was read with them), a `Read` of a line range the symbols it
-covered, an `ambits show` the ones it named, an `ambits rg` the ones its
-matches sat in. **Symbols written** say what the write did to each —
+covered, an `ambits show` the ones it named, an `ambits rg` each one a match
+sat in — an impl and a method in it both, when both matched. The inspector's
+traces for a symbol, the trace summary and following a call from the
+timeline all go by the same credited reads. **Symbols written** say what the write did to each —
 edited, created (no symbol had its id before), deleted — and, unless
 deleted, whether its version is still there. A write recorded before
 ambits knew created from edited lists every symbol it touched as edited.

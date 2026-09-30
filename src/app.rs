@@ -1250,11 +1250,15 @@ impl App {
             }
             return;
         }
-        if let Some(file) = &span.file {
-            if self.reveal(file, span.symbol.as_deref()) {
-                self.trace_view.open = false;
-                self.focus = FocusPanel::Left;
-            }
+        // To the first symbol it was credited with reading, exactly; else to
+        // the symbol it named in its file, by name.
+        let revealed = match span.read.first() {
+            Some((id, _)) => self.reveal_id(crate::symbols::split_id(id).0, Some(id.clone())),
+            None => span.file.as_deref().is_some_and(|file| self.reveal(file, span.symbol.as_deref())),
+        };
+        if revealed {
+            self.trace_view.open = false;
+            self.focus = FocusPanel::Left;
         }
     }
 
@@ -1977,7 +1981,9 @@ pub struct Credit<'a> {
     ledger: &'a mut ContextLedger,
     depth_cache: &'a mut crate::tracking::alignment::DepthOrdinalCache,
     agent: &'a str,
-    read: Vec<(String, ReadDepth)>,
+    /// Each credit, and whether it came with a parent read whole — implied,
+    /// so not worth listing.
+    read: Vec<(String, ReadDepth, bool)>,
 }
 
 impl<'a> Credit<'a> {
@@ -1985,26 +1991,22 @@ impl<'a> Credit<'a> {
         Credit { ledger, depth_cache, agent, read: Vec::new() }
     }
 
-    fn record(&mut self, sym: &SymbolNode, depth: ReadDepth) {
+    /// Credit `sym` at `depth`; `implied` when it comes with a parent read
+    /// whole.
+    fn record(&mut self, sym: &SymbolNode, depth: ReadDepth, implied: bool) {
         self.ledger.record(sym.id.clone(), depth, sym.content_hash, self.agent.to_string(), sym.estimated_tokens as usize);
         self.depth_cache.record(&sym.id, self.agent, depth);
-        self.read.push((sym.id.clone(), depth));
+        self.read.push((sym.id.clone(), depth, implied));
     }
 
-    /// The symbols credited, outermost only — one inside another read with
-    /// it (a method of an impl read whole) goes without saying — each once,
-    /// at the deepest it was credited, in the order first credited.
-    pub fn outermost(self) -> Vec<(String, ReadDepth)> {
-        let ids: std::collections::HashSet<&str> = self.read.iter().map(|(id, _)| id.as_str()).collect();
-        let inside_another = |id: &str| {
-            let (file, name) = crate::symbols::split_id(id);
-            name.match_indices('/').any(|(at, _)| ids.contains(format!("{file}::{}", &name[..at]).as_str()))
-        };
+    /// The symbols the call read, as the trace lists them: each credited in
+    /// its own right — not one that came with a parent read whole (a method
+    /// of an impl read in full) — once, at the deepest it was credited, in
+    /// the order first credited. A search that matched an impl's header and
+    /// a line in one of its methods read both, and lists both.
+    pub fn listed(self) -> Vec<(String, ReadDepth)> {
         let mut out: Vec<(String, ReadDepth)> = Vec::new();
-        for (id, depth) in &self.read {
-            if inside_another(id) {
-                continue;
-            }
+        for (id, depth, _) in self.read.iter().filter(|(_, _, implied)| !implied) {
             match out.iter_mut().find(|(seen, _)| seen == id) {
                 Some((_, d)) => *d = (*d).max(*depth),
                 None => out.push((id.clone(), *depth)),
@@ -2014,8 +2016,8 @@ impl<'a> Credit<'a> {
     }
 }
 
-/// Apply one tool call to the ledger, and say which symbols it read
-/// (outermost: see [`Credit::outermost`]).
+/// Apply one tool call to the ledger, and say which symbols it read (as
+/// [`Credit::listed`] lists them).
 ///
 /// The single place that decides how a tool call becomes symbol reads. It had
 /// been open-coded at three call sites — the TUI, `coverage::run_report`, and
@@ -2061,16 +2063,16 @@ pub fn apply_tool_call(
             if event.target_symbol.is_some() || event.target_lines.is_some() {
                 mark_targeted_symbols(&file.symbols, event, &mut credit);
             } else {
-                mark_file_symbols(&file.symbols, event.read_depth, &mut credit);
+                mark_file_symbols(&file.symbols, event.read_depth, &mut credit, false);
             }
         }
     }
-    credit.outermost()
+    credit.listed()
 }
 
 /// Credit the symbols a call's output showed (`ToolFinished::shown`: the
 /// matches an `ambits rg` printed), as the agent that made the call, and
-/// say which (outermost).
+/// say which.
 pub fn apply_shown(
     tree: &ProjectTree,
     finished: &crate::ingest::ToolFinished,
@@ -2082,7 +2084,7 @@ pub fn apply_shown(
     }
     let mut credit = Credit::new(ledger, depth_cache, &finished.agent_id);
     mark_selectors(tree, &finished.shown, &mut credit);
-    credit.outermost()
+    credit.listed()
 }
 
 /// Mark every symbol named by `selectors` (ids or content hashes), as read
@@ -2129,7 +2131,7 @@ fn mark_selectors(tree: &ProjectTree, selectors: &[(String, ReadDepth)], credit:
         // `impl App`), and a lookup that returned both showed both.
         for sym in file.walk() {
             if let Some(depth) = ids.get(sym.id.as_str()) {
-                credit.record(sym, *depth);
+                credit.record(sym, *depth, false);
             }
         }
     }
@@ -2137,7 +2139,7 @@ fn mark_selectors(tree: &ProjectTree, selectors: &[(String, ReadDepth)], credit:
         for (_, sym) in tree.walk() {
             let hex = crate::journal::hash_hex(&sym.content_hash);
             if let Some(depth) = hashes.iter().filter(|(h, _)| hex.starts_with(h.as_str())).map(|(_, d)| *d).max() {
-                credit.record(sym, depth);
+                credit.record(sym, depth, false);
             }
         }
     }
@@ -2223,10 +2225,12 @@ pub fn normalize_tool_path(tool_path: &Path, project_root: &Path) -> PathBuf {
 ///
 /// Contrast with [`mark_targeted_symbols`], which narrows recording to only the
 /// symbols that match the event's `target_symbol` or `target_lines`.
-pub fn mark_file_symbols(symbols: &[SymbolNode], depth: ReadDepth, credit: &mut Credit<'_>) {
+/// `implied` for symbols that come with a parent read whole: listed by the
+/// parent, not themselves.
+pub fn mark_file_symbols(symbols: &[SymbolNode], depth: ReadDepth, credit: &mut Credit<'_>, implied: bool) {
     for sym in symbols {
-        credit.record(sym, depth);
-        mark_file_symbols(&sym.children, depth, credit);
+        credit.record(sym, depth, implied);
+        mark_file_symbols(&sym.children, depth, credit, true);
     }
 }
 
@@ -2240,12 +2244,12 @@ pub fn mark_targeted_symbols(symbols: &[SymbolNode], event: &AgentToolCall, cred
     for sym in symbols {
         match classify_symbol_match(sym, event) {
             MatchKind::ByName => {
-                credit.record(sym, event.read_depth);
+                credit.record(sym, event.read_depth, false);
                 // Full body was in the response — bulk-mark all descendants.
-                mark_file_symbols(&sym.children, event.read_depth, credit);
+                mark_file_symbols(&sym.children, event.read_depth, credit, true);
             }
             MatchKind::ByLineOverlap => {
-                credit.record(sym, event.read_depth);
+                credit.record(sym, event.read_depth, false);
                 // Parent container overlaps the read range — recurse precisely so
                 // only children whose ranges also overlap get promoted.
                 mark_targeted_symbols(&sym.children, event, credit);
@@ -2409,7 +2413,7 @@ mod tests {
         let mut ledger = ContextLedger::new();
         let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
 
-        mark_file_symbols(&[parent], event.read_depth, &mut Credit::new(&mut ledger, &mut cache, &event.agent_id));
+        mark_file_symbols(&[parent], event.read_depth, &mut Credit::new(&mut ledger, &mut cache, &event.agent_id), false);
 
         assert_eq!(ledger.depth_of("mock/f.rs::parent"), ReadDepth::FullBody);
         assert_eq!(ledger.depth_of("mock/f.rs::child"), ReadDepth::FullBody);
@@ -2758,6 +2762,21 @@ mod tests {
             ReadDepth::Unseen,
             "only the named symbol is credited"
         );
+    }
+
+    /// A call lists what it was credited with in its own right: a search
+    /// that matched a parent and a symbol inside it lists both; a read of
+    /// the whole file, its top-level symbols — their children came with them.
+    #[test]
+    fn a_call_lists_what_it_read_in_its_own_right() {
+        let tree = project(vec![file("mock/f.rs", vec![sym_with_children("mock/f.rs::App", "App", vec![sym("mock/f.rs::App/run", "run")]), sym("mock/f.rs::free", "free")])]);
+        let (mut ledger, mut cache) = (ContextLedger::new(), crate::tracking::alignment::DepthOrdinalCache::new());
+        let shown = vec![("mock/f.rs::App".to_string(), ReadDepth::NameOnly), ("mock/f.rs::App/run".to_string(), ReadDepth::NameOnly)];
+        let search = crate::ingest::ToolFinished { id: Arc::from("s"), agent_id: Arc::from("a"), timestamp: String::new(), error: false, child_agent: None, message: None, shown: shown.clone() };
+        assert_eq!(apply_shown(&tree, &search, &mut ledger, &mut cache), shown);
+        let whole = tool_call("Read", "mock/f.rs", ReadDepth::FullBody);
+        let listed = apply_tool_call(&tree, Path::new(""), &whole, &mut ledger, &mut cache);
+        assert_eq!(listed, vec![("mock/f.rs::App".to_string(), ReadDepth::FullBody), ("mock/f.rs::free".to_string(), ReadDepth::FullBody)]);
     }
 
     /// A file's contents are made once, and made again when the file

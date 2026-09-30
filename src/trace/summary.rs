@@ -86,17 +86,23 @@ impl FileActivity {
     /// What its reads saw: each symbol once, at the deepest it was read,
     /// in the order first read; `None` for a read that failed and saw
     /// nothing (listed only when no read of it succeeded). A `None` symbol
-    /// is the whole file.
+    /// is the whole file. Each read's symbols are those it was credited with
+    /// in this file; one credited with none (a file with no symbols) is the
+    /// symbol it targeted, or the whole file.
     pub fn symbols_read(&self, trace: &Trace) -> Vec<(Option<String>, Option<ReadDepth>)> {
         let mut out: Vec<(Option<String>, Option<ReadDepth>)> = Vec::new();
+        let mut note = |name: Option<String>, depth: Option<ReadDepth>| match out.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, d)) => *d = (*d).max(depth),
+            None => out.push((name, depth)),
+        };
         for &i in &self.reads {
             let s = &trace.spans()[i];
-            let SpanKind::Read(depth) = s.kind else { continue };
-            let depth = (!s.error).then_some(depth);
-            let name = s.symbol_name();
-            match out.iter_mut().find(|(n, _)| *n == name) {
-                Some((_, d)) => *d = (*d).max(depth),
-                None => out.push((name, depth)),
+            let failed = |depth: ReadDepth| (!s.error).then_some(depth);
+            let mut credited = s.reads_in(&self.file).peekable();
+            if credited.peek().is_some() {
+                credited.for_each(|(name, depth)| note(Some(name.to_string()), failed(depth)));
+            } else if let SpanKind::Read(depth) = s.kind {
+                note(s.symbol_name(), failed(depth));
             }
         }
         out
@@ -154,17 +160,22 @@ pub fn detail(trace: &Trace, index: &TraceIndex, root: usize) -> Option<TraceDet
         if s.error {
             failed.push(i);
         }
-        if let Some(file) = &s.file {
-            let at = match files.iter().position(|f| &f.file == file) {
+        // Its own file, and every file it was credited with reading — an
+        // `ambits show` or a search names none of its own.
+        let credited = s.read_files();
+        let own = s.file.as_deref().filter(|f| !credited.contains(f));
+        for file in own.into_iter().chain(credited.iter().copied()) {
+            let at = match files.iter().position(|f| f.file == file) {
                 Some(at) => at,
                 None => {
-                    files.push(FileActivity { file: file.clone(), reads: Vec::new(), writes: Vec::new(), first: i });
+                    files.push(FileActivity { file: file.to_string(), reads: Vec::new(), writes: Vec::new(), first: i });
                     files.len() - 1
                 }
             };
+            let read = credited.contains(&file) || matches!(s.kind, SpanKind::Read(_));
             match s.kind {
-                SpanKind::Read(_) => files[at].reads.push(i),
-                SpanKind::Write => files[at].writes.push(i),
+                SpanKind::Write if s.file.as_deref() == Some(file) => files[at].writes.push(i),
+                _ if read => files[at].reads.push(i),
                 _ => {}
             }
         }

@@ -143,12 +143,25 @@ fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, width: usize) -> Vec<
     }
 
     match s.kind {
+        // What it was credited with reading: one symbol by name, and how
+        // deeply it is known now; several counted (they are rows below).
+        // Credited with none, what it targeted, if anything.
         SpanKind::Read(depth) => {
             let mut read = depth_spans(depth, 0);
-            read.extend(s.symbol_name().map(|name| text(format!(" of {name}"), Color::Gray)));
-            out.push(fact("read", read));
-            if let Some(id) = s.symbol_id() {
-                out.push(fact("now", depth_spans(app.ledger.depth_of(&id), 0)));
+            match s.read.as_slice() {
+                [(id, _)] => {
+                    read.push(text(format!(" of {}", ambits::symbols::split_id(id).1), Color::Gray));
+                    out.push(fact("read", read));
+                    out.push(fact("now", depth_spans(app.ledger.depth_of(id), 0)));
+                }
+                [] => {
+                    read.extend(s.symbol_name().map(|name| text(format!(" of {name}"), Color::Gray)));
+                    out.push(fact("read", read));
+                }
+                many => {
+                    read.push(text(format!(" · {} symbols", many.len()), Color::Gray));
+                    out.push(fact("read", read));
+                }
             }
         }
         SpanKind::Write => match s.id.as_deref().and_then(|op| statuses.get(op)) {
@@ -576,6 +589,27 @@ mod tests {
         assert_eq!(app.focus, FocusPanel::Left);
         assert_eq!(app.tree_rows[app.selected_index].symbol_id, "src/a.rs::App/run", "selected, its file and App unfolded");
         assert_eq!(app.pending_editor_request, None, "no editor");
+    }
+
+    /// A read targeting `run` — a name, not a path — was credited with
+    /// `App/run`: the panel says so, and following it lands there.
+    #[test]
+    fn a_read_is_named_by_what_it_was_credited_with() {
+        use crossterm::event::KeyCode;
+        let mut app = app_with_symbols();
+        let mut c = crate::ui::test_render::tool_call("sess", "r1", "Read", "src/a.rs", "2026-09-27T10:00:01Z");
+        c.target_symbol = Some("run".into());
+        app.process_agent_event(c);
+        assert_eq!(app.trace.spans()[1].read, vec![("src/a.rs::App/run".into(), ambits::tracking::ReadDepth::FullBody)]);
+        app.trace_view.open = true;
+        app.trace_view.open_trace(0);
+        app.trace_view.selected = Some(ambits::trace::view::Item::Span(1));
+        let text = crate::ui::test_render::lines(60, 20, |f| render(f, &app, f.area(), &TraceFrame::new(&app))).join("\n");
+        for want in ["read     ● full body of App/run", "now      ● full body"] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tree_rows[app.selected_index].symbol_id, "src/a.rs::App/run", "followed to what it read");
     }
 
     /// A write lists what it did to each symbol: edited, created, deleted.

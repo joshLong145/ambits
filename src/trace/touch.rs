@@ -23,8 +23,11 @@ pub struct Touch {
 /// The traces whose calls touched `file` (project-relative) — or, given a
 /// symbol id, that symbol — in time order.
 ///
-/// A read touches a symbol when it read the whole file or named the symbol,
-/// something inside it, or something it is inside. A write touches it when
+/// A read touches a symbol when a symbol it was credited with reading is the
+/// symbol, inside it, or around it — which counts the `ambits show`s and
+/// searches that name no file of their own. A read credited with nothing
+/// (of a file with no symbols, say) falls back to the file it named and the
+/// symbol it targeted, if any. A write touches it when
 /// its attribution names it or something nested in it (so a file-level
 /// write touches the file only).
 pub fn touches(trace: &Trace, file: &str, symbol: Option<&str>, writes: &WriteIndex) -> Vec<Touch> {
@@ -35,25 +38,28 @@ pub fn touches(trace: &Trace, file: &str, symbol: Option<&str>, writes: &WriteIn
     let mut index: HashMap<usize, usize> = HashMap::new();
 
     for (i, s) in trace.spans().iter().enumerate() {
-        if s.file.as_deref() != Some(file) {
-            continue;
-        }
-        let (read, wrote) = match (s.kind, symbol, name) {
-            (SpanKind::Write, Some(id), _) => (false, s.id.as_deref().and_then(|op| writes.get(op)).is_some_and(|w| w.touches_symbol(id))),
-            (SpanKind::Write, None, _) => (false, true),
-            (SpanKind::Read(_), Some(_), Some(name)) => {
-                let hit = match s.symbol_name() {
-                    None => true,
-                    Some(target) => nested_in(name, &target) || nested_in(&target, name),
-                };
-                (hit, false)
+        let on_file = s.file.as_deref() == Some(file);
+        // What the call read of it, as credited — which also finds the
+        // `ambits show`s and searches that name no file of their own.
+        let mut credited = s.reads_in(file).map(|(read, _)| read).peekable();
+        let read = match name {
+            _ if credited.peek().is_none() => {
+                // Nothing credited: a read of the file still read it (one of
+                // a file the tree has no symbols for, say).
+                matches!(s.kind, SpanKind::Read(_)) && on_file && name.is_none_or(|name| s.symbol_name().is_none_or(|t| nested_in(name, &t) || nested_in(&t, name)))
             }
-            (SpanKind::Read(_), None, _) => (true, false),
-            // A call on the file that neither read nor wrote it, a search say.
-            (_, None, _) => (false, false),
-            _ => continue,
+            None => true,
+            Some(name) => credited.any(|read| nested_in(name, read) || nested_in(read, name)),
         };
-        if symbol.is_some() && !read && !wrote {
+        let wrote = on_file
+            && s.kind == SpanKind::Write
+            && match symbol {
+                Some(id) => s.id.as_deref().and_then(|op| writes.get(op)).is_some_and(|w| w.touches_symbol(id)),
+                None => true,
+            };
+        // A call on the file that neither read nor wrote it — a search, say —
+        // touches the file, not a symbol in it.
+        if !read && !wrote && !(on_file && symbol.is_none()) {
             continue;
         }
         let root = root_of.get(&i).copied().unwrap_or(i);
@@ -97,6 +103,30 @@ mod tests {
 
     fn prompt(t: &mut Trace, at: &str, text: &str) {
         t.prompt(&Prompt { agent_id: Arc::from("main"), timestamp: at.into(), text: text.into() });
+    }
+
+    /// An `ambits show` names no file of its own; what it was credited with
+    /// reading is what it touched.
+    #[test]
+    fn a_show_touches_the_symbols_it_was_credited_with() {
+        let mut t = Trace::default();
+        prompt(&mut t, "2026-09-27T10:00:00Z", "first");
+        let mut c = crate::helpers::tool_call("Bash", "/p/x", crate::tracking::ReadDepth::FullBody);
+        c.file_path = None;
+        c.agent_id = Arc::from("main");
+        c.tool_use_id = Some(Arc::from("b1"));
+        c.timestamp_str = "2026-09-27T10:00:01Z".into();
+        t.start(&c, Path::new("/p"));
+        t.note_read("b1", vec![("src/a.rs::App/run".into(), crate::tracking::ReadDepth::FullBody)]);
+        let writes = WriteIndex::default();
+        assert_eq!(touches(&t, "src/a.rs", Some("src/a.rs::App"), &writes).len(), 1, "App/run is inside App");
+        assert_eq!(touches(&t, "src/a.rs", None, &writes).len(), 1);
+        assert!(touches(&t, "src/a.rs", Some("src/a.rs::Other"), &writes).is_empty());
+
+        let index = crate::trace::summary::TraceIndex::new(&t);
+        let d = crate::trace::summary::detail(&t, &index, 0).unwrap();
+        assert_eq!(d.files.iter().map(|f| f.file.as_str()).collect::<Vec<_>>(), vec!["src/a.rs"], "its file is in the summary");
+        assert_eq!(d.files[0].symbols_read(&t), vec![(Some("App/run".into()), Some(crate::tracking::ReadDepth::FullBody))]);
     }
 
     #[test]
