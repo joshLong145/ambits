@@ -553,10 +553,10 @@ mod tests {
         app
     }
 
-    /// A read lists the symbols it read, and Enter on one opens its
-    /// definition in the editor.
+    /// A read lists the symbols it read, and Enter on one shows it in the
+    /// symbol tree — its file and the symbols around it unfolded.
     #[test]
-    fn a_read_lists_its_symbols_and_enter_opens_one() {
+    fn a_read_lists_its_symbols_and_enter_shows_one_in_the_tree() {
         use crossterm::event::KeyCode;
         let mut app = app_with_symbols();
         let mut c = crate::ui::test_render::tool_call("sess", "r1", "Read", "src/a.rs", "2026-09-27T10:00:01Z");
@@ -569,9 +569,13 @@ mod tests {
         for want in ["symbols read", "● full body   App/run"] {
             assert!(text.contains(want), "{want}: {text}");
         }
+        assert!(app.tree_rows.iter().all(|r| r.symbol_id != "src/a.rs::App/run"), "folded away to begin with");
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.pending_editor_request, Some((PathBuf::from("/test/src/a.rs"), 3)), "run's definition, at its line");
+        assert!(!app.trace_view.open, "back to the tree");
+        assert_eq!(app.focus, FocusPanel::Left);
+        assert_eq!(app.tree_rows[app.selected_index].symbol_id, "src/a.rs::App/run", "selected, its file and App unfolded");
+        assert_eq!(app.pending_editor_request, None, "no editor");
     }
 
     /// A write lists what it did to each symbol: edited, created, deleted.

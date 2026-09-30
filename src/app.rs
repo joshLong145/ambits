@@ -834,7 +834,15 @@ impl App {
                 }
                 return;
             }
-            Target::Symbol(id) => return self.open_in_editor(&id),
+            Target::Symbol(id) => {
+                // In the tree, its file and the symbols around it unfolded.
+                let (file, _) = crate::symbols::split_id(&id);
+                if self.reveal_id(file, Some(id.clone())) {
+                    self.trace_view.open = false;
+                    self.focus = FocusPanel::Left;
+                }
+                return;
+            }
             Target::Span(i) => Item::Span(i),
             Target::Instant(i) => Item::Instant(i),
         };
@@ -1255,13 +1263,21 @@ impl App {
     /// not in the tree.
     pub fn reveal(&mut self, file: &str, symbol: Option<&str>) -> bool {
         let Some(tree_file) = self.project_tree.file(file) else { return false };
-        let file_id = tree_file.file_path.to_string_lossy().into_owned();
         let target = symbol.map(normalize_name_path).and_then(|name| {
             let nodes = tree_file.walk();
             let exact = nodes.iter().find(|n| n.name_path() == name);
             let by_tail = || nodes.iter().find(|n| n.name_path().ends_with(&format!("/{name}")) || *n.name == *name);
             exact.or_else(by_tail).map(|n| n.id.clone())
         });
+        self.reveal_id(file, target)
+    }
+
+    /// Select symbol `id` in the tree, expanding its file and every symbol
+    /// it sits in; or, `None`, the file. `false` when the file is not in the
+    /// tree. A symbol no longer there leaves the file selected.
+    pub fn reveal_id(&mut self, file: &str, target: Option<String>) -> bool {
+        let Some(tree_file) = self.project_tree.file(file) else { return false };
+        let file_id = tree_file.file_path.to_string_lossy().into_owned();
         self.set_expanded(&file_id, RowKind::File, true);
         if let Some(id) = &target {
             let (path, name) = crate::symbols::split_id(id);
@@ -1270,8 +1286,10 @@ impl App {
                 self.set_expanded(&format!("{path}::{}", segments[..n].join("/")), RowKind::Symbol, true);
             }
         }
-        let want = target.unwrap_or(file_id);
-        if let Some(ix) = self.tree_rows.iter().position(|r| r.symbol_id == want) {
+        let want = target.unwrap_or_else(|| file_id.clone());
+        let at = self.tree_rows.iter().position(|r| r.symbol_id == want);
+        let at = at.or_else(|| self.tree_rows.iter().position(|r| r.symbol_id == file_id));
+        if let Some(ix) = at {
             self.selected_index = ix;
         }
         true

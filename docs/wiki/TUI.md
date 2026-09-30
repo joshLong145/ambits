@@ -259,9 +259,10 @@ A call is named by what the agent said it was for, when its tool takes a
 `description` — `Bash · Run the remote tests`, `Agent · Expert review of
 phase 6` — else by its symbol or file.
 
-`Tab` to the panel, `j` / `k` to a row, `Enter` to open it: a symbol opens
-at its definition in your [editor](#opening-a-symbol-in-your-editor) (a
-deleted one shows its file in the tree); a file shows in the tree; an agent,
+`Tab` to the panel, `j` / `k` to a row, `Enter` to open it: a symbol is
+selected in the tree, its file and the symbols around it unfolded (a
+deleted one selects its file) — `Enter` there opens it in your
+[editor](#opening-a-symbol-in-your-editor); a file shows in the tree; an agent,
 a failure, a related call or a commit is selected in the timeline (the trace
 opened, and unfolded down to it). Focus stays on
 the panel, so you can keep following the trail. `Esc` returns to the
