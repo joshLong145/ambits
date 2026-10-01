@@ -41,7 +41,8 @@ fn dirs_home() -> Option<PathBuf> {
 }
 
 /// Find the most recent session ID by scanning for UUID-named .jsonl files
-/// and selecting the one with the most recent modification time.
+/// and selecting the one that saw something happen last (see
+/// [`last_activity`]).
 pub fn find_latest_session(log_dir: &Path) -> Option<String> {
     find_session_from_files(log_dir)
 }
@@ -68,11 +69,57 @@ fn find_session_from_files(log_dir: &Path) -> Option<String> {
             if meta.len() == 0 {
                 return None;
             }
-            let mtime = meta.modified().ok()?;
-            Some((stem.to_string(), mtime))
+            Some((stem.to_string(), last_activity(&path, &meta)?))
         })
-        .max_by_key(|(_, mtime)| *mtime)
+        .max_by_key(|(_, at)| *at)
         .map(|(session_id, _)| session_id)
+}
+
+/// How much of a log's end is read for its last timestamp: the last few
+/// entries, unless one of them is a very large tool result.
+const ACTIVITY_TAIL: u64 = 256 * 1024;
+
+/// When the session logged at `path` last saw something happen, in
+/// milliseconds: the timestamp of its last entry that has one. Not its
+/// modification time — Claude Code appends untimestamped bookkeeping (a
+/// title, the last prompt, the cost) to a session long finished, which made
+/// a dead session look like the latest one. Falls back to the modification
+/// time for a log whose tail holds no timestamp. Kept per file until its
+/// size or modification time changes: the TUI asks every tick.
+fn last_activity(path: &Path, meta: &fs::Metadata) -> Option<u64> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Seen = HashMap<PathBuf, (std::time::SystemTime, u64, u64)>;
+    static SEEN: OnceLock<Mutex<Seen>> = OnceLock::new();
+    let modified = meta.modified().ok()?;
+    let mut seen = SEEN.get_or_init(Default::default).lock().ok()?;
+    if let Some(&(at_modified, len, at)) = seen.get(path) {
+        if at_modified == modified && len == meta.len() {
+            return Some(at);
+        }
+    }
+    let by_mtime = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
+    let at = last_timestamp(path, meta.len()).unwrap_or(by_mtime);
+    seen.insert(path.to_path_buf(), (modified, meta.len(), at));
+    Some(at)
+}
+
+/// The timestamp of the last entry in the log at `path` (`len` bytes long)
+/// that has one, from its tail.
+fn last_timestamp(path: &Path, len: u64) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    let from = len.saturating_sub(ACTIVITY_TAIL);
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    let tail = String::from_utf8_lossy(&tail);
+    // Whole lines only: the first may have been cut by the seek.
+    let lines: Vec<&str> = tail.lines().skip(usize::from(from > 0)).collect();
+    lines.into_iter().rev().find_map(|line| {
+        let entry: Value = serde_json::from_str(line).ok()?;
+        crate::time::parse_rfc3339_millis(entry.get("timestamp")?.as_str()?)
+    })
 }
 
 /// Check if a string looks like a UUID (8-4-4-4-12 hex chars, exactly 36 bytes).
@@ -1751,6 +1798,28 @@ mod tests {
 
         let result = find_session_from_files(tmp.path());
         assert_eq!(result, Some(uuid2.to_string()));
+    }
+
+    /// A finished session that Claude Code later touched — bookkeeping
+    /// appended, no timestamps, a newer modification time — is not the
+    /// latest: the session that last saw something happen is.
+    #[test]
+    fn the_latest_session_is_the_one_that_last_saw_something_happen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = "11111111-2222-3333-4444-555555555555";
+        let dead = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        fs::write(tmp.path().join(format!("{live}.jsonl")), r#"{"type":"user","timestamp":"2026-09-30T21:00:00Z"}"#.to_string() + "\n").unwrap();
+        let dead_log = [
+            r#"{"type":"user","timestamp":"2026-09-28T14:50:00Z"}"#,
+            r#"{"type":"continued-in","timestamp":"2026-09-28T14:54:49Z","continuedInSessionId":"11111111-2222-3333-4444-555555555555"}"#,
+            r#"{"type":"ai-title","title":"x"}"#,
+            r#"{"type":"cost-state","totalCostUSD":1.0}"#,
+        ];
+        fs::write(tmp.path().join(format!("{dead}.jsonl")), dead_log.join("\n") + "\n").unwrap();
+        // Touched last, as Claude Code does a finished session.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        fs::File::options().append(true).open(tmp.path().join(format!("{dead}.jsonl"))).unwrap().set_modified(later).unwrap();
+        assert_eq!(find_session_from_files(tmp.path()), Some(live.to_string()));
     }
 
     #[test]
