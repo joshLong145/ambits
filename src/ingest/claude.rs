@@ -1346,7 +1346,7 @@ pub fn map_tool_call(
     // metadata lookup and a full one.
     let (target_selectors, read_depth) = match selectors {
         Some(sel) => {
-            let deepest = sel.iter().map(|(_, d)| *d).max().unwrap_or(read_depth);
+            let deepest = sel.iter().map(|s| s.depth).max().unwrap_or(read_depth);
             (sel, deepest)
         }
         None => (Vec::new(), read_depth),

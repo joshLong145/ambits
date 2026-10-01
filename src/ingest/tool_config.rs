@@ -303,6 +303,12 @@ pub struct TargetSelectorSpec {
     /// symbol exists and where it is, not what it says.
     #[serde(default)]
     pub shallow_depth: Option<ReadDepthDe>,
+    /// Flag that may cut a definition short (`--max-bytes`). Without it, a
+    /// full-depth selector printed the whole definition, so what is inside
+    /// it — an impl's methods, a section's subsections — is credited too;
+    /// with it, only the symbol named.
+    #[serde(default)]
+    pub cut_flag: Option<String>,
 }
 
 /// Symbols a command's *output* names, credited when its result arrives:
@@ -336,6 +342,40 @@ impl ResultSelectorSpec {
     }
 }
 
+/// `command`'s words as a shell would split them — quotes taken off,
+/// backslash escapes undone — up to the end of its first command: an
+/// unquoted `|`, `;` or `&`. Enough to read an invocation's arguments, not a
+/// shell: no expansion of any kind.
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                let quoted: String = chars.by_ref().take_while(|&c| c != '\'').collect();
+                word.get_or_insert_with(String::new).push_str(&quoted);
+            }
+            '"' => {
+                let w = word.get_or_insert_with(String::new);
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => w.extend(chars.next()),
+                        c => w.push(c),
+                    }
+                }
+            }
+            '\\' => word.get_or_insert_with(String::new).extend(chars.next()),
+            '|' | ';' | '&' => break,
+            c if c.is_whitespace() => words.extend(word.take()),
+            c => word.get_or_insert_with(String::new).push(c),
+        }
+    }
+    words.extend(word);
+    words
+}
+
 impl TargetSelectorSpec {
     /// Pull selectors and the depth each one earns out of a tool input.
     ///
@@ -350,7 +390,7 @@ impl TargetSelectorSpec {
     /// is whatever preceded the first invocation and is discarded; a marker
     /// that appears inside a path contributes a segment with no selectors,
     /// which costs nothing.
-    pub fn resolve(&self, input: &serde_json::Value) -> Option<Vec<(String, ReadDepth)>> {
+    pub fn resolve(&self, input: &serde_json::Value) -> Option<Vec<crate::ingest::SelectorRead>> {
         let cmd = input.get(&self.key)?.as_str()?;
         if !cmd.contains(&self.requires) {
             return None;
@@ -361,14 +401,17 @@ impl TargetSelectorSpec {
 
         let mut out = Vec::new();
         for segment in cmd.split(&self.requires).skip(1) {
-            let depth = match (self.shallow_flag.as_deref(), shallow) {
-                (Some(flag), Some(d)) if segment.contains(flag) => d,
-                _ => full,
+            let (depth, shown_whole) = match (self.shallow_flag.as_deref(), shallow) {
+                (Some(flag), Some(d)) if segment.contains(flag) => (d, false),
+                _ => (full, self.cut_flag.as_deref().is_none_or(|cut| !segment.contains(cut))),
             };
             // `any` consumes through the match, so what remains is exactly
             // the subcommand's own arguments — which is where selectors live,
             // and the only place they can mean "return this definition".
-            let mut tokens = segment.split_whitespace();
+            // Words as the shell reads them: an id with a space in it — an
+            // impl block, a trait impl, most Markdown headings — is quoted.
+            let words = shell_words(segment);
+            let mut tokens = words.iter().map(String::as_str);
             if let Some(subcommand) = &self.subcommand {
                 if !tokens.any(|t| t == subcommand) {
                     continue;
@@ -376,12 +419,11 @@ impl TargetSelectorSpec {
             }
 
             for token in tokens {
-                let token = token.trim_matches(|c| c == '\'' || c == '"');
                 if matches!(
                     crate::lookup::parse_selector(token),
                     crate::lookup::Selector::Id(_) | crate::lookup::Selector::Hash(_)
                 ) {
-                    out.push((token.to_string(), depth));
+                    out.push(crate::ingest::SelectorRead { selector: token.to_string(), depth, whole: shown_whole });
                 }
             }
         }
@@ -813,6 +855,40 @@ mod tests {
         }
     }
 
+    /// Selectors as `(selector, depth)`, for tests about which and how deep.
+    fn pairs(got: Vec<crate::ingest::SelectorRead>) -> Vec<(String, ReadDepth)> {
+        got.into_iter().map(|s| (s.selector, s.depth)).collect()
+    }
+
+    #[test]
+    fn words_are_read_as_the_shell_reads_them() {
+        assert_eq!(shell_words(r#" -p . show 'a.rs::impl App' "d.md::Doc/Read \"me\"" b\ c x | head"#), vec!["-p", ".", "show", "a.rs::impl App", "d.md::Doc/Read \"me\"", "b c", "x"]);
+    }
+
+    /// An id with a space in it — an impl block, a trait impl, a Markdown
+    /// heading — is quoted, and is one selector.
+    #[test]
+    fn a_quoted_id_with_spaces_is_one_selector() {
+        let cfg = ToolMappingConfig::builtin().unwrap();
+        let got = pairs(selector_spec(&cfg)
+            .resolve(&bash_input("ambits -p . show 'src/a.rs::impl App' \"src/b.rs::Display for App\" 'docs/s.md::Sharing/What leaves the machine' | head"))
+            .unwrap());
+        let ids: Vec<&str> = got.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(ids, vec!["src/a.rs::impl App", "src/b.rs::Display for App", "docs/s.md::Sharing/What leaves the machine"]);
+    }
+
+    /// A full `show` printed the whole definition; `--no-body` printed none
+    /// of it, and `--max-bytes` may have cut it short — per invocation.
+    #[test]
+    fn a_full_show_reads_what_is_inside_the_symbol_too() {
+        let cfg = ToolMappingConfig::builtin().unwrap();
+        let got = selector_spec(&cfg)
+            .resolve(&bash_input("ambits show a.rs::A && ambits show a.rs::B --no-body && ambits show a.rs::C --max-bytes 400"))
+            .unwrap();
+        let whole: Vec<(&str, bool)> = got.iter().map(|s| (s.selector.as_str(), s.whole)).collect();
+        assert_eq!(whole, vec![("a.rs::A", true), ("a.rs::B", false), ("a.rs::C", false)]);
+    }
+
     fn selector_spec(cfg: &ToolMappingConfig) -> &TargetSelectorSpec {
         let idx = cfg.index["Bash"];
         cfg.tools[idx]
@@ -824,11 +900,11 @@ mod tests {
     #[test]
     fn show_command_yields_its_selectors_at_full_body() {
         let cfg = ToolMappingConfig::builtin().unwrap();
-        let got = selector_spec(&cfg)
+        let got = pairs(selector_spec(&cfg)
             .resolve(&bash_input(
                 "ambits -p . show 'src/filter.rs::PathFilter/matches' 6e42b7a3",
             ))
-            .expect("selectors found");
+            .expect("selectors found"));
         assert_eq!(
             got,
             vec![
@@ -843,9 +919,9 @@ mod tests {
     #[test]
     fn a_metadata_only_lookup_earns_a_shallower_depth() {
         let cfg = ToolMappingConfig::builtin().unwrap();
-        let got = selector_spec(&cfg)
+        let got = pairs(selector_spec(&cfg)
             .resolve(&bash_input("ambits -p . show 'a.rs::x' --no-body"))
-            .unwrap();
+            .unwrap());
         assert_eq!(got, vec![("a.rs::x".to_string(), ReadDepth::NameOnly)]);
     }
 
@@ -854,9 +930,9 @@ mod tests {
     #[test]
     fn flags_and_their_values_are_not_mistaken_for_selectors() {
         let cfg = ToolMappingConfig::builtin().unwrap();
-        let got = selector_spec(&cfg)
+        let got = pairs(selector_spec(&cfg)
             .resolve(&bash_input("ambits show a.rs::x --max-bytes 4000 --no-body"))
-            .unwrap();
+            .unwrap());
         assert_eq!(got, vec![("a.rs::x".to_string(), ReadDepth::NameOnly)]);
     }
 
@@ -867,11 +943,11 @@ mod tests {
     #[test]
     fn each_invocation_gets_its_own_depth() {
         let cfg = ToolMappingConfig::builtin().unwrap();
-        let got = selector_spec(&cfg)
+        let got = pairs(selector_spec(&cfg)
             .resolve(&bash_input(
                 "ambits show a.rs::shallow --no-body && ambits show b.rs::deep",
             ))
-            .unwrap();
+            .unwrap());
         assert_eq!(
             got,
             vec![
@@ -885,9 +961,9 @@ mod tests {
     #[test]
     fn a_marker_inside_a_path_contributes_nothing() {
         let cfg = ToolMappingConfig::builtin().unwrap();
-        let got = selector_spec(&cfg)
+        let got = pairs(selector_spec(&cfg)
             .resolve(&bash_input("./target/debug/ambits -p . show a.rs::x"))
-            .unwrap();
+            .unwrap());
         assert_eq!(got, vec![("a.rs::x".to_string(), ReadDepth::FullBody)]);
     }
 
@@ -919,11 +995,11 @@ mod tests {
     #[test]
     fn a_search_beside_a_lookup_credits_only_the_lookup() {
         let cfg = ToolMappingConfig::builtin().unwrap();
-        let got = selector_spec(&cfg)
+        let got = pairs(selector_spec(&cfg)
             .resolve(&bash_input(
                 "ambits -p . rg 'a.rs::pattern' && ambits -p . show b.rs::real",
             ))
-            .unwrap();
+            .unwrap());
         assert_eq!(got, vec![("b.rs::real".to_string(), ReadDepth::FullBody)]);
     }
 

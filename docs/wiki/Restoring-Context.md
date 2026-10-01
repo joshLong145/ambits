@@ -71,8 +71,13 @@ context.
 
 ambits parses `show` invocations out of the session log and credits the
 symbols they name, so reading efficiently costs nothing in coverage versus a
-plain `Read`. `--no-body` credits name-level only — the agent learned where a
-symbol is, not what it says. `rg`/`grep` credit the symbols their printed
+plain `Read`. A `show` prints the whole definition, so what is inside the
+symbol — an impl's or trait impl's methods, a Markdown section's
+subsections — is credited with it, unless `--max-bytes` may have cut it
+short, when only the symbol named is. `--no-body` credits name-level only —
+the agent learned where a symbol is, not what it says. Ids are read as the
+shell reads them, so a quoted one with spaces (`'src/a.rs::impl App'`,
+`'docs/x.md::Guide/Getting started'`) is one id. `rg`/`grep` credit the symbols their printed
 matches sit in at name level — seen, not read; see
 [Searching Code](Searching-Code#searching-is-seeing-not-reading).
 

@@ -156,7 +156,11 @@ description   = "Bash {pattern|cmd}"
 # search commands take a regex over file content, so `ambits rg
 # 'src/app.rs::App'` asks for that *text* — crediting it as a read of that
 # symbol would claim knowledge of a definition the search may never have shown.
-target_selectors = { key = "command", requires = "ambits", subcommand = "show", depth = "FullBody", shallow_flag = "--no-body", shallow_depth = "NameOnly" }
+#
+# A full `show` prints the whole definition — an impl's every method, a
+# Markdown section's subsections — so what is inside the symbol is credited
+# with it, unless `--max-bytes` may have cut it short.
+target_selectors = { key = "command", requires = "ambits", subcommand = "show", depth = "FullBody", shallow_flag = "--no-body", shallow_depth = "NameOnly", cut_flag = "--max-bytes" }
 # A search's own output names the symbol each printed match sits in; those
 # are credited when the result arrives, at name depth — a matching line, not
 # the definition (`show` earns that). Modes that print no symbols (`-l`, `-c`,

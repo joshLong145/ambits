@@ -1919,7 +1919,7 @@ fn event_log_path_and_target(tree: &ProjectTree, event: &AgentToolCall) -> (Stri
         (None, None) if !event.target_selectors.is_empty() => event
             .target_selectors
             .iter()
-            .map(|(sel, _)| sel.as_str())
+            .map(|s| s.selector.as_str())
             .collect::<Vec<_>>()
             .join(", "),
         (None, None) => "-".to_string(),
@@ -1949,7 +1949,7 @@ fn resolve_selector_path(tree: &ProjectTree, event: &AgentToolCall) -> Option<St
 
     let symbols = tree.walk();
     let mut paths: Vec<&Path> = Vec::new();
-    for (sel, _) in &event.target_selectors {
+    for sel in event.target_selectors.iter().map(|s| &s.selector) {
         let matched = match crate::lookup::parse_selector(sel) {
             crate::lookup::Selector::Id(_) => {
                 symbols.iter().find(|(_, sym)| sym.id == *sel).map(|(p, _)| *p)
@@ -2054,7 +2054,7 @@ pub fn apply_tool_call(
     let mut credit = Credit::new(ledger, depth_cache, &event.agent_id);
 
     if !event.target_selectors.is_empty() {
-        mark_selectors(tree, &event.target_selectors, &mut credit);
+        mark_selectors(tree, event.target_selectors.iter().map(|s| (s.selector.as_str(), s.depth, s.whole)), &mut credit);
     }
 
     if let Some(ref file_path) = event.file_path {
@@ -2083,7 +2083,7 @@ pub fn apply_shown(
         return Vec::new();
     }
     let mut credit = Credit::new(ledger, depth_cache, &finished.agent_id);
-    mark_selectors(tree, &finished.shown, &mut credit);
+    mark_selectors(tree, finished.shown.iter().map(|(s, d)| (s.as_str(), *d, false)), &mut credit);
     credit.listed()
 }
 
@@ -2100,27 +2100,36 @@ pub fn apply_shown(
 /// A selector matching nothing is silently ignored. The command may have been
 /// a miss, or may name a symbol that has since changed; either way there is
 /// no read to record.
-fn mark_selectors(tree: &ProjectTree, selectors: &[(String, ReadDepth)], credit: &mut Credit<'_>) {
+fn mark_selectors<'s>(tree: &ProjectTree, selectors: impl IntoIterator<Item = (&'s str, ReadDepth, bool)>, credit: &mut Credit<'_>) {
     // An id names its file, so only the files named are walked, each once;
     // a hash can be anywhere, so only a hash selector walks the whole tree
     // (and only then are symbols' hashes spelled out to compare). A search
     // result names up to 200 ids, on the event loop.
-    let mut by_file: HashMap<&str, HashMap<&str, ReadDepth>> = HashMap::new();
-    let mut hashes: Vec<(String, ReadDepth)> = Vec::new();
-    for (sel, depth) in selectors {
+    //
+    // A selector `whole` printed the whole definition, so what is inside the
+    // symbol is credited with it (implied: listed by the symbol).
+    let mut by_file: HashMap<&str, HashMap<&str, (ReadDepth, bool)>> = HashMap::new();
+    let mut hashes: Vec<(String, ReadDepth, bool)> = Vec::new();
+    for (sel, depth, whole) in selectors {
         match crate::lookup::parse_selector(sel) {
-            crate::lookup::Selector::Hash(h) => hashes.push((h, *depth)),
+            crate::lookup::Selector::Hash(h) => hashes.push((h, depth, whole)),
             crate::lookup::Selector::Id(_) => {
-                // A symbol named more than once takes the deepest naming;
-                // `record` is upgrade-only anyway, but this keeps the credit
-                // independent of order.
-                let depths = by_file.entry(crate::symbols::split_id(sel).0).or_default();
-                let at = depths.entry(sel.as_str()).or_insert(*depth);
-                *at = (*at).max(*depth);
+                // A symbol named more than once takes the deepest naming,
+                // and the widest; `record` is upgrade-only anyway, but this
+                // keeps the credit independent of order.
+                let named = by_file.entry(crate::symbols::split_id(sel).0).or_default();
+                let at = named.entry(sel).or_insert((depth, whole));
+                *at = (at.0.max(depth), at.1 || whole);
             }
             crate::lookup::Selector::Unrecognized(_) => {}
         }
     }
+    let mut credit_one = |sym: &SymbolNode, depth: ReadDepth, whole: bool| {
+        credit.record(sym, depth, false);
+        if whole {
+            mark_file_symbols(&sym.children, depth, credit, true);
+        }
+    };
     // One pass over the files, not a lookup per file named: finding a file
     // by path normalises every path it passes.
     let named = tree.files.iter().filter_map(|file| {
@@ -2130,16 +2139,17 @@ fn mark_selectors(tree: &ProjectTree, selectors: &[(String, ReadDepth)], credit:
         // Every symbol an id names: ids are not unique (`struct App` and
         // `impl App`), and a lookup that returned both showed both.
         for sym in file.walk() {
-            if let Some(depth) = ids.get(sym.id.as_str()) {
-                credit.record(sym, *depth, false);
+            if let Some(&(depth, whole)) = ids.get(sym.id.as_str()) {
+                credit_one(sym, depth, whole);
             }
         }
     }
     if !hashes.is_empty() {
         for (_, sym) in tree.walk() {
             let hex = crate::journal::hash_hex(&sym.content_hash);
-            if let Some(depth) = hashes.iter().filter(|(h, _)| hex.starts_with(h.as_str())).map(|(_, d)| *d).max() {
-                credit.record(sym, depth, false);
+            let named = hashes.iter().filter(|(h, ..)| hex.starts_with(h.as_str()));
+            if let Some((depth, whole)) = named.fold(None, |acc: Option<(ReadDepth, bool)>, (_, d, w)| Some(acc.map_or((*d, *w), |(ad, aw)| (ad.max(*d), aw || *w)))) {
+                credit_one(sym, depth, whole);
             }
         }
     }
@@ -2753,7 +2763,7 @@ mod tests {
 
         let mut event = tool_call("Bash", "", ReadDepth::FullBody);
         event.file_path = None;
-        event.target_selectors = vec![("mock/f.rs::alpha".into(), ReadDepth::FullBody)];
+        event.target_selectors = vec![crate::ingest::SelectorRead::new("mock/f.rs::alpha", ReadDepth::FullBody)];
         app.process_agent_event(event);
 
         assert_eq!(app.ledger.depth_of("mock/f.rs::alpha"), ReadDepth::FullBody);
@@ -2799,7 +2809,7 @@ mod tests {
         let mut app = test_app(vec![file("mock/f.rs", syms)]);
         let mut read = tool_call("Bash", "", ReadDepth::FullBody);
         read.file_path = None;
-        read.target_selectors = vec![("mock/f.rs::beta".into(), ReadDepth::FullBody)];
+        read.target_selectors = vec![crate::ingest::SelectorRead::new("mock/f.rs::beta", ReadDepth::FullBody)];
         app.process_agent_event(read);
 
         app.process_tool_finished(&crate::ingest::ToolFinished {
@@ -2816,6 +2826,28 @@ mod tests {
         assert_eq!(app.ledger.depth_of("mock/f.rs::gamma"), ReadDepth::Unseen, "not shown");
     }
 
+    /// A `show` that printed a container whole — an impl and every method in
+    /// it — read what is inside it too, and lists the container; one cut
+    /// short read only the container.
+    #[test]
+    fn a_whole_show_of_a_container_reads_its_children() {
+        let impl_app = || file("mock/f.rs", vec![sym_with_children("mock/f.rs::App", "App", vec![sym("mock/f.rs::App/run", "run")])]);
+        let show = |whole: bool| {
+            let mut event = tool_call("Bash", "", ReadDepth::FullBody);
+            event.file_path = None;
+            event.target_selectors = vec![crate::ingest::SelectorRead { selector: "mock/f.rs::App".into(), depth: ReadDepth::FullBody, whole }];
+            event
+        };
+        let mut app = test_app(vec![impl_app()]);
+        let listed = apply_tool_call(&app.project_tree, &app.project_root, &show(true), &mut app.ledger, &mut app.depth_cache);
+        assert_eq!(app.ledger.depth_of("mock/f.rs::App/run"), ReadDepth::FullBody, "its method came with it");
+        assert_eq!(listed, vec![("mock/f.rs::App".to_string(), ReadDepth::FullBody)], "listed as the impl");
+
+        let mut cut = test_app(vec![impl_app()]);
+        apply_tool_call(&cut.project_tree, &cut.project_root, &show(false), &mut cut.ledger, &mut cut.depth_cache);
+        assert_eq!(cut.ledger.depth_of("mock/f.rs::App/run"), ReadDepth::Unseen, "perhaps cut before it");
+    }
+
     /// Selectors carry their own location, so one command can legitimately
     /// name symbols in different files.
     #[test]
@@ -2828,8 +2860,8 @@ mod tests {
         let mut event = tool_call("Bash", "", ReadDepth::FullBody);
         event.file_path = None;
         event.target_selectors = vec![
-            ("a.rs::one".into(), ReadDepth::FullBody),
-            ("b.rs::two".into(), ReadDepth::FullBody),
+            crate::ingest::SelectorRead::new("a.rs::one", ReadDepth::FullBody),
+            crate::ingest::SelectorRead::new("b.rs::two", ReadDepth::FullBody),
         ];
         app.process_agent_event(event);
 
@@ -2847,7 +2879,7 @@ mod tests {
 
         let mut event = tool_call("Bash", "", ReadDepth::FullBody);
         event.file_path = None;
-        event.target_selectors = vec![(hex[3..11].to_string(), ReadDepth::FullBody)];
+        event.target_selectors = vec![crate::ingest::SelectorRead::new(&hex[3..11], ReadDepth::FullBody)];
         app.process_agent_event(event);
 
         assert_eq!(app.ledger.depth_of("a.rs::only"), ReadDepth::FullBody);
@@ -2864,7 +2896,7 @@ mod tests {
 
         let mut event = tool_call("Bash", "", ReadDepth::FullBody);
         event.file_path = None;
-        event.target_selectors = vec![("a.rs::one".into(), ReadDepth::FullBody)];
+        event.target_selectors = vec![crate::ingest::SelectorRead::new("a.rs::one", ReadDepth::FullBody)];
 
         let (path, target) = event_log_path_and_target(&app.project_tree, &event);
         assert_eq!(path, "a.rs");
@@ -2881,8 +2913,8 @@ mod tests {
         let mut event = tool_call("Bash", "", ReadDepth::FullBody);
         event.file_path = None;
         event.target_selectors = vec![
-            ("a.rs::one".into(), ReadDepth::FullBody),
-            ("b.rs::two".into(), ReadDepth::FullBody),
+            crate::ingest::SelectorRead::new("a.rs::one", ReadDepth::FullBody),
+            crate::ingest::SelectorRead::new("b.rs::two", ReadDepth::FullBody),
         ];
 
         let (path, target) = event_log_path_and_target(&app.project_tree, &event);
@@ -2898,7 +2930,7 @@ mod tests {
 
         let mut event = tool_call("Bash", "", ReadDepth::FullBody);
         event.file_path = None;
-        event.target_selectors = vec![("a.rs::nope".into(), ReadDepth::FullBody)];
+        event.target_selectors = vec![crate::ingest::SelectorRead::new("a.rs::nope", ReadDepth::FullBody)];
 
         let (path, target) = event_log_path_and_target(&app.project_tree, &event);
         assert_eq!(path, "-");
@@ -2925,7 +2957,7 @@ mod tests {
 
         let mut event = tool_call("Bash", "", ReadDepth::FullBody);
         event.file_path = None;
-        event.target_selectors = vec![("a.rs::nope".into(), ReadDepth::FullBody)];
+        event.target_selectors = vec![crate::ingest::SelectorRead::new("a.rs::nope", ReadDepth::FullBody)];
         app.process_agent_event(event);
 
         assert_eq!(app.ledger.total_seen(), 0);
@@ -3921,7 +3953,7 @@ mod write_tests {
             ("target symbol", write_call(tool_call_targeted("replace_symbol_body", "src/a.rs", ReadDepth::Unseen, "f"))),
             ("selectors", {
                 let mut c = write_call(tool_call("Bash", "src/a.rs", ReadDepth::Unseen));
-                c.target_selectors = vec![("src/a.rs::f".into(), ReadDepth::Unseen)];
+                c.target_selectors = vec![crate::ingest::SelectorRead::new("src/a.rs::f", ReadDepth::Unseen)];
                 c
             }),
         ];

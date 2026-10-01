@@ -66,6 +66,26 @@ pub struct WriteEvent {
     pub source: WriteSource,
 }
 
+/// A symbol a lookup (`ambits show`) named, and what reading its output
+/// earns: the depth, and whether everything inside it was printed too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectorRead {
+    /// A symbol id or content hash.
+    pub selector: String,
+    pub depth: ReadDepth,
+    /// The whole definition was printed — an impl's every method, a
+    /// section's subsections — so what is inside it was read with it. Not
+    /// for `--no-body` (no source) or `--max-bytes` (perhaps cut short).
+    pub whole: bool,
+}
+
+impl SelectorRead {
+    /// `selector` at `depth`, nothing inside it read with it.
+    pub fn new(selector: impl Into<String>, depth: ReadDepth) -> Self {
+        SelectorRead { selector: selector.into(), depth, whole: false }
+    }
+}
+
 /// A parsed agent tool call event.
 #[derive(Debug, Clone)]
 pub struct AgentToolCall {
@@ -92,7 +112,7 @@ pub struct AgentToolCall {
     /// Each carries its own depth: a single shell command may hold several
     /// invocations, one asking for definitions and another for metadata only,
     /// and they earn different credit.
-    pub target_selectors: Vec<(String, ReadDepth)>,
+    pub target_selectors: Vec<SelectorRead>,
     /// Human-readable label for the agent (e.g. "Explore parser and symbol types").
     /// Falls back to agent_id if no label could be extracted from the session log.
     pub label: Arc<str>,

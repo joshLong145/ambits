@@ -426,7 +426,7 @@ fn tool_bash_show_command_credits_its_selectors() {
 
     assert_eq!(
         call.target_selectors,
-        vec![("src/app.rs::App/render".to_string(), ReadDepth::FullBody)]
+        vec![ambits::ingest::SelectorRead { selector: "src/app.rs::App/render".to_string(), depth: ReadDepth::FullBody, whole: true }]
     );
     assert_eq!(
         call.read_depth,

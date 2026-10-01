@@ -157,7 +157,7 @@ put in front of you:
 
 | Command | Credited |
 |---|---|
-| `show <id>` | Each symbol named, as read in **full** |
+| `show <id>` | Each symbol named, as read in **full** — and what is inside it (an impl's methods, a section's subsections), unless `--max-bytes` is given |
 | `show --no-body <id>` | Each symbol named, at **name** depth only |
 | `rg` / `grep` | Each symbol a printed match sits in, at **name** depth — seen, not read |
 
