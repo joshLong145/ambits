@@ -7,7 +7,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use crate::symbols::FileSymbols;
 use crate::writes::{FileContents, Status, WriteRecord};
 
 /// Every write of one session, one record per op (the journal's fold rule).
@@ -69,12 +68,14 @@ pub struct WriteMark {
 pub struct FileWrites<'a> {
     /// Latest first.
     writes: Vec<&'a WriteRecord>,
-    now: FileContents,
+    now: std::sync::Arc<FileContents>,
 }
 
 impl<'a> FileWrites<'a> {
-    pub fn new(writes: Vec<&'a WriteRecord>, file: &FileSymbols) -> Self {
-        Self { writes, now: FileContents::from_symbols(file) }
+    /// `writes` against `now`, the file as the tree holds it — the same
+    /// contents the trace compares against (`App::file_contents`).
+    pub fn new(writes: Vec<&'a WriteRecord>, now: std::sync::Arc<FileContents>) -> Self {
+        Self { writes, now }
     }
 
     /// Every write to the file, symbol- or file-level.
@@ -93,6 +94,7 @@ impl<'a> FileWrites<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::symbols::FileSymbols;
     use super::*;
     use crate::parser::ParserRegistry;
     use crate::writes::Level;
@@ -130,13 +132,13 @@ mod tests {
         let mut index = WriteIndex::default();
         index.insert(write("t1", "2026-09-27T10:00:00Z", "main", vec![("S/a", hash(&before, "S/a"))]));
         let by_file = index.by_file(None);
-        let marks = FileWrites::new(by_file["src/lib.rs"].clone(), &before);
+        let marks = FileWrites::new(by_file["src/lib.rs"].clone(), std::sync::Arc::new(FileContents::from_symbols(&before)));
         assert_eq!(marks.symbol_mark("src/lib.rs::S/a").map(|m| m.status), Some(Status::Current));
         assert_eq!(marks.symbol_mark("src/lib.rs::S/b"), None);
         assert_eq!(marks.symbol_mark("src/lib.rs::c"), None);
 
         let after = parse(&SRC.replace("fn a() {}", "fn a() { 1; }"));
-        let marks = FileWrites::new(by_file["src/lib.rs"].clone(), &after);
+        let marks = FileWrites::new(by_file["src/lib.rs"].clone(), std::sync::Arc::new(FileContents::from_symbols(&after)));
         assert_eq!(marks.symbol_mark("src/lib.rs::S/a").map(|m| m.status), Some(Status::Changed));
     }
 
@@ -148,7 +150,7 @@ mod tests {
         index.insert(write("t1", "2026-09-27T10:00:00Z", "main", vec![("S/a", "b3:stale".into())]));
         index.insert(write("t2", "2026-09-27T10:00:01Z", "main", vec![("S/b", hash(&file, "S/b"))]));
         let by_file = index.by_file(None);
-        let marks = FileWrites::new(by_file["src/lib.rs"].clone(), &file);
+        let marks = FileWrites::new(by_file["src/lib.rs"].clone(), std::sync::Arc::new(FileContents::from_symbols(&file)));
         assert_eq!(marks.symbol_mark("src/lib.rs::S"), Some(WriteMark { status: Status::Current, latest: "t2".into(), count: 2 }));
         assert_eq!(marks.symbol_mark("src/lib.rs::S/a").map(|m| m.status), Some(Status::Changed));
         assert_eq!(marks.file_mark().map(|m| m.count), Some(2));
@@ -162,7 +164,7 @@ mod tests {
         let mut index = WriteIndex::default();
         index.insert(write("t1", "2026-09-27T10:00:00Z", "main", vec![]));
         let by_file = index.by_file(None);
-        let marks = FileWrites::new(by_file["src/lib.rs"].clone(), &file);
+        let marks = FileWrites::new(by_file["src/lib.rs"].clone(), std::sync::Arc::new(FileContents::from_symbols(&file)));
         assert_eq!(marks.file_mark(), Some(WriteMark { status: Status::Unknown, latest: "t1".into(), count: 1 }));
         assert_eq!(marks.symbol_mark("src/lib.rs::S"), None);
     }

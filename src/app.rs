@@ -675,9 +675,11 @@ impl App {
             let file_path = file.file_path.to_string_lossy().to_string();
             // Writes name files normalized; only look when there are any.
             let file_writes = (!writes.is_empty())
-                .then(|| writes.remove(crate::objects::normalize_path(&file_path).as_str()))
-                .flatten()
-                .map(|w| crate::write_index::FileWrites::new(w, file));
+                .then(|| {
+                    let rel = crate::objects::normalize_path(&file_path);
+                    Some(crate::write_index::FileWrites::new(writes.remove(rel.as_str())?, self.file_contents(&rel)?))
+                })
+                .flatten();
             let file_id = file_path.clone();
             let is_expanded = self.expansion.is_expanded(&file_id, RowKind::File);
 
@@ -1285,16 +1287,17 @@ impl App {
     }
 
     /// `file` (project-relative) as write statuses compare against it, or
-    /// `None` when it is not in the tree. Made once and kept until the file
-    /// changes — a frame asks for every written file, and making one walks
-    /// all its symbols — which its top-level symbols' merkle hashes (each
-    /// covering everything beneath it) tell, without a signal from each
-    /// place the tree is updated.
+    /// `None` when it is not in the tree — for the tree's write marks and
+    /// the trace's alike. Made once and kept until the file changes: a frame
+    /// asks for every written file, and the tree on every rebuild. A change
+    /// is told by exactly what the contents are made of — each symbol's name
+    /// path and hash — without a signal from each place the tree is updated.
     pub fn file_contents(&self, file: &str) -> Option<Arc<crate::writes::FileContents>> {
         let symbols = self.project_tree.file(file)?;
         let mut fingerprint = blake3::Hasher::new();
-        for sym in &symbols.symbols {
-            fingerprint.update(&sym.merkle_hash);
+        for sym in symbols.walk() {
+            fingerprint.update(sym.name_path().as_bytes());
+            fingerprint.update(&sym.content_hash);
         }
         let fingerprint = fingerprint.finalize();
         let mut cache = self.file_contents.borrow_mut();
@@ -1494,10 +1497,9 @@ impl App {
     /// the first, when ids collide. A no-op for a symbol no longer in the
     /// tree.
     fn open_in_editor(&mut self, id: &str) {
-        let (file, _) = crate::symbols::split_id(id);
-        let Some(tree_file) = self.project_tree.file(file) else { return };
-        if let Some(sym) = tree_file.walk().into_iter().find(|sym| sym.id == id) {
-            self.pending_editor_request = Some((self.project_root.join(&tree_file.file_path), sym.line_range.start));
+        let found = crate::lookup::find(&self.project_tree, &[id]);
+        if let Some(&(path, sym)) = found.first().and_then(|hits| hits.first()) {
+            self.pending_editor_request = Some((self.project_root.join(path), sym.line_range.start));
         }
     }
 
@@ -1919,8 +1921,8 @@ fn event_log_path_and_target(tree: &ProjectTree, event: &AgentToolCall) -> (Stri
 }
 
 /// The file path of the first `target_selectors` entry that resolves to a
-/// symbol in `tree`, matched the same way [`mark_selectors`] matches
-/// by id or content-hash prefix. `None` if there are no selectors, or none of
+/// symbol in `tree`, resolved as everything resolves a selector
+/// ([`crate::lookup::find`]). `None` if there are no selectors, or none of
 /// them resolve.
 ///
 /// The activity log has one `path` column but a selector-driven command can
@@ -1932,20 +1934,10 @@ fn resolve_selector_path(tree: &ProjectTree, event: &AgentToolCall) -> Option<St
         return None;
     }
 
-    let symbols = tree.walk();
+    let names: Vec<&str> = event.target_selectors.iter().map(|s| s.selector.as_str()).collect();
     let mut paths: Vec<&Path> = Vec::new();
-    for sel in event.target_selectors.iter().map(|s| &s.selector) {
-        let matched = match crate::lookup::parse_selector(sel) {
-            crate::lookup::Selector::Id(_) => {
-                symbols.iter().find(|(_, sym)| sym.id == *sel).map(|(p, _)| *p)
-            }
-            crate::lookup::Selector::Hash(h) => symbols
-                .iter()
-                .find(|(_, sym)| crate::journal::hash_hex(&sym.content_hash).starts_with(h.as_str()))
-                .map(|(p, _)| *p),
-            crate::lookup::Selector::Unrecognized(_) => None,
-        };
-        if let Some(p) = matched {
+    for hits in crate::lookup::find(tree, &names) {
+        if let Some(&(p, _)) = hits.first() {
             if !paths.contains(&p) {
                 paths.push(p);
             }
@@ -2086,55 +2078,17 @@ pub fn apply_shown(
 /// a miss, or may name a symbol that has since changed; either way there is
 /// no read to record.
 fn mark_selectors<'s>(tree: &ProjectTree, selectors: impl IntoIterator<Item = (&'s str, ReadDepth, bool)>, credit: &mut Credit<'_>) {
-    // An id names its file, so only the files named are walked, each once;
-    // a hash can be anywhere, so only a hash selector walks the whole tree
-    // (and only then are symbols' hashes spelled out to compare). A search
-    // result names up to 200 ids, on the event loop.
-    //
-    // A selector `whole` printed the whole definition, so what is inside the
+    // Resolved as `show` resolves them (`lookup::find`). A symbol named more
+    // than once takes the deepest naming; `record` is upgrade-only. A
+    // selector `whole` printed the whole definition, so what is inside the
     // symbol is credited with it (implied: listed by the symbol).
-    let mut by_file: HashMap<&str, HashMap<&str, (ReadDepth, bool)>> = HashMap::new();
-    let mut hashes: Vec<(String, ReadDepth, bool)> = Vec::new();
-    for (sel, depth, whole) in selectors {
-        match crate::lookup::parse_selector(sel) {
-            crate::lookup::Selector::Hash(h) => hashes.push((h, depth, whole)),
-            crate::lookup::Selector::Id(_) => {
-                // A symbol named more than once takes the deepest naming,
-                // and the widest; `record` is upgrade-only anyway, but this
-                // keeps the credit independent of order.
-                let named = by_file.entry(crate::symbols::split_id(sel).0).or_default();
-                let at = named.entry(sel).or_insert((depth, whole));
-                *at = (at.0.max(depth), at.1 || whole);
-            }
-            crate::lookup::Selector::Unrecognized(_) => {}
-        }
-    }
-    let mut credit_one = |sym: &SymbolNode, depth: ReadDepth, whole: bool| {
-        credit.record(sym, depth, false);
-        if whole {
-            mark_file_symbols(&sym.children, depth, credit, true);
-        }
-    };
-    // One pass over the files, not a lookup per file named: finding a file
-    // by path normalises every path it passes.
-    let named = tree.files.iter().filter_map(|file| {
-        by_file.get(crate::objects::normalize_path(&file.file_path.to_string_lossy()).as_str()).map(|ids| (file, ids))
-    });
-    for (file, ids) in named {
-        // Every symbol an id names: ids are not unique (`struct App` and
-        // `impl App`), and a lookup that returned both showed both.
-        for sym in file.walk() {
-            if let Some(&(depth, whole)) = ids.get(sym.id.as_str()) {
-                credit_one(sym, depth, whole);
-            }
-        }
-    }
-    if !hashes.is_empty() {
-        for (_, sym) in tree.walk() {
-            let hex = crate::journal::hash_hex(&sym.content_hash);
-            let named = hashes.iter().filter(|(h, ..)| hex.starts_with(h.as_str()));
-            if let Some((depth, whole)) = named.fold(None, |acc: Option<(ReadDepth, bool)>, (_, d, w)| Some(acc.map_or((*d, *w), |(ad, aw)| (ad.max(*d), aw || *w)))) {
-                credit_one(sym, depth, whole);
+    let selectors: Vec<(&str, ReadDepth, bool)> = selectors.into_iter().collect();
+    let names: Vec<&str> = selectors.iter().map(|(s, ..)| *s).collect();
+    for ((_, depth, whole), hits) in selectors.iter().zip(crate::lookup::find(tree, &names)) {
+        for (_, sym) in hits {
+            credit.record(sym, *depth, false);
+            if *whole {
+                mark_file_symbols(&sym.children, *depth, credit, true);
             }
         }
     }
@@ -2774,7 +2728,7 @@ mod tests {
         let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::alpha", "alpha")])]);
         let first = app.file_contents("mock/f.rs").unwrap();
         assert!(Arc::ptr_eq(&first, &app.file_contents("mock/f.rs").unwrap()), "kept");
-        app.project_tree.files[0].symbols[0].merkle_hash = [9; 32];
+        app.project_tree.files[0].symbols[0].content_hash = [9; 32];
         assert!(!Arc::ptr_eq(&first, &app.file_contents("mock/f.rs").unwrap()), "made again");
         assert!(app.file_contents("mock/absent.rs").is_none());
     }

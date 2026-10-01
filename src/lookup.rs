@@ -132,6 +132,48 @@ struct ResultDto<'a> {
     suggestions: Vec<&'a str>,
 }
 
+/// The symbols each of `selectors` names in `tree`, in their order, each
+/// with its file: by id — the file the id names, walked once however many
+/// ids name it — or by content-hash prefix, every symbol's hash spelled out
+/// only when one is a hash. Ids are not unique, so every symbol with the id.
+///
+/// The one resolution of a selector: what `show` prints, what a `show` or a
+/// search is credited with, what the TUI logs and opens.
+pub fn find<'t>(tree: &'t ProjectTree, selectors: &[&str]) -> Vec<Vec<(&'t Path, &'t SymbolNode)>> {
+    let parsed: Vec<Selector> = selectors.iter().map(|s| parse_selector(s)).collect();
+    let mut out: Vec<Vec<(&'t Path, &'t SymbolNode)>> = vec![Vec::new(); selectors.len()];
+    let mut by_file: HashMap<&str, Vec<(usize, &str)>> = HashMap::new();
+    for (i, selector) in parsed.iter().enumerate() {
+        if let Selector::Id(id) = selector {
+            by_file.entry(crate::symbols::split_id(id).0).or_default().push((i, id.as_str()));
+        }
+    }
+    // One pass over the files: finding a file by path normalises each path.
+    if !by_file.is_empty() {
+        for file in &tree.files {
+            let Some(ids) = by_file.get(crate::objects::normalize_path(&file.file_path.to_string_lossy()).as_str()) else { continue };
+            for sym in file.walk() {
+                for &(i, _) in ids.iter().filter(|(_, id)| sym.id == *id) {
+                    out[i].push((file.file_path.as_path(), sym));
+                }
+            }
+        }
+    }
+    if parsed.iter().any(|s| matches!(s, Selector::Hash(_))) {
+        for (path, sym) in tree.walk() {
+            let hex = hash_hex(&sym.content_hash);
+            for (i, selector) in parsed.iter().enumerate() {
+                if let Selector::Hash(prefix) = selector {
+                    if hex.starts_with(prefix.as_str()) {
+                        out[i].push((path, sym));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Suggestions for an id that matched nothing, at most.
 const SUGGESTIONS: usize = 5;
 
@@ -328,32 +370,16 @@ fn resolve<'a>(
     max_bytes: Option<usize>,
     coverage: Option<&'a crate::restore::CoverageIndex>,
 ) -> ShowDto<'a> {
-    let all = tree.walk();
-    // Hex once per symbol rather than once per (symbol, query).
-    let hashes: Vec<String> = all
-        .iter()
-        .map(|(_, s)| hash_hex(&s.content_hash))
-        .collect();
+    let names: Vec<&str> = queries.iter().map(String::as_str).collect();
+    let found = find(tree, &names);
+    // Every symbol, only to suggest ids for one that matched nothing.
+    let mut all: Option<Vec<(&Path, &SymbolNode)>> = None;
 
     let mut cache: HashMap<PathBuf, String> = HashMap::new();
     let mut results = Vec::with_capacity(queries.len());
 
-    for query in queries {
+    for (query, mut hits) in queries.iter().zip(found) {
         let selector = parse_selector(query);
-        let mut hits: Vec<(&Path, &SymbolNode)> = match &selector {
-            Selector::Hash(prefix) => all
-                .iter()
-                .zip(&hashes)
-                .filter(|(_, h)| h.starts_with(prefix.as_str()))
-                .map(|((f, s), _)| (*f, *s))
-                .collect(),
-            Selector::Id(id) => all
-                .iter()
-                .filter(|(_, s)| s.id == *id)
-                .map(|(f, s)| (*f, *s))
-                .collect(),
-            Selector::Unrecognized(_) => Vec::new(),
-        };
 
         // Stable output: the tree walk is deterministic, but sorting makes the
         // contract explicit rather than incidental.
@@ -381,7 +407,7 @@ fn resolve<'a>(
             .collect();
 
         let suggestions = match (&selector, hits_empty) {
-            (Selector::Id(id), true) => suggest(&all, id),
+            (Selector::Id(id), true) => suggest(all.get_or_insert_with(|| tree.walk()), id),
             _ => Vec::new(),
         };
         results.push(ResultDto {
