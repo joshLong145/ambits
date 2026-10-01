@@ -120,6 +120,16 @@ pub fn normalize_path(path: &str) -> String {
     path.replace('\\', "/").nfc().collect()
 }
 
+/// The project file a tool call's `path` names, in the one form every
+/// record and the symbol tree carry (see [`project_rel`]): an absolute path
+/// under `root` with the root taken off, a relative one as it is. `None` for
+/// a path outside the project. The one way the ledger, the trace and write
+/// attribution agree on which file a call was about.
+pub fn project_file(path: &std::path::Path, root: &std::path::Path) -> Option<String> {
+    let rel = if path.is_absolute() { path.strip_prefix(root).ok()? } else { path };
+    project_rel(rel)
+}
+
 /// A path inside the project in the one form every record carries:
 /// relative, `/`-separated, NFC (see [`normalize_path`]). `None` for the
 /// project root itself or anything that climbs out of it (`..`, a root or

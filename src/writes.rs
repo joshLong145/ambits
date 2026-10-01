@@ -257,14 +257,9 @@ pub fn build_record(
     registry: &ParserRegistry,
     symbol_level: bool,
 ) -> Option<WriteRecord> {
-    let rel = if event.path.is_absolute() {
-        event.path.strip_prefix(project_root).ok()?
-    } else {
-        event.path.as_path()
-    };
     // Normalized, and parsed under the normalized name, so the file and its
     // symbol ids match what `touched`, snapshots and linkage look up.
-    let file = crate::objects::project_rel(rel)?;
+    let file = crate::objects::project_file(&event.path, project_root)?;
     let rel = Path::new(&file);
 
     let fh = match &event.source {

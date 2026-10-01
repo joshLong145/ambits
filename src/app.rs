@@ -2057,14 +2057,14 @@ pub fn apply_tool_call(
         mark_selectors(tree, event.target_selectors.iter().map(|s| (s.selector.as_str(), s.depth, s.whole)), &mut credit);
     }
 
-    if let Some(ref file_path) = event.file_path {
-        let tool_rel = normalize_tool_path(file_path, project_root);
-        for file in tree.files.iter().filter(|f| f.file_path == tool_rel) {
-            if event.target_symbol.is_some() || event.target_lines.is_some() {
-                mark_targeted_symbols(&file.symbols, event, &mut credit);
-            } else {
-                mark_file_symbols(&file.symbols, event.read_depth, &mut credit, false);
-            }
+    // The file as the trace and write records name it: `./src/a.rs`, or
+    // one named with a decomposed accent, is the tree's `src/a.rs`.
+    let named = event.file_path.as_deref().and_then(|p| crate::objects::project_file(p, project_root));
+    if let Some(file) = named.as_deref().and_then(|f| tree.file(f)) {
+        if event.target_symbol.is_some() || event.target_lines.is_some() {
+            mark_targeted_symbols(&file.symbols, event, &mut credit);
+        } else {
+            mark_file_symbols(&file.symbols, event.read_depth, &mut credit, false);
         }
     }
     credit.listed()
@@ -2216,18 +2216,6 @@ fn flatten_symbol(sym: &SymbolNode, depth: usize, cx: &RowContext<'_>, rows: &mu
     }
 }
 
-/// Convert a tool call file path (usually absolute) to a relative path matching
-/// the project tree's convention. Strips the project root prefix if present.
-pub fn normalize_tool_path(tool_path: &Path, project_root: &Path) -> PathBuf {
-    if tool_path.is_absolute() {
-        tool_path
-            .strip_prefix(project_root)
-            .unwrap_or(tool_path)
-            .to_path_buf()
-    } else {
-        tool_path.to_path_buf()
-    }
-}
 
 /// Unconditionally record every symbol in `symbols` (and all their descendants)
 /// at the event's `read_depth`. Used when the entire file — or the entire body of
@@ -2397,22 +2385,27 @@ mod tests {
     use crate::symbols::FileSymbols;
     use std::path::Path;
 
+    /// A call's file is the tree's file however the tool spelled it — the
+    /// one rule the ledger, the trace and write records share.
     #[test]
-    fn normalize_tool_path_absolute() {
-        let result = normalize_tool_path(
-            Path::new("/project/src/main.rs"),
-            Path::new("/project"),
-        );
-        assert_eq!(result, PathBuf::from("src/main.rs"));
+    fn a_calls_file_is_the_trees_however_it_is_spelled() {
+        let file = |p: &str| crate::objects::project_file(Path::new(p), Path::new("/project"));
+        for spelled in ["/project/src/main.rs", "src/main.rs", "./src/main.rs", "/project/./src/main.rs"] {
+            assert_eq!(file(spelled).as_deref(), Some("src/main.rs"), "{spelled}");
+        }
+        assert_eq!(file("/elsewhere/main.rs"), None, "outside the project");
+        assert_eq!(file("../main.rs"), None);
+        assert_eq!(file("cafe\u{301}.rs").as_deref(), Some("caf\u{e9}.rs"), "NFC, as the tree's paths are");
     }
 
+    /// A read named `./mock/f.rs` credits the tree's `mock/f.rs`.
     #[test]
-    fn normalize_tool_path_relative() {
-        let result = normalize_tool_path(
-            Path::new("src/main.rs"),
-            Path::new("/project"),
-        );
-        assert_eq!(result, PathBuf::from("src/main.rs"));
+    fn a_read_credits_the_file_however_it_is_spelled() {
+        let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::alpha", "alpha")])]);
+        let mut call = tool_call("Read", "./mock/f.rs", ReadDepth::FullBody);
+        call.tool_use_id = Some(Arc::from("r1"));
+        app.process_agent_event(call);
+        assert_eq!(app.ledger.depth_of("mock/f.rs::alpha"), ReadDepth::FullBody);
     }
 
     #[test]

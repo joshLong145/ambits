@@ -195,10 +195,7 @@ impl Trace {
         } else {
             SpanKind::Other
         };
-        let file = call.file_path.as_deref().and_then(|p| {
-            let rel = p.strip_prefix(project_root).unwrap_or(p);
-            crate::objects::project_rel(rel)
-        });
+        let file = call.file_path.as_deref().and_then(|p| crate::objects::project_file(p, project_root));
         if let Some(id) = &call.tool_use_id {
             self.by_id.insert(id.clone(), self.spans.len());
         }

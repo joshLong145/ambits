@@ -572,7 +572,7 @@ pub fn run_report(
     // `mark_*_symbols` signature) but never read.
     let mut depth_cache = crate::tracking::alignment::DepthOrdinalCache::new();
     let mut known_agents: Vec<String> = Vec::new();
-    let mut files_accessed: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut files_accessed: BTreeSet<String> = BTreeSet::new();
     let mut tool_call_count: usize = 0;
     let mut compactions: Vec<CompactionSummary> = Vec::new();
     if let (Some(ref log_dir), Some(ref sid)) = (&log_dir, &session_id) {
@@ -586,10 +586,7 @@ pub fn run_report(
                         if !known_agents.iter().any(|a: &String| a.as_str() == &*tc.agent_id) {
                             known_agents.push(tc.agent_id.to_string());
                         }
-                        if let Some(ref file_path) = tc.file_path {
-                            files_accessed
-                                .insert(crate::app::normalize_tool_path(file_path, project_path));
-                        }
+                        files_accessed.extend(tc.file_path.as_deref().and_then(|p| crate::objects::project_file(p, project_path)));
                         crate::app::apply_tool_call(
                             project_tree,
                             project_path,
@@ -606,10 +603,7 @@ pub fn run_report(
                             timestamp,
                             summary,
                             tool_calls_before: tool_call_count,
-                            files_before: files_accessed
-                                .iter()
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .collect(),
+                            files_before: files_accessed.iter().cloned().collect(),
                             symbols_seen_before: seen,
                             seen_percent_before: if total > 0 {
                                 seen as f64 / total as f64 * 100.0
