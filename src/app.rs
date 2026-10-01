@@ -1844,18 +1844,17 @@ impl App {
         }
     }
 
-    /// `main` for the session's own agent, else the agent id.
-    pub fn agent_name<'a>(&self, id: &'a str) -> &'a str {
-        if self.session_id.as_deref() == Some(id) { "main" } else { id }
-    }
-
-    /// An agent as a reader knows it: `main`, or a subagent by the task
-    /// that started it (`Expert review of phase 6`), else by its id.
+    /// An agent as a reader knows it — the one name every view gives it:
+    /// `main` for the session's own; a subagent by the task it was started
+    /// for (its delegation's), else by the label its log gave it (its task
+    /// prompt's first line); else its id.
     pub fn agent_title(&self, id: &str) -> String {
-        match self.trace.delegation_of(id).map(|d| self.trace.spans()[d].task()) {
-            Some(task) if !task.is_empty() => task,
-            _ => self.agent_name(id).to_string(),
+        if self.session_id.as_deref() == Some(id) {
+            return "main".to_string();
         }
+        let task = self.trace.delegation_of(id).map(|d| self.trace.spans()[d].task()).filter(|t| !t.is_empty());
+        let label = || self.agent_tree.agents.get(id).map(|n| n.label.clone()).filter(|l| !l.is_empty() && l != id);
+        task.or_else(label).unwrap_or_else(|| id.to_string())
     }
 
     /// Process an agent tool call event and update the ledger.
@@ -2719,6 +2718,33 @@ mod tests {
         let whole = tool_call("Read", "mock/f.rs", ReadDepth::FullBody);
         let listed = apply_tool_call(&tree, Path::new(""), &whole, &mut ledger, &mut cache);
         assert_eq!(listed, vec![("mock/f.rs::App".to_string(), ReadDepth::FullBody), ("mock/f.rs::free".to_string(), ReadDepth::FullBody)]);
+    }
+
+    /// Every view names an agent one way: `main`; a subagent by its
+    /// delegation's task, else its log's label, else its id.
+    #[test]
+    fn an_agent_has_one_name_everywhere() {
+        let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::a", "a")])]);
+        app.set_session_id(Some("sess".into()));
+        let mut labelled = tool_call("Read", "mock/f.rs", ReadDepth::FullBody);
+        labelled.agent_id = Arc::from("ab1");
+        labelled.label = Arc::from("Review the parser");
+        app.process_agent_event(labelled);
+        assert_eq!(app.agent_title("sess"), "main");
+        assert_eq!(app.agent_title("ab1"), "Review the parser", "its log's label");
+        assert_eq!(app.agent_title("zz9"), "zz9", "nothing known");
+
+        let mut spawn = tool_call("Agent", "", ReadDepth::Unseen);
+        spawn.file_path = None;
+        spawn.tool_use_id = Some(Arc::from("d1"));
+        spawn.summary = Some("Expert review".into());
+        spawn.timestamp_str = "2026-09-27T10:00:00Z".into();
+        app.process_agent_event(spawn);
+        app.process_tool_finished(&crate::ingest::ToolFinished {
+            id: Arc::from("d1"), agent_id: Arc::from("sess"), timestamp: "2026-09-27T10:00:01Z".into(),
+            error: false, child_agent: Some(Arc::from("ab1")), message: None, shown: Vec::new(),
+        });
+        assert_eq!(app.agent_title("ab1"), "Expert review", "its delegation's task first");
     }
 
     /// A file's contents are made once, and made again when the file

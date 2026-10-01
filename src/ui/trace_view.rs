@@ -58,7 +58,7 @@ pub(super) fn render(f: &mut Frame, app: &App, area: Rect, frame: &TraceFrame<'_
         Layout::Waterfall => "waterfall",
         Layout::Tracks => "tracks",
     };
-    let who = app.agent_filter.as_deref().map_or("all agents".to_string(), |a| app.agent_name(a).to_string());
+    let who = app.agent_filter.as_deref().map_or("all agents".to_string(), |a| app.agent_title(a));
     let title = match tv.focus {
         Some(root) => format!(" Trace — {} · {who} · {layout} ", super::fit(&app.trace.spans()[root].name(), 48)),
         None => format!(" Traces — {who} "),

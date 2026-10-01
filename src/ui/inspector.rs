@@ -80,7 +80,7 @@ fn symbol_facts(app: &App, row: &ambits::app::TreeRow) -> Vec<Line<'static>> {
     let mut read = depth_spans(depth, 0);
     if let Some(entry) = app.ledger.entries.get(&row.symbol_id).filter(|_| depth.is_seen()) {
         let mut by: Vec<(String, ReadDepth)> =
-            entry.agent_depths.iter().filter(|(_, d)| d.is_seen()).map(|(a, d)| (app.agent_name(a).to_string(), *d)).collect();
+            entry.agent_depths.iter().filter(|(_, d)| d.is_seen()).map(|(a, d)| (app.agent_title(a), *d)).collect();
         by.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let who: Vec<String> = by.iter().map(|(a, d)| if *d == depth { a.clone() } else { format!("{a} ({})", depth_word(*d)) }).collect();
         if !who.is_empty() {
@@ -134,7 +134,7 @@ fn written(app: &App, row: &ambits::app::TreeRow, lines: &mut Vec<Line<'static>>
     let when = ambits::time::short(&w.t);
     let times = if mark.count > 1 { format!(" · {} writes", mark.count) } else { String::new() };
     let color = tree_view::write_color(mark.status);
-    lines.push(fact("written", vec![text("✎ ", color), text(format!("{when} by {} ({}){times}", app.agent_name(&w.a), w.tool), Color::White)]));
+    lines.push(fact("written", vec![text("✎ ", color), text(format!("{when} by {} ({}){times}", app.agent_title(&w.a), w.tool), Color::White)]));
     lines.push(fact("", vec![text(mark.status.phrase(), color)]));
 }
 

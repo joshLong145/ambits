@@ -8,7 +8,6 @@ use ambits::app::App;
 use ambits::tracking::alignment::FileAlignment;
 
 use super::colors;
-use super::stats::short_id;
 
 /// Render the sub-agent alignment popup over `area`. The caller must verify
 /// `app.show_alignment_overlay` before calling.
@@ -29,7 +28,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 lines.push(Line::from(""));
             }
             lines.push(Line::from(Span::styled(
-                format!("{}  \u{2194}  {}", short_id(&pair.agent_a), short_id(&pair.agent_b)),
+                format!("{}  \u{2194}  {}", super::fit(&app.agent_title(&pair.agent_a), 28), super::fit(&app.agent_title(&pair.agent_b), 28)),
                 Style::default().add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(vec![

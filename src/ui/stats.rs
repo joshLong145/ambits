@@ -213,7 +213,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 "\u{251c}\u{2500} "
             };
 
-            let display_name = short_id(agent_id);
+            let display_name = super::fit(&app.agent_title(agent_id), 32);
 
             // Per-agent seen%
             let agent_seen = app.ledger.total_seen_for_agent(agent_id);

@@ -81,7 +81,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let total = app.project_tree.total_symbols();
     let pct = (seen * 100).checked_div(total).unwrap_or(0);
     let session = app.session_slug.clone().or_else(|| app.session_id.as_ref().map(|s| s.chars().take(8).collect())).unwrap_or_else(|| "no session".into());
-    let who = filter.map_or("all agents".to_string(), |a| app.agent_name(a).to_string());
+    let who = filter.map_or("all agents".to_string(), |a| app.agent_title(a));
     let dim = Style::default().fg(Color::DarkGray);
     let mut spans = vec![
         Span::styled(" ambits", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
