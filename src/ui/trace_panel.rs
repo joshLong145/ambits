@@ -145,7 +145,6 @@ fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, width: usize) -> Vec<
     match s.kind {
         // What it was credited with reading: one symbol by name, and how
         // deeply it is known now; several counted (they are rows below).
-        // Credited with none, what it targeted, if anything.
         SpanKind::Read(depth) => {
             let mut read = depth_spans(depth, 0);
             match s.read.as_slice() {
@@ -154,10 +153,7 @@ fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, width: usize) -> Vec<
                     out.push(fact("read", read));
                     out.push(fact("now", depth_spans(app.ledger.depth_of(id), 0)));
                 }
-                [] => {
-                    read.extend(s.symbol_name().map(|name| text(format!(" of {name}"), Color::Gray)));
-                    out.push(fact("read", read));
-                }
+                [] => out.push(fact("read", read)),
                 many => {
                     read.push(text(format!(" · {} symbols", many.len()), Color::Gray));
                     out.push(fact("read", read));
@@ -250,7 +246,7 @@ fn file_details(app: &App, frame: &TraceFrame<'_>, file: &FileActivity, width: u
             Some((w, status)) if w.syms.is_empty() => note(WHOLE_FILE.to_string(), Wrote::Stands(*status)),
             Some((w, _)) => symbols_written(now.as_deref(), w).into_iter().for_each(|(name, status)| note(name, Wrote::Stands(status))),
             None => {
-                let name = s.symbol_name().unwrap_or_else(|| WHOLE_FILE.to_string());
+                let name = WHOLE_FILE.to_string();
                 note(name, if s.error { Wrote::Failed } else { Wrote::Unattributed });
             }
         }

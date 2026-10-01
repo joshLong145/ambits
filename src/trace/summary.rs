@@ -87,8 +87,8 @@ impl FileActivity {
     /// in the order first read; `None` for a read that failed and saw
     /// nothing (listed only when no read of it succeeded). A `None` symbol
     /// is the whole file. Each read's symbols are those it was credited with
-    /// in this file; one credited with none (a file with no symbols) is the
-    /// symbol it targeted, or the whole file.
+    /// in this file; one credited with none (a file with no symbols) read the
+    /// whole file.
     pub fn symbols_read(&self, trace: &Trace) -> Vec<(Option<String>, Option<ReadDepth>)> {
         let mut out: Vec<(Option<String>, Option<ReadDepth>)> = Vec::new();
         let mut note = |name: Option<String>, depth: Option<ReadDepth>| match out.iter_mut().find(|(n, _)| *n == name) {
@@ -102,7 +102,7 @@ impl FileActivity {
             if credited.peek().is_some() {
                 credited.for_each(|(name, depth)| note(Some(name.to_string()), failed(depth)));
             } else if let SpanKind::Read(depth) = s.kind {
-                note(s.symbol_name(), failed(depth));
+                note(None, failed(depth));
             }
         }
         out
@@ -395,20 +395,24 @@ mod tests {
     fn a_files_reads_are_each_symbol_once_at_its_deepest() {
         let mut t = Trace::default();
         t.prompt(&Prompt { agent_id: Arc::from("main"), timestamp: "2026-09-27T10:00:00Z".into(), text: "go".into() });
-        let reads = [
-            ("r1", Some("impl App/fn run"), ReadDepth::Signature, false),
-            ("r2", None, ReadDepth::Overview, false),
-            ("r3", Some("App/run"), ReadDepth::FullBody, false),
-            ("r4", Some("App/stop"), ReadDepth::FullBody, true),
-            ("r5", None, ReadDepth::FullBody, true),
+        // Each read — id, target, depth, failed — with what the ledger
+        // credited it with: the one source.
+        type Read<'a> = (&'a str, Option<&'a str>, ReadDepth, bool, &'a [&'a str]);
+        let reads: [Read<'_>; 5] = [
+            ("r1", Some("impl App/fn run"), ReadDepth::Signature, false, &["src/a.rs::App/run"]),
+            ("r2", None, ReadDepth::Overview, false, &[]),
+            ("r3", Some("App/run"), ReadDepth::FullBody, false, &["src/a.rs::App/run"]),
+            ("r4", Some("App/stop"), ReadDepth::FullBody, true, &["src/a.rs::App/stop"]),
+            ("r5", None, ReadDepth::FullBody, true, &[]),
         ];
-        for (id, symbol, depth, error) in reads {
+        for (id, symbol, depth, error, credited) in reads {
             let mut c = crate::helpers::tool_call("Read", "/p/src/a.rs", depth);
             c.agent_id = Arc::from("main");
             c.tool_use_id = Some(Arc::from(id));
             c.timestamp_str = "2026-09-27T10:00:01Z".into();
             c.target_symbol = symbol.map(String::from);
             t.start(&c, Path::new("/p"));
+            t.note_read(id, credited.iter().map(|s| (s.to_string(), depth)).collect());
             t.finish(&ToolFinished { id: Arc::from(id), agent_id: Arc::from("main"), timestamp: "2026-09-27T10:00:02Z".into(), error, message: None, child_agent: None, shown: Vec::new() });
         }
         let d = detail(&t, &TraceIndex::new(&t), 0).unwrap();

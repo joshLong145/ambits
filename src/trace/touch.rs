@@ -25,9 +25,9 @@ pub struct Touch {
 ///
 /// A read touches a symbol when a symbol it was credited with reading is the
 /// symbol, inside it, or around it — which counts the `ambits show`s and
-/// searches that name no file of their own. A read credited with nothing
-/// (of a file with no symbols, say) falls back to the file it named and the
-/// symbol it targeted, if any. A write touches it when
+/// searches that name no file of their own: the symbols are the ledger's,
+/// never matched again here by name. A read credited with nothing (of a
+/// file with no symbols, say) touches its file only. A write touches it when
 /// its attribution names it or something nested in it (so a file-level
 /// write touches the file only).
 pub fn touches(trace: &Trace, file: &str, symbol: Option<&str>, writes: &WriteIndex) -> Vec<Touch> {
@@ -43,11 +43,9 @@ pub fn touches(trace: &Trace, file: &str, symbol: Option<&str>, writes: &WriteIn
         // `ambits show`s and searches that name no file of their own.
         let mut credited = s.reads_in(file).map(|(read, _)| read).peekable();
         let read = match name {
-            _ if credited.peek().is_none() => {
-                // Nothing credited: a read of the file still read it (one of
-                // a file the tree has no symbols for, say).
-                matches!(s.kind, SpanKind::Read(_)) && on_file && name.is_none_or(|name| s.symbol_name().is_none_or(|t| nested_in(name, &t) || nested_in(&t, name)))
-            }
+            // Nothing credited: a read of the file still read the file (one
+            // the tree has no symbols for, say) — though no symbol in it.
+            _ if credited.peek().is_none() => name.is_none() && on_file && matches!(s.kind, SpanKind::Read(_)),
             None => true,
             Some(name) => credited.any(|read| nested_in(name, read) || nested_in(read, name)),
         };
@@ -138,6 +136,12 @@ mod tests {
         prompt(&mut t, "2026-09-27T11:00:00Z", "second"); // 3
         call(&mut t, "w1", "Edit", None, "2026-09-27T11:00:01Z", true); // 4
         call(&mut t, "r3", "Read", None, "2026-09-27T11:00:02Z", false); // 5
+        // What the ledger credited each read with: the one source of what a
+        // call read. The whole-file read, every top-level symbol.
+        let full = crate::tracking::ReadDepth::FullBody;
+        t.note_read("r1", vec![("src/a.rs::App/run".into(), full)]);
+        t.note_read("r2", vec![("src/a.rs::Other".into(), full)]);
+        t.note_read("r3", vec![("src/a.rs::App".into(), full), ("src/a.rs::Other".into(), full)]);
 
         let mut writes = WriteIndex::default();
         writes.insert(crate::writes::WriteRecord {
@@ -158,7 +162,8 @@ mod tests {
         );
         let parent = touches(&t, "src/a.rs", Some("src/a.rs::App"), &writes);
         assert_eq!(parent.len(), 2, "a read or write inside App touches App");
-        assert!(touches(&t, "src/a.rs", Some("src/a.rs::Unrelated"), &writes).iter().all(|x| x.root == 3 && !x.wrote), "only the whole-file read");
+        assert_eq!(touches(&t, "src/a.rs", Some("src/a.rs::Other"), &writes).iter().map(|x| x.root).collect::<Vec<_>>(), vec![0, 3], "read on its own, and with the file");
+        assert!(touches(&t, "src/a.rs", Some("src/a.rs::Unrelated"), &writes).is_empty(), "nothing credited it");
         assert_eq!(touches(&t, "src/a.rs", None, &writes).iter().map(|x| x.calls).collect::<Vec<_>>(), vec![2, 2]);
         assert!(touches(&t, "src/b.rs", None, &writes).is_empty());
     }

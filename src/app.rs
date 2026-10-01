@@ -828,7 +828,7 @@ impl App {
         let Some(target) = targets.get(self.panel_index.min(targets.len().saturating_sub(1))).cloned() else { return };
         let item = match target {
             Target::File(file) => {
-                if self.reveal(&file, None) {
+                if self.reveal_id(&file, None) {
                     self.trace_view.open = false;
                     self.focus = FocusPanel::Left;
                 }
@@ -1250,30 +1250,15 @@ impl App {
             }
             return;
         }
-        // To the first symbol it was credited with reading, exactly; else to
-        // the symbol it named in its file, by name.
+        // To the first symbol it was credited with reading; else its file.
         let revealed = match span.read.first() {
             Some((id, _)) => self.reveal_id(crate::symbols::split_id(id).0, Some(id.clone())),
-            None => span.file.as_deref().is_some_and(|file| self.reveal(file, span.symbol.as_deref())),
+            None => span.file.as_deref().is_some_and(|file| self.reveal_id(file, None)),
         };
         if revealed {
             self.trace_view.open = false;
             self.focus = FocusPanel::Left;
         }
-    }
-
-    /// Select `file` (project-relative) in the tree, or the symbol in it
-    /// named by `symbol`, expanding what hides it. `false` when the file is
-    /// not in the tree.
-    pub fn reveal(&mut self, file: &str, symbol: Option<&str>) -> bool {
-        let Some(tree_file) = self.project_tree.file(file) else { return false };
-        let target = symbol.map(normalize_name_path).and_then(|name| {
-            let nodes = tree_file.walk();
-            let exact = nodes.iter().find(|n| n.name_path() == name);
-            let by_tail = || nodes.iter().find(|n| n.name_path().ends_with(&format!("/{name}")) || *n.name == *name);
-            exact.or_else(by_tail).map(|n| n.id.clone())
-        });
-        self.reveal_id(file, target)
     }
 
     /// Select symbol `id` in the tree, expanding its file and every symbol
@@ -4019,7 +4004,6 @@ mod trace_view_tests {
         let tree = project(vec![file("src/a.rs", vec![sym_with_children("src/a.rs::S", "S", vec![sym("src/a.rs::S/a", "a")])])]);
         let mut app = App::new(tree, PathBuf::from("/test/project"));
         app.set_session_id(Some("sess".into()));
-        let root = app.project_root.clone();
         let mut calls = vec![
             ("sess", "r1", "Read", "2026-09-27T10:00:00.000Z", "2026-09-27T10:00:01.000Z", None, false),
             ("sess", "d1", "Agent", "2026-09-27T10:00:02.000Z", "2026-09-27T10:00:02.100Z", Some("ax1"), false),
@@ -4030,7 +4014,8 @@ mod trace_view_tests {
             c.agent_id = Arc::from(agent);
             c.tool_use_id = Some(Arc::from(id));
             c.timestamp_str = start.into();
-            app.trace.start(&c, &root);
+            // As the TUI takes a call: traced, and its reads credited.
+            app.process_agent_event(c);
             app.trace.finish(&ToolFinished {
                 id: Arc::from(id),
                 agent_id: Arc::from(agent),
