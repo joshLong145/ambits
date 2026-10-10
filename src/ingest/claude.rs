@@ -907,9 +907,13 @@ impl LineFeed {
         // the agent's.
         let stem = path.file_stem().and_then(|n| n.to_str()).unwrap_or("unknown");
         let default_id = stem.strip_prefix("agent-").unwrap_or(stem).to_string();
+        // A project inside the session's cwd (a harness launching from a
+        // workspace above its clones) is not a worktree: its tool paths
+        // already name the project, and stripping the cwd would prefix them
+        // with the clone's directory name.
         let remap = project_root.and_then(|root| {
             let cwd = extract_cwd(path)?;
-            (cwd != root).then(|| (cwd, root.to_path_buf()))
+            (cwd != root && !root.starts_with(&cwd)).then(|| (cwd, root.to_path_buf()))
         });
         Self { default_id, label: Arc::from(extract_agent_label(path).as_str()), remap, pending_metadata: None }
     }
@@ -2364,6 +2368,31 @@ description  = "UserTool {target}"
         let log = tmp.path().join("agent.jsonl");
         fs::write(&log, r#"{"type":"user","cwd":"/tmp/worktree-xyz","sessionId":"s1"}"#).unwrap();
         assert_eq!(extract_cwd(&log), Some(PathBuf::from("/tmp/worktree-xyz")));
+    }
+
+    fn feed_remap(cwd: &str, project: &str) -> Option<(PathBuf, PathBuf)> {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("s.jsonl");
+        fs::write(&log, format!(r#"{{"type":"user","cwd":"{cwd}","sessionId":"s1"}}"#)).unwrap();
+        LineFeed::for_file(&log, Some(Path::new(project))).remap
+    }
+
+    #[test]
+    fn a_project_inside_the_sessions_cwd_is_not_remapped() {
+        assert_eq!(feed_remap("/workspace/run-1", "/workspace/run-1/repo"), None);
+    }
+
+    #[test]
+    fn a_worktree_elsewhere_is_remapped_to_the_project() {
+        assert_eq!(
+            feed_remap("/tmp/worktree-abc", "/home/user/myproject"),
+            Some((PathBuf::from("/tmp/worktree-abc"), PathBuf::from("/home/user/myproject"))),
+        );
+    }
+
+    #[test]
+    fn a_worktree_nested_in_the_project_is_still_remapped() {
+        assert!(feed_remap("/p/.claude/worktrees/x", "/p").is_some());
     }
 
     #[test]
