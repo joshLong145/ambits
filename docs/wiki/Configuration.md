@@ -31,6 +31,19 @@ the UNVERIFIED session-log fallback.
 
 CLI flags win over the config file.
 
+### Keeping state outside the project
+
+Everything under `.ambits/` except `tools.toml` — journals, snapshot objects,
+refs, links and caches — moves to another directory with `--state-dir <DIR>`
+or `AMBITS_STATE_DIR=<DIR>`; the flag wins. A relative path resolves against
+the working directory. The project's `.ambits/tools.toml` is still read from
+the project, and nothing is written there. Use it when the checkout is one an
+agent commits from, so ambits state can never be staged by `git add -A`.
+
+Every command of a session must name the same directory: one that does not
+reads and writes `.ambits/` as usual and will not see the other's journals.
+Legacy `.ambit/coverage/` journals are not migrated into an external directory.
+
 ## Restricting scope
 
 ```bash

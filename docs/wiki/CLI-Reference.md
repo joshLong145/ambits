@@ -49,6 +49,7 @@ collects them in one place.
 | `--editor <TEMPLATE>` | [Editor](TUI#opening-a-symbol-in-your-editor) for `Enter` in the TUI |
 | `--no-journal` | Disable the read journal |
 | `--flush-interval-ms <MS>` | Journal write interval (default 5000) |
+| `--state-dir <DIR>` | Keep journals, snapshots and caches in `DIR` instead of `.ambits/` (also `$AMBITS_STATE_DIR`) |
 | `--log-output <DIR>` | Write a JSON-lines [debug log](Configuration#debug-logging) per session |
 
 ## `ambits rg`

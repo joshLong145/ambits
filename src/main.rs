@@ -123,6 +123,12 @@ struct Cli {
     #[arg(long)]
     flush_interval_ms: Option<u64>,
 
+    /// Keep journals, snapshots and caches in this directory instead of the
+    /// project's `.ambits/`. Falls back to `$AMBITS_STATE_DIR`. The project's
+    /// `.ambits/tools.toml` is still read from the project.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -1354,6 +1360,11 @@ fn run() -> Result<()> {
         None => ambits::state_dir::find_project_root(&std::env::current_dir()?),
     };
     let project_path = project.canonicalize().unwrap_or(project);
+
+    if let Some(dir) = cli.state_dir.take().or_else(|| std::env::var_os(ambits::state_dir::STATE_DIR_ENV).map(PathBuf::from)) {
+        let dir = if dir.is_absolute() { dir } else { std::env::current_dir()?.join(dir) };
+        let _ = ambits::state_dir::set_override(dir);
+    }
 
     // Resolve tool call mapping config. Warnings go to stderr via `report_warnings`.
     let (tool_config, config_warnings) =

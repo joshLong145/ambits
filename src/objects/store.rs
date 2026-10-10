@@ -38,7 +38,7 @@ impl Store {
     /// The store of `project_root`. Nothing is created until something is
     /// written.
     pub fn at(project_root: &Path) -> Self {
-        Self::at_root(&project_root.join(crate::state_dir::STATE_DIR))
+        Self::at_root(&crate::state_dir::state_root(project_root))
     }
 
     /// A store whose root is `dir` itself: a remote, laid out as `.ambits/`

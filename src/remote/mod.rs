@@ -191,7 +191,7 @@ pub fn push(req: &PushRequest<'_>) -> Result<PushOutcome> {
 fn links_to_send(project_root: &Path, session: &str, ignore: &SyncIgnore, remote: &Store) -> Result<Vec<(String, crate::linkage::Link)>> {
     let ops = journal::read_session_writes(&journal::journal_dir(project_root), session);
     let have: HashSet<String> = crate::linkage::links_of(remote.root())?.into_iter().map(|(k, _)| k).collect();
-    Ok(crate::linkage::links_of(&project_root.join(crate::state_dir::STATE_DIR))?
+    Ok(crate::linkage::links_of(&crate::state_dir::state_root(project_root))?
         .into_iter()
         .filter(|(k, l)| ops.contains_key(&l.op) && !have.contains(k))
         .filter(|(_, l)| !ignore.is_ignored(&l.path) && !ignore.ignores_symbol(&l.target) && !ignore.is_ignored(&l.target))

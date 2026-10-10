@@ -231,7 +231,7 @@ impl Resolver {
     pub fn new(project_root: &Path) -> Option<Self> {
         let repo = Repo::discover(project_root).filter(|r| r.head.is_some())?;
         let tips = tips(&repo);
-        let state = project_root.join(crate::state_dir::STATE_DIR);
+        let state = crate::state_dir::state_root(project_root);
         // A file per entry, as older ambits kept them: caches, so dropped.
         let _ = std::fs::remove_dir_all(state.join("links"));
         let _ = std::fs::remove_dir_all(state.join(crate::state_dir::CACHE).join("never-landed"));
@@ -646,7 +646,7 @@ pub fn import_links(project_root: &Path, links: Vec<Link>) -> Result<usize> {
         }
     }
     drop(resolver);
-    add_links(&project_root.join(crate::state_dir::STATE_DIR), proven, crate::objects::store::Durability::NoSync)
+    add_links(&crate::state_dir::state_root(project_root), proven, crate::objects::store::Durability::NoSync)
 }
 
 /// A unit's key in both caches: a hash of `(op, target, hash)`.

@@ -125,8 +125,7 @@ pub const JOURNAL_SUBDIR: &str = ".ambits/coverage";
 /// legacy `.ambit/coverage/`. Every reader and the writer go through here, so
 /// whichever runs first performs the one-time move.
 pub fn journal_dir(project_root: &Path) -> PathBuf {
-    crate::state_dir::migrate_legacy_journals(project_root);
-    project_root.join(JOURNAL_SUBDIR)
+    crate::state_dir::coverage_dir(project_root)
 }
 
 /// Default interval between ledger diffs.

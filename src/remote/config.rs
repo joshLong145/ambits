@@ -31,7 +31,7 @@ pub struct RemoteConfig {
 }
 
 fn config_path(project_root: &Path) -> PathBuf {
-    project_root.join(crate::state_dir::STATE_DIR).join("config")
+    crate::state_dir::state_root(project_root).join("config")
 }
 
 impl Config {
@@ -74,7 +74,7 @@ pub fn add(project_root: &Path, name: &str, path: &Path) -> Result<Vec<String>> 
     }
     let path = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
     let path = path.canonicalize().unwrap_or(path);
-    if path.starts_with(project_root.join(crate::state_dir::STATE_DIR)) {
+    if path.starts_with(crate::state_dir::state_root(project_root)) {
         bail!("a remote cannot live inside this project's own store");
     }
     let mut warnings = Vec::new();

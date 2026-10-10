@@ -11,10 +11,43 @@
 //! - a legacy `tools.toml` is read in place with a warning, because it may be
 //!   committed, and moving a tracked file is the user's decision.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Directory, relative to the project root, holding all ambits state.
 pub const STATE_DIR: &str = ".ambits";
+
+/// Environment variable naming a state directory to use instead of
+/// `<project>/.ambits`, as `--state-dir` does.
+pub const STATE_DIR_ENV: &str = "AMBITS_STATE_DIR";
+
+static OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Keep all state in `dir` rather than under the project, for the rest of the
+/// process. Must run before anything resolves a state path, or those earlier
+/// readers and writers will have used `<project>/.ambits`; a second call fails.
+pub fn set_override(dir: PathBuf) -> Result<(), PathBuf> {
+    OVERRIDE.set(dir)
+}
+
+/// The directory holding `project_root`'s state: the override when one is
+/// set, else `<project_root>/.ambits`.
+pub fn state_root(project_root: &Path) -> PathBuf {
+    state_root_with(project_root, OVERRIDE.get().map(PathBuf::as_path))
+}
+
+fn state_root_with(project_root: &Path, over: Option<&Path>) -> PathBuf {
+    over.map_or_else(|| project_root.join(STATE_DIR), Path::to_path_buf)
+}
+
+/// The coverage journal directory under [`state_root`]. Legacy journals are
+/// migrated only into the default location, since they belong to the project.
+pub(crate) fn coverage_dir(project_root: &Path) -> PathBuf {
+    if OVERRIDE.get().is_none() {
+        migrate_legacy_journals(project_root);
+    }
+    state_root(project_root).join(COVERAGE)
+}
 
 /// Where earlier releases kept the same state.
 pub const LEGACY_STATE_DIR: &str = ".ambit";
@@ -178,6 +211,16 @@ mod tests {
         let nested = dir.path().join("a/b");
         std::fs::create_dir_all(&nested).unwrap();
         assert_eq!(find_project_root(&nested), nested);
+    }
+
+    #[test]
+    fn without_an_override_state_lives_under_the_project() {
+        assert_eq!(state_root_with(Path::new("/p"), None), Path::new("/p/.ambits"));
+    }
+
+    #[test]
+    fn an_override_replaces_the_project_state_dir() {
+        assert_eq!(state_root_with(Path::new("/p"), Some(Path::new("/tmp/s"))), Path::new("/tmp/s"));
     }
 
     #[test]
