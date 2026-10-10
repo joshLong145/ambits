@@ -159,28 +159,12 @@ pub fn is_uuid(s: &str) -> bool {
 /// complete before the main session reaches the token threshold for a
 /// compaction, so this heuristic covers the common case.
 pub fn session_log_files(log_dir: &Path, session_id: &str) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-
-    // New format: <log_dir>/<session-id>/subagents/agent-*.jsonl
-    // All files in this directory belong to the session by definition.
-    let subagents_dir = log_dir.join(session_id).join("subagents");
-    if subagents_dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(&subagents_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
-                if name.starts_with("agent-")
-                    && name.ends_with(".jsonl")
-                    && !name.starts_with("agent-acompact-")
-                {
-                    files.push(path);
-                }
-            }
-        }
-    }
+    // New format: <log_dir>/<session-id>/subagents/**/agent-*.jsonl
+    // All files under this directory belong to the session by definition.
+    let mut files: Vec<PathBuf> = subagent_logs(&log_dir.join(session_id).join("subagents"))
+        .into_iter()
+        .filter(|path| !path.file_name().and_then(|n| n.to_str()).unwrap_or("").starts_with("agent-acompact-"))
+        .collect();
 
     // Old format: <log_dir>/agent-*.jsonl (check sessionId in first lines).
     if let Ok(entries) = fs::read_dir(log_dir) {
@@ -208,6 +192,32 @@ pub fn session_log_files(log_dir: &Path, session_id: &str) -> Vec<PathBuf> {
     }
 
     files
+}
+
+/// Every `agent-*.jsonl` under `subagents`, at any depth and in path order:
+/// Claude Code nests a workflow's agents in `subagents/workflows/<run-id>/`.
+fn subagent_logs(subagents: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut dirs = vec![subagents.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // `file_type` does not follow symlinks, so a link cannot loop the walk.
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => dirs.push(path),
+                Ok(t) if t.is_file() => {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if name.starts_with("agent-") && name.ends_with(".jsonl") {
+                        found.push(path);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 fn agent_belongs_to_session(path: &Path, session_id: &str) -> bool {
@@ -574,21 +584,18 @@ const CALLER_TAIL: u64 = 512 * 1024;
 /// agent: Claude Code sets the session (`CLAUDE_CODE_SESSION_ID`), not the
 /// agent, and `CLAUDE_CODE_CHILD_SESSION` is set in the main agent too.
 pub fn calling_agent(log_dir: &Path, session_id: &str, args: &[String]) -> Caller {
-    let subagents = log_dir.join(session_id).join("subagents");
+    let subagent_files = subagent_logs(&log_dir.join(session_id).join("subagents"));
     let mut logs: Vec<(PathBuf, Option<String>)> = vec![(log_dir.join(format!("{session_id}.jsonl")), None)];
-    if let Ok(entries) = fs::read_dir(&subagents) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-            if let (Some(id), Some("jsonl")) = (stem.strip_prefix("agent-"), path.extension().and_then(|e| e.to_str())) {
-                logs.push((path.clone(), Some(id.to_string())));
-            }
+    for path in &subagent_files {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        if let Some(id) = stem.strip_prefix("agent-") {
+            logs.push((path.clone(), Some(id.to_string())));
         }
     }
-    let found: Vec<Option<String>> = logs.into_iter().filter(|(path, _)| runs_pending(path, args)).map(|(_, id)| id).collect();
+    let found: Vec<(PathBuf, Option<String>)> = logs.into_iter().filter(|(path, _)| runs_pending(path, args)).collect();
     match found.as_slice() {
-        [None] => Caller::Agent { id: session_id.to_string(), parent: None },
-        [Some(id)] => Caller::Agent { id: id.clone(), parent: Some(parent_of(&subagents, id, session_id)) },
+        [(_, None)] => Caller::Agent { id: session_id.to_string(), parent: None },
+        [(path, Some(id))] => Caller::Agent { id: id.clone(), parent: Some(parent_of(path, &subagent_files, id, session_id)) },
         [] => Caller::Unknown("no running call in the session's logs is this command".into()),
         many => Caller::Unknown(format!("{} agents are running this same command", many.len())),
     }
@@ -652,16 +659,14 @@ fn command_runs(command: &str, args: &[String]) -> bool {
 /// The agent that started subagent `id`: the main agent, for one it
 /// started itself (`spawnDepth` 1 in its `.meta.json`); else the subagent
 /// whose log holds the call that started it.
-fn parent_of(subagents: &Path, id: &str, session_id: &str) -> String {
-    let meta: Option<Value> = fs::read_to_string(subagents.join(format!("agent-{id}.meta.json"))).ok().and_then(|m| serde_json::from_str(&m).ok());
+fn parent_of(log: &Path, subagent_files: &[PathBuf], id: &str, session_id: &str) -> String {
+    let meta_path = log.with_file_name(format!("agent-{id}.meta.json"));
+    let meta: Option<Value> = fs::read_to_string(meta_path).ok().and_then(|m| serde_json::from_str(&m).ok());
     let depth = meta.as_ref().and_then(|m| m.get("spawnDepth")).and_then(Value::as_u64).unwrap_or(1);
     let started_by = meta.as_ref().and_then(|m| m.get("toolUseId")).and_then(Value::as_str).map(|t| format!("\"id\":\"{t}\""));
     let (true, Some(needle)) = (depth > 1, started_by) else { return session_id.to_string() };
-    let Ok(entries) = fs::read_dir(subagents) else { return session_id.to_string() };
-    entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+    subagent_files
+        .iter()
         .find(|p| fs::read_to_string(p).is_ok_and(|log| log.contains(&needle)))
         .and_then(|p| p.file_stem().and_then(|s| s.to_str()).map(|s| s.trim_start_matches("agent-").to_string()))
         .unwrap_or_else(|| session_id.to_string())
@@ -2435,6 +2440,21 @@ description  = "UserTool {target}"
     }
 
     #[test]
+    fn session_log_files_finds_agents_nested_under_workflows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = "abcd1234-abcd-abcd-abcd-abcd12345678";
+        let nested = tmp.path().join(session).join("subagents/workflows/run-1");
+        fs::create_dir_all(&nested).unwrap();
+        let agent = nested.join("agent-w1.jsonl");
+        fs::write(&agent, r#"{"type":"user"}"#).unwrap();
+        fs::write(nested.join("agent-w1.meta.json"), "{}").unwrap();
+        let main_file = tmp.path().join(format!("{session}.jsonl"));
+        fs::write(&main_file, r#"{"type":"user"}"#).unwrap();
+
+        assert_eq!(session_log_files(tmp.path(), session), vec![agent, main_file]);
+    }
+
+    #[test]
     fn parse_log_file_remaps_worktree_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let worktree = tmp.path().join("worktree");
@@ -2798,11 +2818,18 @@ mod write_tests {
         assert_eq!(calling_agent(dir.path(), "s", &args), Caller::Agent { id: "s".into(), parent: None }, "the main agent");
 
         let spawn = serde_json::json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t9", "name": "Agent", "input": {"prompt": "x"}}]}}).to_string();
-        session_logs(dir.path(), &[], &[("a1", 1, "t0", &[spawn]), ("a2", 2, "t9", std::slice::from_ref(&running))]);
+        session_logs(dir.path(), &[], &[("a1", 1, "t0", &[spawn.clone()]), ("a2", 2, "t9", std::slice::from_ref(&running))]);
         assert_eq!(calling_agent(dir.path(), "s", &args), Caller::Agent { id: "a2".into(), parent: Some("a1".into()) }, "started by a subagent");
 
         session_logs(dir.path(), std::slice::from_ref(&running), &[("a1", 1, "t0", std::slice::from_ref(&running))]);
         assert!(matches!(calling_agent(dir.path(), "s", &args), Caller::Unknown(why) if why.contains("2 agents")));
+
+        session_logs(dir.path(), &[], &[("a1", 1, "t0", &[spawn])]);
+        let nested = dir.path().join("s/subagents/workflows/run-1");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("agent-a3.jsonl"), running.clone() + "\n").unwrap();
+        std::fs::write(nested.join("agent-a3.meta.json"), r#"{"spawnDepth":2,"toolUseId":"t9"}"#).unwrap();
+        assert_eq!(calling_agent(dir.path(), "s", &args), Caller::Agent { id: "a3".into(), parent: Some("a1".into()) }, "nested under a workflow");
         let other: Vec<String> = ["-p", ".", "rg", "other"].map(String::from).to_vec();
         assert!(matches!(calling_agent(dir.path(), "s", &other), Caller::Unknown(_)));
     }
