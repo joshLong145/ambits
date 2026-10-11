@@ -17,6 +17,7 @@
 - [Snapshots](Snapshots)
 - [Sharing](Sharing)
 - [Traces](Traces)
+- [Reports](Reports)
 - [Configuration](Configuration)
 
 **Reference**

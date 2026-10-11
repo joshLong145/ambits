@@ -389,6 +389,16 @@ enum Commands {
         format: CallersFormat,
     },
 
+    /// The session as one JSON document: its trace, what each agent read of
+    /// every symbol, and every write with its status and the commit it
+    /// landed in. Reads the journal when one exists; never writes it.
+    Report {
+        /// Cut the document until it fits in this many bytes; what was cut
+        /// is listed in its `truncated` field.
+        #[arg(long)]
+        max_bytes: Option<usize>,
+    },
+
     /// Inspect, remove or build the coverage journals under .ambits/coverage.
     Cache {
         #[command(subcommand)]
@@ -1685,6 +1695,42 @@ fn run() -> Result<()> {
             require_clean: *require_clean,
         })?;
         ambits::objects::snapshot::print_outcome(&mut io::stdout().lock(), &outcome)?;
+        return Ok(());
+    }
+
+    if let Some(Commands::Report { max_bytes }) = &command {
+        report_warnings(&config_warnings);
+        let session = require_session(session_id.as_deref(), "report on")?.to_string();
+        if log_dir.as_ref().is_none_or(|d| ingester.session_log_files(d, &session).is_empty()) {
+            color_eyre::eyre::bail!("no logs for session {session}: pass --log-dir, or run inside a project with Claude Code logs");
+        }
+        let (mut app, _) = replayed_app(project_tree, &project_path, filter, &session_id, &log_dir, &*ingester);
+        app.rehydrate_from_journal();
+        let mut writes = ambits::journal::read_session_writes(&ambits::journal::journal_dir(&project_path), &session);
+        for (_, event) in app.take_pending_writes() {
+            if let Some(record) = ambits::writes::build_record(&event, &project_path, &registry, !cli.serena) {
+                if writes.get(&record.op).is_none_or(|known| known.av < record.av) {
+                    writes.insert(record.op.clone(), record);
+                }
+            }
+        }
+        if let Some((start, end)) = app.trace.range() {
+            app.trace.set_commits(&ambits::git::commits_between(&project_path, start, end));
+        }
+        let mut report = ambits::report::build(ambits::report::Inputs {
+            project_root: &project_path,
+            session_id: &session,
+            tree: &app.project_tree,
+            ledger: &app.ledger,
+            trace: &app.trace,
+            agents: &app.agent_tree,
+            writes: writes.into_values().collect(),
+            registry: &registry,
+        })?;
+        if let Some(max) = max_bytes {
+            ambits::report::fit(&mut report, *max)?;
+        }
+        writeln!(io::stdout().lock(), "{}", serde_json::to_string(&report)?)?;
         return Ok(());
     }
 

@@ -197,3 +197,81 @@ fn cache_sync_credits_a_subagent_nested_under_a_workflow() {
         "no read credited to the nested agent:\n{journal}"
     );
 }
+
+fn report(l: &Layout, extra: &[&str]) -> Value {
+    run(l, &[&["--state-dir", l.logs.with_file_name("state").to_str().unwrap()], &["report"][..], extra].concat())
+}
+
+#[test]
+fn the_report_attributes_the_edit_to_its_symbol_and_its_span() {
+    let l = layout();
+    let r = report(&l, &[]);
+    assert_eq!(r["schema_version"], 1);
+    assert_eq!(r["project"]["name"], "repo");
+    let write = &r["writes"][0];
+    assert_eq!(write["symbols"], json!([{"id": "src/a.rs::alpha", "status": "current"}]), "{write}");
+    let span = &r["spans"][write["span"].as_u64().unwrap() as usize];
+    assert_eq!((span["kind"].as_str(), span["tool"].as_str()), (Some("write"), Some("Edit")));
+    let prompt = r["spans"].as_array().unwrap().iter().find(|s| s["kind"] == "prompt").unwrap();
+    assert_eq!(span["parent"], prompt["i"], "the edit nests under the prompt that started its turn");
+}
+
+#[test]
+fn the_report_lists_each_symbol_with_who_read_it_and_which_writes_touched_it() {
+    let l = layout();
+    let r = report(&l, &[]);
+    let file = r["files"].as_array().unwrap().iter().find(|f| f["path"] == "src/a.rs").unwrap();
+    let alpha = file["symbols"].as_array().unwrap().iter().find(|s| s["id"] == "src/a.rs::alpha").unwrap();
+    assert_eq!(alpha["reads"][SESSION], "full_body");
+    assert_eq!(alpha["writes"], json!([r["writes"][0]["op"]]));
+    let read = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Read").unwrap();
+    assert_eq!(read["read_count"], 2, "{read}");
+    assert_eq!(r["totals"]["symbols_written"], 1);
+}
+
+#[test]
+fn the_report_writes_no_state() {
+    let l = layout();
+    report(&l, &[]);
+    assert!(!l.logs.with_file_name("state").exists());
+    assert!(!l.clone.join(".ambits").exists());
+}
+
+#[test]
+fn the_report_carries_no_absolute_path() {
+    let l = layout();
+    let text = report(&l, &[]).to_string();
+    let root = l.clone.parent().unwrap().to_string_lossy().into_owned();
+    // A call's own description is the one field that may name a path.
+    let without_details: Value = {
+        let mut r: Value = serde_json::from_str(&text).unwrap();
+        for s in r["spans"].as_array_mut().unwrap() {
+            s["detail"] = Value::Null;
+        }
+        r
+    };
+    assert!(!without_details.to_string().contains(&root), "{without_details}");
+}
+
+#[test]
+fn max_bytes_cuts_in_order_and_says_so() {
+    let l = layout();
+    let full = report(&l, &[]);
+    let r = report(&l, &["--max-bytes", "10"]);
+    assert_eq!(r["truncated"], json!(["unwritten_file_symbols", "span_reads", "other_spans"]));
+    assert_eq!(r["writes"], full["writes"], "writes are never cut");
+    let read = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Read").unwrap();
+    assert_eq!((read["read"].clone(), read["read_count"].clone()), (json!([]), json!(2)));
+    assert!(report(&l, &["--max-bytes", "100000000"])["truncated"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn the_report_folds_in_writes_already_journaled() {
+    let l = layout();
+    let state = l.logs.with_file_name("state");
+    assert!(sync(&l, &state, &[]).status.success());
+    std::fs::remove_file(l.logs.join(format!("{SESSION}.jsonl"))).unwrap();
+    std::fs::write(l.logs.join(format!("{SESSION}.jsonl")), "{\"type\":\"user\",\"sessionId\":\"x\"}\n").unwrap();
+    let r = report(&l, &[]);
+    assert_eq!(r["writes"][0]["symbols"][0]["id"], "src/a.rs::alpha", "the journal's write survives a log that lost it");
+}

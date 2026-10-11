@@ -18,6 +18,7 @@ collects them in one place.
 | `ambits -p <path> log [ref]` | [Snapshot history](Snapshots#history) |
 | `ambits -p <path> restore <ref> [--into <session>]` | [Restore a snapshot](Snapshots#restoring) into a session |
 | `ambits -p <path> trace [--format otlp\|chrome]` | [Export the session as a trace](Traces) |
+| `ambits -p <path> report [--max-bytes N]` | [The session as one JSON document](Reports): trace, reads, writes |
 | `ambits -p <path> remote add\|list\|remove` | [Remotes](Sharing#configuration): directories snapshots are shared through |
 | `ambits -p <path> push [remote]` | [Push](Sharing#push) this session's snapshots |
 | `ambits -p <path> fetch [remote]` | [Fetch](Sharing#fetch) every session's snapshots |
@@ -130,6 +131,13 @@ prefix (7+ hex digits); the current session by default.
 `ambits -p . trace [--format otlp|chrome]` — the session (`--session`, or the
 latest) and its subagents as a trace on stdout; default `otlp`. `--agent`
 keeps one agent's subtree. See [Traces](Traces).
+
+## `ambits report`
+
+`ambits -p . report [--max-bytes N]` — the session (`--session`, or the
+latest) as one JSON document on stdout: its trace, each agent's reads of
+every symbol, and every write with its status and the commit it landed in.
+Reads the journal when there is one; writes nothing. See [Reports](Reports).
 
 ## `ambits remote`
 

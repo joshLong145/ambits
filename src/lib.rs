@@ -27,6 +27,7 @@ pub mod objects;
 pub mod output;
 pub mod parser;
 pub mod remote;
+pub mod report;
 pub mod restore;
 pub mod search;
 pub mod state_dir;
