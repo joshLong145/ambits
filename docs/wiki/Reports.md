@@ -17,6 +17,29 @@ when there is one: its reads keep the content hash they were journaled with,
 and its writes are included even if the logs have since lost them. It writes
 nothing. To have the journal hold everything first, run `cache sync`.
 
+## As a page
+
+`--format html` writes the same document as one self-contained HTML page:
+a summary, the files with each symbol's read depth and the writes that
+touched it, the writes grouped by the commit they landed in, and the trace as
+a timeline with one lane per agent. Open it in any browser; it needs no
+server.
+
+```bash
+ambits -p . report --format html > report.html
+ambits report --format html --from-json screened.json > report.html
+```
+
+`--from-json` renders a document `report` printed earlier, exactly as
+given, without reading any session, log or checkout: build the JSON, screen
+it, then render the screened copy. It takes no `--max-bytes`; cut the JSON
+when it is built.
+
+The page loads nothing. Its Content-Security-Policy is `default-src 'none'`
+with only its own script and stylesheet allowed, by hash, and it shows every
+value from the document as text, never as markup. The tab is in the URL
+(`report.html#writes`), so a link can open one.
+
 ## What it carries, and what it does not
 
 No file contents and no absolute paths: symbol ids, project-relative paths,

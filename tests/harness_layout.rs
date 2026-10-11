@@ -275,3 +275,59 @@ fn the_report_folds_in_writes_already_journaled() {
     let r = report(&l, &[]);
     assert_eq!(r["writes"][0]["symbols"][0]["id"], "src/a.rs::alpha", "the journal's write survives a log that lost it");
 }
+
+fn embedded_report(page: &str) -> Value {
+    let open = "<script id=\"report-data\" type=\"application/json\">";
+    let start = page.find(open).expect("the data element") + open.len();
+    let end = start + page[start..].find("</script>").unwrap();
+    serde_json::from_str(&page[start..end]).expect("the embedded report parses")
+}
+
+fn report_page(l: &Layout, args: &[&str]) -> std::process::Output {
+    let logs = l.logs.to_string_lossy().into_owned();
+    let clone = l.clone.to_string_lossy().into_owned();
+    ambits(&l.clone).args([&["-p", clone.as_str(), "--log-dir", logs.as_str(), "--session", SESSION, "report"], args].concat()).output().unwrap()
+}
+
+#[test]
+fn the_html_report_embeds_the_json_report_under_a_closed_policy() {
+    let l = layout();
+    let out = report_page(&l, &["--format", "html"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let page = String::from_utf8(out.stdout).unwrap();
+    assert!(page.starts_with("<!doctype html>"));
+    assert!(page.contains("default-src 'none'"), "the page must load nothing");
+    assert!(!page.contains("{{"), "a placeholder was left unfilled");
+    let mut embedded = embedded_report(&page);
+    let mut json = report(&l, &[]);
+    for r in [&mut embedded, &mut json] {
+        r["generated_at"] = Value::Null;
+    }
+    assert_eq!(embedded, json);
+}
+
+#[test]
+fn from_json_renders_a_screened_report_without_the_session() {
+    let l = layout();
+    let mut r = report(&l, &[]);
+    r["spans"][0]["detail"] = json!("[REDACTED]");
+    let file = l.logs.with_file_name("screened.json");
+    std::fs::write(&file, r.to_string()).unwrap();
+    std::fs::remove_dir_all(&l.logs).unwrap();
+    let out = ambits(&l.clone).args(["report", "--format", "html", "--from-json", file.to_str().unwrap()]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(embedded_report(&String::from_utf8(out.stdout).unwrap()), r, "rendered exactly as given");
+}
+
+#[test]
+fn from_json_needs_the_html_format_and_takes_no_size_limit() {
+    let l = layout();
+    let file = l.logs.with_file_name("r.json");
+    std::fs::write(&file, report(&l, &[]).to_string()).unwrap();
+    let path = file.to_str().unwrap();
+    let json_out = ambits(&l.clone).args(["report", "--from-json", path]).output().unwrap();
+    assert!(!json_out.status.success());
+    assert!(String::from_utf8_lossy(&json_out.stderr).contains("--format html"));
+    let capped = ambits(&l.clone).args(["report", "--format", "html", "--from-json", path, "--max-bytes", "10"]).output().unwrap();
+    assert!(!capped.status.success(), "--max-bytes cannot apply to a report built elsewhere");
+}

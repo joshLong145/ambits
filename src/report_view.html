@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="{{CSP}}">
+<meta name="referrer" content="no-referrer">
+<title>ambits report</title>
+<style>
+:root {
+  --bg: #fbfbfa; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e3e2de;
+  --accent: #2f5fd0; --d1: #eef1f8; --d2: #d9e1f4; --d3: #b5c6ec; --d4: #7d9be0;
+  --ok: #1f7a4d; --warn: #a15c00; --bad: #b3261e; --prompt: #6d4bc4; --read: #2f5fd0;
+  --write: #c2410c; --delegate: #0f766e; --other: #8a8a84;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #151514; --panel: #1d1d1b; --ink: #ecebe7; --muted: #a3a29c; --line: #34332f;
+    --accent: #7ea2ff; --d1: #22283a; --d2: #2a3552; --d3: #36497a; --d4: #4f6fc0;
+    --ok: #5cc493; --warn: #e3a54a; --bad: #f2867d; --prompt: #b29cf2; --read: #7ea2ff;
+    --write: #f59b6b; --delegate: #4fc7b8; --other: #8f8e88;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #151514; --panel: #1d1d1b; --ink: #ecebe7; --muted: #a3a29c; --line: #34332f;
+  --accent: #7ea2ff; --d1: #22283a; --d2: #2a3552; --d3: #36497a; --d4: #4f6fc0;
+  --ok: #5cc493; --warn: #e3a54a; --bad: #f2867d; --prompt: #b29cf2; --read: #7ea2ff;
+  --write: #f59b6b; --delegate: #4fc7b8; --other: #8f8e88;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+code, .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px; }
+header { padding: 20px 16px 8px; max-width: 1200px; margin: 0 auto; }
+header h1 { font-size: 20px; margin: 0 0 4px; }
+header .meta { color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 16px; }
+nav { position: sticky; top: 0; background: var(--bg); border-bottom: 1px solid var(--line); z-index: 2; }
+nav .inner { max-width: 1200px; margin: 0 auto; padding: 0 16px; display: flex; gap: 4px; overflow-x: auto; }
+nav button { background: none; border: 0; border-bottom: 2px solid transparent; color: var(--muted); padding: 10px 12px; font: inherit; cursor: pointer; white-space: nowrap; }
+nav button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
+main { max-width: 1200px; margin: 0 auto; padding: 16px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; margin-bottom: 18px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.tile .v { font-size: 22px; font-weight: 600; }
+.tile .k { color: var(--muted); font-size: 12px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-bottom: 14px; }
+.card h2 { font-size: 15px; margin: 0 0 8px; }
+.notice { border-left: 3px solid var(--warn); padding: 8px 12px; background: var(--panel); margin-bottom: 14px; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
+.controls input[type="search"] { flex: 1 1 220px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); font: inherit; }
+details.file { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; margin-bottom: 6px; }
+details.file > summary { cursor: pointer; padding: 7px 10px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+details.file > summary .path { flex: 1 1 260px; overflow-wrap: anywhere; }
+.counts { color: var(--muted); font-size: 12px; }
+.sym { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 3px 10px; border-top: 1px solid var(--line); }
+.sym .name { overflow-wrap: anywhere; }
+.sym .kind, .sym .lines { color: var(--muted); font-size: 12px; }
+.chip { display: inline-block; border-radius: 10px; padding: 0 8px; font-size: 11.5px; line-height: 18px; border: 1px solid var(--line); white-space: nowrap; }
+.chip.d1 { background: var(--d1); } .chip.d2 { background: var(--d2); } .chip.d3 { background: var(--d3); } .chip.d4 { background: var(--d4); color: #fff; }
+.chip.current { border-color: var(--ok); color: var(--ok); } .chip.changed { border-color: var(--warn); color: var(--warn); }
+.chip.removed { border-color: var(--bad); color: var(--bad); } .chip.unknown { color: var(--muted); }
+a.chip { text-decoration: none; color: inherit; }
+.bar { height: 6px; width: 90px; background: var(--line); border-radius: 3px; overflow: hidden; display: inline-block; vertical-align: middle; }
+.bar > span { display: block; height: 100%; background: var(--accent); }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 6px 8px; border-top: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
+.scroll { overflow-x: auto; }
+.lanes { position: relative; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 0; margin-bottom: 12px; }
+.lane { position: relative; height: 26px; margin: 2px 0; }
+.lane .label { position: absolute; left: 8px; top: 4px; width: 120px; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lane .track { position: absolute; left: 136px; right: 12px; top: 3px; height: 20px; }
+.span { position: absolute; top: 2px; height: 16px; min-width: 3px; border-radius: 3px; cursor: pointer; border: 0; padding: 0; opacity: .85; }
+.span:hover, .span:focus { opacity: 1; outline: 2px solid var(--ink); }
+.span.prompt { background: var(--prompt); top: 0; height: 20px; opacity: .25; }
+.span.read { background: var(--read); } .span.write { background: var(--write); }
+.span.delegate { background: var(--delegate); } .span.other { background: var(--other); }
+.span.error { outline: 2px solid var(--bad); }
+.instant { position: absolute; top: 0; bottom: 0; width: 0; border-left: 1px dashed var(--muted); }
+.instant.commit { border-left-color: var(--ok); }
+.legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+.calls .row { display: flex; gap: 8px; padding: 3px 8px; border-top: 1px solid var(--line); cursor: pointer; align-items: baseline; }
+.calls .row:hover, .calls .row.sel { background: var(--d1); }
+.calls .row .t { color: var(--muted); font-size: 12px; flex: 0 0 64px; }
+.calls .row .n { overflow-wrap: anywhere; }
+.calls .row.prompt .n { font-weight: 600; }
+.detail { position: sticky; top: 52px; }
+.detail dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 0; }
+.detail dt { color: var(--muted); }
+.detail dd { margin: 0; overflow-wrap: anywhere; }
+.detail pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; max-height: 220px; overflow: auto; }
+.split { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 14px; }
+@media (max-width: 760px) { .split { grid-template-columns: 1fr; } .detail { position: static; } .lane .label { width: 70px; } .lane .track { left: 84px; } }
+.empty { color: var(--muted); padding: 8px 0; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header id="top"></header>
+<nav><div class="inner" role="tablist" id="tabs"></div></nav>
+<main>
+<section id="panel-summary" role="tabpanel"></section>
+<section id="panel-files" role="tabpanel" hidden></section>
+<section id="panel-writes" role="tabpanel" hidden></section>
+<section id="panel-trace" role="tabpanel" hidden></section>
+</main>
+<script id="report-data" type="application/json">{{DATA}}</script>
+<script>
+"use strict";
+(function () {
+  const R = JSON.parse(document.getElementById("report-data").textContent);
+  const DEPTHS = ["unseen", "name_only", "overview", "signature", "full_body"];
+  const DEPTH_LABEL = { name_only: "name", overview: "overview", signature: "signature", full_body: "full" };
+
+  function el(tag, props) {
+    const e = document.createElement(tag);
+    if (props) {
+      for (const [k, v] of Object.entries(props)) {
+        if (v === undefined || v === null || v === false) continue;
+        if (k === "class") e.className = v;
+        else if (k === "text") e.textContent = String(v);
+        else if (k === "on") for (const [ev, fn] of Object.entries(v)) e.addEventListener(ev, fn);
+        else e.setAttribute(k, String(v));
+      }
+    }
+    for (let i = 2; i < arguments.length; i++) {
+      const kid = arguments[i];
+      if (kid === undefined || kid === null || kid === false) continue;
+      if (Array.isArray(kid)) kid.forEach(k => k && e.append(k));
+      else e.append(typeof kid === "object" ? kid : document.createTextNode(String(kid)));
+    }
+    return e;
+  }
+  const short = sha => (sha || "").slice(0, 7);
+  const clock = ms => new Date(ms).toISOString().slice(11, 19);
+  const depthClass = d => "d" + Math.max(0, DEPTHS.indexOf(d));
+  const pct = (a, b) => (b ? Math.round((100 * a) / b) : 0);
+
+  // A subagent goes by what its delegation was for, else its own label.
+  const delegatedAs = new Map(R.spans.filter(x => x.child_agent).map(x => [x.child_agent, x.name.replace(/^[^·]*·\s*/, "")]));
+  const agentName = new Map();
+  R.agents.forEach((a, i) => {
+    const named = delegatedAs.get(a.id) || (a.label && a.label !== a.id ? a.label : "");
+    agentName.set(a.id, a.id === R.session_id ? "main" : (named ? named.slice(0, 48) : "agent " + i));
+  });
+  const nameOf = id => agentName.get(id) || id;
+  const writeByOp = new Map(R.writes.map(w => [w.op, w]));
+  const spanById = new Map(R.spans.map(s => [s.i, s]));
+
+  document.title = (R.project.name || "project") + " · ambits report";
+  document.getElementById("top").append(
+    el("h1", { text: R.project.name || "Session report" }),
+    el("div", { class: "meta" },
+      el("span", null, "session ", el("code", { text: R.session_id })),
+      R.project.head ? el("span", null, "HEAD ", el("code", { text: short(R.project.head) })) : null,
+      el("span", { text: "generated " + R.generated_at }),
+      el("span", { text: "ambits " + R.ambits_version })));
+
+  const panels = { summary: "Summary", files: "Files", writes: "Writes", trace: "Trace" };
+  const tabs = document.getElementById("tabs");
+  function show(id) {
+    for (const key of Object.keys(panels)) {
+      document.getElementById("panel-" + key).hidden = key !== id;
+      tabs.querySelector('[data-tab="' + key + '"]').setAttribute("aria-selected", String(key === id));
+    }
+  }
+  for (const [id, label] of Object.entries(panels)) {
+    tabs.append(el("button", { role: "tab", "data-tab": id, "aria-selected": String(id === "summary"), text: label, on: { click: () => { history.replaceState(null, "", "#" + id); show(id); } } }));
+  }
+  window.addEventListener("hashchange", () => { const id = location.hash.slice(1); if (panels[id]) show(id); });
+  function jumpToWrite(op) {
+    show("writes");
+    const row = document.getElementById("w-" + op);
+    if (row) { row.scrollIntoView({ block: "center" }); row.classList.add("sel"); }
+  }
+
+  // Summary
+  (function () {
+    const t = R.totals;
+    const s = document.getElementById("panel-summary");
+    if (R.truncated.length) {
+      s.append(el("div", { class: "notice", text: "This report was cut to fit a size limit: " + R.truncated.join(", ") + ". Writes and totals are complete." }));
+    }
+    const tile = (v, k) => el("div", { class: "tile" }, el("div", { class: "v", text: v }), el("div", { class: "k", text: k }));
+    s.append(el("div", { class: "tiles" },
+      tile(t.writes, "writes"),
+      tile(t.symbols_written, "symbols written"),
+      tile(pct(t.symbols_read, t.symbols) + "%", "symbols read (" + t.symbols_read + " of " + t.symbols + ")"),
+      tile(t.symbols_read_full, "read in full"),
+      tile(t.files, "files"),
+      tile(t.spans, "tool calls and prompts"),
+      tile(t.agents, "agents")));
+
+    const commits = new Map();
+    for (const w of R.writes) for (const c of (w.landed.commits || [])) commits.set(c, (commits.get(c) || 0) + 1);
+    const subjects = new Map(R.instants.filter(i => i.kind === "commit").map(i => [i.sha, i.subject]));
+    const commitCard = el("div", { class: "card" }, el("h2", { text: "Commits the writes landed in" }));
+    if (!commits.size) commitCard.append(el("div", { class: "empty", text: "No write landed in a commit." }));
+    for (const [sha, n] of commits) {
+      commitCard.append(el("div", null, el("code", { text: short(sha) }), " ", subjects.get(sha) || "", el("span", { class: "counts", text: " · " + n + " write" + (n === 1 ? "" : "s") })));
+    }
+    s.append(commitCard);
+
+    const agents = el("div", { class: "card" }, el("h2", { text: "Agents" }));
+    for (const a of R.agents) {
+      const calls = R.spans.filter(x => x.agent === a.id && x.kind !== "prompt").length;
+      agents.append(el("div", null, el("strong", { text: nameOf(a.id) }), " ", el("code", { class: "counts", text: a.id }),
+        a.parent ? el("span", { class: "counts", text: " · started by " + nameOf(a.parent) }) : null,
+        el("span", { class: "counts", text: " · " + calls + " calls" })));
+    }
+    s.append(agents);
+
+    const top = R.files.filter(f => f.symbols_written > 0).sort((a, b) => b.symbols_written - a.symbols_written).slice(0, 10);
+    const filesCard = el("div", { class: "card" }, el("h2", { text: "Most-written files" }));
+    if (!top.length) filesCard.append(el("div", { class: "empty", text: "No symbol-level writes." }));
+    top.forEach(f => filesCard.append(el("div", null, el("code", { text: f.path }), el("span", { class: "counts", text: " · " + f.symbols_written + " symbols written, " + f.symbols_read + " read" }))));
+    s.append(filesCard);
+  })();
+
+  // Files
+  (function () {
+    const s = document.getElementById("panel-files");
+    const query = el("input", { type: "search", placeholder: "Filter files and symbols", "aria-label": "Filter files and symbols" });
+    const activeOnly = el("input", { type: "checkbox", id: "active-only", checked: "checked" });
+    s.append(el("div", { class: "controls" }, query, el("label", null, activeOnly, " only files something read or wrote")),
+      el("div", { class: "legend" }, "read depth:", ...["name_only", "overview", "signature", "full_body"].map(d => el("span", { class: "chip " + depthClass(d), text: DEPTH_LABEL[d] }))));
+    const list = el("div");
+    s.append(list);
+
+    function symbolRow(sym) {
+      const reads = Object.entries(sym.reads).map(([agent, d]) => el("span", { class: "chip " + depthClass(d), title: nameOf(agent) + ": " + d, text: nameOf(agent) + " · " + DEPTH_LABEL[d] }));
+      const writes = sym.writes.map(op => {
+        const w = writeByOp.get(op);
+        const st = w ? ((w.symbols.find(x => x.id === sym.id) || {}).status || (w.removed.includes(sym.id) ? "removed" : "unknown")) : "unknown";
+        const created = w && w.created.includes(sym.id);
+        return el("a", { class: "chip " + st, href: "#w-" + op, title: (w ? w.tool + " at " + w.time : op) + " · now " + st,
+          text: (created ? "created" : "written") + " · " + st, on: { click: ev => { ev.preventDefault(); jumpToWrite(op); } } });
+      });
+      const row = el("div", { class: "sym" },
+        el("span", { style: null, class: "name mono", text: sym.name }),
+        el("span", { class: "kind", text: sym.kind }),
+        el("span", { class: "lines", text: "L" + sym.lines[0] + "–" + sym.lines[1] }), ...reads, ...writes);
+      row.style.paddingLeft = (10 + 16 * sym.level) + "px";
+      return row;
+    }
+
+    function render() {
+      const q = query.value.trim().toLowerCase();
+      list.replaceChildren();
+      let shown = 0;
+      for (const f of R.files) {
+        const active = f.symbols_read > 0 || f.symbols_written > 0 || R.writes.some(w => w.file === f.path);
+        if (activeOnly.checked && !active) continue;
+        const syms = q ? f.symbols.filter(x => x.id.toLowerCase().includes(q)) : f.symbols;
+        if (q && !f.path.toLowerCase().includes(q) && !syms.length) continue;
+        shown++;
+        const d = el("details", { class: "file" },
+          el("summary", null,
+            el("span", { class: "path mono", text: f.path }),
+            el("span", { class: "counts", text: f.symbols_read + "/" + f.total_symbols + " read · " + f.symbols_written + " written" }),
+            el("span", { class: "bar", title: pct(f.symbols_read, f.total_symbols) + "% read" }, (() => { const b = el("span"); b.style.width = pct(f.symbols_read, f.total_symbols) + "%"; return b; })())));
+        if (f.symbols_written > 0 || q) d.open = true;
+        if (!f.symbols.length) d.append(el("div", { class: "sym counts", text: f.total_symbols ? "Symbols not listed for this file." : "No symbols in this file." }));
+        syms.forEach(x => d.append(symbolRow(x)));
+        list.append(d);
+      }
+      if (!shown) list.append(el("div", { class: "empty", text: "No files match." }));
+    }
+    query.addEventListener("input", render);
+    activeOnly.addEventListener("change", render);
+    render();
+  })();
+
+  // Writes
+  (function () {
+    const s = document.getElementById("panel-writes");
+    if (!R.writes.length) { s.append(el("div", { class: "empty", text: "This session wrote nothing." })); return; }
+    const groups = new Map();
+    for (const w of R.writes) {
+      const key = (w.landed.commits && w.landed.commits.length) ? w.landed.commits.join(" ") : w.landed.state;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(w);
+    }
+    const subjects = new Map(R.instants.filter(i => i.kind === "commit").map(i => [i.sha, i.subject]));
+    const stateText = { verified: "verified", unverified: "not verified", partial: "partly verified", uncommitted: "not committed", no_repository: "no repository" };
+    for (const [key, ws] of groups) {
+      const state = ws[0].landed.state;
+      const title = ws[0].landed.commits && ws[0].landed.commits.length
+        ? ws[0].landed.commits.map(c => short(c) + (subjects.get(c) ? " " + subjects.get(c) : "")).join(", ")
+        : stateText[state] || state;
+      const table = el("table", null, el("thead", null, el("tr", null, ...["Time", "Agent", "Tool", "File", "Symbols", "File now"].map(h => el("th", { text: h })))));
+      const body = el("tbody");
+      for (const w of ws) {
+        const syms = w.symbols.map(x => el("span", { class: "chip " + x.status, title: x.id, text: x.id.split("::").pop() + (w.created.includes(x.id) ? " (new)" : "") + " · " + x.status }));
+        const removed = w.removed.map(id => el("span", { class: "chip removed", title: id, text: id.split("::").pop() + " · deleted" }));
+        body.append(el("tr", { id: "w-" + w.op },
+          el("td", { class: "mono", text: w.time.slice(11, 19) || w.time }),
+          el("td", { text: nameOf(w.agent) }),
+          el("td", { text: w.tool }),
+          el("td", { class: "mono", text: w.file }),
+          el("td", null, ...syms, ...removed, w.level === "file" ? el("span", { class: "chip unknown", text: "whole file" }) : null, w.outside_symbols ? el("span", { class: "chip unknown", text: "outside symbols" }) : null),
+          el("td", null, el("span", { class: "chip " + w.status, text: w.status }))));
+      }
+      table.append(body);
+      s.append(el("div", { class: "card" }, el("h2", null, key === state ? title : "Commit " + title, el("span", { class: "counts", text: " · " + (stateText[state] || state) + " · " + ws.length + " write" + (ws.length === 1 ? "" : "s") })), el("div", { class: "scroll" }, table)));
+    }
+  })();
+
+  // Trace
+  (function () {
+    const s = document.getElementById("panel-trace");
+    if (!R.spans.length) { s.append(el("div", { class: "empty", text: "No tool calls." })); return; }
+    const ends = R.spans.map(x => x.end_ms || x.start_ms);
+    const t0 = Math.min(...R.spans.map(x => x.start_ms));
+    const t1 = Math.max(t0 + 1, ...ends, ...R.instants.map(i => i.t_ms));
+    const at = t => (100 * (t - t0)) / (t1 - t0);
+
+    s.append(el("div", { class: "legend" }, ...["prompt", "read", "write", "delegate", "other"].map(k => {
+      const sw = el("i", { class: "span " + k }); sw.style.position = "static";
+      return el("span", null, sw, k);
+    }), el("span", { text: clock(t0) + " → " + clock(t1) })));
+
+    const detail = el("div", { class: "card detail" }, el("div", { class: "empty", text: "Select a call to see it here." }));
+    const lanes = el("div", { class: "lanes" });
+    const order = R.agents.map(a => a.id);
+    R.spans.forEach(x => { if (!order.includes(x.agent)) order.push(x.agent); });
+    const select = new Map();
+
+    function showDetail(x) {
+      const rows = [["Kind", x.kind + (x.depth ? " · " + x.depth : "")], ["Tool", x.tool], ["Agent", nameOf(x.agent)],
+        ["When", clock(x.start_ms) + (x.end_ms ? " · " + (x.end_ms - x.start_ms) + " ms" : " · no result")],
+        ["File", x.file], ["Symbol", x.symbol], ["Started", x.child_agent ? nameOf(x.child_agent) : null], ["Error", x.message]];
+      const dl = el("dl");
+      for (const [k, v] of rows) if (v) dl.append(el("dt", { text: k }), el("dd", { class: k === "File" || k === "Symbol" ? "mono" : null, text: v }));
+      if (x.detail) dl.append(el("dt", { text: "Detail" }), el("dd", null, el("pre", { class: "mono", text: x.detail })));
+      if (x.read_count) {
+        const reads = x.read.length ? x.read.map(([id, d]) => el("div", null, el("span", { class: "chip " + depthClass(d), text: DEPTH_LABEL[d] }), " ", el("code", { text: id }))) : [el("div", { class: "counts", text: x.read_count + " symbols (list cut for size)" })];
+        dl.append(el("dt", { text: "Read" }), el("dd", null, ...reads));
+      }
+      const w = R.writes.find(w => w.span === x.i);
+      if (w) dl.append(el("dt", { text: "Write" }), el("dd", null, el("a", { href: "#w-" + w.op, class: "chip " + w.status, text: "see write · " + w.status, on: { click: ev => { ev.preventDefault(); jumpToWrite(w.op); } } })));
+      detail.replaceChildren(el("h2", { text: x.name }), dl);
+      select.forEach((nodes, i) => nodes.forEach(n => n.classList.toggle("sel", i === x.i)));
+    }
+
+    for (const agent of order) {
+      const track = el("div", { class: "track" });
+      for (const x of R.spans.filter(x => x.agent === agent)) {
+        const b = el("button", { class: "span " + x.kind + (x.error ? " error" : ""), title: x.name, "aria-label": x.name, on: { click: () => showDetail(x) } });
+        b.style.left = at(x.start_ms) + "%";
+        b.style.width = Math.max(0.25, at(x.end_ms || x.start_ms) - at(x.start_ms)) + "%";
+        track.append(b);
+        select.set(x.i, [b]);
+      }
+      for (const i of R.instants.filter(i => i.agent === null || i.agent === agent)) {
+        const m = el("div", { class: "instant " + i.kind, title: i.kind + (i.sha ? " " + short(i.sha) : "") + (i.subject ? " " + i.subject : "") + " at " + clock(i.t_ms) });
+        m.style.left = at(i.t_ms) + "%";
+        track.append(m);
+      }
+      lanes.append(el("div", { class: "lane" }, el("div", { class: "label", title: agent, text: nameOf(agent) }), track));
+    }
+
+    const level = x => { let n = 0, p = x.parent; while (p !== null && p !== undefined && spanById.has(p) && n < 32) { n++; p = spanById.get(p).parent; } return n; };
+    const calls = el("div", { class: "card calls" }, el("h2", { text: "Calls" }));
+    for (const x of [...R.spans].sort((a, b) => a.start_ms - b.start_ms || a.i - b.i)) {
+      const row = el("div", { class: "row " + x.kind, tabindex: "0", on: { click: () => showDetail(x), keydown: ev => { if (ev.key === "Enter") showDetail(x); } } },
+        el("span", { class: "t mono", text: clock(x.start_ms) }),
+        el("span", { class: "chip", text: x.kind }),
+        el("span", { class: "n", text: x.name }));
+      row.style.paddingLeft = (8 + 16 * level(x)) + "px";
+      calls.append(row);
+      select.get(x.i).push(row);
+    }
+    s.append(lanes, el("div", { class: "split" }, calls, detail));
+  })();
+
+  const start = location.hash.slice(1);
+  if (panels[start]) show(start);
+})();
+</script>
+</body>
+</html>

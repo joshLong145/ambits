@@ -393,9 +393,18 @@ enum Commands {
     /// every symbol, and every write with its status and the commit it
     /// landed in. Reads the journal when one exists; never writes it.
     Report {
+        #[arg(long, value_enum, default_value = "json")]
+        format: ReportFormat,
+
+        /// Render this JSON report, which `report` printed earlier, instead
+        /// of building one: no session, logs or checkout are read. For a
+        /// harness that screens the JSON before publishing it.
+        #[arg(long)]
+        from_json: Option<PathBuf>,
+
         /// Cut the document until it fits in this many bytes; what was cut
         /// is listed in its `truncated` field.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_json")]
         max_bytes: Option<usize>,
     },
 
@@ -754,6 +763,14 @@ enum CacheCommands {
         #[arg(long, value_enum, default_value = "text")]
         format: CacheSyncFormat,
     },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum ReportFormat {
+    /// The schema-versioned document, on one line.
+    Json,
+    /// One self-contained page: no network, its own script only.
+    Html,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -1438,6 +1455,15 @@ fn run() -> Result<()> {
         return ambits::touched::run(&project_path, target, matches!(format, TouchedFormat::Json));
     }
 
+    if let Some(Commands::Report { format, from_json: Some(path), .. }) = &command {
+        if *format != ReportFormat::Html {
+            color_eyre::eyre::bail!("--from-json renders a report; pass --format html");
+        }
+        let json = std::fs::read_to_string(path).map_err(|e| color_eyre::eyre::eyre!("{}: {e}", path.display()))?;
+        write!(io::stdout().lock(), "{}", ambits::report::render_html(&json)?)?;
+        return Ok(());
+    }
+
     if let Some(Commands::Cache { command }) = &command {
         match command {
             CacheCommands::Status => return ambits::cache::status(&project_path),
@@ -1698,7 +1724,7 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(Commands::Report { max_bytes }) = &command {
+    if let Some(Commands::Report { format, max_bytes, .. }) = &command {
         report_warnings(&config_warnings);
         let session = require_session(session_id.as_deref(), "report on")?.to_string();
         if log_dir.as_ref().is_none_or(|d| ingester.session_log_files(d, &session).is_empty()) {
@@ -1730,7 +1756,12 @@ fn run() -> Result<()> {
         if let Some(max) = max_bytes {
             ambits::report::fit(&mut report, *max)?;
         }
-        writeln!(io::stdout().lock(), "{}", serde_json::to_string(&report)?)?;
+        let json = serde_json::to_string(&report)?;
+        let out = &mut io::stdout().lock();
+        match format {
+            ReportFormat::Json => writeln!(out, "{json}")?,
+            ReportFormat::Html => write!(out, "{}", ambits::report::render_html(&json)?)?,
+        }
         return Ok(());
     }
 

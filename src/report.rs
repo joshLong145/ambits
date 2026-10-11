@@ -398,3 +398,112 @@ pub fn fit(report: &mut Report, max_bytes: usize) -> Result<()> {
     Ok(())
 }
 
+
+const VIEW: &str = include_str!("report_view.html");
+
+/// The report page for `json`, a document `report` printed: one HTML file
+/// that loads nothing and runs only its own script, the document embedded.
+pub fn render_html(json: &str) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|e| color_eyre::eyre::eyre!("not a JSON report: {e}"))?;
+    match value.get("schema_version").and_then(serde_json::Value::as_u64) {
+        Some(v) if v == u64::from(SCHEMA_VERSION) => {}
+        other => color_eyre::eyre::bail!("not an ambits report of schema version {SCHEMA_VERSION} (found {other:?})"),
+    }
+    let csp = format!(
+        "default-src 'none'; script-src '{}'; style-src '{}'; img-src data:; base-uri 'none'; form-action 'none'",
+        csp_hash(inline(VIEW, "<script>")),
+        csp_hash(inline(VIEW, "<style>")),
+    );
+    let data = embeddable(&serde_json::to_string(&value)?);
+    Ok(VIEW.replacen("{{CSP}}", &csp, 1).replacen("{{DATA}}", &data, 1))
+}
+
+/// The text between `open` and the next closing tag of the same element.
+fn inline<'a>(page: &'a str, open: &str) -> &'a str {
+    let name: String = open[1..].chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+    let close = format!("</{name}>");
+    let start = page.find(open).expect("the template has the element") + open.len();
+    let end = start + page[start..].find(&close).expect("the element is closed");
+    &page[start..end]
+}
+
+fn csp_hash(text: &str) -> String {
+    use sha2::Digest as _;
+    format!("sha256-{}", base64(&sha2::Sha256::digest(text.as_bytes())))
+}
+
+/// JSON safe inside a `<script>` element: nothing in it can close the
+/// element or open a comment, and JavaScript reads it unchanged. Outside
+/// strings JSON has none of these characters, so escaping is always valid.
+fn embeddable(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        match c {
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | u32::from(*chunk.get(2).unwrap_or(&0));
+        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            out.push(if i <= chunk.len() { ALPHABET[(n >> shift) as usize & 63] as char } else { '=' });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal(detail: &str) -> String {
+        serde_json::json!({"schema_version": SCHEMA_VERSION, "session_id": "s", "detail": detail}).to_string()
+    }
+
+    #[test]
+    fn base64_matches_the_standard_padding() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn the_policy_allows_exactly_the_pages_own_script_and_style() {
+        let page = render_html(&minimal("x")).unwrap();
+        let script = csp_hash(inline(&page, "<script>"));
+        let style = csp_hash(inline(&page, "<style>"));
+        assert!(page.contains(&format!("script-src '{script}'")), "the script hash is stale");
+        assert!(page.contains(&format!("style-src '{style}'")), "the style hash is stale");
+        assert!(page.contains("default-src 'none'"));
+    }
+
+    #[test]
+    fn data_cannot_close_its_script_element() {
+        let hostile = "</script><script>alert(1)</script><!-- \u{2028} & >";
+        let page = render_html(&minimal(hostile)).unwrap();
+        assert_eq!(page.matches("</script>").count(), 2, "only the template's own two elements close");
+        assert!(!page.contains("<!--"));
+        let embedded = inline(&page, "<script id=\"report-data\" type=\"application/json\">");
+        let back: serde_json::Value = serde_json::from_str(embedded).unwrap();
+        assert_eq!(back["detail"], hostile, "the escaped JSON parses back to the same text");
+    }
+
+    #[test]
+    fn only_a_report_of_this_schema_is_rendered() {
+        assert!(render_html("not json").is_err());
+        assert!(render_html(r#"{"schema_version": 99}"#).is_err());
+        assert!(render_html(r#"{"session_id": "s"}"#).is_err());
+    }
+}
