@@ -47,7 +47,8 @@ fn layout() -> Layout {
             merge(base("2026-10-10T10:00:00.000Z"), json!({"type": "user", "message": {"role": "user", "content": "## Runtime Context\n\n- Issue: X-1"}})),
             merge(base("2026-10-10T10:00:01.000Z"), json!({"type": "assistant", "message": {"role": "assistant", "content": [
                 {"type": "tool_use", "id": "toolu_r", "name": "Read", "input": {"file_path": file}}]}})),
-            merge(base("2026-10-10T10:00:01.200Z"), json!({"type": "user", "toolUseResult": {},
+            merge(base("2026-10-10T10:00:01.200Z"), json!({"type": "user",
+                "toolUseResult": {"type": "text", "file": {"filePath": file, "content": before, "startLine": 1}},
                 "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_r", "content": "ok"}]}})),
             merge(base("2026-10-10T10:00:02.000Z"), json!({"type": "assistant", "message": {"role": "assistant", "content": [
                 {"type": "tool_use", "id": "toolu_e", "name": "Edit", "input": {"file_path": file, "old_string": "fn alpha() {}", "new_string": "fn alpha() { let _x = 1; }"}}]}})),
@@ -242,7 +243,8 @@ fn the_report_carries_no_absolute_path() {
     let l = layout();
     let text = report(&l, &[]).to_string();
     let root = l.clone.parent().unwrap().to_string_lossy().into_owned();
-    // A call's own description is the one field that may name a path.
+    // A call's own description is the one field that may name a path; its
+    // path arguments are made project-relative.
     let without_details: Value = {
         let mut r: Value = serde_json::from_str(&text).unwrap();
         for s in r["spans"].as_array_mut().unwrap() {
@@ -258,7 +260,7 @@ fn max_bytes_cuts_in_order_and_says_so() {
     let l = layout();
     let full = report(&l, &[]);
     let r = report(&l, &["--max-bytes", "10"]);
-    assert_eq!(r["truncated"], json!(["unwritten_file_symbols", "span_reads", "other_spans"]));
+    assert_eq!(r["truncated"], json!(["unwritten_file_symbols", "read_text", "span_reads", "arguments", "diffs", "other_spans"]));
     assert_eq!(r["writes"], full["writes"], "writes are never cut");
     let read = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Read").unwrap();
     assert_eq!((read["read"].clone(), read["read_count"].clone()), (json!([]), json!(2)));
@@ -330,4 +332,36 @@ fn from_json_needs_the_html_format_and_takes_no_size_limit() {
     assert!(String::from_utf8_lossy(&json_out.stderr).contains("--format html"));
     let capped = ambits(&l.clone).args(["report", "--format", "html", "--from-json", path, "--max-bytes", "10"]).output().unwrap();
     assert!(!capped.status.success(), "--max-bytes cannot apply to a report built elsewhere");
+}
+
+#[test]
+fn an_edit_span_carries_its_arguments_and_the_tools_own_patch() {
+    let l = layout();
+    let r = report(&l, &[]);
+    let edit = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Edit").unwrap();
+    let file_path = edit["args"].as_array().unwrap().iter().find(|a| a["key"] == "file_path").unwrap();
+    assert_eq!(file_path["value"], "src/a.rs", "a path argument inside the project is relative");
+    let new_string = edit["args"].as_array().unwrap().iter().find(|a| a["key"] == "new_string").unwrap();
+    assert_eq!(new_string["bulk"], true, "file contents an argument wrote are summed up, not repeated");
+    assert_eq!(
+        edit["content"],
+        json!({"type": "change", "exact": true, "cut": 0, "hunks": [{"old_start": 1, "new_start": 1,
+            "lines": [["-", "fn alpha() {}"], ["+", "fn alpha() { let _x = 1; }"]]}]})
+    );
+}
+
+#[test]
+fn a_read_span_carries_the_text_it_returned() {
+    let l = layout();
+    let r = report(&l, &[]);
+    let read = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Read").unwrap();
+    assert_eq!(read["content"], json!({"type": "read", "start": 1, "lines": ["fn alpha() {}", "", "fn beta() {}"], "cut": 0}));
+}
+
+#[test]
+fn a_prompt_span_carries_no_call_content() {
+    let l = layout();
+    let r = report(&l, &[]);
+    let prompt = r["spans"].as_array().unwrap().iter().find(|s| s["kind"] == "prompt").unwrap();
+    assert_eq!((prompt["args"].clone(), prompt["content"].clone()), (json!([]), Value::Null));
 }

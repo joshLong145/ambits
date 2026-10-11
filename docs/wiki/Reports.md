@@ -22,7 +22,9 @@ nothing. To have the journal hold everything first, run `cache sync`.
 `--format html` writes the same document as one self-contained HTML page:
 a summary, the files with each symbol's read depth and the writes that
 touched it, the writes grouped by the commit they landed in, and the trace as
-a timeline with one lane per agent. Open it in any browser; it needs no
+a timeline with one lane per agent above every call. A call expands in place
+when clicked, as in the TUI: its arguments, and the change it made or the
+text it read, with line numbers. Open it in any browser; it needs no
 server.
 
 ```bash
@@ -38,14 +40,19 @@ when it is built.
 The page loads nothing. Its Content-Security-Policy is `default-src 'none'`
 with only its own script and stylesheet allowed, by hash, and it shows every
 value from the document as text, never as markup. The tab is in the URL
-(`report.html#writes`), so a link can open one.
+(`report.html#writes`), and `#trace:<span id>` opens one call.
 
-## What it carries, and what it does not
+## What it carries
 
-No file contents and no absolute paths: symbol ids, project-relative paths,
-and the project directory's name. It does carry what the session logs said
-about each call (a shell command, the first line of a prompt, an error
-message), so screen it for secrets before publishing it.
+Everything the session's logs said about each call except its output: its
+arguments, the diff of every write, and the text every read returned, as
+the [TUI's call view](TUI) shows them. A report is therefore as sensitive
+as the transcript itself. It holds file contents, and a command or a call's
+description says whatever it said, secrets included, so screen it before
+publishing it. Unlike a [snapshot](Snapshots), which never holds contents.
+
+Files are named by project-relative path, path arguments included, and the
+project by its directory's name, never its path.
 
 ## Fields
 
@@ -68,7 +75,20 @@ A span: `i` (its id, which `parent` and a write's `span` refer to), `parent`,
 `name`, `detail`, `file`, `symbol`, `start_ms`, `end_ms` (`null` while it had
 no result), `error`, `message`, `depth` (for a read), `read` (the symbols it
 was credited with, each with its depth), `read_count`, `child_agent` (for a
-delegation).
+delegation), `args` and `content`.
+
+`args` lists the call's arguments as `key`, `value` and `bulk`; a `bulk`
+argument held file contents the call wrote and is summed up (`8 lines · in
+the change below`), since `content` shows them. `content` is `null`, or:
+
+- `{"type": "change", "exact", "cut", "hunks"}` for a write: each hunk's
+  `old_start`, `new_start` and `lines` as `[op, text]` with `op` one of ` `,
+  `+`, `-`. `exact` when the hunks are the tool's own patch; otherwise they
+  are what the call asked for and carry no line numbers.
+- `{"type": "read", "start", "lines", "cut"}` for a read: the text it
+  returned, its first line numbered `start`.
+
+`cut` counts lines left out past the TUI's limit of 5000 per call.
 
 A symbol, under its file: `id`, `name`, `kind` (the language's word: `fn`,
 `class`, `def`), `level` (0 for top level), `lines` (1-based, inclusive),
@@ -87,8 +107,11 @@ with its `status`), `created`, `removed`, `status` for the whole file
 cut in `truncated`:
 
 1. `unwritten_file_symbols`: the symbol lists of files nothing wrote.
-2. `span_reads`: every span's `read` list; `read_count` stays.
-3. `other_spans`: spans that neither read, wrote nor delegated.
+2. `read_text`: the text reads returned.
+3. `span_reads`: every span's `read` list; `read_count` stays.
+4. `arguments`: every call's `args`.
+5. `diffs`: every write's `content`.
+6. `other_spans`: spans that neither read, wrote nor delegated.
 
 Writes, totals and the remaining spans are never cut, so a report can still
 exceed the limit.

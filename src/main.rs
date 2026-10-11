@@ -1743,6 +1743,14 @@ fn run() -> Result<()> {
         if let Some((start, end)) = app.trace.range() {
             app.trace.set_commits(&ambits::git::commits_between(&project_path, start, end));
         }
+        let wanted: std::collections::HashMap<String, ambits::ingest::content::ContentKind> = app
+            .trace
+            .spans()
+            .iter()
+            .filter_map(|s| Some((s.id.as_deref()?.to_string(), ambits::report::content_kind(s.kind)?)))
+            .collect();
+        let log_files = log_dir.as_ref().map(|d| ingester.session_log_files(d, &session)).unwrap_or_default();
+        let details = ingester.call_details(&log_files, &wanted);
         let mut report = ambits::report::build(ambits::report::Inputs {
             project_root: &project_path,
             session_id: &session,
@@ -1752,6 +1760,7 @@ fn run() -> Result<()> {
             agents: &app.agent_tree,
             writes: writes.into_values().collect(),
             registry: &registry,
+            details,
         })?;
         if let Some(max) = max_bytes {
             ambits::report::fit(&mut report, *max)?;

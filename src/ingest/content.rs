@@ -1,7 +1,9 @@
 //! What a call read or wrote, as its agent's log recorded it: a write's
 //! change as diff hunks, a read's text with its line numbers, anything
-//! else's output. For display only — loaded on demand, held in memory, and
-//! never written anywhere (spec §9.6).
+//! else's output. Loaded on demand for display and held in memory; the one
+//! place it is written is a report (`ambits report`), which embeds the
+//! arguments, changes and reads but not output. Never into the journal or
+//! a snapshot (spec §9.6).
 
 use std::borrow::Cow;
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -726,10 +727,55 @@ pub fn call_detail(files: &[PathBuf], id: &str, kind: ContentKind) -> Option<Cal
     if input.is_none() && result.is_none() {
         return None;
     }
-    Some(CallDetail {
-        args: input.as_ref().map(super::content::args).unwrap_or_default(),
-        content: build_content(kind, input.as_ref(), result.as_ref().map(|r| (r.content.as_ref().unwrap_or(&Value::Null), r.detail.as_ref(), r.is_error))),
-    })
+    Some(assemble_detail(kind, input.as_ref(), result.as_ref()))
+}
+
+/// [`call_detail`] for every call in `wanted` at once, in one pass over
+/// `files`: a call the logs have neither half of is absent. For display
+/// only, as `call_detail` is.
+pub fn call_details(files: &[PathBuf], wanted: &HashMap<String, ContentKind>) -> HashMap<String, CallDetail> {
+    let mut inputs: HashMap<String, Value> = HashMap::new();
+    let mut results: HashMap<String, ToolResult> = HashMap::new();
+    let mut buf = Vec::new();
+    for path in files {
+        let Ok(file) = fs::File::open(path) else { continue };
+        let mut reader = BufReader::new(file);
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let Ok(line) = std::str::from_utf8(&buf) else { continue };
+            if !line.contains("\"tool_use") && !line.contains("\"tool_result") {
+                continue;
+            }
+            let Ok(mut obj) = serde_json::from_str::<Value>(line) else { continue };
+            if let Some(Value::Array(blocks)) = obj.pointer_mut("/message/content") {
+                for block in blocks.iter_mut().filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use")) {
+                    let Some(id) = block.get("id").and_then(Value::as_str).filter(|id| wanted.contains_key(*id)).map(str::to_string) else { continue };
+                    if let Some(input) = block.get_mut("input").map(Value::take) {
+                        inputs.entry(id).or_insert(input);
+                    }
+                }
+            }
+            for r in parse_tool_results(&mut obj).into_iter().filter(|r| wanted.contains_key(&*r.tool_use_id)) {
+                results.entry(r.tool_use_id.to_string()).or_insert(r);
+            }
+        }
+    }
+    wanted
+        .iter()
+        .filter(|(id, _)| inputs.contains_key(*id) || results.contains_key(*id))
+        .map(|(id, kind)| (id.clone(), assemble_detail(*kind, inputs.get(id), results.get(id))))
+        .collect()
+}
+
+fn assemble_detail(kind: ContentKind, input: Option<&Value>, result: Option<&ToolResult>) -> CallDetail {
+    CallDetail {
+        args: input.map(super::content::args).unwrap_or_default(),
+        content: build_content(kind, input, result.map(|r| (r.content.as_ref().unwrap_or(&Value::Null), r.detail.as_ref(), r.is_error))),
+    }
 }
 
 /// A call's content from its input and its result (content, `toolUseResult`
@@ -1615,6 +1661,9 @@ impl SessionIngester for ClaudeIngester {
     fn call_detail(&self, files: &[PathBuf], id: &str, kind: ContentKind) -> Option<CallDetail> {
         call_detail(files, id, kind)
     }
+    fn call_details(&self, files: &[PathBuf], wanted: &HashMap<String, ContentKind>) -> HashMap<String, CallDetail> {
+        call_details(files, wanted)
+    }
     fn calling_agent(&self, log_dir: &Path, session_id: &str, args: &[String]) -> Caller {
         calling_agent(log_dir, session_id, args)
     }
@@ -1724,6 +1773,38 @@ mod tests {
         let got = call_detail(&[log], "toolu_1", ContentKind::Other).unwrap();
         assert_eq!(got.content, Some(CallContent::Output { lines: vec!["a".into(), "b".into()], cut: 0 }));
         assert_eq!((got.args[0].key.as_str(), got.args[0].value.as_str()), ("command", "ls"), "with its arguments");
+    }
+
+    /// One pass for many calls finds what one lookup per call does.
+    #[test]
+    fn call_details_agrees_with_call_detail_for_every_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let call = |id: &str, name: &str, input: &str| format!(r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"{name}","input":{input}}}]}}}}"#);
+        let result = |id: &str, content: &str, detail: &str| format!(r#"{{"type":"user","toolUseResult":{detail},"message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","content":{content}}}]}}}}"#);
+        let both = r#"{"type":"user","toolUseResult":{"type":"text","file":{"filePath":"/p/b.rs","content":"B","startLine":1}},"message":{"content":[{"type":"tool_result","tool_use_id":"a","content":"1\tA"},{"type":"tool_result","tool_use_id":"b","content":"1\tB"}]}}"#;
+        let lines = [
+            call("e", "Edit", r#"{"file_path":"/p/a.rs","old_string":"x","new_string":"y"}"#),
+            result("e", r#""ok""#, r#"{"structuredPatch":[{"oldStart":3,"oldLines":1,"newStart":3,"newLines":1,"lines":["-x","+y"]}]}"#),
+            call("r", "Read", r#"{"file_path":"/p/a.rs"}"#),
+            result("r", r#""40\tfn a() {}""#, r#"{"type":"text","file":{"filePath":"/p/a.rs","content":"fn a() {}","startLine":40}}"#),
+            call("c", "Bash", r#"{"command":"ls"}"#),
+            result("c", r#"[{"type":"text","text":"a\nb"}]"#, "null"),
+            call("a", "Read", r#"{"file_path":"/p/a.rs"}"#),
+            call("b", "Read", r#"{"file_path":"/p/b.rs"}"#),
+            both.to_string(),
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let wanted: HashMap<String, ContentKind> = [("e", ContentKind::Write), ("r", ContentKind::Read), ("c", ContentKind::Other), ("a", ContentKind::Read), ("b", ContentKind::Read), ("absent", ContentKind::Read)]
+            .into_iter()
+            .map(|(id, k)| (id.to_string(), k))
+            .collect();
+        let files = [path];
+        let batch = call_details(&files, &wanted);
+        for (id, kind) in &wanted {
+            assert_eq!(batch.get(id), call_detail(&files, id, *kind).as_ref(), "{id}");
+        }
+        assert!(!batch.contains_key("absent"));
     }
 
     /// Convenience: unwrap `ParsedLine::Events` for tests that don't care about clear detection.

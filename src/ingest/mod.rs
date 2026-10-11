@@ -335,11 +335,22 @@ pub trait SessionIngester: Send + Sync {
     }
 
     /// Call `id`'s arguments and what it read or wrote, from the session's
-    /// log `files`, for display only: never persisted (spec §9.6).
+    /// log `files`: for display, or a report, never the journal or a
+    /// snapshot (spec §9.6).
     /// Default: not available.
     fn call_detail(&self, files: &[PathBuf], id: &str, kind: content::ContentKind) -> Option<content::CallDetail> {
         let _ = (files, id, kind);
         None
+    }
+
+    /// [`Self::call_detail`] for every call in `wanted`, keyed by id; a call
+    /// the logs have nothing for is absent. Default: one call at a time.
+    fn call_details(
+        &self,
+        files: &[PathBuf],
+        wanted: &std::collections::HashMap<String, content::ContentKind>,
+    ) -> std::collections::HashMap<String, content::CallDetail> {
+        wanted.iter().filter_map(|(id, kind)| Some((id.clone(), self.call_detail(files, id, *kind)?))).collect()
     }
 }
 

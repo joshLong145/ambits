@@ -79,18 +79,31 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
 .instant.commit { border-left-color: var(--ok); }
 .legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
 .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
-.calls .row { display: flex; gap: 8px; padding: 3px 8px; border-top: 1px solid var(--line); cursor: pointer; align-items: baseline; }
+.calls .row { scroll-margin-top: 56px; display: flex; gap: 8px; padding: 3px 8px; border-top: 1px solid var(--line); cursor: pointer; align-items: baseline; }
 .calls .row:hover, .calls .row.sel { background: var(--d1); }
 .calls .row .t { color: var(--muted); font-size: 12px; flex: 0 0 64px; }
 .calls .row .n { overflow-wrap: anywhere; }
 .calls .row.prompt .n { font-weight: 600; }
-.detail { position: sticky; top: 52px; }
-.detail dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 0; }
-.detail dt { color: var(--muted); }
-.detail dd { margin: 0; overflow-wrap: anywhere; }
-.detail pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; max-height: 220px; overflow: auto; }
-.split { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 14px; }
-@media (max-width: 760px) { .split { grid-template-columns: 1fr; } .detail { position: static; } .lane .label { width: 70px; } .lane .track { left: 84px; } }
+.expand { padding: 8px 12px 12px; border-top: 1px dashed var(--line); background: var(--bg); }
+.expand dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 12px; margin: 0; }
+.expand dt { color: var(--muted); }
+.expand dd { margin: 0; overflow-wrap: anywhere; min-width: 0; }
+.expand pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; max-height: 220px; overflow: auto; }
+.span.sel { outline: 2px solid var(--ink); opacity: 1; }
+.code { border: 1px solid var(--line); border-radius: 6px; overflow: auto; max-height: 480px; margin-top: 4px; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; line-height: 1.5; }
+.code .ln { display: grid; grid-template-columns: 3.5em 3.5em 1.2em 1fr; white-space: pre; }
+.code.read .ln { grid-template-columns: 4em 1fr; }
+.code .no { color: var(--muted); text-align: right; padding-right: 8px; user-select: none; }
+.code .op { color: var(--muted); user-select: none; }
+.code .ln.add { background: color-mix(in srgb, var(--ok) 16%, transparent); }
+.code .ln.del { background: color-mix(in srgb, var(--bad) 16%, transparent); }
+.code .hunk { color: var(--muted); padding: 2px 8px; border-top: 1px solid var(--line); background: var(--bg); }
+.code .hunk:first-child { border-top: 0; }
+.args { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; }
+.args .k { color: var(--muted); }
+.args .v { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; max-height: 160px; overflow: auto; }
+.args .v.bulk { color: var(--muted); font-style: italic; }
+@media (max-width: 760px) { .expand dl { grid-template-columns: 1fr; } .lane .label { width: 70px; } .lane .track { left: 84px; } }
 .empty { color: var(--muted); padding: 8px 0; }
 [hidden] { display: none !important; }
 </style>
@@ -145,6 +158,7 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
   });
   const nameOf = id => agentName.get(id) || id;
   const writeByOp = new Map(R.writes.map(w => [w.op, w]));
+  let openSpan = () => {};
   const spanById = new Map(R.spans.map(s => [s.i, s]));
 
   document.title = (R.project.name || "project") + " · ambits report";
@@ -167,7 +181,13 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
   for (const [id, label] of Object.entries(panels)) {
     tabs.append(el("button", { role: "tab", "data-tab": id, "aria-selected": String(id === "summary"), text: label, on: { click: () => { history.replaceState(null, "", "#" + id); show(id); } } }));
   }
-  window.addEventListener("hashchange", () => { const id = location.hash.slice(1); if (panels[id]) show(id); });
+  // `#files`, `#writes`, `#trace`, or `#trace:<span id>` for one call.
+  function route() {
+    const [id, arg] = location.hash.slice(1).split(":");
+    if (id === "trace" && arg !== undefined && /^\d+$/.test(arg)) openSpan(Number(arg));
+    else if (panels[id]) show(id);
+  }
+  window.addEventListener("hashchange", route);
   function jumpToWrite(op) {
     show("writes");
     const row = document.getElementById("w-" + op);
@@ -320,13 +340,12 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
       return el("span", null, sw, k);
     }), el("span", { text: clock(t0) + " → " + clock(t1) })));
 
-    const detail = el("div", { class: "card detail" }, el("div", { class: "empty", text: "Select a call to see it here." }));
     const lanes = el("div", { class: "lanes" });
     const order = R.agents.map(a => a.id);
     R.spans.forEach(x => { if (!order.includes(x.agent)) order.push(x.agent); });
     const select = new Map();
 
-    function showDetail(x) {
+    function detailOf(x) {
       const rows = [["Kind", x.kind + (x.depth ? " · " + x.depth : "")], ["Tool", x.tool], ["Agent", nameOf(x.agent)],
         ["When", clock(x.start_ms) + (x.end_ms ? " · " + (x.end_ms - x.start_ms) + " ms" : " · no result")],
         ["File", x.file], ["Symbol", x.symbol], ["Started", x.child_agent ? nameOf(x.child_agent) : null], ["Error", x.message]];
@@ -337,20 +356,64 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
         const reads = x.read.length ? x.read.map(([id, d]) => el("div", null, el("span", { class: "chip " + depthClass(d), text: DEPTH_LABEL[d] }), " ", el("code", { text: id }))) : [el("div", { class: "counts", text: x.read_count + " symbols (list cut for size)" })];
         dl.append(el("dt", { text: "Read" }), el("dd", null, ...reads));
       }
+      if (x.args.length) {
+        const args = el("div", { class: "args" });
+        for (const a of x.args) args.append(el("span", { class: "k mono", text: a.key }), el("pre", { class: "v mono" + (a.bulk ? " bulk" : ""), text: a.value }));
+        dl.append(el("dt", { text: "Arguments" }), el("dd", null, args));
+      }
+      if (x.content) dl.append(el("dt", { text: x.content.type === "change" ? "Change" : "Read" }), el("dd", null, contentView(x.content)));
       const w = R.writes.find(w => w.span === x.i);
       if (w) dl.append(el("dt", { text: "Write" }), el("dd", null, el("a", { href: "#w-" + w.op, class: "chip " + w.status, text: "see write · " + w.status, on: { click: ev => { ev.preventDefault(); jumpToWrite(w.op); } } })));
-      detail.replaceChildren(el("h2", { text: x.name }), dl);
-      select.forEach((nodes, i) => nodes.forEach(n => n.classList.toggle("sel", i === x.i)));
+      return el("div", { class: "expand" }, dl);
+    }
+
+    // A call's details open under its row, as the TUI expands a call; built
+    // when first opened, so a large session costs nothing until it is read.
+    function toggle(x, open) {
+      const nodes = select.get(x.i);
+      const wanted = open === undefined ? !nodes.box : open;
+      if (wanted && !nodes.box) {
+        nodes.box = detailOf(x);
+        nodes.row.after(nodes.box);
+      } else if (!wanted && nodes.box) {
+        nodes.box.remove();
+        nodes.box = null;
+      }
+      nodes.row.setAttribute("aria-expanded", String(Boolean(nodes.box)));
+      nodes.row.classList.toggle("sel", Boolean(nodes.box));
+      nodes.bar.classList.toggle("sel", Boolean(nodes.box));
+    }
+    const reveal = x => { toggle(x, true); select.get(x.i).row.scrollIntoView({ block: "start" }); };
+
+    function contentView(c) {
+      const box = el("div", { class: "code " + c.type });
+      const cell = (cls, text) => el("span", { class: cls, text: text });
+      if (c.type === "read") {
+        c.lines.forEach((line, n) => box.append(el("div", { class: "ln" }, cell("no", c.start + n), cell("t", line))));
+      } else {
+        for (const h of c.hunks) {
+          if (c.exact && h.old_start !== null) box.append(el("div", { class: "hunk", text: "@@ -" + h.old_start + " +" + h.new_start + " @@" }));
+          let oldNo = h.old_start, newNo = h.new_start;
+          for (const [op, line] of h.lines) {
+            const o = op === "+" ? "" : (oldNo === null ? "" : oldNo++);
+            const n = op === "-" ? "" : (newNo === null ? "" : newNo++);
+            box.append(el("div", { class: "ln" + (op === "+" ? " add" : op === "-" ? " del" : "") }, cell("no", o), cell("no", n), cell("op", op), cell("t", line)));
+          }
+        }
+        if (!c.exact) box.prepend(el("div", { class: "hunk", text: "as the call asked; the tool recorded no patch" }));
+      }
+      if (c.cut) box.append(el("div", { class: "hunk", text: "… " + c.cut + " more lines left out" }));
+      return box;
     }
 
     for (const agent of order) {
       const track = el("div", { class: "track" });
       for (const x of R.spans.filter(x => x.agent === agent)) {
-        const b = el("button", { class: "span " + x.kind + (x.error ? " error" : ""), title: x.name, "aria-label": x.name, on: { click: () => showDetail(x) } });
+        const b = el("button", { class: "span " + x.kind + (x.error ? " error" : ""), title: x.name, "aria-label": x.name, on: { click: () => reveal(x) } });
         b.style.left = at(x.start_ms) + "%";
         b.style.width = Math.max(0.25, at(x.end_ms || x.start_ms) - at(x.start_ms)) + "%";
         track.append(b);
-        select.set(x.i, [b]);
+        select.set(x.i, { bar: b, row: null, box: null });
       }
       for (const i of R.instants.filter(i => i.agent === null || i.agent === agent)) {
         const m = el("div", { class: "instant " + i.kind, title: i.kind + (i.sha ? " " + short(i.sha) : "") + (i.subject ? " " + i.subject : "") + " at " + clock(i.t_ms) });
@@ -363,19 +426,19 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
     const level = x => { let n = 0, p = x.parent; while (p !== null && p !== undefined && spanById.has(p) && n < 32) { n++; p = spanById.get(p).parent; } return n; };
     const calls = el("div", { class: "card calls" }, el("h2", { text: "Calls" }));
     for (const x of [...R.spans].sort((a, b) => a.start_ms - b.start_ms || a.i - b.i)) {
-      const row = el("div", { class: "row " + x.kind, tabindex: "0", on: { click: () => showDetail(x), keydown: ev => { if (ev.key === "Enter") showDetail(x); } } },
+      const row = el("div", { class: "row " + x.kind, tabindex: "0", role: "button", "aria-expanded": "false", on: { click: () => toggle(x), keydown: ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggle(x); } } } },
         el("span", { class: "t mono", text: clock(x.start_ms) }),
         el("span", { class: "chip", text: x.kind }),
         el("span", { class: "n", text: x.name }));
       row.style.paddingLeft = (8 + 16 * level(x)) + "px";
       calls.append(row);
-      select.get(x.i).push(row);
+      select.get(x.i).row = row;
     }
-    s.append(lanes, el("div", { class: "split" }, calls, detail));
+    s.append(lanes, calls);
+    openSpan = i => { const x = spanById.get(i); if (x) { show("trace"); reveal(x); } };
   })();
 
-  const start = location.hash.slice(1);
-  if (panels[start]) show(start);
+  route();
 })();
 </script>
 </body>

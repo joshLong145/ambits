@@ -3,11 +3,14 @@
 //! which commit it landed in. Built for a viewer that has neither the logs
 //! nor the checkout, so everything it shows is in the document.
 //!
-//! Like a snapshot (spec §9.6) it carries no file contents and no absolute
-//! paths: symbol ids, project-relative paths, the project directory's name.
-//! It does carry what the session logs said about each call — a shell
-//! command, the first line of a prompt, an error message — which a harness
-//! that publishes it should screen for secrets first.
+//! It names files by project-relative path, path arguments included, and
+//! the project by its directory's name; a command or a call's description
+//! still says whatever path it said. Unlike a snapshot (spec §9.6) it
+//! does carry file contents, as the session logs recorded them: each call's
+//! arguments, every write's diff, and the text every read returned, besides
+//! what the logs said of each call (a shell command, a prompt's first line,
+//! an error). A report is as sensitive as the session's transcript, and a
+//! harness that publishes one should screen it for secrets first.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -15,6 +18,7 @@ use std::path::Path;
 use color_eyre::eyre::Result;
 use serde::Serialize;
 
+use crate::ingest::content::{CallContent, CallDetail, ContentKind, DiffLine};
 use crate::journal::DepthDto;
 use crate::linkage::{Landed, Resolver};
 use crate::parser::ParserRegistry;
@@ -106,6 +110,39 @@ pub struct SpanDto {
     pub read_count: usize,
     /// For a delegation, the agent it started.
     pub child_agent: Option<String>,
+    /// Its arguments as the log recorded them; file contents it wrote are
+    /// summed up here, since `content` shows them.
+    pub args: Vec<ArgDto>,
+    /// What it wrote or read, as the log recorded it.
+    pub content: Option<ContentDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ArgDto {
+    pub key: String,
+    pub value: String,
+    /// Holds file contents the call wrote, summed up in `value`.
+    pub bulk: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentDto {
+    /// A write's change. `exact` when the hunks are the tool's own patch,
+    /// with line numbers; else what the call asked for. `cut` lines were
+    /// left out.
+    Change { exact: bool, cut: usize, hunks: Vec<HunkDto> },
+    /// The text a read returned, its first line numbered `start`; `cut`
+    /// lines were left out.
+    Read { start: u32, lines: Vec<String>, cut: usize },
+}
+
+#[derive(Debug, Serialize)]
+pub struct HunkDto {
+    pub old_start: Option<u32>,
+    pub new_start: Option<u32>,
+    /// Each line as `[op, text]`, `op` one of ` `, `+`, `-`.
+    pub lines: Vec<(&'static str, String)>,
 }
 
 #[derive(Debug, Serialize)]
@@ -186,13 +223,26 @@ pub struct Inputs<'a> {
     pub agents: &'a AgentTree,
     pub writes: Vec<WriteRecord>,
     pub registry: &'a ParserRegistry,
+    /// Each call's arguments and content, by `tool_use_id`.
+    pub details: HashMap<String, CallDetail>,
+}
+
+/// What `content` each span kind carries, as the TUI loads it; `None` for a
+/// prompt, which has no call.
+pub fn content_kind(kind: SpanKind) -> Option<ContentKind> {
+    match kind {
+        SpanKind::Read(_) => Some(ContentKind::Read),
+        SpanKind::Write => Some(ContentKind::Write),
+        SpanKind::Delegate | SpanKind::Other => Some(ContentKind::Other),
+        SpanKind::Prompt => None,
+    }
 }
 
 /// The report for `inputs`, before any size limit.
 pub fn build(inputs: Inputs<'_>) -> Result<Report> {
-    let Inputs { project_root, session_id, tree, ledger, trace, agents, writes, registry } = inputs;
+    let Inputs { project_root, session_id, tree, ledger, trace, agents, writes, registry, details } = inputs;
 
-    let spans = spans(trace);
+    let spans = spans(trace, &details, project_root);
     let span_of_op: HashMap<&str, usize> =
         trace.spans().iter().enumerate().filter_map(|(i, s)| Some((s.id.as_deref()?, i))).collect();
 
@@ -312,7 +362,20 @@ pub fn build(inputs: Inputs<'_>) -> Result<Report> {
     })
 }
 
-fn spans(trace: &Trace) -> Vec<SpanDto> {
+/// Arguments that name a file; one inside the project is shown relative to
+/// it, as every other path in the report is.
+const PATH_ARGS: &[&str] = &["file_path", "notebook_path", "path", "relative_path"];
+
+fn arg_value(key: &str, value: &str, project_root: &Path) -> String {
+    if !PATH_ARGS.contains(&key) {
+        return value.to_string();
+    }
+    Path::new(value)
+        .strip_prefix(project_root)
+        .map_or_else(|_| value.to_string(), |rel| crate::objects::normalize_path(&rel.to_string_lossy()))
+}
+
+fn spans(trace: &Trace, details: &HashMap<String, CallDetail>, project_root: &Path) -> Vec<SpanDto> {
     let mut parent: HashMap<usize, usize> = HashMap::new();
     fn walk(node: &Node, parent: &mut HashMap<usize, usize>) {
         for child in &node.children {
@@ -354,8 +417,43 @@ fn spans(trace: &Trace) -> Vec<SpanDto> {
             read: s.read.iter().map(|(id, d)| (id.clone(), DepthDto::from(*d))).collect(),
             read_count: s.read.len(),
             child_agent: s.child_agent.as_deref().map(str::to_string),
+            args: s
+                .id
+                .as_deref()
+                .and_then(|id| details.get(id))
+                .map(|d| d.args.iter().map(|a| ArgDto { key: a.key.clone(), value: arg_value(&a.key, &a.value, project_root), bulk: a.bulk }).collect())
+                .unwrap_or_default(),
+            content: s.id.as_deref().and_then(|id| details.get(id)).and_then(|d| d.content.as_ref()).and_then(content),
         })
         .collect()
+}
+
+/// A call's content for the report; a call's output is not carried.
+fn content(c: &CallContent) -> Option<ContentDto> {
+    match c {
+        CallContent::Change { hunks, exact, cut } => Some(ContentDto::Change {
+            exact: *exact,
+            cut: *cut,
+            hunks: hunks
+                .iter()
+                .map(|h| HunkDto {
+                    old_start: h.old_start,
+                    new_start: h.new_start,
+                    lines: h
+                        .lines
+                        .iter()
+                        .map(|l| match l {
+                            DiffLine::Same(t) => (" ", t.clone()),
+                            DiffLine::Added(t) => ("+", t.clone()),
+                            DiffLine::Removed(t) => ("-", t.clone()),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }),
+        CallContent::Read { start, lines, cut } => Some(ContentDto::Read { start: *start, lines: lines.clone(), cut: *cut }),
+        CallContent::Output { .. } => None,
+    }
 }
 
 fn instant(i: &crate::trace::Instant) -> InstantDto {
@@ -368,36 +466,33 @@ fn instant(i: &crate::trace::Instant) -> InstantDto {
 }
 
 /// Cut `report` until its JSON fits in `max_bytes`, recording each cut in
-/// `truncated`: first the symbol lists of files nothing wrote, then every
-/// span's list of symbols read (its `read_count` stays), then the spans that
-/// neither read nor wrote. Writes, totals and the remaining spans are never
-/// cut, so a report can still exceed the limit; the caller sees `truncated`.
+/// `truncated`, in this order: the symbol lists of files nothing wrote;
+/// the text reads returned; every span's list of symbols read (its
+/// `read_count` stays); every call's arguments; every write's diff; the
+/// spans that neither read, wrote nor delegated. Writes, totals and the
+/// remaining spans are never cut, so a report can still exceed the limit;
+/// the caller sees `truncated`.
 pub fn fit(report: &mut Report, max_bytes: usize) -> Result<()> {
+    type Cut = fn(&mut Report);
+    let cuts: [(&'static str, Cut); 6] = [
+        ("unwritten_file_symbols", |r| r.files.iter_mut().filter(|f| f.symbols_written == 0).for_each(|f| f.symbols.clear())),
+        ("read_text", |r| r.spans.iter_mut().filter(|s| matches!(s.content, Some(ContentDto::Read { .. }))).for_each(|s| s.content = None)),
+        ("span_reads", |r| r.spans.iter_mut().for_each(|s| s.read.clear())),
+        ("arguments", |r| r.spans.iter_mut().for_each(|s| s.args.clear())),
+        ("diffs", |r| r.spans.iter_mut().for_each(|s| s.content = None)),
+        // Ids stay as they are, so `parent` and a write's `span` still resolve.
+        ("other_spans", |r| r.spans.retain(|s| matches!(s.kind, "prompt" | "read" | "write" | "delegate"))),
+    ];
     let size = |r: &Report| serde_json::to_vec(r).map(|v| v.len());
-    if size(report)? <= max_bytes {
-        return Ok(());
+    for (name, cut) in cuts {
+        if size(report)? <= max_bytes {
+            break;
+        }
+        cut(report);
+        report.truncated.push(name);
     }
-    for file in report.files.iter_mut().filter(|f| f.symbols_written == 0) {
-        file.symbols.clear();
-    }
-    report.truncated.push("unwritten_file_symbols");
-    if size(report)? <= max_bytes {
-        return Ok(());
-    }
-    for span in &mut report.spans {
-        span.read.clear();
-    }
-    report.truncated.push("span_reads");
-    if size(report)? <= max_bytes {
-        return Ok(());
-    }
-    // Ids stay as they are, so `parent` and a write's `span` still resolve.
-    let keep = |s: &SpanDto| matches!(s.kind, "prompt" | "read" | "write" | "delegate");
-    report.spans.retain(keep);
-    report.truncated.push("other_spans");
     Ok(())
 }
-
 
 const VIEW: &str = include_str!("report_view.html");
 
