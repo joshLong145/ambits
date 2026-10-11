@@ -369,11 +369,14 @@ impl App {
                 "no session id resolved; coverage journaling disabled".to_string()
             ];
         };
-        // A switch to the current session retired its own writer, which still
-        // holds the journal's lock. Late writes reach the new writer instead,
-        // since `record_write` finds a journal by session.
+        // A switch to the current session retired its own writer, which holds
+        // the journal's lock: take it back rather than reopen, since a lock
+        // dropped here can outlive the drop in a child mid-spawn.
         if self.retired_journal.as_ref().is_some_and(|j| j.session_id() == session_id) {
-            self.retired_journal = None;
+            let journal = self.retired_journal.take().expect("checked above");
+            let warnings = journal.warnings().to_vec();
+            self.journal = Some(journal);
+            return warnings;
         }
         let journal = crate::journal::Journal::open(
             &self.project_root,

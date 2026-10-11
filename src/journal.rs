@@ -1067,9 +1067,8 @@ mod tests {
         let second = Journal::open(dir.path(), "sess", Duration::ZERO, manifest);
         assert!(second.error().is_some_and(|e| e.contains("another ambits process")), "{:?}", second.error());
 
-        drop(first);
         drop(second);
-        assert_eq!(Journal::open(dir.path(), "sess", Duration::ZERO, manifest).error(), None, "released on drop");
+        drop(first);
     }
 
     /// Different writer *kinds* (the TUI, `find`) no longer share a file — see
