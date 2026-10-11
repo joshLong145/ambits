@@ -2818,7 +2818,7 @@ mod write_tests {
         assert_eq!(calling_agent(dir.path(), "s", &args), Caller::Agent { id: "s".into(), parent: None }, "the main agent");
 
         let spawn = serde_json::json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t9", "name": "Agent", "input": {"prompt": "x"}}]}}).to_string();
-        session_logs(dir.path(), &[], &[("a1", 1, "t0", &[spawn.clone()]), ("a2", 2, "t9", std::slice::from_ref(&running))]);
+        session_logs(dir.path(), &[], &[("a1", 1, "t0", std::slice::from_ref(&spawn)), ("a2", 2, "t9", std::slice::from_ref(&running))]);
         assert_eq!(calling_agent(dir.path(), "s", &args), Caller::Agent { id: "a2".into(), parent: Some("a1".into()) }, "started by a subagent");
 
         session_logs(dir.path(), std::slice::from_ref(&running), &[("a1", 1, "t0", std::slice::from_ref(&running))]);
