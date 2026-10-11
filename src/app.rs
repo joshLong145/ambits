@@ -369,6 +369,12 @@ impl App {
                 "no session id resolved; coverage journaling disabled".to_string()
             ];
         };
+        // A switch to the current session retired its own writer, which still
+        // holds the journal's lock. Late writes reach the new writer instead,
+        // since `record_write` finds a journal by session.
+        if self.retired_journal.as_ref().is_some_and(|j| j.session_id() == session_id) {
+            self.retired_journal = None;
+        }
         let journal = crate::journal::Journal::open(
             &self.project_root,
             &session_id,
@@ -384,7 +390,10 @@ impl App {
                 )
             },
         );
-        let warnings = journal.warnings().to_vec();
+        let mut warnings = journal.warnings().to_vec();
+        if let Some(error) = journal.error() {
+            warnings.push(format!("coverage journaling disabled: {error}"));
+        }
         self.journal = Some(journal);
         warnings
     }
@@ -3830,6 +3839,21 @@ mod write_tests {
         app.record_write("a", record("toolu_a"));
         assert!(journaled(dir.path(), "a").writes.contains_key("toolu_a"));
         assert!(journaled(dir.path(), "b").writes.is_empty());
+    }
+
+    /// Re-attaching the current session retires its own writer, which still
+    /// holds the journal's lock; journaling must resume rather than be refused.
+    #[test]
+    fn switching_to_the_current_session_keeps_journaling_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = journaling_app(dir.path(), std::time::Duration::ZERO);
+        switch(&mut app, "a");
+        assert_eq!(app.journal.as_ref().and_then(|j| j.error()), None);
+        app.process_agent_event(tool_call("Read", "src/a.rs", ReadDepth::FullBody));
+        app.sync_journal();
+        app.record_write("a", record("toolu_a"));
+        assert!(journaled(dir.path(), "a").reads.contains_key("src/a.rs::f"));
+        assert!(journaled(dir.path(), "a").writes.contains_key("toolu_a"));
     }
 
     #[test]

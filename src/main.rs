@@ -389,7 +389,7 @@ enum Commands {
         format: CallersFormat,
     },
 
-    /// Inspect or remove the coverage journals under .ambits/coverage.
+    /// Inspect, remove or build the coverage journals under .ambits/coverage.
     Cache {
         #[command(subcommand)]
         command: CacheCommands,
@@ -735,6 +735,23 @@ enum CacheCommands {
         #[arg(long)]
         all: bool,
     },
+
+    /// Bring the session's journal up to date from its logs, as the TUI would
+    /// on launch, then exit: every read, and every write attributed to the
+    /// symbols it changed. For runs with no terminal; fails while a TUI has
+    /// the session's journal open.
+    Sync {
+        #[arg(long, value_enum, default_value = "text")]
+        format: CacheSyncFormat,
+    },
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum CacheSyncFormat {
+    /// One line: the journal's path and what it now holds.
+    Text,
+    /// Schema-versioned JSON on a single line.
+    Json,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -1412,12 +1429,14 @@ fn run() -> Result<()> {
     }
 
     if let Some(Commands::Cache { command }) = &command {
-        return match command {
-            CacheCommands::Status => ambits::cache::status(&project_path),
+        match command {
+            CacheCommands::Status => return ambits::cache::status(&project_path),
             CacheCommands::Clear { session, all } => {
-                ambits::cache::clear(&project_path, session.as_deref(), *all)
+                return ambits::cache::clear(&project_path, session.as_deref(), *all);
             }
-        };
+            // Needs the scanned tree and the session, so it is dispatched below.
+            CacheCommands::Sync { .. } => {}
+        }
     }
 
     let registry = ParserRegistry::new();
@@ -1608,11 +1627,8 @@ fn run() -> Result<()> {
 
         match outcome {
             Ok(outcome) => {
-                // Neither dialect journals its own reads — the TUI is the sole
-                // journal writer (see journal.rs's module doc). A search run
-                // with no TUI attached to the session earns no coverage credit;
-                // that is an accepted trade for never having two processes able
-                // to write the same session's journal.
+                // Neither dialect journals its own reads (see journal.rs's
+                // module doc, "One writer").
                 if outcome.matched {
                     return Ok(());
                 }
@@ -1669,6 +1685,52 @@ fn run() -> Result<()> {
             require_clean: *require_clean,
         })?;
         ambits::objects::snapshot::print_outcome(&mut io::stdout().lock(), &outcome)?;
+        return Ok(());
+    }
+
+    if let Some(Commands::Cache { command: CacheCommands::Sync { format } }) = &command {
+        report_warnings(&config_warnings);
+        if !journal_enabled {
+            color_eyre::eyre::bail!("cache sync writes the journal, which --no-journal or `[cache] enabled = false` turns off");
+        }
+        let session = require_session(session_id.as_deref(), "sync")?.to_string();
+        if log_dir.as_ref().is_none_or(|d| ingester.session_log_files(d, &session).is_empty()) {
+            color_eyre::eyre::bail!("no logs for session {session}: pass --log-dir, or run inside a project with Claude Code logs");
+        }
+        let (mut app, _) = replayed_app(project_tree, &project_path, filter, &session_id, &log_dir, &*ingester);
+        attach_journal(&mut app, journal_settings(cli.serena, Some(0)));
+        for (write_session, event) in app.take_pending_writes() {
+            if let Some(record) = ambits::writes::build_record(&event, &project_path, &registry, !cli.serena) {
+                app.record_write(&write_session, record);
+            }
+        }
+        app.sync_journal();
+        let journal = app.journal.as_ref().ok_or_else(|| color_eyre::eyre::eyre!("no journal was opened for session {session}"))?;
+        if let Some(error) = journal.error() {
+            color_eyre::eyre::bail!("cannot write the journal: {error}");
+        }
+        let held = ambits::journal::read_journal_session(&ambits::journal::journal_dir(&project_path), &session);
+        let out = &mut io::stdout().lock();
+        match format {
+            CacheSyncFormat::Text => writeln!(
+                out,
+                "journal {}: {} symbols read, {} writes",
+                journal.path().display(),
+                held.reads.len(),
+                held.writes.len()
+            )?,
+            CacheSyncFormat::Json => writeln!(
+                out,
+                "{}",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "session_id": session,
+                    "journal": journal.path(),
+                    "symbols_read": held.reads.len(),
+                    "writes": held.writes.len(),
+                })
+            )?,
+        }
         return Ok(());
     }
 
@@ -1744,50 +1806,14 @@ fn run() -> Result<()> {
     // terminal swallowing input with the panic message painted on an alternate
     // screen nobody would ever see again.
 
-    let mut app = App::new(project_tree, project_path.clone());
+    let (mut app, handoff) = replayed_app(project_tree, &project_path, filter, &session_id, &log_dir, &*ingester);
     app.set_editor_template(editor_template);
-    app.filter = filter.map(Arc::new);
-    app.set_session_id(session_id.clone());
-    app.session_slug = log_dir.as_ref()
-        .zip(session_id.as_ref())
-        .and_then(|(ld, sid)| ingester.session_slug(ld, sid));
-
-    // Pre-populate the ledger from existing session logs. The tailer the TUI
-    // starts later continues exactly where this stops.
-    let mut handoff = ingest::Handoff::default();
-    if let (Some(ref log_dir), Some(ref session_id)) = (&log_dir, &session_id) {
-        let log_files = ingester.session_log_files(log_dir, session_id);
-        handoff = tui::replay_session(&mut app, &*ingester, log_files, &project_path);
-    }
 
     let serena_mode = cli.serena;
 
-    // Journal the session: fold the journal into the replayed ledger, then
-    // open it for appending. The replay above rebuilt *which* symbols were
-    // read but stamped each with the hash it has now, so nothing looks
-    // drifted; only the journal knows what they looked like at the time. And
-    // `Journal::open` seeds its dedup map from what is on disk, so the sync
-    // appends only genuinely new reads — which keeps relaunching idempotent.
     // CLI flags win over the `[cache]` stanza in tools.toml.
     if journal_enabled {
-        app.set_journal_settings(Some(ambits::app::JournalSettings {
-            backend: if serena_mode { "serena" } else { "tree-sitter" },
-            interval: std::time::Duration::from_millis(
-                cli.flush_interval_ms
-                    .or(cache_cfg.flush_interval_ms)
-                    .unwrap_or(ambits::journal::DEFAULT_FLUSH_INTERVAL_MS),
-            ),
-        }));
-        let attach = app.attach_journal();
-        if let Some(stats) = attach.rehydrated {
-            if stats.drifted > 0 || stats.inserted > 0 || stats.moved > 0 {
-                ambits::try_eprintln!(
-                    "[ambit] rehydrated from journal: {} corrected, {} recovered, {} moved, {} stale",
-                    stats.corrected, stats.inserted, stats.moved, stats.drifted
-                );
-            }
-        }
-        report_warnings(attach.warnings);
+        attach_journal(&mut app, journal_settings(serena_mode, cli.flush_interval_ms.or(cache_cfg.flush_interval_ms)));
     }
 
     // Terminal setup, as late as possible. The guard restores it on every
@@ -1816,6 +1842,57 @@ fn run() -> Result<()> {
     terminal.show_cursor()?;
 
     result
+}
+
+/// A session's `App`: the tree, with every log the session has on disk
+/// replayed into its ledger, and where a tailer would continue from.
+fn replayed_app(
+    project_tree: ambits::symbols::ProjectTree,
+    project_path: &Path,
+    filter: Option<PathFilter>,
+    session_id: &Option<String>,
+    log_dir: &Option<PathBuf>,
+    ingester: &dyn SessionIngester,
+) -> (App, ingest::Handoff) {
+    let mut app = App::new(project_tree, project_path.to_path_buf());
+    app.filter = filter.map(Arc::new);
+    app.set_session_id(session_id.clone());
+    app.session_slug = log_dir.as_ref()
+        .zip(session_id.as_ref())
+        .and_then(|(ld, sid)| ingester.session_slug(ld, sid));
+    let mut handoff = ingest::Handoff::default();
+    if let (Some(log_dir), Some(session_id)) = (log_dir, session_id) {
+        let log_files = ingester.session_log_files(log_dir, session_id);
+        handoff = tui::replay_session(&mut app, ingester, log_files, project_path);
+    }
+    (app, handoff)
+}
+
+fn journal_settings(serena: bool, flush_interval_ms: Option<u64>) -> ambits::app::JournalSettings {
+    ambits::app::JournalSettings {
+        backend: if serena { "serena" } else { "tree-sitter" },
+        interval: Duration::from_millis(flush_interval_ms.unwrap_or(ambits::journal::DEFAULT_FLUSH_INTERVAL_MS)),
+    }
+}
+
+/// Journal the replayed session: fold its journal into the ledger, then open
+/// it for appending. The replay rebuilt *which* symbols were read but stamped
+/// each with the hash it has now, so nothing looks drifted; only the journal
+/// knows what they looked like at the time. `Journal::open` seeds its dedup
+/// map from what is on disk, so the sync appends only genuinely new reads,
+/// which keeps relaunching idempotent.
+fn attach_journal(app: &mut App, settings: ambits::app::JournalSettings) {
+    app.set_journal_settings(Some(settings));
+    let attach = app.attach_journal();
+    if let Some(stats) = attach.rehydrated {
+        if stats.drifted > 0 || stats.inserted > 0 || stats.moved > 0 {
+            ambits::try_eprintln!(
+                "[ambit] rehydrated from journal: {} corrected, {} recovered, {} moved, {} stale",
+                stats.corrected, stats.inserted, stats.moved, stats.drifted
+            );
+        }
+    }
+    report_warnings(attach.warnings);
 }
 
 /// Put the terminal back the way it was found.

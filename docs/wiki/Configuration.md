@@ -7,9 +7,20 @@ While the [TUI](TUI) runs it maintains an append-only NDJSON record at
 including the content hash the symbol had at the time. This is what lets
 `restore-context` answer after the fact, and it survives restarts.
 
-The TUI is the only writer: a search or `show` run with no TUI attached to the
-session earns no coverage credit. That is a deliberate trade for never needing
-two processes to reason about writing the same journal.
+A search or `show` writes no journal itself. Where no TUI runs, such as an
+agent harness on a CI runner or in a container, `cache sync` builds the same
+journal after the fact: it replays the session's logs exactly as the TUI does
+at launch, journals every read and every write, and exits.
+
+```bash
+ambits -p <clone> --log-dir <logs> -s <session> --state-dir <dir> cache sync --format json
+# {"journal":"…/coverage/<session>.ndjson","schema_version":1,"session_id":"…","symbols_read":12,"writes":3}
+```
+
+A replayed read is stamped with the symbol's content as it is when the sync
+runs, so run it before the checkout changes further. Running it again appends
+only what is new. One process writes a session's journal at a time: while the
+TUI has it open, `cache sync` fails rather than writing alongside it.
 
 ```bash
 ambits -p . cache status              # journals on disk, size and age

@@ -25,7 +25,7 @@ collects them in one place.
 | `ambits -p <path> gc` | Delete [unreachable snapshot objects](Snapshots#garbage-collection) |
 | `ambits -p <path> --coverage` | [Coverage report](Coverage-and-Multi-Agent) |
 | `ambits -p <path> --dump` | Print the symbol tree |
-| `ambits -p <path> cache status\|clear` | Inspect or remove [read journals](Configuration#the-read-journal) |
+| `ambits -p <path> cache status\|clear\|sync` | Inspect, remove or [build without a TUI](Configuration#the-read-journal) read journals |
 | `ambits hook install` | Register the post-compaction hook |
 | `ambits skill install` | Install the Claude Code skill |
 
@@ -160,6 +160,7 @@ and 90 days.
 | `cache status` | Journals on disk, with size and age |
 | `cache clear --session <ID>` | Delete one session's journal |
 | `cache clear --all` | Delete every journal for this project |
+| `cache sync [--format text\|json]` | Journal the session from its logs, as the TUI does at launch, and exit |
 
 ## `ambits hook install`
 

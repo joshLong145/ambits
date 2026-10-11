@@ -103,5 +103,5 @@ since the hook would then run for every repository.
 Not seen: changes made while resolving a merge conflict (merge commits list
 none), and files whose names contain `:` or `\`.
 
-Writes are journaled by the [TUI](TUI), like reads — see
+Writes are journaled like reads, by the [TUI](TUI) or by `cache sync` — see
 [Configuration → The read journal](Configuration#the-read-journal).

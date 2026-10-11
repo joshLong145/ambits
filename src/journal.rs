@@ -61,23 +61,21 @@
 //!
 //! ## One writer
 //!
-//! The TUI is the *only* process that ever opens a journal for writing.
-//! `ambits find` briefly was a second writer — it showed source too, so it
-//! seemed fair for it to record what it showed — first sharing the primary
-//! file under an `O_APPEND` safety net, then (once that stopped feeling
-//! sound to lean on as the only guarantee) writing its own shard,
-//! `<session>.find.ndjson`, so the two processes never touched the same file
-//! at all. Both were real fixes to a real problem, but they were fixing the
-//! wrong layer: the actual goal was never "make two writers safe," it was
-//! "never need to ask whether two writers are safe." `find` no longer writes
-//! to the journal. A search run with no TUI attached to the session earns no
-//! coverage credit — an accepted, deliberate trade. Re-deriving credit from
-//! the session log after the fact was considered and rejected: replaying a
-//! `find` command and re-running its search would stamp *today's* file
-//! content against a read that happened whenever the TUI's tailer catches up
-//! to it, which is exactly the "vacuous comparison" this journal exists to
-//! avoid (see "Why this exists," above) — the very failure mode a `find`-only
-//! journal write was supposed to prevent in the first place.
+//! A session's primary journal has one writer at a time, and the file lock
+//! [`Journal::open`] takes enforces it: a second opener gets an error rather
+//! than interleaving its appends with the first's. Two processes write it:
+//! the TUI, and `ambits cache sync` for a run with no terminal, which does
+//! exactly what the TUI does at launch (replay the logs, fold in the journal,
+//! sync) and then exits. Both stamp a replayed read with the symbol's hash
+//! at replay time, so a sync run once at the end of a session records what
+//! the code looked like then, not at each read.
+//!
+//! `ambits find` briefly was another writer, first sharing the primary file
+//! under `O_APPEND`, then writing its own shard, `<session>.find.ndjson`. It
+//! no longer writes at all: re-running a search to credit its reads would
+//! stamp today's content against a read that happened whenever the replay
+//! caught up to it, which is the "vacuous comparison" this journal exists to
+//! avoid (see "Why this exists," above).
 //!
 //! [`Journal::open_shard`], [`session_shard_paths`], and
 //! [`read_journal_session`] are kept rather than torn back out: they cost
@@ -821,6 +819,19 @@ impl Journal {
                 return journal;
             }
         };
+        // The primary journal is held until this writer drops, so a second
+        // writer of it (a TUI and `cache sync`) is refused rather than
+        // interleaved. Shards keep sharing whole-line appends.
+        match shard.map_or_else(|| fs4::FileExt::try_lock(&file), |_| Ok(())) {
+            Ok(()) => {}
+            Err(fs4::TryLockError::WouldBlock) => {
+                journal.error = Some(format!("{} is open for writing by another ambits process", path.display()));
+                return journal;
+            }
+            Err(fs4::TryLockError::Error(e)) => {
+                journal.warnings.push(format!("{}: cannot lock ({e}); another writer would not be refused", path.display()));
+            }
+        }
         journal.file = Some(file);
 
         // Append a fresh header when the file has none, or when its header
@@ -859,6 +870,12 @@ impl Journal {
     /// Non-fatal complaints accumulated so far (corrupt lines, write failures).
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    /// Why journaling stopped, once opening or a write has failed; the
+    /// journal then writes nothing more for the rest of the process.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
     }
 
     /// Number of distinct symbols currently recorded on disk.
@@ -1039,6 +1056,20 @@ mod tests {
         let mut ledger = ContextLedger::new();
         ledger.record("a.rs::x".into(), ReadDepth::FullBody, content_hash("b"), "ag".into(), 5);
         assert_eq!(second.sync(&ledger), 1, "and it still appends reads");
+    }
+
+    #[test]
+    fn a_second_writer_of_the_primary_journal_is_refused_while_the_first_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Journal::open(dir.path(), "sess", Duration::ZERO, manifest);
+        assert_eq!(first.error(), None);
+
+        let second = Journal::open(dir.path(), "sess", Duration::ZERO, manifest);
+        assert!(second.error().is_some_and(|e| e.contains("another ambits process")), "{:?}", second.error());
+
+        drop(first);
+        drop(second);
+        assert_eq!(Journal::open(dir.path(), "sess", Duration::ZERO, manifest).error(), None, "released on drop");
     }
 
     /// Different writer *kinds* (the TUI, `find`) no longer share a file — see
