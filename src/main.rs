@@ -1733,7 +1733,7 @@ fn run() -> Result<()> {
         let (mut app, _) = replayed_app(project_tree, &project_path, filter, &session_id, &log_dir, &*ingester);
         app.rehydrate_from_journal();
         let mut writes = ambits::journal::read_session_writes(&ambits::journal::journal_dir(&project_path), &session);
-        for (_, event) in app.take_pending_writes() {
+        for (_, event) in recovered_writes(&mut app, log_dir.as_deref(), &session, &project_path, &*ingester) {
             if let Some(record) = ambits::writes::build_record(&event, &project_path, &registry, !cli.serena) {
                 if writes.get(&record.op).is_none_or(|known| known.av < record.av) {
                     writes.insert(record.op.clone(), record);
@@ -1785,7 +1785,7 @@ fn run() -> Result<()> {
         }
         let (mut app, _) = replayed_app(project_tree, &project_path, filter, &session_id, &log_dir, &*ingester);
         attach_journal(&mut app, journal_settings(cli.serena, Some(0)));
-        for (write_session, event) in app.take_pending_writes() {
+        for (write_session, event) in recovered_writes(&mut app, log_dir.as_deref(), &session, &project_path, &*ingester) {
             if let Some(record) = ambits::writes::build_record(&event, &project_path, &registry, !cli.serena) {
                 app.record_write(&write_session, record);
             }
@@ -1952,6 +1952,45 @@ fn replayed_app(
         handoff = tui::replay_session(&mut app, ingester, log_files, project_path);
     }
     (app, handoff)
+}
+
+/// The replayed session's queued writes, with the `originalFile` Claude Code
+/// left out of large files recovered from disk (`writes::recover_originals`).
+/// Undoing them needs every write made since, so the writes of the other
+/// sessions logged beside this one, and active after it, are read too.
+fn recovered_writes(
+    app: &mut App,
+    log_dir: Option<&Path>,
+    session: &str,
+    project_path: &Path,
+    ingester: &dyn SessionIngester,
+) -> Vec<(Arc<str>, ingest::WriteEvent)> {
+    let (sessions, mut events): (Vec<Arc<str>>, Vec<ingest::WriteEvent>) = app.take_pending_writes().into_iter().unzip();
+    let later = log_dir.map(|dir| later_writes(dir, session, project_path, ingester)).unwrap_or_default();
+    ambits::writes::recover_originals(&mut events, &later, project_path);
+    sessions.into_iter().zip(events).collect()
+}
+
+/// Writes by the sessions in `log_dir` other than `session` whose logs were
+/// written to after its own.
+fn later_writes(log_dir: &Path, session: &str, project_path: &Path, ingester: &dyn SessionIngester) -> Vec<ingest::WriteEvent> {
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let Some(since) = modified(&log_dir.join(format!("{session}.jsonl"))) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(log_dir) else { return Vec::new() };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter_map(|p| {
+            let stem = p.file_stem()?.to_str()?.to_string();
+            (p.extension()? == "jsonl" && stem != session && ingest::claude::is_uuid(&stem) && modified(&p)? >= since).then_some(stem)
+        })
+        .flat_map(|other| ingester.session_log_files(log_dir, &other))
+        .flat_map(|file| ingester.replay_log_file(&file, project_path).events)
+        .filter_map(|event| match event {
+            ingest::SessionEvent::Write(w) => Some(w),
+            _ => None,
+        })
+        .collect()
 }
 
 fn journal_settings(serena: bool, flush_interval_ms: Option<u64>) -> ambits::app::JournalSettings {

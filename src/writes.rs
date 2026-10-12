@@ -32,7 +32,7 @@
 //! despite being a `Range`, so containment is `start <= n && n <= end`,
 //! never `Range::contains`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -324,6 +324,101 @@ pub fn build_record(
         fh,
         origin: None,
     })
+}
+
+/// Fill in the missing `originalFile` of `events` (one session's writes)
+/// from each file as it is on disk, so writes to files over Claude Code's
+/// ~10 KB limit can be attributed to symbols. Working newest first, each
+/// write is undone with its own hunks, every context and added line checked
+/// against the text: `later` are writes made after the session (other
+/// sessions of the same checkout), undone first and otherwise unused.
+///
+/// The first write whose hunks do not fit stops recovery for its file: it and
+/// every earlier write keep `original` absent and are attributed at file
+/// level, as without this. So does every earlier write once one is a create,
+/// opaque, user-modified, without hunks, or marks a missing final newline.
+/// Only each hunk's own lines are checked: a change no write records that
+/// falls outside them, such as a formatter's elsewhere in the file, is
+/// carried into the recovered text unseen.
+pub fn recover_originals(events: &mut [WriteEvent], later: &[WriteEvent], project_root: &Path) {
+    // `(time, op, index into events)` for each write to a file; `None` for a
+    // later session's write.
+    type Link<'a> = (&'a str, &'a str, Option<usize>);
+    let mut chains: BTreeMap<String, Vec<Link<'_>>> = BTreeMap::new();
+    for (i, e) in events.iter().enumerate() {
+        if let Some(file) = crate::objects::project_file(&e.path, project_root) {
+            chains.entry(file).or_default().push((&e.timestamp, &e.op, Some(i)));
+        }
+    }
+    let later_index: HashMap<&str, &WriteEvent> = later.iter().map(|e| (&*e.op, e)).collect();
+    for e in later {
+        if let Some(file) = crate::objects::project_file(&e.path, project_root) {
+            if chains.contains_key(&file) {
+                chains.entry(file).or_default().push((&e.timestamp, &e.op, None));
+            }
+        }
+    }
+    let mut recovered: Vec<(usize, String)> = Vec::new();
+    for (file, mut chain) in chains {
+        chain.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        let Some(mut text) = crate::objects::read_regular(&project_root.join(&file)).and_then(|b| String::from_utf8(b).ok()) else {
+            continue;
+        };
+        for (_, op, own) in chain.into_iter().rev() {
+            let event = match own {
+                Some(i) => &events[i],
+                None => later_index[op],
+            };
+            let Some(before) = undo(&event.source, &text) else { break };
+            if let (Some(i), WriteSource::Edit { original: None, .. } | WriteSource::Write { original: None, create: false, .. }) =
+                (own, &event.source)
+            {
+                recovered.push((i, before.clone()));
+            }
+            text = before;
+        }
+    }
+    for (i, before) in recovered {
+        match &mut events[i].source {
+            WriteSource::Edit { original, .. } | WriteSource::Write { original, .. } => *original = Some(before),
+            WriteSource::Opaque => {}
+        }
+    }
+}
+
+/// The file before `source`, given `after`: its hunks reversed and checked
+/// against `after`. `None` when it cannot be known.
+fn undo(source: &WriteSource, after: &str) -> Option<String> {
+    let hunks = match source {
+        WriteSource::Edit { hunks: Some(hunks), user_modified: false, .. } => hunks,
+        WriteSource::Write { hunks: Some(hunks), user_modified: false, create: false, content, .. } if content == after => hunks,
+        _ => return None,
+    };
+    if hunks.iter().flat_map(|h| &h.lines).any(|l| l.starts_with('\\')) {
+        return None;
+    }
+    let reversed: Vec<Hunk> = hunks
+        .iter()
+        .map(|h| Hunk {
+            old_start: h.new_start,
+            new_start: h.old_start,
+            lines: h
+                .lines
+                .iter()
+                .map(|l| match l.as_bytes().first() {
+                    Some(b'+') => format!("-{}", &l[1..]),
+                    Some(b'-') => format!("+{}", &l[1..]),
+                    _ => l.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+    let before = apply_hunks(&lines(after), &reversed)?;
+    let mut text = before.join("\n");
+    if after.ends_with('\n') && !before.is_empty() {
+        text.push('\n');
+    }
+    Some(text)
 }
 
 /// One diff hunk, as Claude Code records it in `structuredPatch`.
@@ -1020,5 +1115,137 @@ mod record_tests {
             let json = serde_json::to_string(&rec).unwrap();
             assert!(!json.contains(CANARY), "leaked into {json}");
         }
+    }
+}
+
+/// Recovering the `originalFile` Claude Code leaves out of large files.
+#[cfg(test)]
+mod recover_tests {
+    use super::*;
+    use crate::ingest::{Hunk, WriteEvent, WriteSource};
+    use std::sync::Arc;
+
+    const V0: &str = "fn alpha() {\n    let a = 1;\n}\n\nfn beta() {\n    let b = 2;\n}\n";
+    const V1: &str = "fn alpha() {\n    let a = 10;\n}\n\nfn beta() {\n    let b = 2;\n}\n";
+    const V2: &str = "fn alpha() {\n    let a = 10;\n}\n\nfn beta() {\n    let b = 20;\n}\n";
+
+    fn edit(op: &str, at: &str, path: &Path, start: u32, old: &str, new: &str, user_modified: bool) -> WriteEvent {
+        WriteEvent {
+            op: Arc::from(op),
+            agent_id: Arc::from("agent-1"),
+            tool_name: Arc::from("Edit"),
+            path: path.to_path_buf(),
+            timestamp: at.into(),
+            source: WriteSource::Edit {
+                original: None,
+                old: old.trim().into(),
+                new: new.trim().into(),
+                replace_all: false,
+                hunks: Some(vec![Hunk { old_start: start, new_start: start, lines: vec![format!("-{old}"), format!("+{new}")] }]),
+                user_modified,
+            },
+        }
+    }
+
+    fn original(e: &WriteEvent) -> Option<&str> {
+        match &e.source {
+            WriteSource::Edit { original, .. } | WriteSource::Write { original, .. } => original.as_deref(),
+            WriteSource::Opaque => None,
+        }
+    }
+
+    fn project(text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, text).unwrap();
+        (dir, file)
+    }
+
+    fn alpha_edit(file: &Path) -> WriteEvent {
+        edit("e1", "2026-10-10T10:00:01Z", file, 2, "    let a = 1;", "    let a = 10;", false)
+    }
+
+    fn beta_edit(file: &Path) -> WriteEvent {
+        edit("e2", "2026-10-10T10:00:02Z", file, 6, "    let b = 2;", "    let b = 20;", false)
+    }
+
+    #[test]
+    fn each_edit_gets_the_file_as_it_was_before_it() {
+        let (dir, file) = project(V2);
+        let mut events = vec![beta_edit(&file), alpha_edit(&file)];
+        recover_originals(&mut events, &[], dir.path());
+        assert_eq!(original(&events[1]), Some(V0), "the earlier edit, final newline included");
+        assert_eq!(original(&events[0]), Some(V1));
+        let record = build_record(&events[1], dir.path(), &ParserRegistry::new(), true).unwrap();
+        assert_eq!(record.level, Level::Symbol);
+        assert_eq!(record.syms.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), ["a.rs::alpha"]);
+    }
+
+    #[test]
+    fn a_later_sessions_write_is_undone_first() {
+        let (dir, file) = project(V2);
+        let mut events = vec![alpha_edit(&file)];
+        recover_originals(&mut events, &[beta_edit(&file)], dir.path());
+        assert_eq!(original(&events[0]), Some(V0));
+    }
+
+    #[test]
+    fn a_change_no_write_accounts_for_stops_recovery_for_that_file_only() {
+        let (dir, file) = project(&V2.replace("let a = 10;", "let a = 11;"));
+        let other = dir.path().join("b.rs");
+        std::fs::write(&other, V1).unwrap();
+        let mut events = vec![alpha_edit(&file), beta_edit(&file), alpha_edit(&other)];
+        recover_originals(&mut events, &[], dir.path());
+        assert_eq!(original(&events[1]).map(|t| t.contains("let b = 2;")), Some(true), "after the outside change: recovered");
+        assert_eq!(original(&events[0]), None, "before it: unknowable");
+        assert_eq!(original(&events[2]), Some(V0), "another file is unaffected");
+    }
+
+    #[test]
+    fn a_user_modified_write_ends_the_chain() {
+        let (dir, file) = project(V2);
+        let mut events = vec![alpha_edit(&file), edit("e2", "2026-10-10T10:00:02Z", &file, 6, "    let b = 2;", "    let b = 20;", true)];
+        recover_originals(&mut events, &[], dir.path());
+        assert_eq!((original(&events[0]), original(&events[1])), (None, None));
+    }
+
+    #[test]
+    fn a_pure_insertion_and_a_pure_deletion_undo_exactly() {
+        let inserted = "fn alpha() {\n    let a = 1;\n}\n// note\n\nfn beta() {\n    let b = 2;\n}\n";
+        let (dir, file) = project(inserted);
+        let mut insert = edit("e1", "2026-10-10T10:00:01Z", &file, 0, "", "", false);
+        if let WriteSource::Edit { hunks, .. } = &mut insert.source {
+            *hunks = Some(vec![Hunk { old_start: 3, new_start: 4, lines: vec!["+// note".into()] }]);
+        }
+        let mut events = vec![insert];
+        recover_originals(&mut events, &[], dir.path());
+        assert_eq!(original(&events[0]), Some(V0));
+
+        let (dir, file) = project(inserted);
+        let mut delete = edit("e1", "2026-10-10T10:00:01Z", &file, 0, "", "", false);
+        if let WriteSource::Edit { hunks, .. } = &mut delete.source {
+            *hunks = Some(vec![Hunk { old_start: 4, new_start: 3, lines: vec!["-// gone".into()] }]);
+        }
+        let mut events = vec![delete];
+        recover_originals(&mut events, &[], dir.path());
+        assert_eq!(original(&events[0]), Some("fn alpha() {\n    let a = 1;\n}\n// gone\n// note\n\nfn beta() {\n    let b = 2;\n}\n"));
+    }
+
+    #[test]
+    fn nothing_before_a_create_is_recovered() {
+        let (dir, file) = project(V2);
+        let create = WriteEvent {
+            op: Arc::from("w1"),
+            timestamp: "2026-10-10T10:00:01Z".into(),
+            tool_name: Arc::from("Write"),
+            source: WriteSource::Write { original: None, content: V1.into(), create: true, hunks: None, user_modified: false },
+            ..alpha_edit(&file)
+        };
+        let earlier = edit("e0", "2026-10-10T10:00:00Z", &file, 2, "    let a = 0;", "    let a = 1;", false);
+        let mut events = vec![earlier, create, beta_edit(&file)];
+        recover_originals(&mut events, &[], dir.path());
+        assert_eq!(original(&events[2]), Some(V1), "the edit after the create");
+        assert_eq!(original(&events[1]), None, "a create has no original");
+        assert_eq!(original(&events[0]), None, "the file before it was created is unknowable");
     }
 }

@@ -365,3 +365,77 @@ fn a_prompt_span_carries_no_call_content() {
     let prompt = r["spans"].as_array().unwrap().iter().find(|s| s["kind"] == "prompt").unwrap();
     assert_eq!((prompt["args"].clone(), prompt["content"].clone()), (json!([]), Value::Null));
 }
+
+/// The session's log with every Edit result's `originalFile` taken out, as
+/// Claude Code leaves it out for a file over ~10 KB.
+fn without_original_file(l: &Layout) {
+    let log = l.logs.join(format!("{SESSION}.jsonl"));
+    let lines: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut v: Value = serde_json::from_str(line).unwrap();
+            if let Some(result) = v.get_mut("toolUseResult").and_then(Value::as_object_mut) {
+                if result.contains_key("structuredPatch") {
+                    result.insert("originalFile".into(), Value::Null);
+                }
+            }
+            v.to_string()
+        })
+        .collect();
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+}
+
+fn journaled_write(state: &Path) -> Value {
+    let journal = std::fs::read_to_string(state.join(format!("coverage/{SESSION}.ndjson"))).unwrap();
+    journal.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|r| r["kind"] == "write").expect("a write record")
+}
+
+#[test]
+fn an_edit_without_original_file_is_still_attributed_to_its_symbol() {
+    let l = layout();
+    without_original_file(&l);
+    let state = l.logs.with_file_name("state");
+    assert!(sync(&l, &state, &[]).status.success());
+    let write = journaled_write(&state);
+    assert_eq!((write["level"].as_str(), write["syms"][0][0].as_str()), (Some("symbol"), Some("src/a.rs::alpha")), "{write}");
+}
+
+#[test]
+fn a_later_sessions_edit_to_the_same_file_is_undone_first() {
+    const LATER: &str = "9d1e2f3a-4b5c-4d6e-8f70-112233445566";
+    let l = layout();
+    without_original_file(&l);
+    // A second session, later, edits `alpha` again on the same line: the
+    // first edit's added line is no longer on disk until this one is undone.
+    let file = l.clone.join("src/a.rs");
+    std::fs::write(&file, "fn alpha() { let _x = 2; }\n\nfn beta() {}\n").unwrap();
+    let base = |at: &str| json!({"sessionId": LATER, "cwd": l.clone.parent().unwrap(), "timestamp": at});
+    let merge = |mut a: Value, b: Value| {
+        a.as_object_mut().unwrap().extend(b.as_object().unwrap().clone());
+        a
+    };
+    let later_log = l.logs.join(format!("{LATER}.jsonl"));
+    let path = file.to_string_lossy().into_owned();
+    write_log(
+        &later_log,
+        &[
+            merge(base("2026-10-10T11:00:00.000Z"), json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_later", "name": "Edit", "input": {"file_path": path, "old_string": "let _x = 1;", "new_string": "let _x = 2;"}}]}})),
+            merge(base("2026-10-10T11:00:00.200Z"), json!({"type": "user",
+                "toolUseResult": {"filePath": path, "oldString": "let _x = 1;", "newString": "let _x = 2;", "originalFile": null,
+                    "replaceAll": false, "userModified": false,
+                    "structuredPatch": [{"oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1, "lines": ["-fn alpha() { let _x = 1; }", "+fn alpha() { let _x = 2; }"]}]},
+                "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_later", "content": "ok"}]}})),
+        ],
+    );
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    std::fs::File::options().write(true).open(&later_log).unwrap().set_modified(later).unwrap();
+
+    let state = l.logs.with_file_name("state");
+    assert!(sync(&l, &state, &[]).status.success());
+    let write = journaled_write(&state);
+    assert_eq!((write["level"].as_str(), write["syms"][0][0].as_str()), (Some("symbol"), Some("src/a.rs::alpha")), "{write}");
+    let r = report(&l, &[]);
+    assert_eq!(r["writes"][0]["symbols"][0]["status"], "changed", "the later session changed alpha again");
+}

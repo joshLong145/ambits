@@ -31,11 +31,19 @@ For each successful write, from the tool's result in the session log:
 
 Symbol-level attribution needs the file's text before the write, which Claude
 Code includes only for smaller files (about 10 KB and under) and for newly
-created files. Larger files get file-level writes, and so does any write whose
-log entry carries no usable patch. Attribution checks that the logged changes
-turn the old text into exactly the new one, and falls back to file level
-rather than guess — so a symbol a symbol-level write does not name really was
-left alone.
+created files. For a larger file, `cache sync` and `report` recover it from the
+file as it is on disk: they undo the session's writes to it newest first, each
+with its own patch, after first undoing the writes later sessions logged beside
+it made. Every undone line is checked, and the first write that does not fit
+stops recovery for that file: something no write records changed it since (a
+formatter, a merge, a shell redirect), so that write and every earlier one stay
+file-level. A change outside a write's own lines is not detected and is carried
+into the recovered text. The TUI attributes writes as they arrive and recovers
+nothing, so it gives large files file-level writes.
+
+Attribution then checks that the logged changes turn the old text into exactly
+the new one, and falls back to file level rather than guess, so a symbol a
+symbol-level write does not name really was left alone.
 
 **File contents are never stored** — only paths, symbol names and hashes.
 

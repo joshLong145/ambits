@@ -28,8 +28,9 @@ pub use crate::writes::Hunk;
 /// or logged (spec §9.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteSource {
-    /// An `Edit`: `original` is `originalFile`, which the log omits for most
-    /// edits (capped near 10 KB) — then only a file-level write is possible.
+    /// An `Edit`: `original` is `originalFile`, which the log omits for files
+    /// over ~10 KB; `writes::recover_originals` can then recover it, and
+    /// without it only a file-level write is possible.
     Edit {
         original: Option<String>,
         old: String,
