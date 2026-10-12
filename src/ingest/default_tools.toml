@@ -168,6 +168,9 @@ target_selectors = { key = "command", requires = "ambits", subcommand = "show", 
 # the definition (`show` earns that). Modes that print no symbols (`-l`, `-c`,
 # `-q`) name none, so earn nothing.
 result_selectors = { key = "command", requires = "ambits", subcommands = ["rg", "grep"], depth = "NameOnly" }
+# A command that prints a file's lines (`sed -n 10,40p a.rs`, `head`, `tail`,
+# `cat`, `nl`) is credited as a Read of those lines.
+command_reads = "command"
 
 [[tool]]
 names         = ["TodoWrite"]

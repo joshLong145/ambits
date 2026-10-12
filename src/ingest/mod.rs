@@ -3,6 +3,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 pub mod claude;
+pub mod command_reads;
 pub mod content;
 pub mod tool_config;
 
@@ -129,6 +130,9 @@ pub struct AgentToolCall {
     /// When its output names symbols it showed (`ambits rg`), the depth
     /// each earns once the result arrives (see `ResultSelectorSpec`).
     pub result_depth: Option<ReadDepth>,
+    /// The file lines a shell command printed (`sed -n 10,40p a.rs`), each
+    /// credited as a read of those lines (see `ToolMapping::command_reads`).
+    pub file_reads: Vec<command_reads::FileRead>,
 }
 
 /// Point-in-time ledger snapshot captured at a compaction boundary.

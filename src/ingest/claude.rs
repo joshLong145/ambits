@@ -974,8 +974,13 @@ impl LineFeed {
         match parse_jsonl_line(line.trim(), &self.default_id, mapper) {
             ParsedLine::Events(mut calls) => {
                 for call in &mut calls {
-                    if let (Some((worktree, project)), Some(fp)) = (&self.remap, &call.file_path) {
-                        call.file_path = Some(remap_path(fp, worktree, project));
+                    if let Some((worktree, project)) = &self.remap {
+                        if let Some(fp) = &call.file_path {
+                            call.file_path = Some(remap_path(fp, worktree, project));
+                        }
+                        for read in &mut call.file_reads {
+                            read.path = remap_path(&read.path, worktree, project);
+                        }
                     }
                     call.label = self.label.clone();
                 }
@@ -1247,11 +1252,20 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
                     effect: Effect::Read,
                     summary: None,
                     result_depth: None,
+                    file_reads: Vec::new(),
                 }
             }
         };
         let summary = input.get("description").and_then(Value::as_str).map(|d| d.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|d| !d.is_empty());
-        events.push(AgentToolCall { tool_use_id, summary, ..event });
+        // A command's paths are relative to the shell's directory, which
+        // the record names as it was when the call was made.
+        let cwd = obj.get("cwd").and_then(Value::as_str).map(Path::new);
+        let file_reads = event
+            .file_reads
+            .iter()
+            .map(|r| super::command_reads::FileRead { path: super::command_reads::resolve(&r.path, cwd), ..r.clone() })
+            .collect();
+        events.push(AgentToolCall { tool_use_id, summary, file_reads, ..event });
     }
 
     ParsedLine::Events(events)
@@ -1484,6 +1498,12 @@ pub fn map_tool_call(
         target_selectors,
         label: agent_arc,
         result_depth: mapping.result_selectors.as_ref().and_then(|spec| spec.applies(input)),
+        file_reads: mapping
+            .command_reads
+            .as_ref()
+            .and_then(|key| input.get(key)?.as_str())
+            .map(super::command_reads::file_reads)
+            .unwrap_or_default(),
         // Set by `parse_jsonl_line`, which sees the tool_use block's id.
         tool_use_id: None,
         effect,

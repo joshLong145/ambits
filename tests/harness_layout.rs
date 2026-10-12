@@ -483,3 +483,47 @@ fn max_bytes_cuts_output_before_symbol_reads() {
     assert_eq!(read["read_count"], 2);
     assert!(!read["read"].as_array().unwrap().is_empty(), "symbol reads survive a cut that output alone satisfies");
 }
+
+/// A Bash call run from the workspace, as an agent harness runs it.
+fn append_shell(l: &Layout, id: &str, command: &str) {
+    use std::io::Write as _;
+    let cwd = l.clone.parent().unwrap().to_string_lossy().into_owned();
+    let call = json!({"type": "assistant", "sessionId": SESSION, "cwd": cwd, "timestamp": "2026-10-10T10:00:06.000Z",
+        "message": {"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}]}});
+    let result = json!({"type": "user", "sessionId": SESSION, "cwd": cwd, "timestamp": "2026-10-10T10:00:06.100Z",
+        "toolUseResult": {"stdout": "", "stderr": "", "interrupted": false},
+        "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": "fn alpha() {}"}]}});
+    let mut log = std::fs::OpenOptions::new().append(true).open(l.logs.join(format!("{SESSION}.jsonl"))).unwrap();
+    writeln!(log, "{call}\n{result}").unwrap();
+}
+
+/// A layout whose only read is the shell command.
+fn shell_only(command: &str) -> Layout {
+    let l = layout();
+    let log = l.logs.join(format!("{SESSION}.jsonl"));
+    let kept: Vec<String> = std::fs::read_to_string(&log).unwrap().lines().filter(|line| !line.contains("toolu_r")).map(String::from).collect();
+    std::fs::write(&log, kept.join("\n") + "\n").unwrap();
+    append_shell(&l, "toolu_sh", command);
+    l
+}
+
+#[test]
+fn a_shell_command_that_prints_lines_reads_the_symbols_on_them() {
+    let l = shell_only("cd repo && sed -n 1,1p src/a.rs");
+    let r = report(&l, &[]);
+    let file = r["files"].as_array().unwrap().iter().find(|f| f["path"] == "src/a.rs").unwrap();
+    let depth = |name: &str| file["symbols"].as_array().unwrap().iter().find(|s| s["name"] == name).unwrap()["reads"][SESSION].clone();
+    assert_eq!(depth("alpha"), "full_body", "line 1 is all of alpha");
+    assert_eq!(depth("beta"), Value::Null, "beta was not printed");
+    let sh = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Bash").unwrap();
+    assert_eq!(sh["read_count"], 1);
+}
+
+#[test]
+fn tail_reads_the_last_lines_of_the_file() {
+    let l = shell_only("tail -n 1 repo/src/a.rs");
+    let r = report(&l, &[]);
+    let file = r["files"].as_array().unwrap().iter().find(|f| f["path"] == "src/a.rs").unwrap();
+    let read: Vec<&str> = file["symbols"].as_array().unwrap().iter().filter(|s| !s["reads"].as_object().unwrap().is_empty()).map(|s| s["name"].as_str().unwrap()).collect();
+    assert_eq!(read, ["beta"]);
+}

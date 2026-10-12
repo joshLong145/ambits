@@ -2055,6 +2055,24 @@ pub fn apply_tool_call(
             mark_file_symbols(&file.symbols, event.read_depth, &mut credit, false);
         }
     }
+    for read in &event.file_reads {
+        let Some(file) = crate::objects::project_file(&read.path, project_root).and_then(|f| tree.file(&f)) else { continue };
+        use crate::ingest::command_reads::Lines;
+        let lines = match &read.lines {
+            Lines::Whole => {
+                mark_file_symbols(&file.symbols, ReadDepth::FullBody, &mut credit, false);
+                continue;
+            }
+            Lines::Range(r) => r.clone(),
+            Lines::Tail(n) => {
+                let total = file.total_lines as u32;
+                total.saturating_sub(*n).saturating_add(1).max(1)..total.saturating_add(1)
+            }
+        };
+        // What the command printed is what a Read of those lines returns.
+        let as_read = AgentToolCall { target_symbol: None, target_lines: Some(lines), read_depth: ReadDepth::FullBody, ..event.clone() };
+        mark_targeted_symbols(&file.symbols, &as_read, &mut credit);
+    }
     credit.listed()
 }
 
@@ -3657,6 +3675,7 @@ mod tests {
             effect: crate::ingest::Effect::Read,
             summary: None,
             result_depth: None,
+            file_reads: Vec::new(),
         };
         app.process_agent_event(event);
 

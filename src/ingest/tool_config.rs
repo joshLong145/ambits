@@ -94,6 +94,10 @@ pub struct ToolMapping {
     pub target_selectors: Option<TargetSelectorSpec>,
     #[serde(default)]
     pub result_selectors: Option<ResultSelectorSpec>,
+    /// Input key holding a shell command whose printed file lines are
+    /// credited as reads of them (`sed -n`, `head`, `tail`, `cat`, `nl`).
+    #[serde(default)]
+    pub command_reads: Option<String>,
     /// Name of a built-in stanza to inherit fields from.
     #[serde(default)]
     pub extends: Option<String>,
@@ -687,6 +691,9 @@ impl ToolMappingConfig {
                     // coverage hole the spec exists to close.
                     if stanza.target_selectors.is_none() {
                         stanza.target_selectors = base_stanza.target_selectors.clone();
+                    }
+                    if stanza.command_reads.is_none() {
+                        stanza.command_reads = base_stanza.command_reads.clone();
                     }
                     if stanza.result_selectors.is_none() {
                         stanza.result_selectors = base_stanza.result_selectors.clone();

@@ -284,6 +284,7 @@ pub(crate) mod test_render {
             effect: ambits::ingest::Effect::Read,
             summary: None,
             result_depth: None,
+            file_reads: Vec::new(),
         }
     }
 

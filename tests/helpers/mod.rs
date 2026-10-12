@@ -105,6 +105,7 @@ pub fn tool_call(tool: &str, path: &str, depth: ReadDepth) -> AgentToolCall {
         effect: crate::ingest::Effect::Read,
         summary: None,
         result_depth: None,
+        file_reads: Vec::new(),
     }
 }
 

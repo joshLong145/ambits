@@ -411,6 +411,7 @@ fn journal_records_symbols_read_through_app() {
         effect: ambits::ingest::Effect::Read,
         summary: None,
         result_depth: None,
+        file_reads: Vec::new(),
     };
     app.process_agent_event(call.clone());
     app.sync_journal();
@@ -462,6 +463,7 @@ fn journal_survives_compaction() {
         effect: ambits::ingest::Effect::Read,
         summary: None,
         result_depth: None,
+        file_reads: Vec::new(),
     });
     app.process_compaction("summary".into(), "ts".into(), "ag".into(), None);
     app.sync_journal();
@@ -492,6 +494,7 @@ fn read_call(root: &std::path::Path, rel: &str) -> AgentToolCall {
         effect: ambits::ingest::Effect::Read,
         summary: None,
         result_depth: None,
+        file_reads: Vec::new(),
     }
 }
 

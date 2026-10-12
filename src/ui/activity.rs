@@ -173,6 +173,7 @@ mod tests {
             effect: ambits::ingest::Effect::Read,
             summary: None,
             result_depth: None,
+            file_reads: Vec::new(),
         });
 
         let backend = TestBackend::new(60, 10);
