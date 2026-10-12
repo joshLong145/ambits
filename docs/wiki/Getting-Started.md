@@ -6,7 +6,7 @@
 cargo install ambits
 ```
 
-Or build from source — Rust 1.82+ (`rust-version` in `Cargo.toml`):
+Or build from source — Rust 1.88+ (`rust-version` in `Cargo.toml`):
 
 ```bash
 cargo build --release

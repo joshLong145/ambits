@@ -116,7 +116,7 @@ The wiki's source is [`docs/wiki/`](docs/wiki/); edit it there.
 
 ## Building from source
 
-Requires Rust 1.82+ (declared as `rust-version` in `Cargo.toml`).
+Requires Rust 1.88+ (declared as `rust-version` in `Cargo.toml`).
 
 ```bash
 cargo build --release
