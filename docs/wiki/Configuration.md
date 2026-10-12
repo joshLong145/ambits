@@ -118,7 +118,7 @@ description   = "MyCustomReader {path}"
 | `extends` | Name of a built-in stanza to inherit unset fields from |
 | `target_symbol`, `target_lines`, `target_selectors` | Narrow the read to specific symbols rather than the whole file; see the built-ins. `target_lines = { offset_key, limit_key, default_limit }` names the lines a call returned; `default_limit` is how many a call giving only an offset returns (the built-in `Read` sets 2000) |
 | `result_selectors` | Credit the symbols a command's **output** names, when its result arrives: `{ key, requires, subcommands, depth }`. The built-in `Bash` stanza credits `ambits rg`/`grep` matches at `NameOnly` |
-| `command_reads` | Input key holding a shell command whose printed file lines are credited as a read of those lines: `sed -n A,Bp`, `head`, `tail`, `cat` and `nl`, in a `;`/`&&`/`\|\|` chain and after a `cd`, relative to the shell's directory. A command it cannot follow with certainty (a variable, a glob, a heredoc) earns nothing. The built-in `Bash` stanza sets it to `"command"` |
+| `command_reads` | Input key holding a shell command whose printed file lines are credited as a read of those lines: `sed -n A,Bp`, `head`, `tail`, `cat` and `nl`, in a `;`/`&&`/`\|\|` chain and after a `cd`, relative to the shell's directory. A line-numbered search there (`grep -n`, `grep -rn`, `rg -n`) credits the symbol on each line its output printed, matches and `-A/-B/-C` context alike, at `NameOnly` when the result arrives. A command it cannot follow with certainty (a variable, a glob, a heredoc) earns nothing. The built-in `Bash` stanza sets it to `"command"` |
 
 A call that names lines earns its depth only for the symbols wholly inside
 them. One it shows part of earns no more than `Signature` when the lines

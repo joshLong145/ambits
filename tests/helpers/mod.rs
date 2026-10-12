@@ -106,6 +106,7 @@ pub fn tool_call(tool: &str, path: &str, depth: ReadDepth) -> AgentToolCall {
         summary: None,
         result_depth: None,
         file_reads: Vec::new(),
+        searches: Vec::new(),
     }
 }
 

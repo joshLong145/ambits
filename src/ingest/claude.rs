@@ -374,6 +374,9 @@ pub struct ToolResult {
     /// Symbols the output names, filled in by the correlator for a call
     /// whose output credits them (`ambits rg`).
     pub shown: Vec<(String, ReadDepth)>,
+    /// File lines the output printed, filled in by the correlator for a
+    /// line-numbered search.
+    pub printed: Vec<(PathBuf, u32)>,
 }
 
 /// Pairs the calls whose results matter with those results: a write's, to
@@ -413,7 +416,7 @@ impl ResultCorrelator {
     pub fn note_calls(&mut self, calls: &[AgentToolCall]) {
         for call in calls {
             let write = call.effect == Effect::Write && call.file_path.is_some();
-            if !write && call.result_depth.is_none() {
+            if !write && call.result_depth.is_none() && call.searches.is_empty() {
                 continue;
             }
             let Some(id) = &call.tool_use_id else { continue };
@@ -443,6 +446,11 @@ impl ResultCorrelator {
             if let Some(depth) = call.result_depth {
                 let text = result.content.as_ref().and_then(content_text).unwrap_or_default();
                 result.shown = crate::search::shown_selectors(&text).into_iter().map(|id| (id, depth)).collect();
+                continue;
+            }
+            if !call.searches.is_empty() {
+                let text = result.content.as_ref().and_then(content_text).unwrap_or_default();
+                result.printed = super::command_reads::printed_lines(&text, &call.searches);
                 continue;
             }
             if result.is_error {
@@ -562,6 +570,7 @@ fn parse_tool_results(obj: &mut Value) -> Vec<ToolResult> {
                 message: is_error.then(|| content.as_ref().and_then(error_summary).or_else(|| detail_text.as_ref().and_then(error_summary))).flatten(),
                 content,
                 shown: Vec::new(),
+                printed: Vec::new(),
             })
         })
         .collect()
@@ -981,6 +990,10 @@ impl LineFeed {
                         for read in &mut call.file_reads {
                             read.path = remap_path(&read.path, worktree, project);
                         }
+                        for search in &mut call.searches {
+                            search.dir = remap_path(&search.dir, worktree, project);
+                            search.file = search.file.as_deref().map(|f| remap_path(f, worktree, project));
+                        }
                     }
                     call.label = self.label.clone();
                 }
@@ -1005,6 +1018,7 @@ impl LineFeed {
                         child_agent,
                         message: r.message.clone(),
                         shown: std::mem::take(&mut r.shown),
+                        printed: std::mem::take(&mut r.printed),
                     }));
                 }
                 out.extend(written.into_iter().map(SessionEvent::Write));
@@ -1028,6 +1042,7 @@ impl LineFeed {
                     child_agent: Some(agent),
                     message: error.then(|| format!("ended: {}", crate::objects::printable(&status))),
                     shown: Vec::new(),
+                    printed: Vec::new(),
                 }))
             }
             ParsedLine::Prompt { agent, text, timestamp } => out.push(SessionEvent::Prompt(super::Prompt {
@@ -1253,6 +1268,7 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
                     summary: None,
                     result_depth: None,
                     file_reads: Vec::new(),
+                    searches: Vec::new(),
                 }
             }
         };
@@ -1265,7 +1281,15 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
             .iter()
             .map(|r| super::command_reads::FileRead { path: super::command_reads::resolve(&r.path, cwd), ..r.clone() })
             .collect();
-        events.push(AgentToolCall { tool_use_id, summary, file_reads, ..event });
+        let searches = event
+            .searches
+            .iter()
+            .map(|q| super::command_reads::Search {
+                dir: super::command_reads::resolve(&q.dir, cwd),
+                file: q.file.as_deref().map(|f| super::command_reads::resolve(f, cwd)),
+            })
+            .collect();
+        events.push(AgentToolCall { tool_use_id, summary, file_reads, searches, ..event });
     }
 
     ParsedLine::Events(events)
@@ -1503,6 +1527,12 @@ pub fn map_tool_call(
             .as_ref()
             .and_then(|key| input.get(key)?.as_str())
             .map(super::command_reads::file_reads)
+            .unwrap_or_default(),
+        searches: mapping
+            .command_reads
+            .as_ref()
+            .and_then(|key| input.get(key)?.as_str())
+            .map(super::command_reads::searches)
             .unwrap_or_default(),
         // Set by `parse_jsonl_line`, which sees the tool_use block's id.
         tool_use_id: None,
@@ -3195,7 +3225,7 @@ mod write_tests {
         for i in 0..3 * ResultCorrelator::MAX_PENDING {
             let id = format!("t{i}");
             c.note_calls(&[write_call(&id)]);
-            let done = ToolResult { tool_use_id: Arc::from(id.as_str()), is_error: false, detail: None, timestamp: String::new(), message: None, content: None, shown: Vec::new() };
+            let done = ToolResult { tool_use_id: Arc::from(id.as_str()), is_error: false, detail: None, timestamp: String::new(), message: None, content: None, shown: Vec::new(), printed: Vec::new() };
             assert_eq!(c.resolve(&mut [done]).len(), 1);
         }
         c.note_calls(&[write_call("last")]);

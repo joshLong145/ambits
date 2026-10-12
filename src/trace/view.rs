@@ -706,6 +706,7 @@ mod tests {
                     error: tool == "Edit",
                     message: None, child_agent: child.map(Arc::from),
                     shown: Vec::new(),
+                    printed: Vec::new(),
                 });
             }
         }

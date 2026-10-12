@@ -262,6 +262,154 @@ fn tokenize(command: &str) -> Option<Vec<Token>> {
     Some(out)
 }
 
+/// A line-numbered search a command ran (`grep -n`, `rg -n`): its output
+/// names the file lines it printed, which the result credits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Search {
+    /// The directory it ran in, from any `cd` before it; a relative one is
+    /// relative to the shell's working directory, as for [`FileRead`].
+    pub dir: PathBuf,
+    /// The one path it searched, for a lone search whose output may carry
+    /// no file names, so every `N:` line is that file's if it is one.
+    pub file: Option<PathBuf>,
+}
+
+/// The line-numbered searches `command` ran, in order.
+pub fn searches(command: &str) -> Vec<Search> {
+    let Some(tokens) = tokenize(command) else { return Vec::new() };
+    let mut out = Vec::new();
+    let mut dir = PathBuf::new();
+    let mut commands = 0;
+    for pipeline in tokens.split(|t| matches!(t, Token::Sep)) {
+        let Some(first) = pipeline.split(|t| matches!(t, Token::Pipe)).next() else { continue };
+        let Some(words) = first.iter().map(Token::word).collect::<Option<Vec<&str>>>() else { continue };
+        match words.as_slice() {
+            ["cd", to] => dir = dir.join(to),
+            ["cd", ..] => return out,
+            [program, args @ ..] => {
+                commands += 1;
+                if let Some(file) = search_of(program, args) {
+                    out.push(Search { dir: dir.clone(), file: file.map(|f| dir.join(f)) });
+                }
+            }
+            [] => {}
+        }
+    }
+    // With other commands' output beside it, an unprefixed `N:` line could
+    // be any of them.
+    if commands > 1 {
+        for search in &mut out {
+            search.file = None;
+        }
+    }
+    out
+}
+
+/// For `grep`/`rg` given line numbers: `Some(Some(file))` when it searched
+/// one file and prints no file names, `Some(None)` when it names them.
+fn search_of<'a>(program: &str, args: &[&'a str]) -> Option<Option<&'a str>> {
+    let takes_value: &[char] = match program {
+        "grep" | "egrep" | "fgrep" => &['e', 'f', 'A', 'B', 'C', 'm', 'd', 'D'],
+        "rg" => &['e', 'f', 'g', 't', 'T', 'A', 'B', 'C', 'm', 'M', 'j', 'E', 'r'],
+        _ => return None,
+    };
+    let (mut numbered, mut names_files, mut pattern_given) = (false, false, false);
+    let mut operands = Vec::new();
+    let mut it = args.iter();
+    while let Some(&a) = it.next() {
+        if a == "--" {
+            operands.extend(it.by_ref().copied());
+            break;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            match long.split('=').next().unwrap_or_default() {
+                "line-number" => numbered = true,
+                "recursive" | "with-filename" | "files-with-matches" | "count" => names_files = true,
+                "regexp" | "file" => {
+                    pattern_given = true;
+                    if !long.contains('=') {
+                        it.next();
+                    }
+                }
+                "no-filename" | "no-heading" => {}
+                other if !long.contains('=') && matches!(other, "after-context" | "before-context" | "context" | "max-count" | "glob" | "type") => {
+                    it.next();
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if let Some(flags) = a.strip_prefix('-').filter(|f| !f.is_empty()) {
+            for (i, c) in flags.char_indices() {
+                match c {
+                    'n' => numbered = true,
+                    'r' | 'R' | 'H' | 'l' | 'L' | 'c' if program != "rg" || c != 'r' => names_files = true,
+                    _ if takes_value.contains(&c) => {
+                        if matches!(c, 'e' | 'f') {
+                            pattern_given = true;
+                        }
+                        if i + c.len_utf8() == flags.len() {
+                            it.next();
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        operands.push(a);
+    }
+    if !numbered {
+        return None;
+    }
+    let files: Vec<&str> = operands.into_iter().skip(usize::from(!pattern_given)).collect();
+    Some(match files.as_slice() {
+        [file] if !names_files && plain_path(file) && !file.ends_with('/') => Some(*file),
+        _ => None,
+    })
+}
+
+/// The `(file, line)` pairs a search's `output` printed: `path:N:` and
+/// context `path-N-` lines, or `N:`/`N-` lines of a search's one file. A
+/// path may itself hold `-` or `:`, so every split is returned and the
+/// caller keeps those naming a file it knows; relative paths are joined to
+/// the search's directory.
+pub fn printed_lines(output: &str, searches: &[Search]) -> Vec<(PathBuf, u32)> {
+    let mut out = std::collections::BTreeSet::new();
+    let lone = match searches {
+        [Search { file: Some(file), .. }] => Some(file),
+        _ => None,
+    };
+    for line in output.lines().take(20_000) {
+        // A lone search's argument may be a directory, whose output names
+        // files after all: both readings are offered.
+        if let Some(file) = lone {
+            if let Some(n) = leading_number(line) {
+                out.insert((file.clone(), n));
+            }
+        }
+        for (i, c) in line.char_indices() {
+            if (c == ':' || c == '-') && i > 0 {
+                if let Some(n) = leading_number(&line[i + 1..]) {
+                    let path = Path::new(&line[..i]);
+                    for search in searches {
+                        out.insert((search.dir.join(path), n));
+                    }
+                }
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// `N` from `N:...` or `N-...`.
+fn leading_number(s: &str) -> Option<u32> {
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    let rest = s.as_bytes().get(digits)?;
+    (digits > 0 && matches!(rest, b':' | b'-')).then(|| s[..digits].parse().ok()).flatten()
+}
+
 /// `path` resolved against `cwd` when relative.
 pub fn resolve(path: &Path, cwd: Option<&Path>) -> PathBuf {
     match cwd {
@@ -320,6 +468,29 @@ mod tests {
     fn only_a_pipelines_first_command_reads_files() {
         assert_eq!(reads("cat a.rs | head -n 3"), [("a.rs".into(), Lines::Whole)]);
         assert!(reads("git show HEAD:a.rs | head -n 20").is_empty());
+    }
+
+    #[test]
+    fn a_line_numbered_search_is_found_in_its_spellings() {
+        let one = |c: &str| searches(c);
+        assert_eq!(one("grep -n foo a.py"), [Search { dir: "".into(), file: Some("a.py".into()) }]);
+        assert_eq!(one("grep -rn 'class X' -A5 src/"), [Search { dir: "".into(), file: None }]);
+        assert_eq!(one("rg --line-number x src"), [Search { dir: "".into(), file: Some("src".into()) }], "rg names no file for one path argument");
+        assert_eq!(one("grep -e foo -n a.py b.py"), [Search { dir: "".into(), file: None }], "two files: names printed");
+        assert!(one("grep foo a.py").is_empty(), "no line numbers");
+        assert!(one("grep -A5 n a.py").is_empty(), "the n is -A's value's neighbour, not a flag");
+        let chained = one("cd repo && grep -n x a.py; sed -n 1,2p b.py");
+        assert_eq!(chained, [Search { dir: "repo".into(), file: None }], "another command's output beside it");
+    }
+
+    #[test]
+    fn printed_lines_come_from_matches_and_context() {
+        let s = [Search { dir: "/ws".into(), file: None }];
+        let got = printed_lines("docs/worker-mcp.md:57:a match\ndocs/worker-mcp.md-58-context\n--\nnot a hit", &s);
+        assert!(got.contains(&("/ws/docs/worker-mcp.md".into(), 57)));
+        assert!(got.contains(&("/ws/docs/worker-mcp.md".into(), 58)));
+        let lone = [Search { dir: "/ws".into(), file: Some("/ws/a.py".into()) }];
+        assert_eq!(printed_lines("12:def f():\n13-    pass\nx", &lone), [("/ws/a.py".into(), 12), ("/ws/a.py".into(), 13)]);
     }
 
     #[test]

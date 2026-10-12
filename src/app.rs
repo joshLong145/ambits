@@ -1807,6 +1807,11 @@ impl App {
             self.trace.note_read(&finished.id, read);
             self.rebuild_tree_rows();
         }
+        if !finished.printed.is_empty() {
+            let read = apply_printed(&self.project_tree, &self.project_root, finished, &mut self.ledger, &mut self.depth_cache);
+            self.trace.note_read(&finished.id, read);
+            self.rebuild_tree_rows();
+        }
     }
 
     /// A prompt starts a turn: the trace nests the calls that follow under it.
@@ -2090,6 +2095,31 @@ pub fn apply_shown(
     }
     let mut credit = Credit::new(ledger, depth_cache, &finished.agent_id);
     mark_selectors(tree, finished.shown.iter().map(|(s, d)| (s.as_str(), *d, false)), &mut credit);
+    credit.listed()
+}
+
+/// Credit the innermost symbol on each file line a search printed
+/// (`ToolFinished::printed`) at `NameOnly`: a matching line, not the
+/// definition. Lines of files the tree does not hold are ignored, which is
+/// how a candidate split of an ambiguous `path:N:` line is told apart.
+pub fn apply_printed(
+    tree: &ProjectTree,
+    project_root: &Path,
+    finished: &crate::ingest::ToolFinished,
+    ledger: &mut ContextLedger,
+    depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
+) -> Vec<(String, ReadDepth)> {
+    fn innermost(symbols: &[SymbolNode], line: u32) -> Option<&SymbolNode> {
+        let sym = symbols.iter().find(|s| s.line_range.start <= line && line <= s.line_range.end)?;
+        innermost(&sym.children, line).or(Some(sym))
+    }
+    let mut credit = Credit::new(ledger, depth_cache, &finished.agent_id);
+    for (path, line) in &finished.printed {
+        let Some(file) = crate::objects::project_file(path, project_root).and_then(|f| tree.file(&f)) else { continue };
+        if let Some(sym) = innermost(&file.symbols, *line) {
+            credit.record(sym, ReadDepth::NameOnly, false);
+        }
+    }
     credit.listed()
 }
 
@@ -2779,7 +2809,7 @@ mod tests {
         let tree = project(vec![file("mock/f.rs", vec![sym_with_children("mock/f.rs::App", "App", vec![sym("mock/f.rs::App/run", "run")]), sym("mock/f.rs::free", "free")])]);
         let (mut ledger, mut cache) = (ContextLedger::new(), crate::tracking::alignment::DepthOrdinalCache::new());
         let shown = vec![("mock/f.rs::App".to_string(), ReadDepth::NameOnly), ("mock/f.rs::App/run".to_string(), ReadDepth::NameOnly)];
-        let search = crate::ingest::ToolFinished { id: Arc::from("s"), agent_id: Arc::from("a"), timestamp: String::new(), error: false, child_agent: None, message: None, shown: shown.clone() };
+        let search = crate::ingest::ToolFinished { id: Arc::from("s"), agent_id: Arc::from("a"), timestamp: String::new(), error: false, child_agent: None, message: None, shown: shown.clone(), printed: Vec::new() };
         assert_eq!(apply_shown(&tree, &search, &mut ledger, &mut cache), shown);
         let whole = tool_call("Read", "mock/f.rs", ReadDepth::FullBody);
         let listed = apply_tool_call(&tree, Path::new(""), &whole, &mut ledger, &mut cache);
@@ -2808,7 +2838,7 @@ mod tests {
         app.process_agent_event(spawn);
         app.process_tool_finished(&crate::ingest::ToolFinished {
             id: Arc::from("d1"), agent_id: Arc::from("sess"), timestamp: "2026-09-27T10:00:01Z".into(),
-            error: false, child_agent: Some(Arc::from("ab1")), message: None, shown: Vec::new(),
+            error: false, child_agent: Some(Arc::from("ab1")), message: None, shown: Vec::new(), printed: Vec::new(),
         });
         assert_eq!(app.agent_title("ab1"), "Expert review", "its delegation's task first");
     }
@@ -2844,6 +2874,7 @@ mod tests {
             child_agent: None,
             message: None,
             shown: vec![("mock/f.rs::alpha".into(), ReadDepth::NameOnly), ("mock/f.rs::beta".into(), ReadDepth::NameOnly)],
+            printed: Vec::new(),
         });
         assert_eq!(app.ledger.depth_of("mock/f.rs::alpha"), ReadDepth::NameOnly, "seen, not read");
         assert_eq!(app.ledger.depth_of("mock/f.rs::beta"), ReadDepth::FullBody, "a full read stays full");
@@ -3676,6 +3707,7 @@ mod tests {
             summary: None,
             result_depth: None,
             file_reads: Vec::new(),
+            searches: Vec::new(),
         };
         app.process_agent_event(event);
 
@@ -4085,6 +4117,7 @@ mod trace_view_tests {
                 error,
                 message: None, child_agent: child.map(Arc::from),
                 shown: Vec::new(),
+                printed: Vec::new(),
             });
         }
         // Read after its calls, as a tailer poll can deliver it; its time

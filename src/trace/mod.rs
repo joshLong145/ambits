@@ -430,6 +430,7 @@ mod tests {
             error: false,
             message: None, child_agent: child.map(Arc::from),
             shown: Vec::new(),
+            printed: Vec::new(),
         }
     }
 

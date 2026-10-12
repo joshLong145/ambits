@@ -174,6 +174,7 @@ mod tests {
             summary: None,
             result_depth: None,
             file_reads: Vec::new(),
+            searches: Vec::new(),
         });
 
         let backend = TestBackend::new(60, 10);

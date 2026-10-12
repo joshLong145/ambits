@@ -285,6 +285,7 @@ pub(crate) mod test_render {
             summary: None,
             result_depth: None,
             file_reads: Vec::new(),
+            searches: Vec::new(),
         }
     }
 

@@ -485,26 +485,41 @@ fn max_bytes_cuts_output_before_symbol_reads() {
 }
 
 /// A Bash call run from the workspace, as an agent harness runs it.
-fn append_shell(l: &Layout, id: &str, command: &str) {
+fn append_shell_printing(l: &Layout, id: &str, command: &str, output: &str) {
     use std::io::Write as _;
     let cwd = l.clone.parent().unwrap().to_string_lossy().into_owned();
     let call = json!({"type": "assistant", "sessionId": SESSION, "cwd": cwd, "timestamp": "2026-10-10T10:00:06.000Z",
         "message": {"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}]}});
     let result = json!({"type": "user", "sessionId": SESSION, "cwd": cwd, "timestamp": "2026-10-10T10:00:06.100Z",
         "toolUseResult": {"stdout": "", "stderr": "", "interrupted": false},
-        "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": "fn alpha() {}"}]}});
+        "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": output}]}});
     let mut log = std::fs::OpenOptions::new().append(true).open(l.logs.join(format!("{SESSION}.jsonl"))).unwrap();
     writeln!(log, "{call}\n{result}").unwrap();
 }
 
 /// A layout whose only read is the shell command.
 fn shell_only(command: &str) -> Layout {
+    shell_only_printing(command, "fn alpha() {}")
+}
+
+fn shell_only_printing(command: &str, output: &str) -> Layout {
     let l = layout();
     let log = l.logs.join(format!("{SESSION}.jsonl"));
     let kept: Vec<String> = std::fs::read_to_string(&log).unwrap().lines().filter(|line| !line.contains("toolu_r")).map(String::from).collect();
     std::fs::write(&log, kept.join("\n") + "\n").unwrap();
-    append_shell(&l, "toolu_sh", command);
+    append_shell_printing(&l, "toolu_sh", command, output);
     l
+}
+
+/// Each symbol of `src/a.rs` some agent read, with the depth.
+fn reads_of_a(r: &Value) -> Vec<(String, String)> {
+    let file = r["files"].as_array().unwrap().iter().find(|f| f["path"] == "src/a.rs").unwrap();
+    file["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| Some((s["name"].as_str()?.to_string(), s["reads"][SESSION].as_str()?.to_string())))
+        .collect()
 }
 
 #[test]
@@ -526,4 +541,22 @@ fn tail_reads_the_last_lines_of_the_file() {
     let file = r["files"].as_array().unwrap().iter().find(|f| f["path"] == "src/a.rs").unwrap();
     let read: Vec<&str> = file["symbols"].as_array().unwrap().iter().filter(|s| !s["reads"].as_object().unwrap().is_empty()).map(|s| s["name"].as_str().unwrap()).collect();
     assert_eq!(read, ["beta"]);
+}
+
+#[test]
+fn a_lone_grep_of_one_file_credits_the_symbols_on_its_lines() {
+    let l = shell_only_printing("cd repo && grep -n alpha src/a.rs", "1:fn alpha() { let _x = 1; }");
+    assert_eq!(reads_of_a(&report(&l, &[])), [("alpha".into(), "name_only".into())]);
+}
+
+#[test]
+fn a_recursive_grep_credits_matches_and_context_by_file() {
+    let l = shell_only_printing("grep -rn -A1 beta repo/src", "repo/src/a.rs-2-\nrepo/src/a.rs:3:fn beta() {}\nrepo/src/missing-1-x.rs:9:not a file");
+    assert_eq!(reads_of_a(&report(&l, &[])), [("beta".into(), "name_only".into())], "line 2 is blank, in no symbol");
+}
+
+#[test]
+fn a_grep_without_line_numbers_credits_nothing() {
+    let l = shell_only_printing("grep alpha repo/src/a.rs", "fn alpha() { let _x = 1; }");
+    assert!(reads_of_a(&report(&l, &[])).is_empty());
 }

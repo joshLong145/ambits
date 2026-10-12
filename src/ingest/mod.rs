@@ -133,6 +133,9 @@ pub struct AgentToolCall {
     /// The file lines a shell command printed (`sed -n 10,40p a.rs`), each
     /// credited as a read of those lines (see `ToolMapping::command_reads`).
     pub file_reads: Vec<command_reads::FileRead>,
+    /// The line-numbered searches a shell command ran (`grep -n`), whose
+    /// printed lines the result credits (see `ToolFinished::printed`).
+    pub searches: Vec<command_reads::Search>,
 }
 
 /// Point-in-time ledger snapshot captured at a compaction boundary.
@@ -216,6 +219,9 @@ pub struct ToolFinished {
     /// Symbols its output showed, and the depth each earns: an `ambits rg`
     /// match names the symbol it sits in (see `ResultSelectorSpec`).
     pub shown: Vec<(String, ReadDepth)>,
+    /// File lines a line-numbered search printed (`path:N:`), each a
+    /// candidate the caller keeps only when it names a file it knows.
+    pub printed: Vec<(PathBuf, u32)>,
 }
 
 /// A compaction event surfaced by the incremental tailer (no ledger snapshot
