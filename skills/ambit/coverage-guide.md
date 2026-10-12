@@ -34,7 +34,7 @@ src/config.rs                      90.0%   90.0%   <- Configuration fully read
 
 ## Coverage by File Type
 
-### Source Files (*.rs, *.py, *.ts)
+### Source Files (*.rs, *.py, *.ts, *.java)
 - Aim for 70%+ Full% on files you're modifying
 - 50%+ Seen% across the module gives structural awareness
 

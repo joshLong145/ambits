@@ -878,6 +878,43 @@ mod record_tests {
         assert_eq!(rec.fh, None, "only a Write carries a file hash");
     }
 
+    /// Attribution goes through the registry, so a Java edit lands on the
+    /// method it changed, not on its class. An overload shares that method's
+    /// id, and a removed line credits every symbol the id names after the
+    /// write, so the record carries both overloads' hashes under the one id.
+    #[test]
+    fn an_edit_to_a_java_method_is_attributed_to_that_method() {
+        let before = "class Shape {\n    int area() {\n        return 1;\n    }\n\n    int area(int scale) {\n        return scale;\n    }\n}\n";
+        let source = WriteSource::Edit {
+            original: Some(before.into()),
+            old: "return 1;".into(),
+            new: "return 2;".into(),
+            replace_all: false,
+            hunks: Some(vec![Hunk {
+                old_start: 3,
+                new_start: 3,
+                lines: vec!["-        return 1;".into(), "+        return 2;".into()],
+            }]),
+            user_modified: false,
+        };
+        let rec = build(&event("/proj/src/Shape.java", source)).unwrap();
+        assert_eq!(rec.level, Level::Symbol);
+        let after = before.replace("return 1;", "return 2;");
+        let file = crate::parser::java::JavaParser::new()
+            .parse_file(Path::new("src/Shape.java"), &after)
+            .unwrap();
+        let mut overloads: Vec<(String, String)> = file.symbols[0]
+            .children
+            .iter()
+            .map(|s| (s.id.clone(), crate::journal::encode_hash(&s.content_hash)))
+            .collect();
+        overloads.sort();
+        assert_eq!(overloads.len(), 2);
+        assert!(overloads.iter().all(|(id, _)| id == "src/Shape.java::Shape/area"));
+        assert_eq!(rec.syms, overloads);
+        assert!(rec.removed.is_empty() && !rec.outside_symbols);
+    }
+
     #[test]
     fn missing_original_file_or_user_modified_is_file_level() {
         for source in [edit(None, false), edit(Some(BEFORE), true)] {

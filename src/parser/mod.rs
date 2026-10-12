@@ -1,3 +1,4 @@
+pub mod java;
 pub mod markdown;
 pub mod python;
 pub mod rust;
@@ -31,7 +32,7 @@ pub struct SymbolMeta {
 /// rule is contiguity, not comment syntax: a plain `//` note glued to what
 /// follows reads as being about it too, so it is swept in exactly like a doc
 /// comment would be. `comment_kinds` names the grammar's comment node kinds
-/// (Rust distinguishes `line_comment`/`block_comment`; Python and
+/// (Rust and Java distinguish `line_comment`/`block_comment`; Python and
 /// TypeScript each use a single `comment` kind), since that differs per
 /// language and nothing else in this walk does.
 ///
@@ -240,6 +241,7 @@ impl ParserRegistry {
         registry.register(Box::new(rust::RustParser::new()));
         registry.register(Box::new(python::PythonParser::new()));
         registry.register(Box::new(typescript::TypescriptParser::new()));
+        registry.register(Box::new(java::JavaParser::new()));
         registry.register(Box::new(markdown::MarkdownParser::new()));
         registry
     }

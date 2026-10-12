@@ -97,7 +97,7 @@ ambits -p . trace --format chrome > session.trace.json   # open in ui.perfetto.d
 
 | Backend | Languages |
 |---|---|
-| tree-sitter (default) | Rust, Python, TypeScript, Markdown |
+| tree-sitter (default) | Rust, Python, TypeScript, Java, Markdown |
 | [Serena](https://github.com/oraios/serena) (`--serena`) | Anything Serena supports |
 
 Search covers every text file; a file no parser handles simply has no symbols.

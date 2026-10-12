@@ -63,7 +63,7 @@ current directory, and with none the whole project is searched.
 
 | Backend | Languages |
 |---|---|
-| tree-sitter (default) | Rust, Python, TypeScript, Markdown (headings as symbols) |
+| tree-sitter (default) | Rust, Python, TypeScript, Java, Markdown (headings as symbols) |
 | [Serena](https://github.com/oraios/serena) (`--serena`) | Anything Serena's language servers support |
 
 Every text file is still searchable with `rg`/`grep`; a file no parser handles

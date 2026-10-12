@@ -455,7 +455,7 @@ struct RgArgs {
         #[arg(short, long, value_name = "GLOB")]
         glob: Vec<String>,
 
-        /// Restrict to a file type, e.g. rust, py, ts, md.
+        /// Restrict to a file type, e.g. rust, py, ts, java, md.
         #[arg(short = 't', long = "type", value_name = "TYPE")]
         file_type: Vec<String>,
 

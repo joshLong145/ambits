@@ -80,7 +80,7 @@ it:
 
 - its doc comments and any comments glued above it (no blank line between);
 - in Rust, its attributes — `#[derive(..)]`, `#[test]`, `#[cfg(..)]` — and the
-  docs above those.
+  docs above those; in Java, its annotations and the Javadoc above them.
 
 And leaves out what is about something else:
 
@@ -92,8 +92,8 @@ And leaves out what is about something else:
 ## Ambiguity is reported, not resolved
 
 `matches` is an array because ids are not guaranteed unique — Rust allows a
-type several inherent `impl` blocks in one file, and nothing in the name
-distinguishes them. A content hash always names exactly one symbol.
+type several inherent `impl` blocks in one file, Java overloads share a
+method's name, and nothing in the name distinguishes them. A content hash always names exactly one symbol.
 
 - Empty `matches` — no such symbol. For an id, `suggestions` then lists up to
   five ids it likely meant, from the same file (or one whose path ends with

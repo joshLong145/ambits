@@ -189,7 +189,7 @@ list replaces an earlier layer's, except that patterns in the user-global
 
 | Backend | Languages |
 |---|---|
-| tree-sitter (default) | Rust, Python, TypeScript, Markdown |
+| tree-sitter (default) | Rust, Python, TypeScript, Java, Markdown |
 | [Serena](https://github.com/oraios/serena) MCP | Any language Serena supports |
 
 ```bash
@@ -199,6 +199,12 @@ ambits -p . --serena
 Markdown symbols are ATX headings (`#` through `######`), nested by level; a
 heading's span runs to the next heading of equal or shallower depth. Content
 before the first heading becomes a `preamble` symbol.
+
+Java symbols are classes, interfaces, enums, records and `@interface` types,
+nested to any depth, with their methods, constructors and fields (one symbol
+per declared variable): `Shapes.java::Shapes/Renderer/visible`. Overloads share
+an id and are told apart by content hash. Enum constants, and anything inside a
+method body, are not symbols.
 
 ## Claude Code skill
 
