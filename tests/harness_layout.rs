@@ -260,7 +260,7 @@ fn max_bytes_cuts_in_order_and_says_so() {
     let l = layout();
     let full = report(&l, &[]);
     let r = report(&l, &["--max-bytes", "10"]);
-    assert_eq!(r["truncated"], json!(["unwritten_file_symbols", "read_text", "span_reads", "arguments", "diffs", "other_spans"]));
+    assert_eq!(r["truncated"], json!(["unwritten_file_symbols", "read_text", "output", "span_reads", "arguments", "diffs", "other_spans"]));
     assert_eq!(r["writes"], full["writes"], "writes are never cut");
     let read = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Read").unwrap();
     assert_eq!((read["read"].clone(), read["read_count"].clone()), (json!([]), json!(2)));
@@ -438,4 +438,48 @@ fn a_later_sessions_edit_to_the_same_file_is_undone_first() {
     assert_eq!((write["level"].as_str(), write["syms"][0][0].as_str()), (Some("symbol"), Some("src/a.rs::alpha")), "{write}");
     let r = report(&l, &[]);
     assert_eq!(r["writes"][0]["symbols"][0]["status"], "changed", "the later session changed alpha again");
+}
+
+/// A Bash call, and its result, appended to the session's log.
+fn append_command(l: &Layout, id: &str, command: &str, output: &str, failed: bool) {
+    use std::io::Write as _;
+    let call = json!({"type": "assistant", "sessionId": SESSION, "timestamp": "2026-10-10T10:00:05.000Z",
+        "message": {"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command, "description": "List the sources"}}]}});
+    let result = json!({"type": "user", "sessionId": SESSION, "timestamp": "2026-10-10T10:00:05.400Z",
+        "toolUseResult": {"stdout": output, "stderr": "", "interrupted": false},
+        "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": output, "is_error": failed}]}});
+    let mut log = std::fs::OpenOptions::new().append(true).open(l.logs.join(format!("{SESSION}.jsonl"))).unwrap();
+    writeln!(log, "{call}\n{result}").unwrap();
+}
+
+#[test]
+fn a_command_span_carries_its_output() {
+    let l = layout();
+    append_command(&l, "toolu_ls", "ls src", "a.rs\nb.rs", false);
+    let r = report(&l, &[]);
+    let ls = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Bash").unwrap();
+    assert_eq!(ls["content"], json!({"type": "output", "lines": ["a.rs", "b.rs"], "cut": 0}));
+    assert_eq!(ls["args"][0], json!({"key": "description", "value": "List the sources", "bulk": false}));
+}
+
+#[test]
+fn a_failed_command_still_carries_what_it_printed() {
+    let l = layout();
+    append_command(&l, "toolu_bad", "cargo test", "error[E0425]: cannot find value `x`", true);
+    let r = report(&l, &[]);
+    let bad = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Bash").unwrap();
+    assert_eq!(bad["error"], true);
+    assert_eq!(bad["content"]["lines"], json!(["error[E0425]: cannot find value `x`"]));
+}
+
+#[test]
+fn max_bytes_cuts_output_before_symbol_reads() {
+    let l = layout();
+    append_command(&l, "toolu_ls", "ls src", &"x\n".repeat(2000), false);
+    let full = serde_json::to_vec(&report(&l, &[])).unwrap().len();
+    let r = report(&l, &["--max-bytes", &(full - 1000).to_string()]);
+    assert_eq!(r["truncated"], json!(["unwritten_file_symbols", "read_text", "output"]), "{}", r["truncated"]);
+    let read = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Read").unwrap();
+    assert_eq!(read["read_count"], 2);
+    assert!(!read["read"].as_array().unwrap().is_empty(), "symbol reads survive a cut that output alone satisfies");
 }

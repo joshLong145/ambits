@@ -7,10 +7,11 @@
 //! the project by its directory's name; a command or a call's description
 //! still says whatever path it said. Unlike a snapshot (spec §9.6) it
 //! does carry file contents, as the session logs recorded them: each call's
-//! arguments, every write's diff, and the text every read returned, besides
-//! what the logs said of each call (a shell command, a prompt's first line,
-//! an error). A report is as sensitive as the session's transcript, and a
-//! harness that publishes one should screen it for secrets first.
+//! arguments, every write's diff, the text every read returned and every
+//! other call's output, besides what the logs said of each call (a shell
+//! command, a prompt's first line, an error). A report is as sensitive as
+//! the session's transcript, and a harness that publishes one should screen
+//! it for secrets first.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -113,7 +114,7 @@ pub struct SpanDto {
     /// Its arguments as the log recorded them; file contents it wrote are
     /// summed up here, since `content` shows them.
     pub args: Vec<ArgDto>,
-    /// What it wrote or read, as the log recorded it.
+    /// What it wrote, read or returned, as the log recorded it.
     pub content: Option<ContentDto>,
 }
 
@@ -135,6 +136,9 @@ pub enum ContentDto {
     /// The text a read returned, its first line numbered `start`; `cut`
     /// lines were left out.
     Read { start: u32, lines: Vec<String>, cut: usize },
+    /// What any other call returned: a command's output, a search's matches,
+    /// a subagent's answer. `cut` lines were left out.
+    Output { lines: Vec<String>, cut: usize },
 }
 
 #[derive(Debug, Serialize)]
@@ -428,7 +432,6 @@ fn spans(trace: &Trace, details: &HashMap<String, CallDetail>, project_root: &Pa
         .collect()
 }
 
-/// A call's content for the report; a call's output is not carried.
 fn content(c: &CallContent) -> Option<ContentDto> {
     match c {
         CallContent::Change { hunks, exact, cut } => Some(ContentDto::Change {
@@ -452,7 +455,7 @@ fn content(c: &CallContent) -> Option<ContentDto> {
                 .collect(),
         }),
         CallContent::Read { start, lines, cut } => Some(ContentDto::Read { start: *start, lines: lines.clone(), cut: *cut }),
-        CallContent::Output { .. } => None,
+        CallContent::Output { lines, cut } => Some(ContentDto::Output { lines: lines.clone(), cut: *cut }),
     }
 }
 
@@ -467,16 +470,18 @@ fn instant(i: &crate::trace::Instant) -> InstantDto {
 
 /// Cut `report` until its JSON fits in `max_bytes`, recording each cut in
 /// `truncated`, in this order: the symbol lists of files nothing wrote;
-/// the text reads returned; every span's list of symbols read (its
+/// the text reads returned; every other call's output; every span's list
+/// of symbols read (its
 /// `read_count` stays); every call's arguments; every write's diff; the
 /// spans that neither read, wrote nor delegated. Writes, totals and the
 /// remaining spans are never cut, so a report can still exceed the limit;
 /// the caller sees `truncated`.
 pub fn fit(report: &mut Report, max_bytes: usize) -> Result<()> {
     type Cut = fn(&mut Report);
-    let cuts: [(&'static str, Cut); 6] = [
+    let cuts: [(&'static str, Cut); 7] = [
         ("unwritten_file_symbols", |r| r.files.iter_mut().filter(|f| f.symbols_written == 0).for_each(|f| f.symbols.clear())),
         ("read_text", |r| r.spans.iter_mut().filter(|s| matches!(s.content, Some(ContentDto::Read { .. }))).for_each(|s| s.content = None)),
+        ("output", |r| r.spans.iter_mut().filter(|s| matches!(s.content, Some(ContentDto::Output { .. }))).for_each(|s| s.content = None)),
         ("span_reads", |r| r.spans.iter_mut().for_each(|s| s.read.clear())),
         ("arguments", |r| r.spans.iter_mut().for_each(|s| s.args.clear())),
         ("diffs", |r| r.spans.iter_mut().for_each(|s| s.content = None)),

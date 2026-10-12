@@ -93,6 +93,7 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
 .code { border: 1px solid var(--line); border-radius: 6px; overflow: auto; max-height: 480px; margin-top: 4px; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; line-height: 1.5; }
 .code .ln { display: grid; grid-template-columns: 3.5em 3.5em 1.2em 1fr; white-space: pre; }
 .code.read .ln { grid-template-columns: 4em 1fr; }
+.code.output .ln { grid-template-columns: 1fr; padding: 0 8px; }
 .code .no { color: var(--muted); text-align: right; padding-right: 8px; user-select: none; }
 .code .op { color: var(--muted); user-select: none; }
 .code .ln.add { background: color-mix(in srgb, var(--ok) 16%, transparent); }
@@ -361,7 +362,8 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
         for (const a of x.args) args.append(el("span", { class: "k mono", text: a.key }), el("pre", { class: "v mono" + (a.bulk ? " bulk" : ""), text: a.value }));
         dl.append(el("dt", { text: "Arguments" }), el("dd", null, args));
       }
-      if (x.content) dl.append(el("dt", { text: x.content.type === "change" ? "Change" : "Read" }), el("dd", null, contentView(x.content)));
+      const titles = { change: "Change", read: "Read", output: x.error ? "Error output" : "Output" };
+      if (x.content) dl.append(el("dt", { text: titles[x.content.type] || x.content.type }), el("dd", null, contentView(x.content)));
       const w = R.writes.find(w => w.span === x.i);
       if (w) dl.append(el("dt", { text: "Write" }), el("dd", null, el("a", { href: "#w-" + w.op, class: "chip " + w.status, text: "see write · " + w.status, on: { click: ev => { ev.preventDefault(); jumpToWrite(w.op); } } })));
       return el("div", { class: "expand" }, dl);
@@ -390,6 +392,9 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
       const cell = (cls, text) => el("span", { class: cls, text: text });
       if (c.type === "read") {
         c.lines.forEach((line, n) => box.append(el("div", { class: "ln" }, cell("no", c.start + n), cell("t", line))));
+      } else if (c.type === "output") {
+        if (!c.lines.length) box.append(el("div", { class: "hunk", text: "no output" }));
+        c.lines.forEach(line => box.append(el("div", { class: "ln" }, cell("t", line))));
       } else {
         for (const h of c.hunks) {
           if (c.exact && h.old_start !== null) box.append(el("div", { class: "hunk", text: "@@ -" + h.old_start + " +" + h.new_start + " @@" }));

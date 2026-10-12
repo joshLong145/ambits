@@ -23,8 +23,8 @@ nothing. To have the journal hold everything first, run `cache sync`.
 a summary, the files with each symbol's read depth and the writes that
 touched it, the writes grouped by the commit they landed in, and the trace as
 a timeline with one lane per agent above every call. A call expands in place
-when clicked, as in the TUI: its arguments, and the change it made or the
-text it read, with line numbers. Open it in any browser; it needs no
+when clicked, as in the TUI: its arguments, and the change it made, the
+text it read with line numbers, or what it printed. Open it in any browser; it needs no
 server.
 
 ```bash
@@ -44,9 +44,10 @@ value from the document as text, never as markup. The tab is in the URL
 
 ## What it carries
 
-Everything the session's logs said about each call except its output: its
-arguments, the diff of every write, and the text every read returned, as
-the [TUI's call view](TUI) shows them. A report is therefore as sensitive
+Everything the session's logs said about each call, as the
+[TUI's call view](TUI) shows it: its arguments, the diff of every write, the
+text every read returned, and every other call's output (a command's, a
+search's, a subagent's answer). A report is therefore as sensitive
 as the transcript itself. It holds file contents, and a command or a call's
 description says whatever it said, secrets included, so screen it before
 publishing it. Unlike a [snapshot](Snapshots), which never holds contents.
@@ -87,6 +88,8 @@ the change below`), since `content` shows them. `content` is `null`, or:
   are what the call asked for and carry no line numbers.
 - `{"type": "read", "start", "lines", "cut"}` for a read: the text it
   returned, its first line numbered `start`.
+- `{"type": "output", "lines", "cut"}` for any other call: what it
+  returned, failed calls included.
 
 `cut` counts lines left out past the TUI's limit of 5000 per call.
 
@@ -108,10 +111,11 @@ cut in `truncated`:
 
 1. `unwritten_file_symbols`: the symbol lists of files nothing wrote.
 2. `read_text`: the text reads returned.
-3. `span_reads`: every span's `read` list; `read_count` stays.
-4. `arguments`: every call's `args`.
-5. `diffs`: every write's `content`.
-6. `other_spans`: spans that neither read, wrote nor delegated.
+3. `output`: every other call's output.
+4. `span_reads`: every span's `read` list; `read_count` stays.
+5. `arguments`: every call's `args`.
+6. `diffs`: every write's `content`.
+7. `other_spans`: spans that neither read, wrote nor delegated.
 
 Writes, totals and the remaining spans are never cut, so a report can still
 exceed the limit.
