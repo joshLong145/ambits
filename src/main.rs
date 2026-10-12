@@ -34,7 +34,7 @@ use events::AppEvent;
 use ambits::parser::ParserRegistry;
 
 #[derive(ClapParser, Debug)]
-#[command(name = "ambits", about = "Visualize LLM agent context coverage")]
+#[command(name = "ambits", version = ambits::version(), about = "Visualize LLM agent context coverage")]
 struct Cli {
     /// Path to the project root to analyze. Defaults to the nearest enclosing
     /// directory containing `.git` or `.ambits`, else the current directory.

@@ -44,6 +44,12 @@ fs4 = { version = "1.1.0", features = ["sync"] }
 # SHA-256 for the report page's CSP hashes, the only digest CSP accepts.
 sha2 = "0.10"
 
+# One shipped binary, built rarely: smaller and faster beats a quick build.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
 [features]
 dhat-heap = ["dep:dhat"]
 

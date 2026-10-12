@@ -342,7 +342,7 @@ pub fn build(inputs: Inputs<'_>) -> Result<Report> {
 
     Ok(Report {
         schema_version: SCHEMA_VERSION,
-        ambits_version: env!("CARGO_PKG_VERSION"),
+        ambits_version: crate::version(),
         generated_at: crate::time::now_rfc3339(),
         session_id: session_id.to_string(),
         project: Project {
