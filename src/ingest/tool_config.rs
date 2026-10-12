@@ -439,6 +439,10 @@ impl TargetSelectorSpec {
 pub struct TargetLinesSpec {
     pub offset_key: String,
     pub limit_key: String,
+    /// Lines the tool returns when the call gives an offset but no limit;
+    /// without it such a call names no range and credits the whole file.
+    #[serde(default)]
+    pub default_limit: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------

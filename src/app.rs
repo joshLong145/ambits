@@ -2197,7 +2197,7 @@ pub fn mark_targeted_symbols(symbols: &[SymbolNode], event: &AgentToolCall, cred
                 mark_file_symbols(&sym.children, event.read_depth, credit, true);
             }
             MatchKind::ByLineOverlap => {
-                credit.record(sym, event.read_depth, false);
+                credit.record(sym, overlap_depth(sym, event), false);
                 // Parent container overlaps the read range — recurse precisely so
                 // only children whose ranges also overlap get promoted.
                 mark_targeted_symbols(&sym.children, event, credit);
@@ -2270,9 +2270,25 @@ pub fn symbol_name_matches(sym: &SymbolNode, event: &AgentToolCall) -> bool {
 }
 
 /// Check if a symbol's line range overlaps with the tool call's `target_lines`.
+/// A symbol's range includes its last line; a call's range does not.
 pub fn symbol_lines_match(sym: &SymbolNode, event: &AgentToolCall) -> bool {
     let Some(ref target_range) = event.target_lines else { return false };
-    sym.line_range.start < target_range.end && target_range.start < sym.line_range.end
+    sym.line_range.start < target_range.end && target_range.start <= sym.line_range.end
+}
+
+/// What a line-range read earned of `sym`, which it overlaps: the call's
+/// depth when every line of the symbol was in range; otherwise no more than
+/// `Signature` when the range began at or before the symbol's first line,
+/// and no more than `Overview` when it began inside it.
+pub fn overlap_depth(sym: &SymbolNode, event: &AgentToolCall) -> ReadDepth {
+    let Some(ref range) = event.target_lines else { return event.read_depth };
+    let from_start = range.start <= sym.line_range.start;
+    let to_end = sym.line_range.end < range.end;
+    match (from_start, to_end) {
+        (true, true) => event.read_depth,
+        (true, false) => event.read_depth.min(ReadDepth::Signature),
+        (false, _) => event.read_depth.min(ReadDepth::Overview),
+    }
 }
 
 /// Check if a symbol matches the tool call's target_symbol or target_lines.
@@ -2397,7 +2413,7 @@ mod tests {
         mark_targeted_symbols(&[s1, s2], &event, &mut Credit::new(&mut ledger, &mut cache, &event.agent_id));
 
         assert_eq!(ledger.depth_of("mock/f.rs::a"), ReadDepth::Unseen);
-        assert_eq!(ledger.depth_of("mock/f.rs::b"), ReadDepth::FullBody);
+        assert_eq!(ledger.depth_of("mock/f.rs::b"), ReadDepth::Overview, "lines 12-17 of 10-20: begun inside");
     }
 
     #[test]
@@ -2519,17 +2535,37 @@ mod tests {
             "f.rs::Foo", "Foo", vec![method_a, method_b], 1, 100,
         );
 
-        // Read only covers method_b's range.
-        let event = tool_call_lines("Read", "f.rs", ReadDepth::FullBody, 50, 70);
+        // Read covers exactly method_b's lines, 50 through 70.
+        let event = tool_call_lines("Read", "f.rs", ReadDepth::FullBody, 50, 71);
         let mut ledger = ContextLedger::new();
         let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
 
         mark_targeted_symbols(&[impl_block], &event, &mut Credit::new(&mut ledger, &mut cache, &event.agent_id));
 
-        // The parent is marked (it overlaps), but method_a is NOT.
-        assert_eq!(ledger.depth_of("f.rs::Foo"), ReadDepth::FullBody);
+        // The parent is marked (it overlaps) no deeper than a part of it shows,
+        // and method_a is not marked at all.
+        assert_eq!(ledger.depth_of("f.rs::Foo"), ReadDepth::Overview);
         assert_eq!(ledger.depth_of("f.rs::Foo/method_b"), ReadDepth::FullBody);
         assert_eq!(ledger.depth_of("f.rs::Foo/method_a"), ReadDepth::Unseen);
+    }
+
+    #[test]
+    fn a_read_earns_depth_by_how_much_of_each_symbol_it_shows() {
+        let f = sym_with_lines("f.rs::f", "f", 10, 20);
+        let depth_for = |start, end| {
+            let event = tool_call_lines("Read", "f.rs", ReadDepth::FullBody, start, end);
+            let mut ledger = ContextLedger::new();
+            let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
+            mark_targeted_symbols(std::slice::from_ref(&f), &event, &mut Credit::new(&mut ledger, &mut cache, &event.agent_id));
+            ledger.depth_of("f.rs::f")
+        };
+        assert_eq!(depth_for(10, 21), ReadDepth::FullBody, "every line");
+        assert_eq!(depth_for(1, 40), ReadDepth::FullBody, "and more");
+        assert_eq!(depth_for(10, 15), ReadDepth::Signature, "from its first line");
+        assert_eq!(depth_for(5, 12), ReadDepth::Signature, "from before it");
+        assert_eq!(depth_for(14, 30), ReadDepth::Overview, "from inside it");
+        assert_eq!(depth_for(20, 25), ReadDepth::Overview, "its last line only: a range ending on it still overlaps");
+        assert_eq!(depth_for(21, 25), ReadDepth::Unseen, "after it");
     }
 
     #[test]

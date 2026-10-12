@@ -6,7 +6,9 @@ path_keys    = ["file_path", "relative_path"]
 pattern_keys = []
 depth        = { type = "fixed", value = "FullBody" }
 description  = "Read {file_path|short}"
-target_lines = { offset_key = "offset", limit_key = "limit" }
+# Claude Code's Read starts at line 1 and returns 2000 lines unless told
+# otherwise, so a call naming only one of these still names a range.
+target_lines = { offset_key = "offset", limit_key = "limit", default_limit = 2000 }
 
 [[tool]]
 names        = ["Edit", "mcp__acp__Edit", "mcp__plugin_serena_serena__replace_content"]

@@ -1454,11 +1454,19 @@ pub fn map_tool_call(
         None => (Vec::new(), read_depth),
     };
 
-    // Extract target_lines.
+    // The lines a call asked for, half-open: an offset alone reads the
+    // tool's default number of lines, a limit alone starts at line 1, and
+    // neither is the whole file.
     let target_lines = mapping.target_lines.as_ref().and_then(|spec| {
-        let offset = input.get(&spec.offset_key)?.as_u64()? as u32;
-        let limit  = input.get(&spec.limit_key)?.as_u64()? as u32;
-        Some(offset..offset + limit)
+        let as_line = |key: &str| input.get(key).and_then(Value::as_u64).map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+        let (offset, limit) = (as_line(&spec.offset_key), as_line(&spec.limit_key));
+        let limit = match (offset, limit) {
+            (None, None) => return None,
+            (_, Some(limit)) => limit,
+            (Some(_), None) => spec.default_limit?,
+        };
+        let start = offset.unwrap_or(1).max(1);
+        Some(start..start.saturating_add(limit))
     });
 
     // Intern agent_id once and share between agent_id and label fields.
@@ -1773,6 +1781,17 @@ mod tests {
         let got = call_detail(&[log], "toolu_1", ContentKind::Other).unwrap();
         assert_eq!(got.content, Some(CallContent::Output { lines: vec!["a".into(), "b".into()], cut: 0 }));
         assert_eq!((got.args[0].key.as_str(), got.args[0].value.as_str()), ("command", "ls"), "with its arguments");
+    }
+
+    /// A Read's range follows Claude Code's defaults for the half it leaves out.
+    #[test]
+    fn a_read_names_the_lines_it_returns() {
+        let config = ToolMappingConfig::builtin().expect("builtin config");
+        let lines = |input: serde_json::Value| map_tool_call(&config, "Read", &input, "a", "t").unwrap().target_lines;
+        assert_eq!(lines(serde_json::json!({"file_path": "/p/a.rs", "offset": 95, "limit": 60})), Some(95..155));
+        assert_eq!(lines(serde_json::json!({"file_path": "/p/a.rs", "offset": 300})), Some(300..2300), "an offset alone: 2000 lines");
+        assert_eq!(lines(serde_json::json!({"file_path": "/p/a.rs", "limit": 40})), Some(1..41), "a limit alone: from line 1");
+        assert_eq!(lines(serde_json::json!({"file_path": "/p/a.rs"})), None, "neither: the whole file");
     }
 
     /// One pass for many calls finds what one lookup per call does.

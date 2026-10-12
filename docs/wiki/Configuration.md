@@ -116,8 +116,14 @@ description   = "MyCustomReader {path}"
 | `effect` | `"read"` (default) or `"write"`. A stanza has **exactly one** of a `depth` or `effect = "write"`: writes grant no read credit. See [Agent Writes](Agent-Writes) |
 | `description` | Activity-feed line; `{key}` interpolates an input value |
 | `extends` | Name of a built-in stanza to inherit unset fields from |
-| `target_symbol`, `target_lines`, `target_selectors` | Narrow the read to specific symbols rather than the whole file; see the built-ins |
+| `target_symbol`, `target_lines`, `target_selectors` | Narrow the read to specific symbols rather than the whole file; see the built-ins. `target_lines = { offset_key, limit_key, default_limit }` names the lines a call returned; `default_limit` is how many a call giving only an offset returns (the built-in `Read` sets 2000) |
 | `result_selectors` | Credit the symbols a command's **output** names, when its result arrives: `{ key, requires, subcommands, depth }`. The built-in `Bash` stanza credits `ambits rg`/`grep` matches at `NameOnly` |
+
+A call that names lines earns its depth only for the symbols wholly inside
+them. One it shows part of earns no more than `Signature` when the lines
+start at or before its first line, and no more than `Overview` when they start
+inside it, so reading 20 lines of a 500-line class does not count as reading
+the class.
 
 A tool that **changes** files is declared a write instead of given a depth:
 
