@@ -660,6 +660,7 @@ fn make_symbol(
         file_path: Arc::clone(ctx.file_path),
         byte_range: start_byte as u32..byte_range.end as u32,
         line_range: start_line as u32..end_line as u32,
+        head_line: super::head_line(span.line_node),
         content_hash: content_hash(text),
         merkle_hash: [0u8; 32],
         children,

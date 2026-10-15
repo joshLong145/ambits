@@ -16,7 +16,7 @@ pub fn sym(id: &str, name: &str) -> SymbolNode {
         label: "fn",
         file_path: Arc::new(PathBuf::new()),
         byte_range: 0..100,
-        line_range: 1..10,
+        line_range: 1..10, head_line: 1,
         content_hash: hash,
         merkle_hash: hash,
         children: Vec::new(),
@@ -45,6 +45,7 @@ pub fn sym_with_bytes(id: &str, name: &str, start: u32, end: u32) -> SymbolNode 
 pub fn sym_with_lines(id: &str, name: &str, start: usize, end: usize) -> SymbolNode {
     let mut s = sym(id, name);
     s.line_range = start as u32..end as u32;
+    s.head_line = start as u32;
     s
 }
 
@@ -59,6 +60,7 @@ pub fn sym_with_children_and_lines(
     let mut s = sym(id, name);
     s.children = children;
     s.line_range = start as u32..end as u32;
+    s.head_line = start as u32;
     s
 }
 

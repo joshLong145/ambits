@@ -1091,6 +1091,7 @@ mod tests {
     fn rehydrate_re_keys_a_moved_symbol_to_its_current_id() {
         let mut moved = sym_hashed("src/util.rs::helper", "helper", "fn body");
         moved.line_range = 12..18;
+        moved.head_line = 12;
         let tree = project(vec![file("src/util.rs", vec![moved])]);
         let hash = content_hash("fn body");
 
@@ -1316,6 +1317,7 @@ mod tests {
     fn a_moved_symbol_is_restored_at_its_new_home() {
         let mut moved = sym_hashed("src/util.rs::format_tokens", "format_tokens", "fn body");
         moved.line_range = 12..18;
+        moved.head_line = 12;
         let tree = project(vec![
             file("src/util.rs", vec![moved]),
             file("src/stats.rs", vec![sym_hashed("src/stats.rs::other", "other", "unrelated")]),

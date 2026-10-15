@@ -313,7 +313,7 @@ mod tests {
         SymbolNode {
             id: id.into(), name: name.into(), category: SymbolCategory::Function,
             label: "fn", file_path: std::sync::Arc::new(PathBuf::new()),
-            byte_range: 0..100, line_range: 1..10, content_hash: hash,
+            byte_range: 0..100, line_range: 1..10, head_line: 1, content_hash: hash,
             merkle_hash: hash, children: Vec::new(), estimated_tokens: 30,
         }
     }

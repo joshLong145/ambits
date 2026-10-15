@@ -258,6 +258,7 @@ fn make_symbol(
         file_path: Arc::clone(ctx.file_path),
         byte_range: start_byte as u32..end_byte as u32,
         line_range: start_line as u32..end_line as u32,
+        head_line: super::head_line(node),
         content_hash: content_hash(text),
         merkle_hash: [0u8; 32],
         children,
@@ -562,6 +563,7 @@ mod tests {
         assert_eq!(m.name.as_ref(), "toString");
         assert_eq!(m.byte_range.start as usize, src.find("@Override").unwrap());
         assert_eq!(m.line_range.start, 2);
+        assert_eq!(m.head_line, 4, "its name is on the line after its annotations");
     }
 
     /// A Javadoc glued to a declaration widens it, as `///` does in Rust,

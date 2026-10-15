@@ -71,6 +71,9 @@ pub struct SymbolNode {
     pub byte_range: Range<u32>,
     /// 1-based inclusive line range. `u32` for the same reason as `byte_range`.
     pub line_range: Range<u32>,
+    /// The line that names the symbol, inside `line_range`, which also holds
+    /// the comments, attributes and decorators above it.
+    pub head_line: u32,
     pub content_hash: [u8; 32],
     pub merkle_hash: [u8; 32],
     pub children: Vec<SymbolNode>,

@@ -40,7 +40,11 @@ delegation covers all its rounds, idle time included.
 A call with no result yet (still running, or the session ended) has no end:
 it is exported with zero length and marked `ambits.open`.
 A failed call, or an agent that stopped with any status but `completed`, is
-an error.
+an error. A call failed when its result says `is_error`, or when its only
+result is text that reads as a failure: it starts `Error`, is wrapped in
+`<tool_use_error>`, or is Claude Code's message for a call the user rejected.
+Other plain text, such as `StructuredOutput`'s "Structured output provided
+successfully", is a success.
 
 Compactions and git commits are moments rather than spans: span events in
 OTLP — on the prompt they happened during, else on the session — and

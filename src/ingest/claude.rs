@@ -529,10 +529,19 @@ fn parse_hunks(patch: Option<&Value>) -> Option<Vec<Hunk>> {
 }
 
 /// Whether a `tool_result` block says its call failed: `is_error`, or the
-/// line's `toolUseResult` is a string (a rejection, "String to replace not
-/// found") — which says so only when the line holds this one result.
+/// line's `toolUseResult` is text that reads as a failure — which says so
+/// only when the line holds this one result. Text alone is not enough:
+/// `StructuredOutput` succeeds with "Structured output provided successfully".
 fn result_failed(block: &Value, detail: Option<&Value>, single: bool) -> bool {
-    block.get("is_error").and_then(Value::as_bool).unwrap_or(false) || (single && detail.is_some_and(Value::is_string))
+    block.get("is_error").and_then(Value::as_bool).unwrap_or(false)
+        || (single && detail.and_then(Value::as_str).is_some_and(reads_as_failure))
+}
+
+/// Claude Code's failure text: it starts `Error`, is wrapped in
+/// `<tool_use_error>`, or is its message for a call the user rejected.
+fn reads_as_failure(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("Error") || text.contains("<tool_use_error>") || text.starts_with("The user doesn't want to proceed")
 }
 
 /// Every `tool_result` block on a `type:"user"` line.
@@ -1764,17 +1773,29 @@ mod tests {
         }
     }
 
-    /// A string `toolUseResult` fails the call only when the line holds
-    /// that one result; `is_error` always does.
+    /// A `toolUseResult` that reads as a failure fails the call only when
+    /// the line holds that one result; `is_error` always does.
     #[test]
     fn one_rule_says_a_result_failed() {
         let ok = serde_json::json!({"type": "tool_result", "tool_use_id": "a"});
         let err = serde_json::json!({"type": "tool_result", "tool_use_id": "a", "is_error": true});
-        let text = serde_json::json!("String to replace not found");
+        let text = serde_json::json!("Error: String to replace not found");
         assert!(result_failed(&ok, Some(&text), true));
         assert!(!result_failed(&ok, Some(&text), false), "whose message it is, is unknown");
+        let wrapped = serde_json::json!("<tool_use_error>String to replace not found in file.</tool_use_error>");
+        assert!(result_failed(&ok, Some(&wrapped), true));
         assert!(!result_failed(&ok, Some(&serde_json::json!({"type": "text"})), true));
         assert!(result_failed(&err, None, false));
+    }
+
+    /// As Claude Code logs it: a plain-text result with no `is_error`.
+    #[test]
+    fn structured_output_that_succeeded_is_not_a_failure() {
+        let ok = serde_json::json!({"type": "tool_result", "tool_use_id": "a", "content": "Structured output provided successfully"});
+        assert!(!result_failed(&ok, Some(&serde_json::json!("Structured output provided successfully")), true));
+        let rejected = serde_json::json!({"type": "tool_result", "tool_use_id": "a", "is_error": true});
+        let schema = serde_json::json!("Error: Output does not match required schema: /root_cause: must NOT have more than 2500 characters");
+        assert!(result_failed(&rejected, Some(&schema), true), "a schema rejection still fails");
     }
 
     #[test]

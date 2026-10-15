@@ -24,6 +24,13 @@ pub struct SymbolMeta {
     pub label: &'static str,
 }
 
+/// The 1-based line that names the symbol `node` declares: its `name`
+/// field's, else the node's own first line, which lies below any comments
+/// or attributes glued above it.
+pub fn head_line(node: tree_sitter::Node<'_>) -> u32 {
+    node.child_by_field_name("name").unwrap_or(node).start_position().row as u32 + 1
+}
+
 /// The earliest node in an unbroken run of comments immediately above
 /// `node` — no blank line, no other node between one and the next — or
 /// `None` if `node` has no such comment directly above it.

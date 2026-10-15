@@ -552,7 +552,7 @@ mod tests {
         use ambits::symbols::{FileSymbols, SymbolCategory, SymbolNode};
         let node = |id: &str, name: &str, lines: std::ops::Range<u32>, children: Vec<SymbolNode>| SymbolNode {
             id: id.into(), name: name.into(), category: SymbolCategory::Function, label: "fn",
-            file_path: Arc::new(PathBuf::from("src/a.rs")), byte_range: 0..10, line_range: lines,
+            file_path: Arc::new(PathBuf::from("src/a.rs")), byte_range: 0..10, head_line: lines.start, line_range: lines,
             content_hash: [1; 32], merkle_hash: [1; 32], children, estimated_tokens: 5,
         };
         let run = node("src/a.rs::App/run", "run", 3..5, vec![]);

@@ -168,6 +168,7 @@ fn extract_symbols(
                 file_path: Arc::clone(file_path),
                 byte_range: start_byte as u32..end_byte as u32,
                 line_range: start_line as u32..end_line as u32,
+                head_line: super::head_line(child),
                 content_hash: content_hash(text),
                 merkle_hash: [0u8; 32],
                 children: Vec::new(),
@@ -231,6 +232,7 @@ fn extract_body_children(
                 file_path: Arc::clone(file_path),
                 byte_range: start_byte as u32..end_byte as u32,
                 line_range: start_line as u32..end_line as u32,
+                head_line: super::head_line(child),
                 content_hash: content_hash(text),
                 merkle_hash: [0u8; 32],
                 children: Vec::new(),
@@ -499,6 +501,8 @@ impl Display for P {
         assert_starts_at("/// Docs.\n#[derive(Debug)]\npub struct S;\n", "/// Docs.");
         assert_starts_at("#[test]\nfn t() {}\n", "#[test]");
         assert_starts_at("#[inline]\n/// Docs.\nfn f() {}\n", "#[inline]");
+        let syms = parse("/// Docs.\n#[derive(Debug)]\npub struct S;\n");
+        assert_eq!((syms[0].line_range.start, syms[0].head_line), (1, 3), "named below its docs and attributes");
         assert_starts_at(
             "/// Docs.\n#[derive(Debug)]\n#[serde(rename_all = \"snake_case\")]\nenum E { A }\n",
             "/// Docs.",

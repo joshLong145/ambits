@@ -188,7 +188,7 @@ mod tests {
         let hash = ambits::symbols::merkle::content_hash("alpha");
         let alpha = SymbolNode {
             id: "mock/a.rs::alpha".into(), name: "alpha".into(), category: SymbolCategory::Function,
-            label: "fn", file_path: Arc::new(PathBuf::from("mock/a.rs")), byte_range: 0..10, line_range: 1..3,
+            label: "fn", file_path: Arc::new(PathBuf::from("mock/a.rs")), byte_range: 0..10, line_range: 1..3, head_line: 1,
             content_hash: hash, merkle_hash: hash, children: Vec::new(), estimated_tokens: 12,
         };
         let tree = ProjectTree { root: PathBuf::from("/test"), files: vec![FileSymbols { file_path: "mock/a.rs".into(), symbols: vec![alpha], total_lines: 3 }] };

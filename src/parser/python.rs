@@ -28,6 +28,7 @@
 //! | `x: int = ...` (annotated assignment)      | Variable | `"var"`  |
 //! | `MAX_SIZE = ...` (UPPER_SNAKE_CASE)        | Variable | `"var"`  |
 //! | class methods                              | Function | `"def"`  |
+//! | `def`/`class` nested in a function's body  | (same)   | (same)   |
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -223,16 +224,19 @@ fn extract_symbols(
                 file_path: Arc::clone(file_path),
                 byte_range: start_byte as u32..end_byte as u32,
                 line_range: start_line as u32..end_line as u32,
+                head_line: super::head_line(child),
                 content_hash: content_hash(text),
                 merkle_hash: [0u8; 32],
                 children: Vec::new(),
                 estimated_tokens: estimate_tokens(text) as u32,
             };
 
-            // For classes, recurse into the body block to find methods.
-            if meta.category == SymbolCategory::Type {
-                if let Some(body) = child.child_by_field_name("body") {
-                    extract_symbols(body, src, file_path, names, path_prefix, &name_path, &mut sym.children);
+            // A class's body holds its methods; a function's, its nested definitions.
+            if let Some(body) = child.child_by_field_name("body") {
+                match meta.category {
+                    SymbolCategory::Type => extract_symbols(body, src, file_path, names, path_prefix, &name_path, &mut sym.children),
+                    SymbolCategory::Function => extract_nested_definitions(body, src, file_path, names, path_prefix, &name_path, &mut sym.children),
+                    _ => {}
                 }
             }
 
@@ -301,15 +305,18 @@ fn extract_decorated(
                     file_path: Arc::clone(file_path),
                     byte_range: start_byte as u32..end_byte as u32,
                     line_range: start_line as u32..end_line as u32,
+                    head_line: super::head_line(child),
                     content_hash: content_hash(text),
                     merkle_hash: [0u8; 32],
                     children: Vec::new(),
                     estimated_tokens: estimate_tokens(text) as u32,
                 };
 
-                if meta.category == SymbolCategory::Type {
-                    if let Some(body) = child.child_by_field_name("body") {
-                        extract_symbols(body, src, file_path, names, path_prefix, &name_path, &mut sym.children);
+                if let Some(body) = child.child_by_field_name("body") {
+                    match meta.category {
+                        SymbolCategory::Type => extract_symbols(body, src, file_path, names, path_prefix, &name_path, &mut sym.children),
+                        SymbolCategory::Function => extract_nested_definitions(body, src, file_path, names, path_prefix, &name_path, &mut sym.children),
+                        _ => {}
                     }
                 }
 
@@ -430,6 +437,23 @@ fn extract_type_alias(node: &Node, src: &[u8]) -> Option<(String, SymbolMeta)> {
 /// | `with_statement` | `body`                                              |
 /// | `try_statement`  | `body`; children: `except_clause`/`finally_clause`  |
 /// | `match_statement`| `body` (block of `case_clause`s via `consequence`)  |
+/// The functions and classes defined in a function's body, at any depth of
+/// control flow, but not its local variables, which the module-level
+/// assignment rules would otherwise index.
+fn extract_nested_definitions(
+    body: Node,
+    src: &[u8],
+    file_path: &Arc<PathBuf>,
+    names: &NameInterner,
+    path_prefix: &str,
+    parent_name_path: &str,
+    out: &mut Vec<SymbolNode>,
+) {
+    let mut found = Vec::new();
+    extract_symbols(body, src, file_path, names, path_prefix, parent_name_path, &mut found);
+    out.extend(found.into_iter().filter(|s| s.category != SymbolCategory::Variable));
+}
+
 fn extract_from_compound_bodies(
     node: &Node,
     src: &[u8],
@@ -724,11 +748,24 @@ mod tests {
     }
 
     #[test]
+    fn a_function_nested_in_a_function_is_indexed_but_its_locals_are_not() {
+        let src = "class W:\n    def run(self):\n        limit: int = 3\n        def _handle_sigterm(signum, frame):\n            pass\n        if limit:\n            def helper():\n                pass\n";
+        let syms = parse(src);
+        let run = &syms[0].children[0];
+        assert_eq!(run.id, "test.py::W/run");
+        let kids: Vec<&str> = run.children.iter().map(|c| c.name.as_ref()).collect();
+        assert_eq!(kids, ["_handle_sigterm", "helper"], "nested defs, even under `if`; not the annotated local");
+        assert_eq!(run.children[0].id, "test.py::W/run/_handle_sigterm");
+        assert_eq!(run.children[0].line_range, 4..5);
+    }
+
+    #[test]
     fn parse_multiple_decorators() {
         let syms = parse("@decorator1\n@decorator2\ndef foo():\n    pass\n");
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name.as_ref(), "foo");
         assert_eq!(syms[0].line_range.start, 1);
+        assert_eq!(syms[0].head_line, 3, "the `def` line names it, below its decorators");
     }
 
     #[test]

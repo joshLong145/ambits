@@ -122,9 +122,11 @@ description   = "MyCustomReader {path}"
 
 A call that names lines earns its depth only for the symbols wholly inside
 them. One it shows part of earns no more than `Signature` when the lines
-start at or before its first line, and no more than `Overview` when they start
-inside it, so reading 20 lines of a 500-line class does not count as reading
-the class.
+start at or before the line that names it and reach that line, and no more
+than `Overview` when they start below it, so reading 20 lines of a 500-line
+class does not count as reading the class. A symbol's span includes the
+comments, attributes and decorators above it, and lines showing only those,
+not the line naming it, earn nothing.
 
 A tool that **changes** files is declared a write instead of given a depth:
 
@@ -202,6 +204,12 @@ list replaces an earlier layer's, except that patterns in the user-global
 ```bash
 ambits -p . --serena
 ```
+
+Python symbols are functions, classes and their methods, module-level
+annotated or `UPPER_SNAKE_CASE` assignments, and `type` aliases. A function or
+class defined inside a function's body, even under `if`, `for`, `with` or
+`try`, is a symbol nested under that function (`worker.py::Worker/run/_handle_sigterm`);
+the function's local variables are not.
 
 Markdown symbols are ATX headings (`#` through `######`), nested by level; a
 heading's span runs to the next heading of equal or shallower depth. Content

@@ -2245,7 +2245,10 @@ pub fn mark_targeted_symbols(symbols: &[SymbolNode], event: &AgentToolCall, cred
                 mark_file_symbols(&sym.children, event.read_depth, credit, true);
             }
             MatchKind::ByLineOverlap => {
-                credit.record(sym, overlap_depth(sym, event), false);
+                let depth = overlap_depth(sym, event);
+                if depth.is_seen() {
+                    credit.record(sym, depth, false);
+                }
                 // Parent container overlaps the read range — recurse precisely so
                 // only children whose ranges also overlap get promoted.
                 mark_targeted_symbols(&sym.children, event, credit);
@@ -2325,17 +2328,22 @@ pub fn symbol_lines_match(sym: &SymbolNode, event: &AgentToolCall) -> bool {
 }
 
 /// What a line-range read earned of `sym`, which it overlaps: the call's
-/// depth when every line of the symbol was in range; otherwise no more than
-/// `Signature` when the range began at or before the symbol's first line,
-/// and no more than `Overview` when it began inside it.
+/// depth when every line of the symbol was in range; otherwise nothing when
+/// it showed only the lines above the one naming the symbol (its comments,
+/// attributes or decorators), no more than `Signature` when it began at or
+/// before that line, and no more than `Overview` when it began below it.
 pub fn overlap_depth(sym: &SymbolNode, event: &AgentToolCall) -> ReadDepth {
     let Some(ref range) = event.target_lines else { return event.read_depth };
-    let from_start = range.start <= sym.line_range.start;
-    let to_end = sym.line_range.end < range.end;
-    match (from_start, to_end) {
-        (true, true) => event.read_depth,
-        (true, false) => event.read_depth.min(ReadDepth::Signature),
-        (false, _) => event.read_depth.min(ReadDepth::Overview),
+    if range.start <= sym.line_range.start && sym.line_range.end < range.end {
+        return event.read_depth;
+    }
+    let head = sym.head_line.clamp(sym.line_range.start, sym.line_range.end);
+    if range.end <= head {
+        ReadDepth::Unseen
+    } else if range.start <= head {
+        event.read_depth.min(ReadDepth::Signature)
+    } else {
+        event.read_depth.min(ReadDepth::Overview)
     }
 }
 
@@ -2614,6 +2622,26 @@ mod tests {
         assert_eq!(depth_for(14, 30), ReadDepth::Overview, "from inside it");
         assert_eq!(depth_for(20, 25), ReadDepth::Overview, "its last line only: a range ending on it still overlaps");
         assert_eq!(depth_for(21, 25), ReadDepth::Unseen, "after it");
+    }
+
+    /// Lines 10–11 are its decorators; line 12 names it.
+    #[test]
+    fn a_read_of_only_the_lines_above_a_symbols_name_earns_nothing() {
+        let mut f = sym_with_lines("f.rs::f", "f", 10, 20);
+        f.head_line = 12;
+        let depth_for = |start, end| {
+            let event = tool_call_lines("Read", "f.rs", ReadDepth::FullBody, start, end);
+            let mut ledger = ContextLedger::new();
+            let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
+            let mut credit = Credit::new(&mut ledger, &mut cache, &event.agent_id);
+            mark_targeted_symbols(std::slice::from_ref(&f), &event, &mut credit);
+            let recorded = credit.read.len();
+            (ledger.depth_of("f.rs::f"), recorded)
+        };
+        assert_eq!(depth_for(5, 12), (ReadDepth::Unseen, 0), "its decorators only: not even recorded");
+        assert_eq!(depth_for(5, 13), (ReadDepth::Signature, 1), "down to the line naming it");
+        assert_eq!(depth_for(11, 14), (ReadDepth::Signature, 1), "from inside its decorators");
+        assert_eq!(depth_for(13, 15), (ReadDepth::Overview, 1), "from below its name");
     }
 
     #[test]

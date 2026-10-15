@@ -227,6 +227,7 @@ fn convert_symbol(
         file_path: std::sync::Arc::clone(file_path),
         byte_range: ((start_line * 40 + start_char) as u32)..((end_line * 40 + end_char) as u32),
         line_range: ((start_line + 1) as u32)..((end_line + 1) as u32), // 1-indexed like tree-sitter
+        head_line: (start_line + 1) as u32,
         content_hash,
         merkle_hash: [0u8; 32],
         children,

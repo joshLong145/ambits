@@ -127,7 +127,7 @@ fn make_sym(id: &str, name: &str) -> SymbolNode {
         label: "fn",
         file_path: Arc::new(PathBuf::from("src/bench.rs")),
         byte_range: 0..100,
-        line_range: 1..10,
+        line_range: 1..10, head_line: 1,
         content_hash: hash,
         merkle_hash: hash,
         children: Vec::new(),
