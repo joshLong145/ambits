@@ -406,6 +406,12 @@ enum Commands {
         /// is listed in its `truncated` field.
         #[arg(long, conflicts_with = "from_json")]
         max_bytes: Option<usize>,
+
+        /// A timeline of the harness that ran the session — its phases,
+        /// turns and markers — to carry under `phases` and draw as lanes of
+        /// its own. See the Reports page for the document's shape.
+        #[arg(long, conflicts_with = "from_json")]
+        phases: Option<PathBuf>,
     },
 
     /// Inspect, remove or build the coverage journals under .ambits/coverage.
@@ -1724,8 +1730,16 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(Commands::Report { format, max_bytes, .. }) = &command {
+    if let Some(Commands::Report { format, max_bytes, phases, .. }) = &command {
         report_warnings(&config_warnings);
+        // Read before the session, so a bad document fails without a replay.
+        let phases = phases
+            .as_ref()
+            .map(|path| {
+                let json = std::fs::read_to_string(path).map_err(|e| color_eyre::eyre::eyre!("{}: {e}", path.display()))?;
+                ambits::report::Phases::parse(&json).map_err(|e| e.wrap_err(path.display().to_string()))
+            })
+            .transpose()?;
         let session = require_session(session_id.as_deref(), "report on")?.to_string();
         if log_dir.as_ref().is_none_or(|d| ingester.session_log_files(d, &session).is_empty()) {
             color_eyre::eyre::bail!("no logs for session {session}: pass --log-dir, or run inside a project with Claude Code logs");
@@ -1761,6 +1775,7 @@ fn run() -> Result<()> {
             writes: writes.into_values().collect(),
             registry: &registry,
             details,
+            phases,
         })?;
         if let Some(max) = max_bytes {
             ambits::report::fit(&mut report, *max)?;

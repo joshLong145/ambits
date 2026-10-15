@@ -11,21 +11,21 @@
   --bg: #fbfbfa; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e3e2de;
   --accent: #2f5fd0; --d1: #eef1f8; --d2: #d9e1f4; --d3: #b5c6ec; --d4: #7d9be0;
   --ok: #1f7a4d; --warn: #a15c00; --bad: #b3261e; --prompt: #6d4bc4; --read: #2f5fd0;
-  --write: #c2410c; --delegate: #0f766e; --other: #8a8a84;
+  --write: #c2410c; --delegate: #0f766e; --other: #8a8a84; --phase: #a3367a;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bg: #151514; --panel: #1d1d1b; --ink: #ecebe7; --muted: #a3a29c; --line: #34332f;
     --accent: #7ea2ff; --d1: #22283a; --d2: #2a3552; --d3: #36497a; --d4: #4f6fc0;
     --ok: #5cc493; --warn: #e3a54a; --bad: #f2867d; --prompt: #b29cf2; --read: #7ea2ff;
-    --write: #f59b6b; --delegate: #4fc7b8; --other: #8f8e88;
+    --write: #f59b6b; --delegate: #4fc7b8; --other: #8f8e88; --phase: #e58ac0;
   }
 }
 :root[data-theme="dark"] {
   --bg: #151514; --panel: #1d1d1b; --ink: #ecebe7; --muted: #a3a29c; --line: #34332f;
   --accent: #7ea2ff; --d1: #22283a; --d2: #2a3552; --d3: #36497a; --d4: #4f6fc0;
   --ok: #5cc493; --warn: #e3a54a; --bad: #f2867d; --prompt: #b29cf2; --read: #7ea2ff;
-  --write: #f59b6b; --delegate: #4fc7b8; --other: #8f8e88;
+  --write: #f59b6b; --delegate: #4fc7b8; --other: #8f8e88; --phase: #e58ac0;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
@@ -75,8 +75,12 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
 .span.read { background: var(--read); } .span.write { background: var(--write); }
 .span.delegate { background: var(--delegate); } .span.other { background: var(--other); }
 .span.error { outline: 2px solid var(--bad); }
+.span.phase { background: var(--phase); }
+.lane.host .label { color: var(--ink); }
+.lanes .sep { border-top: 1px solid var(--line); margin: 6px 0; }
 .instant { position: absolute; top: 0; bottom: 0; width: 0; border-left: 1px dashed var(--muted); }
 .instant.commit { border-left-color: var(--ok); }
+.instant.marker { border-left: 2px solid var(--bad); }
 .legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
 .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
 .calls .row { scroll-margin-top: 56px; display: flex; gap: 8px; padding: 3px 8px; border-top: 1px solid var(--line); cursor: pointer; align-items: baseline; }
@@ -330,18 +334,84 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
   // Trace
   (function () {
     const s = document.getElementById("panel-trace");
-    if (!R.spans.length) { s.append(el("div", { class: "empty", text: "No tool calls." })); return; }
+    // The harness's own timeline, when it supplied one (`--phases`).
+    const P = R.phases || { lanes: [], markers: [], incomplete: false };
+    const phaseSpans = P.lanes.flatMap(l => l.spans);
+    if (!R.spans.length && !phaseSpans.length) { s.append(el("div", { class: "empty", text: "No tool calls." })); return; }
     const ends = R.spans.map(x => x.end_ms || x.start_ms);
-    const t0 = Math.min(...R.spans.map(x => x.start_ms));
-    const t1 = Math.max(t0 + 1, ...ends, ...R.instants.map(i => i.t_ms));
+    const t0 = Math.min(...R.spans.map(x => x.start_ms), ...phaseSpans.map(p => p.start_ms), ...P.markers.map(m => m.t_ms));
+    const t1 = Math.max(t0 + 1, ...ends, ...R.instants.map(i => i.t_ms), ...phaseSpans.map(p => p.end_ms), ...P.markers.map(m => m.t_ms));
     const at = t => (100 * (t - t0)) / (t1 - t0);
 
-    s.append(el("div", { class: "legend" }, ...["prompt", "read", "write", "delegate", "other"].map(k => {
+    if (P.incomplete) s.append(el("div", { class: "notice", text: "The harness could not record its whole timeline, so a phase missing here may still have run." }));
+    s.append(el("div", { class: "legend" }, ...[...(phaseSpans.length ? ["phase"] : []), "prompt", "read", "write", "delegate", "other"].map(k => {
       const sw = el("i", { class: "span " + k }); sw.style.position = "static";
       return el("span", null, sw, k);
     }), el("span", { text: clock(t0) + " → " + clock(t1) })));
 
     const lanes = el("div", { class: "lanes" });
+    const attrText = attrs => attrs.map(a => a.key + " " + a.value).join(" · ");
+    const markersOn = track => {
+      for (const m of P.markers) {
+        const mk = el("div", { class: "instant marker", title: m.name + (m.attrs.length ? " · " + attrText(m.attrs) : "") + " at " + clock(m.t_ms) });
+        mk.style.left = at(m.t_ms) + "%";
+        track.append(mk);
+      }
+    };
+
+    // Each harness lane stacks what overlaps into rows, so a phase that runs
+    // inside another sits on the row below it.
+    const phaseItems = [];
+    const phaseSelect = new Map();
+    P.lanes.forEach((lane, li) => {
+      const items = lane.spans.map((p, si) => ({ p, lane: lane.name, key: li + "-" + si }))
+        .sort((a, b) => a.p.start_ms - b.p.start_ms || b.p.end_ms - a.p.end_ms);
+      const rowEnds = [];
+      for (const item of items) {
+        let r = rowEnds.findIndex(end => end <= item.p.start_ms);
+        if (r < 0) { r = rowEnds.length; rowEnds.push(0); }
+        rowEnds[r] = item.p.end_ms;
+        item.row = r;
+      }
+      const tracks = rowEnds.length ? rowEnds.map(() => el("div", { class: "track" })) : [el("div", { class: "track" })];
+      for (const item of items) {
+        const label = lane.name + " · " + item.p.name;
+        const b = el("button", { class: "span phase", title: label + " · " + (item.p.end_ms - item.p.start_ms) + " ms", "aria-label": label, on: { click: () => revealPhase(item) } });
+        b.style.left = at(item.p.start_ms) + "%";
+        b.style.width = Math.max(0.25, at(item.p.end_ms) - at(item.p.start_ms)) + "%";
+        tracks[item.row].append(b);
+        phaseSelect.set(item.key, { bar: b, row: null, box: null });
+        phaseItems.push(item);
+      }
+      tracks.forEach((track, r) => {
+        markersOn(track);
+        lanes.append(el("div", { class: "lane host" }, el("div", { class: "label", title: lane.name, text: r ? "" : lane.name }), track));
+      });
+    });
+    if (P.lanes.length && R.spans.length) lanes.append(el("div", { class: "sep" }));
+
+    function phaseDetail(item) {
+      const dl = el("dl");
+      const rows = [["Lane", item.lane], ["Phase", item.p.name], ["When", clock(item.p.start_ms) + " → " + clock(item.p.end_ms) + " · " + (item.p.end_ms - item.p.start_ms) + " ms"]];
+      for (const a of item.p.attrs) rows.push([a.key, a.value]);
+      for (const [k, v] of rows) dl.append(el("dt", { text: k }), el("dd", { text: v }));
+      return el("div", { class: "expand" }, dl);
+    }
+    function togglePhase(item, open) {
+      const nodes = phaseSelect.get(item.key);
+      const wanted = open === undefined ? !nodes.box : open;
+      if (wanted && !nodes.box) {
+        nodes.box = phaseDetail(item);
+        nodes.row.after(nodes.box);
+      } else if (!wanted && nodes.box) {
+        nodes.box.remove();
+        nodes.box = null;
+      }
+      nodes.row.setAttribute("aria-expanded", String(Boolean(nodes.box)));
+      nodes.row.classList.toggle("sel", Boolean(nodes.box));
+      nodes.bar.classList.toggle("sel", Boolean(nodes.box));
+    }
+    const revealPhase = item => { togglePhase(item, true); phaseSelect.get(item.key).row.scrollIntoView({ block: "start" }); };
     const order = R.agents.map(a => a.id);
     R.spans.forEach(x => { if (!order.includes(x.agent)) order.push(x.agent); });
     const select = new Map();
@@ -425,7 +495,26 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
         m.style.left = at(i.t_ms) + "%";
         track.append(m);
       }
+      markersOn(track);
       lanes.append(el("div", { class: "lane" }, el("div", { class: "label", title: agent, text: nameOf(agent) }), track));
+    }
+
+    const phaseList = el("div", { class: "card calls" }, el("h2", { text: "Phases" }));
+    for (const item of [...phaseItems].sort((a, b) => a.p.start_ms - b.p.start_ms || b.p.end_ms - a.p.end_ms)) {
+      const row = el("div", { class: "row", tabindex: "0", role: "button", "aria-expanded": "false", on: { click: () => togglePhase(item), keydown: ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); togglePhase(item); } } } },
+        el("span", { class: "t mono", text: clock(item.p.start_ms) }),
+        el("span", { class: "chip", text: item.lane }),
+        el("span", { class: "n", text: item.p.name }),
+        el("span", { class: "counts", text: (item.p.end_ms - item.p.start_ms) + " ms" }));
+      row.style.paddingLeft = (8 + 16 * item.row) + "px";
+      phaseList.append(row);
+      phaseSelect.get(item.key).row = row;
+    }
+    for (const m of [...P.markers].sort((a, b) => a.t_ms - b.t_ms)) {
+      phaseList.append(el("div", { class: "row", title: attrText(m.attrs) },
+        el("span", { class: "t mono", text: clock(m.t_ms) }),
+        el("span", { class: "chip removed", text: "marker" }),
+        el("span", { class: "n", text: m.name + (m.attrs.length ? " · " + attrText(m.attrs) : "") })));
     }
 
     const level = x => { let n = 0, p = x.parent; while (p !== null && p !== undefined && spanById.has(p) && n < 32) { n++; p = spanById.get(p).parent; } return n; };
@@ -439,7 +528,8 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
       calls.append(row);
       select.get(x.i).row = row;
     }
-    s.append(lanes, calls);
+    if (!R.spans.length) calls.append(el("div", { class: "empty", text: "No tool calls." }));
+    s.append(...[lanes, phaseItems.length || P.markers.length ? phaseList : null, calls].filter(Boolean));
     openSpan = i => { const x = spanById.get(i); if (x) { show("trace"); reveal(x); } };
   })();
 

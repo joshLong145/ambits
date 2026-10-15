@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use color_eyre::eyre::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::ingest::content::{CallContent, CallDetail, ContentKind, DiffLine};
 use crate::journal::DepthDto;
@@ -48,6 +48,76 @@ pub struct Report {
     pub instants: Vec<InstantDto>,
     pub files: Vec<FileDto>,
     pub writes: Vec<WriteDto>,
+    /// The harness's own timeline, from `--phases`; absent when none was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phases: Option<Phases>,
+}
+
+/// A timeline the harness that ran the session supplies, drawn as lanes of
+/// its own beside the agents': its phases, turns, or whatever it timed.
+/// ambits does not interpret the names; it only checks the times.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Phases {
+    pub lanes: Vec<PhaseLane>,
+    #[serde(default)]
+    pub markers: Vec<PhaseMarker>,
+    /// The harness could not record all of it, so a missing phase is not
+    /// evidence that it did not run.
+    #[serde(default)]
+    pub incomplete: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhaseLane {
+    pub name: String,
+    pub spans: Vec<PhaseSpan>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhaseSpan {
+    pub name: String,
+    /// Epoch ms, as span times are.
+    pub start_ms: u64,
+    pub end_ms: u64,
+    #[serde(default)]
+    pub attrs: Vec<PhaseAttr>,
+}
+
+/// A moment in the harness's timeline, such as a failure it signalled.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhaseMarker {
+    pub t_ms: u64,
+    pub name: String,
+    #[serde(default)]
+    pub attrs: Vec<PhaseAttr>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhaseAttr {
+    pub key: String,
+    pub value: String,
+}
+
+impl Phases {
+    /// The timeline in `json`, refused when a span ends before it starts or a
+    /// lane has no name.
+    pub fn parse(json: &str) -> Result<Self> {
+        let phases: Self = serde_json::from_str(json).map_err(|e| color_eyre::eyre::eyre!("not a phases document: {e}"))?;
+        for lane in &phases.lanes {
+            if lane.name.trim().is_empty() {
+                color_eyre::eyre::bail!("a phases lane has no name");
+            }
+            if let Some(s) = lane.spans.iter().find(|s| s.end_ms < s.start_ms) {
+                color_eyre::eyre::bail!("phase {:?} in lane {:?} ends before it starts", s.name, lane.name);
+            }
+        }
+        Ok(phases)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -229,6 +299,7 @@ pub struct Inputs<'a> {
     pub registry: &'a ParserRegistry,
     /// Each call's arguments and content, by `tool_use_id`.
     pub details: HashMap<String, CallDetail>,
+    pub phases: Option<Phases>,
 }
 
 /// What `content` each span kind carries, as the TUI loads it; `None` for a
@@ -244,7 +315,7 @@ pub fn content_kind(kind: SpanKind) -> Option<ContentKind> {
 
 /// The report for `inputs`, before any size limit.
 pub fn build(inputs: Inputs<'_>) -> Result<Report> {
-    let Inputs { project_root, session_id, tree, ledger, trace, agents, writes, registry, details } = inputs;
+    let Inputs { project_root, session_id, tree, ledger, trace, agents, writes, registry, details, phases } = inputs;
 
     let spans = spans(trace, &details, project_root);
     let span_of_op: HashMap<&str, usize> =
@@ -363,6 +434,7 @@ pub fn build(inputs: Inputs<'_>) -> Result<Report> {
         instants: trace.instants().iter().map(instant).collect(),
         files,
         writes: write_dtos,
+        phases,
     })
 }
 
@@ -472,18 +544,25 @@ fn instant(i: &crate::trace::Instant) -> InstantDto {
 /// `truncated`, in this order: the symbol lists of files nothing wrote;
 /// the text reads returned; every other call's output; every span's list
 /// of symbols read (its
-/// `read_count` stays); every call's arguments; every write's diff; the
-/// spans that neither read, wrote nor delegated. Writes, totals and the
-/// remaining spans are never cut, so a report can still exceed the limit;
-/// the caller sees `truncated`.
+/// `read_count` stays); every call's arguments; the attributes of every
+/// phase and marker; every write's diff; the spans that neither read, wrote
+/// nor delegated. Writes, totals, phase times and the remaining spans are
+/// never cut, so a report can still exceed the limit; the caller sees
+/// `truncated`.
 pub fn fit(report: &mut Report, max_bytes: usize) -> Result<()> {
     type Cut = fn(&mut Report);
-    let cuts: [(&'static str, Cut); 7] = [
+    let cuts: [(&'static str, Cut); 8] = [
         ("unwritten_file_symbols", |r| r.files.iter_mut().filter(|f| f.symbols_written == 0).for_each(|f| f.symbols.clear())),
         ("read_text", |r| r.spans.iter_mut().filter(|s| matches!(s.content, Some(ContentDto::Read { .. }))).for_each(|s| s.content = None)),
         ("output", |r| r.spans.iter_mut().filter(|s| matches!(s.content, Some(ContentDto::Output { .. }))).for_each(|s| s.content = None)),
         ("span_reads", |r| r.spans.iter_mut().for_each(|s| s.read.clear())),
         ("arguments", |r| r.spans.iter_mut().for_each(|s| s.args.clear())),
+        ("phase_attrs", |r| {
+            if let Some(p) = r.phases.as_mut() {
+                p.lanes.iter_mut().flat_map(|l| l.spans.iter_mut()).for_each(|s| s.attrs.clear());
+                p.markers.iter_mut().for_each(|m| m.attrs.clear());
+            }
+        }),
         ("diffs", |r| r.spans.iter_mut().for_each(|s| s.content = None)),
         // Ids stay as they are, so `parent` and a write's `span` still resolve.
         ("other_spans", |r| r.spans.retain(|s| matches!(s.kind, "prompt" | "read" | "write" | "delegate"))),

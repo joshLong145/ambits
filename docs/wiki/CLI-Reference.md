@@ -134,11 +134,12 @@ keeps one agent's subtree. See [Traces](Traces).
 
 ## `ambits report`
 
-`ambits -p . report [--format json|html] [--max-bytes N]` — the session
-(`--session`, or the latest) as one JSON document on stdout, or with
-`--format html` as a self-contained page: its trace, each agent's reads of
-every symbol, and every write with its status and the commit it landed in.
-Reads the journal when there is one; writes nothing.
+`ambits -p . report [--format json|html] [--max-bytes N] [--phases <file>]`
+— the session (`--session`, or the latest) as one JSON document on stdout, or
+with `--format html` as a self-contained page: its trace, each agent's reads
+of every symbol, and every write with its status and the commit it landed in.
+Reads the journal when there is one; writes nothing. `--phases` adds the
+timeline of the harness that ran the session, drawn as lanes of its own.
 `report --format html --from-json <file>` renders a saved document instead.
 See [Reports](Reports).
 

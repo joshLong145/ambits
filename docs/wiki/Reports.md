@@ -22,7 +22,8 @@ nothing. To have the journal hold everything first, run `cache sync`.
 `--format html` writes the same document as one self-contained HTML page:
 a summary, the files with each symbol's read depth and the writes that
 touched it, the writes grouped by the commit they landed in, and the trace as
-a timeline with one lane per agent above every call. A call expands in place
+a timeline with one lane per agent above every call, under any lanes the
+harness supplied (see [A harness's phases](#a-harnesss-phases)). A call expands in place
 when clicked, as in the TUI: its arguments, and the change it made, the
 text it read with line numbers, or what it printed. Open it in any browser; it needs no
 server.
@@ -34,8 +35,42 @@ ambits report --format html --from-json screened.json > report.html
 
 `--from-json` renders a document `report` printed earlier, exactly as
 given, without reading any session, log or checkout: build the JSON, screen
-it, then render the screened copy. It takes no `--max-bytes`; cut the JSON
-when it is built.
+it, then render the screened copy. It takes no `--max-bytes` or `--phases`;
+both apply when the JSON is built.
+
+## A harness's phases
+
+A harness that ran the session (a CI job, an agent runner) can hand
+`report` its own timeline with `--phases <file>`, so the page shows the whole
+run and not only the agent's calls:
+
+```bash
+ambits -p <clone> --log-dir <logs> -s <session> report --phases phases.json
+```
+
+```json
+{
+  "lanes": [
+    {"name": "Phases", "spans": [
+      {"name": "clone", "start_ms": 1791626399100, "end_ms": 1791626399500,
+       "attrs": [{"key": "cost_usd", "value": "0"}]}
+    ]}
+  ],
+  "markers": [{"t_ms": 1791626402000, "name": "tool_failure", "attrs": []}],
+  "incomplete": false
+}
+```
+
+Each lane is drawn above the agents' lanes, in the order given. A span that
+overlaps an earlier one in its lane goes on a row below it, so a phase run
+inside another sits under it. Markers are drawn across every lane, and every
+span and marker is listed under the lanes, where its `attrs` open when it is
+clicked. Times are epoch milliseconds, the clock span times use; `markers`,
+`attrs` and `incomplete` may be left out. `incomplete: true` says the harness
+could not record its whole timeline, and the page says so. ambits does not
+interpret the names. It refuses a document with an unknown field, a lane
+with no name, or a span that ends before it starts. The document is carried
+as given under `phases`, so screen it with the rest.
 
 The page loads nothing. Its Content-Security-Policy is `default-src 'none'`
 with only its own script and stylesheet allowed, by hash, and it shows every
@@ -70,6 +105,7 @@ project by its directory's name, never its path.
 | `instants` | `compaction`, `commit` (`sha`, `subject`) and `snapshot` events, by `t_ms` |
 | `files` | Every file, with `symbols` listed for those something read or wrote |
 | `writes` | Every attributed write, oldest first |
+| `phases` | The `--phases` document as given; absent without `--phases` |
 
 A span: `i` (its id, which `parent` and a write's `span` refer to), `parent`,
 `agent`, `kind` (`prompt`, `read`, `write`, `delegate`, `other`), `tool`,
@@ -114,8 +150,9 @@ cut in `truncated`:
 3. `output`: every other call's output.
 4. `span_reads`: every span's `read` list; `read_count` stays.
 5. `arguments`: every call's `args`.
-6. `diffs`: every write's `content`.
-7. `other_spans`: spans that neither read, wrote nor delegated.
+6. `phase_attrs`: the `attrs` of every phase span and marker.
+7. `diffs`: every write's `content`.
+8. `other_spans`: spans that neither read, wrote nor delegated.
 
-Writes, totals and the remaining spans are never cut, so a report can still
-exceed the limit.
+Writes, totals, phase times and the remaining spans are never cut, so a
+report can still exceed the limit.

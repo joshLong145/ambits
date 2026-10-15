@@ -260,11 +260,85 @@ fn max_bytes_cuts_in_order_and_says_so() {
     let l = layout();
     let full = report(&l, &[]);
     let r = report(&l, &["--max-bytes", "10"]);
-    assert_eq!(r["truncated"], json!(["unwritten_file_symbols", "read_text", "output", "span_reads", "arguments", "diffs", "other_spans"]));
+    assert_eq!(r["truncated"], json!(["unwritten_file_symbols", "read_text", "output", "span_reads", "arguments", "phase_attrs", "diffs", "other_spans"]));
     assert_eq!(r["writes"], full["writes"], "writes are never cut");
     let read = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Read").unwrap();
     assert_eq!((read["read"].clone(), read["read_count"].clone()), (json!([]), json!(2)));
     assert!(report(&l, &["--max-bytes", "100000000"])["truncated"].as_array().unwrap().is_empty());
+}
+
+fn phases_doc() -> Value {
+    json!({
+        "lanes": [
+            {"name": "Run", "spans": [{"name": "run", "start_ms": 1_791_626_399_000u64, "end_ms": 1_791_626_403_000u64, "attrs": []}]},
+            {"name": "Phases", "spans": [
+                {"name": "clone", "start_ms": 1_791_626_399_100u64, "end_ms": 1_791_626_399_500u64, "attrs": [{"key": "cost_usd", "value": "0"}]},
+                {"name": "llm_fix", "start_ms": 1_791_626_400_000u64, "end_ms": 1_791_626_402_900u64, "attrs": [{"key": "cost_usd", "value": "0.41"}]}
+            ]}
+        ],
+        "markers": [{"t_ms": 1_791_626_402_000u64, "name": "tool_failure", "attrs": [{"key": "tool", "value": "Bash"}]}],
+        "incomplete": true
+    })
+}
+
+fn phases_file(l: &Layout, doc: &Value) -> String {
+    let file = l.logs.with_file_name("phases.json");
+    std::fs::write(&file, doc.to_string()).unwrap();
+    file.to_string_lossy().into_owned()
+}
+
+#[test]
+fn the_report_carries_the_harness_phases_as_given() {
+    let l = layout();
+    let doc = phases_doc();
+    let r = report(&l, &["--phases", &phases_file(&l, &doc)]);
+    assert_eq!(r["phases"], doc);
+    assert!(report(&l, &[]).get("phases").is_none(), "no --phases, no key: older readers see the same document");
+}
+
+#[test]
+fn a_phases_document_with_impossible_times_or_unknown_fields_is_refused() {
+    let l = layout();
+    let mut backwards = phases_doc();
+    backwards["lanes"][1]["spans"][0]["end_ms"] = json!(1);
+    let mut unknown = phases_doc();
+    unknown["lanes"][0]["colour"] = json!("red");
+    let mut unnamed = phases_doc();
+    unnamed["lanes"][0]["name"] = json!(" ");
+    for (doc, says) in [(backwards, "ends before it starts"), (unknown, "colour"), (unnamed, "no name")] {
+        let out = report_page(&l, &["--phases", &phases_file(&l, &doc)]);
+        assert!(!out.status.success(), "accepted {doc}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains(says), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+#[test]
+fn max_bytes_cuts_phase_attributes_but_keeps_their_times() {
+    let l = layout();
+    let file = phases_file(&l, &phases_doc());
+    let r = report(&l, &["--phases", &file, "--max-bytes", "10"]);
+    let phases = &r["phases"]["lanes"][1]["spans"];
+    assert_eq!(phases[1]["attrs"], json!([]));
+    assert_eq!((phases[1]["start_ms"].clone(), phases[1]["end_ms"].clone()), (json!(1_791_626_400_000u64), json!(1_791_626_402_900u64)));
+    assert_eq!(r["phases"]["markers"][0]["attrs"], json!([]));
+}
+
+#[test]
+fn the_html_report_embeds_the_phases() {
+    let l = layout();
+    let out = report_page(&l, &["--format", "html", "--phases", &phases_file(&l, &phases_doc())]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(embedded_report(&String::from_utf8(out.stdout).unwrap())["phases"], phases_doc());
+}
+
+#[test]
+fn phases_cannot_be_added_to_a_report_built_elsewhere() {
+    let l = layout();
+    let file = l.logs.with_file_name("r.json");
+    std::fs::write(&file, report(&l, &[]).to_string()).unwrap();
+    let phases = phases_file(&l, &phases_doc());
+    let out = ambits(&l.clone).args(["report", "--format", "html", "--from-json", file.to_str().unwrap(), "--phases", &phases]).output().unwrap();
+    assert!(!out.status.success(), "a screened report carries its phases already");
 }
 
 #[test]
