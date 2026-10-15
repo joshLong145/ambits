@@ -88,8 +88,9 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
 .calls .row .t { color: var(--muted); font-size: 12px; flex: 0 0 64px; }
 .calls .row .n { overflow-wrap: anywhere; }
 .calls .row.prompt .n { font-weight: 600; }
-.calls .group { display: flex; gap: 8px; padding: 7px 8px 3px; border-top: 1px solid var(--line); align-items: baseline; background: var(--bg); }
-.calls .group .t { color: var(--muted); font-size: 12px; flex: 0 0 64px; }
+.calls .row.host { background: var(--bg); }
+.calls .row.nest .n { font-weight: 600; }
+.calls .row.error .n { color: var(--bad); }
 .expand { padding: 8px 12px 12px; border-top: 1px dashed var(--line); background: var(--bg); }
 .expand dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 12px; margin: 0; }
 .expand dt { color: var(--muted); }
@@ -361,12 +362,31 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
       }
     };
 
+    // Every row of the list below, by key: a call `c<i>`, a harness span
+    // `h<lane>-<span>`, a marker `m<n>`. Details are built when first opened.
+    const entries = new Map();
+    function toggle(key, open) {
+      const e = entries.get(key);
+      if (!e || !e.row) return;
+      const wanted = open === undefined ? !e.box : open;
+      if (wanted && !e.box) {
+        e.box = e.detail();
+        e.row.after(e.box);
+      } else if (!wanted && e.box) {
+        e.box.remove();
+        e.box = null;
+      }
+      e.row.setAttribute("aria-expanded", String(Boolean(e.box)));
+      e.row.classList.toggle("sel", Boolean(e.box));
+      if (e.bar) e.bar.classList.toggle("sel", Boolean(e.box));
+    }
+    const reveal = key => { toggle(key, true); const e = entries.get(key); if (e && e.row) e.row.scrollIntoView({ block: "start" }); };
+
     // Each harness lane stacks what overlaps into rows, so a phase that runs
     // inside another sits on the row below it.
-    const phaseItems = [];
-    const phaseSelect = new Map();
+    const hostItems = [];
     P.lanes.forEach((lane, li) => {
-      const items = lane.spans.map((p, si) => ({ p, lane: lane.name, nest: Boolean(lane.nest), key: li + "-" + si }))
+      const items = lane.spans.map((p, si) => ({ p, lane: lane.name, nest: Boolean(lane.nest), key: "h" + li + "-" + si }))
         .sort((a, b) => a.p.start_ms - b.p.start_ms || b.p.end_ms - a.p.end_ms);
       const rowEnds = [];
       for (const item of items) {
@@ -378,12 +398,12 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
       const tracks = rowEnds.length ? rowEnds.map(() => el("div", { class: "track" })) : [el("div", { class: "track" })];
       for (const item of items) {
         const label = lane.name + " · " + item.p.name;
-        const b = el("button", { class: "span phase", title: label + " · " + (item.p.end_ms - item.p.start_ms) + " ms", "aria-label": label, on: { click: () => revealPhase(item) } });
+        const b = el("button", { class: "span phase", title: label + " · " + (item.p.end_ms - item.p.start_ms) + " ms", "aria-label": label, on: { click: () => reveal(item.key) } });
         b.style.left = at(item.p.start_ms) + "%";
         b.style.width = Math.max(0.25, at(item.p.end_ms) - at(item.p.start_ms)) + "%";
         tracks[item.row].append(b);
-        phaseSelect.set(item.key, { bar: b, row: null, box: null });
-        phaseItems.push(item);
+        entries.set(item.key, { bar: b, row: null, box: null });
+        hostItems.push(item);
       }
       tracks.forEach((track, r) => {
         markersOn(track);
@@ -391,73 +411,50 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
       });
     });
     if (P.lanes.length && R.spans.length) lanes.append(el("div", { class: "sep" }));
-
-    function phaseDetail(item) {
-      const dl = el("dl");
-      const rows = [["Lane", item.lane], ["Phase", item.p.name], ["When", clock(item.p.start_ms) + " → " + clock(item.p.end_ms) + " · " + (item.p.end_ms - item.p.start_ms) + " ms"]];
-      for (const a of item.p.attrs) rows.push([a.key, a.value]);
-      for (const [k, v] of rows) dl.append(el("dt", { text: k }), el("dd", { text: v }));
-      return el("div", { class: "expand" }, dl);
-    }
-    function togglePhase(item, open) {
-      const nodes = phaseSelect.get(item.key);
-      const wanted = open === undefined ? !nodes.box : open;
-      if (wanted && !nodes.box) {
-        nodes.box = phaseDetail(item);
-        nodes.row.after(nodes.box);
-      } else if (!wanted && nodes.box) {
-        nodes.box.remove();
-        nodes.box = null;
-      }
-      nodes.row.setAttribute("aria-expanded", String(Boolean(nodes.box)));
-      nodes.row.classList.toggle("sel", Boolean(nodes.box));
-      nodes.bar.classList.toggle("sel", Boolean(nodes.box));
-    }
-    const revealPhase = item => { togglePhase(item, true); phaseSelect.get(item.key).row.scrollIntoView({ block: "start" }); };
     const order = R.agents.map(a => a.id);
     R.spans.forEach(x => { if (!order.includes(x.agent)) order.push(x.agent); });
-    const select = new Map();
 
-    function detailOf(x) {
-      const rows = [["Kind", x.kind + (x.depth ? " · " + x.depth : "")], ["Tool", x.tool], ["Agent", nameOf(x.agent)],
-        ["When", clock(x.start_ms) + (x.end_ms ? " · " + (x.end_ms - x.start_ms) + " ms" : " · no result")],
-        ["File", x.file], ["Symbol", x.symbol], ["Started", x.child_agent ? nameOf(x.child_agent) : null], ["Error", x.message]];
+    // One details layout for every row: a list of named values, then any
+    // key/value grid (a call's arguments, a phase's attributes), then content.
+    const pairs = list => {
+      const grid = el("div", { class: "args" });
+      for (const [k, v, bulk] of list) grid.append(el("span", { class: "k mono", text: k }), el("pre", { class: "v mono" + (bulk ? " bulk" : ""), text: v }));
+      return grid;
+    };
+    const detailList = rows => {
       const dl = el("dl");
       for (const [k, v] of rows) if (v) dl.append(el("dt", { text: k }), el("dd", { class: k === "File" || k === "Symbol" ? "mono" : null, text: v }));
+      return dl;
+    };
+    const took = (start, end) => clock(start) + (end === null || end === undefined ? " · no result" : " · " + (end - start) + " ms");
+
+    function detailOf(x) {
+      const dl = detailList([["Kind", x.kind + (x.depth ? " · " + x.depth : "")], ["Tool", x.tool], ["Agent", nameOf(x.agent)],
+        ["When", took(x.start_ms, x.end_ms)],
+        ["File", x.file], ["Symbol", x.symbol], ["Started", x.child_agent ? nameOf(x.child_agent) : null], ["Error", x.message]]);
       if (x.detail) dl.append(el("dt", { text: "Detail" }), el("dd", null, el("pre", { class: "mono", text: x.detail })));
       if (x.read_count) {
         const reads = x.read.length ? x.read.map(([id, d]) => el("div", null, el("span", { class: "chip " + depthClass(d), text: DEPTH_LABEL[d] }), " ", el("code", { text: id }))) : [el("div", { class: "counts", text: x.read_count + " symbols (list cut for size)" })];
         dl.append(el("dt", { text: "Read" }), el("dd", null, ...reads));
       }
-      if (x.args.length) {
-        const args = el("div", { class: "args" });
-        for (const a of x.args) args.append(el("span", { class: "k mono", text: a.key }), el("pre", { class: "v mono" + (a.bulk ? " bulk" : ""), text: a.value }));
-        dl.append(el("dt", { text: "Arguments" }), el("dd", null, args));
-      }
+      if (x.args.length) dl.append(el("dt", { text: "Arguments" }), el("dd", null, pairs(x.args.map(a => [a.key, a.value, a.bulk]))));
       const titles = { change: "Change", read: "Read", output: x.error ? "Error output" : "Output" };
       if (x.content) dl.append(el("dt", { text: titles[x.content.type] || x.content.type }), el("dd", null, contentView(x.content)));
       const w = R.writes.find(w => w.span === x.i);
       if (w) dl.append(el("dt", { text: "Write" }), el("dd", null, el("a", { href: "#w-" + w.op, class: "chip " + w.status, text: "see write · " + w.status, on: { click: ev => { ev.preventDefault(); jumpToWrite(w.op); } } })));
       return el("div", { class: "expand" }, dl);
     }
-
-    // A call's details open under its row, as the TUI expands a call; built
-    // when first opened, so a large session costs nothing until it is read.
-    function toggle(x, open) {
-      const nodes = select.get(x.i);
-      const wanted = open === undefined ? !nodes.box : open;
-      if (wanted && !nodes.box) {
-        nodes.box = detailOf(x);
-        nodes.row.after(nodes.box);
-      } else if (!wanted && nodes.box) {
-        nodes.box.remove();
-        nodes.box = null;
-      }
-      nodes.row.setAttribute("aria-expanded", String(Boolean(nodes.box)));
-      nodes.row.classList.toggle("sel", Boolean(nodes.box));
-      nodes.bar.classList.toggle("sel", Boolean(nodes.box));
+    function hostDetail(item, calls) {
+      const dl = detailList([["Kind", "phase"], ["Lane", item.lane], ["When", took(item.p.start_ms, item.p.end_ms)],
+        ["Ended", clock(item.p.end_ms)], ["Calls", item.nest ? String(calls) : null]]);
+      if (item.p.attrs.length) dl.append(el("dt", { text: "Attributes" }), el("dd", null, pairs(item.p.attrs.map(a => [a.key, a.value]))));
+      return el("div", { class: "expand" }, dl);
     }
-    const reveal = x => { toggle(x, true); select.get(x.i).row.scrollIntoView({ block: "start" }); };
+    function markerDetail(m) {
+      const dl = detailList([["Kind", "marker"], ["When", clock(m.t_ms)]]);
+      if (m.attrs.length) dl.append(el("dt", { text: "Attributes" }), el("dd", null, pairs(m.attrs.map(a => [a.key, a.value]))));
+      return el("div", { class: "expand" }, dl);
+    }
 
     function contentView(c) {
       const box = el("div", { class: "code " + c.type });
@@ -486,11 +483,11 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
     for (const agent of order) {
       const track = el("div", { class: "track" });
       for (const x of R.spans.filter(x => x.agent === agent)) {
-        const b = el("button", { class: "span " + x.kind + (x.error ? " error" : ""), title: x.name, "aria-label": x.name, on: { click: () => reveal(x) } });
+        const b = el("button", { class: "span " + x.kind + (x.error ? " error" : ""), title: x.name, "aria-label": x.name, on: { click: () => reveal("c" + x.i) } });
         b.style.left = at(x.start_ms) + "%";
         b.style.width = Math.max(0.25, at(x.end_ms || x.start_ms) - at(x.start_ms)) + "%";
         track.append(b);
-        select.set(x.i, { bar: b, row: null, box: null });
+        entries.set("c" + x.i, { bar: b, row: null, box: null });
       }
       for (const i of R.instants.filter(i => i.agent === null || i.agent === agent)) {
         const m = el("div", { class: "instant " + i.kind, title: i.kind + (i.sha ? " " + short(i.sha) : "") + (i.subject ? " " + i.subject : "") + " at " + clock(i.t_ms) });
@@ -501,74 +498,67 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
       lanes.append(el("div", { class: "lane" }, el("div", { class: "label", title: agent, text: nameOf(agent) }), track));
     }
 
-    const phaseList = el("div", { class: "card calls" }, el("h2", { text: "Phases" }));
-    for (const item of [...phaseItems].sort((a, b) => a.p.start_ms - b.p.start_ms || b.p.end_ms - a.p.end_ms)) {
-      const row = el("div", { class: "row", tabindex: "0", role: "button", "aria-expanded": "false", on: { click: () => togglePhase(item), keydown: ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); togglePhase(item); } } } },
-        el("span", { class: "t mono", text: clock(item.p.start_ms) }),
-        el("span", { class: "chip", text: item.lane }),
-        el("span", { class: "n", text: item.p.name }),
-        el("span", { class: "counts", text: (item.p.end_ms - item.p.start_ms) + " ms" }));
-      row.style.paddingLeft = (8 + 16 * item.row) + "px";
-      phaseList.append(row);
-      phaseSelect.get(item.key).row = row;
-    }
-    for (const m of [...P.markers].sort((a, b) => a.t_ms - b.t_ms)) {
-      phaseList.append(el("div", { class: "row", title: attrText(m.attrs) },
-        el("span", { class: "t mono", text: clock(m.t_ms) }),
-        el("span", { class: "chip removed", text: "marker" }),
-        el("span", { class: "n", text: m.name + (m.attrs.length ? " · " + attrText(m.attrs) : "") })));
-    }
-
-    const level = x => { let n = 0, p = x.parent; while (p !== null && p !== undefined && spanById.has(p) && n < 32) { n++; p = spanById.get(p).parent; } return n; };
-    const calls = el("div", { class: "card calls" }, el("h2", { text: "Calls" }));
-    const callRow = (x, indent) => {
-      const row = el("div", { class: "row " + x.kind, tabindex: "0", role: "button", "aria-expanded": "false", on: { click: () => toggle(x), keydown: ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggle(x); } } } },
-        el("span", { class: "t mono", text: clock(x.start_ms) }),
-        el("span", { class: "chip", text: x.kind }),
-        el("span", { class: "n", text: x.name }));
-      row.style.paddingLeft = (8 + 16 * (level(x) + indent)) + "px";
-      calls.append(row);
-      select.get(x.i).row = row;
+    // One list: harness spans, markers and calls as one tree. Each goes
+    // under the shortest span of a `nest` lane open when it started (a span
+    // only under a longer one), and a call under its own parent call (its
+    // turn's prompt) when the two share that span; the rest stay at the top.
+    const nodes = [
+      ...hostItems.map(item => ({ key: item.key, t: item.p.start_ms, len: item.p.end_ms - item.p.start_ms, item })),
+      ...P.markers.map((m, n) => ({ key: "m" + n, t: m.t_ms, len: 0, marker: m })),
+      ...R.spans.map(x => ({ key: "c" + x.i, t: x.start_ms, len: (x.end_ms || x.start_ms) - x.start_ms, call: x })),
+    ];
+    const nests = nodes.filter(n => n.item && n.item.nest);
+    const nestOf = node => {
+      let best = null;
+      for (const c of nests) {
+        if (c === node || c.t > node.t || node.t > c.item.p.end_ms) continue;
+        if (node.item && !(c.len > node.len || (c.len === node.len && c.t < node.t))) continue;
+        if (!best || c.len < best.len || (c.len === best.len && c.t > best.t)) best = c;
+      }
+      return best;
     };
-    const groupHead = (start, lane, name, ms, n, indent) => {
-      const head = el("div", { class: "group" },
-        el("span", { class: "t mono", text: start === null ? "" : clock(start) }),
-        lane ? el("span", { class: "chip", text: lane }) : null,
-        el("strong", { text: name }),
-        el("span", { class: "counts", text: (ms === null ? "" : ms + " ms · ") + (n ? n + " call" + (n === 1 ? "" : "s") : "no calls") }));
-      head.style.paddingLeft = (8 + 16 * indent) + "px";
-      calls.append(head);
+    const nodeByKey = new Map(nodes.map(n => [n.key, n]));
+    const home = new Map(nodes.map(n => [n.key, nestOf(n)]));
+    const parentOf = n => {
+      const up = n.call ? nodeByKey.get("c" + n.call.parent) : null;
+      return up && home.get(up.key) === home.get(n.key) ? up : home.get(n.key);
     };
-    const sorted = [...R.spans].sort((a, b) => a.start_ms - b.start_ms || a.i - b.i);
-    // Each call goes under the shortest span of a `nest` lane open when it started.
-    const nestItems = phaseItems.filter(it => it.nest).sort((a, b) => a.p.start_ms - b.p.start_ms || b.p.end_ms - a.p.end_ms);
-    if (nestItems.length) {
-      const length = it => it.p.end_ms - it.p.start_ms;
-      const home = new Map(nestItems.map(it => [it.key, []]));
-      const outside = [];
-      for (const x of sorted) {
-        let best = null;
-        for (const it of nestItems) {
-          if (it.p.start_ms > x.start_ms || x.start_ms > it.p.end_ms) continue;
-          if (!best || length(it) < length(best) || (length(it) === length(best) && it.p.start_ms > best.p.start_ms)) best = it;
-        }
-        (best ? home.get(best.key) : outside).push(x);
+    const kids = new Map(nodes.map(n => [n.key, []]));
+    const roots = [];
+    for (const n of nodes) { const p = parentOf(n); (p ? kids.get(p.key) : roots).push(n); }
+    const byTime = (a, b) => a.t - b.t || b.len - a.len || (a.call && b.call ? a.call.i - b.call.i : 0);
+    const callsIn = n => kids.get(n.key).reduce((sum, k) => sum + (k.call && k.call.kind !== "prompt" ? 1 : 0) + callsIn(k), 0);
+    const list = el("div", { class: "card calls" }, el("h2", { text: hostItems.length || P.markers.length ? "Phases and calls" : "Calls" }));
+    const row = (key, cls, kids2, indent) => {
+      const r = el("div", { class: "row " + cls, tabindex: "0", role: "button", "aria-expanded": "false", on: { click: () => toggle(key), keydown: ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggle(key); } } } }, ...kids2);
+      r.style.paddingLeft = (8 + 16 * indent) + "px";
+      list.append(r);
+      const e = entries.get(key) || { bar: null, row: null, box: null };
+      e.row = r;
+      entries.set(key, e);
+      return e;
+    };
+    function render(n, depth) {
+      if (n.call) {
+        const x = n.call;
+        row(n.key, x.kind + (x.error ? " error" : ""), [el("span", { class: "t mono", text: clock(x.start_ms) }), el("span", { class: "chip", text: x.kind }),
+          el("span", { class: "n", text: x.name }), el("span", { class: "counts", text: x.kind === "prompt" ? "" : x.end_ms ? (x.end_ms - x.start_ms) + " ms" : "no result" })], depth).detail = () => detailOf(x);
+      } else if (n.marker) {
+        const m = n.marker;
+        row(n.key, "marker", [el("span", { class: "t mono", text: clock(m.t_ms) }), el("span", { class: "chip removed", text: "marker" }),
+          el("span", { class: "n", text: m.name })], depth).detail = () => markerDetail(m);
+      } else {
+        const it = n.item, calls = callsIn(n);
+        const count = it.nest ? " · " + (calls ? calls + " call" + (calls === 1 ? "" : "s") : "no calls") : "";
+        row(n.key, "host" + (it.nest ? " nest" : ""), [el("span", { class: "t mono", text: clock(it.p.start_ms) }), el("span", { class: "chip", text: it.lane }),
+          el("span", { class: "n", text: it.p.name }), el("span", { class: "counts", text: n.len + " ms" + count })], depth).detail = () => hostDetail(it, calls);
       }
-      for (const it of nestItems) {
-        const own = home.get(it.key);
-        groupHead(it.p.start_ms, it.lane, it.p.name, length(it), own.filter(x => x.kind !== "prompt").length, it.row);
-        own.forEach(x => callRow(x, it.row + 1));
-      }
-      if (outside.length) {
-        groupHead(null, null, "Outside every phase", null, outside.filter(x => x.kind !== "prompt").length, 0);
-        outside.forEach(x => callRow(x, 1));
-      }
-    } else {
-      sorted.forEach(x => callRow(x, 0));
+      for (const k of kids.get(n.key).sort(byTime)) render(k, depth + 1);
     }
-    if (!R.spans.length) calls.append(el("div", { class: "empty", text: "No tool calls." }));
-    s.append(...[lanes, phaseItems.length || P.markers.length ? phaseList : null, calls].filter(Boolean));
-    openSpan = i => { const x = spanById.get(i); if (x) { show("trace"); reveal(x); } };
+    for (const n of roots.sort(byTime)) render(n, 0);
+    if (!R.spans.length) list.append(el("div", { class: "empty", text: "No tool calls." }));
+    s.append(lanes, list);
+    openSpan = i => { if (spanById.has(i)) { show("trace"); reveal("c" + i); } };
   })();
 
   route();

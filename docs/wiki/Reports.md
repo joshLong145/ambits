@@ -63,12 +63,17 @@ ambits -p <clone> --log-dir <logs> -s <session> report --phases phases.json
 
 Each lane is drawn above the agents' lanes, in the order given. A span that
 overlaps an earlier one in its lane goes on a row below it, so a phase run
-inside another sits under it. Markers are drawn across every lane, and every
-span and marker is listed under the lanes, where its `attrs` open when it is
-clicked. A lane with `nest: true` groups the call list: each call is listed
-under the shortest of that lane's spans open when it started, every span of
-the lane gets a heading (with "no calls" when it had none), and calls outside
-them all come last. Times are epoch milliseconds, the clock span times use;
+inside another sits under it. Markers are drawn across every lane.
+
+Under the lanes, one list holds the harness's spans and markers and the
+session's calls as a single tree. A lane with `nest: true` is the tree's
+backbone: a call, a marker, or a span of another lane goes under the shortest
+of its spans open when it started (one of its own spans only under a longer
+one), each of its spans says how many calls it holds ("no calls" when none),
+and a call sits under its turn's prompt when the two share a span. Whatever
+no `nest` span holds stays at the top, in time order. Every row opens the
+same way: a phase or marker shows its kind, lane, times and `attrs` in the
+grid a call uses for its arguments. Times are epoch milliseconds, the clock span times use;
 `nest`, `markers`, `attrs` and `incomplete` may be left out. `incomplete: true` says the harness
 could not record its whole timeline, and the page says so. ambits does not
 interpret the names. It refuses a document with an unknown field, a lane
