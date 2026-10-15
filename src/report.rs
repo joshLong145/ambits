@@ -73,6 +73,10 @@ pub struct Phases {
 pub struct PhaseLane {
     pub name: String,
     pub spans: Vec<PhaseSpan>,
+    /// The page lists each call under the shortest of this lane's spans
+    /// that was open when the call started.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nest: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

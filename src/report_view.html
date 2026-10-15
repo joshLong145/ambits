@@ -88,6 +88,8 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
 .calls .row .t { color: var(--muted); font-size: 12px; flex: 0 0 64px; }
 .calls .row .n { overflow-wrap: anywhere; }
 .calls .row.prompt .n { font-weight: 600; }
+.calls .group { display: flex; gap: 8px; padding: 7px 8px 3px; border-top: 1px solid var(--line); align-items: baseline; background: var(--bg); }
+.calls .group .t { color: var(--muted); font-size: 12px; flex: 0 0 64px; }
 .expand { padding: 8px 12px 12px; border-top: 1px dashed var(--line); background: var(--bg); }
 .expand dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 12px; margin: 0; }
 .expand dt { color: var(--muted); }
@@ -364,7 +366,7 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
     const phaseItems = [];
     const phaseSelect = new Map();
     P.lanes.forEach((lane, li) => {
-      const items = lane.spans.map((p, si) => ({ p, lane: lane.name, key: li + "-" + si }))
+      const items = lane.spans.map((p, si) => ({ p, lane: lane.name, nest: Boolean(lane.nest), key: li + "-" + si }))
         .sort((a, b) => a.p.start_ms - b.p.start_ms || b.p.end_ms - a.p.end_ms);
       const rowEnds = [];
       for (const item of items) {
@@ -519,14 +521,50 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
 
     const level = x => { let n = 0, p = x.parent; while (p !== null && p !== undefined && spanById.has(p) && n < 32) { n++; p = spanById.get(p).parent; } return n; };
     const calls = el("div", { class: "card calls" }, el("h2", { text: "Calls" }));
-    for (const x of [...R.spans].sort((a, b) => a.start_ms - b.start_ms || a.i - b.i)) {
+    const callRow = (x, indent) => {
       const row = el("div", { class: "row " + x.kind, tabindex: "0", role: "button", "aria-expanded": "false", on: { click: () => toggle(x), keydown: ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggle(x); } } } },
         el("span", { class: "t mono", text: clock(x.start_ms) }),
         el("span", { class: "chip", text: x.kind }),
         el("span", { class: "n", text: x.name }));
-      row.style.paddingLeft = (8 + 16 * level(x)) + "px";
+      row.style.paddingLeft = (8 + 16 * (level(x) + indent)) + "px";
       calls.append(row);
       select.get(x.i).row = row;
+    };
+    const groupHead = (start, lane, name, ms, n, indent) => {
+      const head = el("div", { class: "group" },
+        el("span", { class: "t mono", text: start === null ? "" : clock(start) }),
+        lane ? el("span", { class: "chip", text: lane }) : null,
+        el("strong", { text: name }),
+        el("span", { class: "counts", text: (ms === null ? "" : ms + " ms · ") + (n ? n + " call" + (n === 1 ? "" : "s") : "no calls") }));
+      head.style.paddingLeft = (8 + 16 * indent) + "px";
+      calls.append(head);
+    };
+    const sorted = [...R.spans].sort((a, b) => a.start_ms - b.start_ms || a.i - b.i);
+    // Each call goes under the shortest span of a `nest` lane open when it started.
+    const nestItems = phaseItems.filter(it => it.nest).sort((a, b) => a.p.start_ms - b.p.start_ms || b.p.end_ms - a.p.end_ms);
+    if (nestItems.length) {
+      const length = it => it.p.end_ms - it.p.start_ms;
+      const home = new Map(nestItems.map(it => [it.key, []]));
+      const outside = [];
+      for (const x of sorted) {
+        let best = null;
+        for (const it of nestItems) {
+          if (it.p.start_ms > x.start_ms || x.start_ms > it.p.end_ms) continue;
+          if (!best || length(it) < length(best) || (length(it) === length(best) && it.p.start_ms > best.p.start_ms)) best = it;
+        }
+        (best ? home.get(best.key) : outside).push(x);
+      }
+      for (const it of nestItems) {
+        const own = home.get(it.key);
+        groupHead(it.p.start_ms, it.lane, it.p.name, length(it), own.filter(x => x.kind !== "prompt").length, it.row);
+        own.forEach(x => callRow(x, it.row + 1));
+      }
+      if (outside.length) {
+        groupHead(null, null, "Outside every phase", null, outside.filter(x => x.kind !== "prompt").length, 0);
+        outside.forEach(x => callRow(x, 1));
+      }
+    } else {
+      sorted.forEach(x => callRow(x, 0));
     }
     if (!R.spans.length) calls.append(el("div", { class: "empty", text: "No tool calls." }));
     s.append(...[lanes, phaseItems.length || P.markers.length ? phaseList : null, calls].filter(Boolean));

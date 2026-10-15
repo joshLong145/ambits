@@ -271,7 +271,7 @@ fn phases_doc() -> Value {
     json!({
         "lanes": [
             {"name": "Run", "spans": [{"name": "run", "start_ms": 1_791_626_399_000u64, "end_ms": 1_791_626_403_000u64, "attrs": []}]},
-            {"name": "Phases", "spans": [
+            {"name": "Phases", "nest": true, "spans": [
                 {"name": "clone", "start_ms": 1_791_626_399_100u64, "end_ms": 1_791_626_399_500u64, "attrs": [{"key": "cost_usd", "value": "0"}]},
                 {"name": "llm_fix", "start_ms": 1_791_626_400_000u64, "end_ms": 1_791_626_402_900u64, "attrs": [{"key": "cost_usd", "value": "0.41"}]}
             ]}
@@ -292,8 +292,19 @@ fn the_report_carries_the_harness_phases_as_given() {
     let l = layout();
     let doc = phases_doc();
     let r = report(&l, &["--phases", &phases_file(&l, &doc)]);
-    assert_eq!(r["phases"], doc);
+    assert_eq!(r["phases"], doc, "a lane given no `nest` is carried without one");
     assert!(report(&l, &[]).get("phases").is_none(), "no --phases, no key: older readers see the same document");
+}
+
+#[test]
+fn a_lane_nests_calls_only_when_it_says_so_with_a_bool() {
+    let l = layout();
+    let mut quoted = phases_doc();
+    quoted["lanes"][1]["nest"] = json!("yes");
+    let out = report_page(&l, &["--phases", &phases_file(&l, &quoted)]);
+    assert!(!out.status.success(), "a `nest` that is not a bool is refused");
+    let r = report(&l, &["--phases", &phases_file(&l, &phases_doc())]);
+    assert_eq!((r["phases"]["lanes"][0].get("nest"), &r["phases"]["lanes"][1]["nest"]), (None, &json!(true)));
 }
 
 #[test]

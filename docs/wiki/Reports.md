@@ -51,7 +51,7 @@ ambits -p <clone> --log-dir <logs> -s <session> report --phases phases.json
 ```json
 {
   "lanes": [
-    {"name": "Phases", "spans": [
+    {"name": "Phases", "nest": true, "spans": [
       {"name": "clone", "start_ms": 1791626399100, "end_ms": 1791626399500,
        "attrs": [{"key": "cost_usd", "value": "0"}]}
     ]}
@@ -65,8 +65,11 @@ Each lane is drawn above the agents' lanes, in the order given. A span that
 overlaps an earlier one in its lane goes on a row below it, so a phase run
 inside another sits under it. Markers are drawn across every lane, and every
 span and marker is listed under the lanes, where its `attrs` open when it is
-clicked. Times are epoch milliseconds, the clock span times use; `markers`,
-`attrs` and `incomplete` may be left out. `incomplete: true` says the harness
+clicked. A lane with `nest: true` groups the call list: each call is listed
+under the shortest of that lane's spans open when it started, every span of
+the lane gets a heading (with "no calls" when it had none), and calls outside
+them all come last. Times are epoch milliseconds, the clock span times use;
+`nest`, `markers`, `attrs` and `incomplete` may be left out. `incomplete: true` says the harness
 could not record its whole timeline, and the page says so. ambits does not
 interpret the names. It refuses a document with an unknown field, a lane
 with no name, or a span that ends before it starts. The document is carried
