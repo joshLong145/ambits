@@ -542,7 +542,7 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
       if (n.call) {
         const x = n.call;
         row(n.key, x.kind + (x.error ? " error" : ""), [el("span", { class: "t mono", text: clock(x.start_ms) }), el("span", { class: "chip", text: x.kind }),
-          el("span", { class: "n", text: x.name }), el("span", { class: "counts", text: x.kind === "prompt" ? "" : x.end_ms ? (x.end_ms - x.start_ms) + " ms" : "no result" })], depth).detail = () => detailOf(x);
+          el("span", { class: "n", text: x.name }), el("span", { class: "counts", text: x.end_ms ? (x.end_ms - x.start_ms) + " ms" : "no result" })], depth).detail = () => detailOf(x);
       } else if (n.marker) {
         const m = n.marker;
         row(n.key, "marker", [el("span", { class: "t mono", text: clock(m.t_ms) }), el("span", { class: "chip removed", text: "marker" }),

@@ -451,6 +451,17 @@ fn a_prompt_span_carries_no_call_content() {
     assert_eq!((prompt["args"].clone(), prompt["content"].clone()), (json!([]), Value::Null));
 }
 
+#[test]
+fn a_prompt_span_ends_when_its_last_call_does() {
+    let l = layout();
+    let r = report(&l, &[]);
+    let spans = r["spans"].as_array().unwrap();
+    let prompt = spans.iter().find(|s| s["kind"] == "prompt").unwrap();
+    let last = spans.iter().filter(|s| s["parent"] == prompt["i"]).filter_map(|s| s["end_ms"].as_u64()).max().unwrap();
+    assert_eq!(prompt["end_ms"].as_u64(), Some(last));
+    assert_eq!(last - prompt["start_ms"].as_u64().unwrap(), 2_300, "from the prompt to the Edit's result");
+}
+
 /// The session's log with every Edit result's `originalFile` taken out, as
 /// Claude Code leaves it out for a file over ~10 KB.
 fn without_original_file(l: &Layout) {

@@ -115,3 +115,28 @@ fn the_agent_filter_keeps_one_agents_spans() {
     assert_eq!(children.len(), 1, "{spans:#?}");
     assert!(children.iter().all(|s| attr(s, "gen_ai.agent.id") == Some(&json!({"stringValue": AGENT}))), "{spans:#?}");
 }
+
+/// A report's delegation ends where its trace's does: with its subagent's
+/// last span when that outlasts the agent's stop.
+#[test]
+fn a_report_delegation_ends_with_its_subagents_last_span() {
+    let (_dir, root) = project();
+    let file = root.join("src/a.rs").to_string_lossy().into_owned();
+    write_log(
+        &root.join("logs").join(SESSION).join(format!("subagents/agent-{AGENT}.jsonl")),
+        &[
+            tool_use(AGENT, "2026-09-27T10:00:31.000Z", "toolu_x", "Read", json!({"file_path": file})),
+            tool_result("2026-09-27T10:00:40.000Z", "toolu_x", json!({})),
+        ],
+    );
+    let logs = root.join("logs").to_string_lossy().into_owned();
+    let out: Value = serde_json::from_str(&run_ambits(&root, &["--log-dir", &logs, "--session", SESSION, "report"])).unwrap();
+    let delegation = out["spans"].as_array().unwrap().iter().find(|s| s["kind"] == "delegate").unwrap();
+    assert_eq!(delegation["end_ms"].as_u64().unwrap() - delegation["start_ms"].as_u64().unwrap(), 39_000);
+
+    let otlp = trace(&root, "otlp");
+    let spans = otlp["resourceSpans"][0]["scopeSpans"][0]["spans"].as_array().unwrap();
+    let traced = spans.iter().find(|s| attr(s, "ambits.subagent.id").is_some()).unwrap();
+    let nanos = |k: &str| traced[k].as_str().unwrap().parse::<u64>().unwrap();
+    assert_eq!(nanos("endTimeUnixNano") - nanos("startTimeUnixNano"), 39_000_000_000);
+}

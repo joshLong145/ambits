@@ -118,7 +118,8 @@ project by its directory's name, never its path.
 A span: `i` (its id, which `parent` and a write's `span` refer to), `parent`,
 `agent`, `kind` (`prompt`, `read`, `write`, `delegate`, `other`), `tool`,
 `name`, `detail`, `file`, `symbol`, `start_ms`, `end_ms` (`null` while it had
-no result), `error`, `message`, `depth` (for a read), `read` (the symbols it
+no result; a prompt or delegation ends with the last span under it, as in
+its trace), `error`, `message`, `depth` (for a read), `read` (the symbols it
 was credited with, each with its depth), `read_count`, `child_agent` (for a
 delegation), `args` and `content`.
 

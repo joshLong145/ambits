@@ -173,7 +173,8 @@ pub struct SpanDto {
     pub symbol: Option<String>,
     /// Milliseconds since the epoch.
     pub start_ms: u64,
-    /// `None` while the call had no result.
+    /// `None` while the call had no result. A prompt or delegation ends
+    /// with the last span under it, as in its trace.
     pub end_ms: Option<u64>,
     pub error: bool,
     pub message: Option<String>,
@@ -457,14 +458,16 @@ fn arg_value(key: &str, value: &str, project_root: &Path) -> String {
 
 fn spans(trace: &Trace, details: &HashMap<String, CallDetail>, project_root: &Path) -> Vec<SpanDto> {
     let mut parent: HashMap<usize, usize> = HashMap::new();
-    fn walk(node: &Node, parent: &mut HashMap<usize, usize>) {
+    let mut end: HashMap<usize, u64> = HashMap::new();
+    fn walk(node: &Node, parent: &mut HashMap<usize, usize>, end: &mut HashMap<usize, u64>) {
+        end.insert(node.span, node.end);
         for child in &node.children {
             parent.insert(child.span, node.span);
-            walk(child, parent);
+            walk(child, parent, end);
         }
     }
     for root in trace.tree() {
-        walk(&root, &mut parent);
+        walk(&root, &mut parent, &mut end);
     }
     trace
         .spans()
@@ -487,7 +490,7 @@ fn spans(trace: &Trace, details: &HashMap<String, CallDetail>, project_root: &Pa
             file: s.file.clone(),
             symbol: s.symbol.clone(),
             start_ms: s.start,
-            end_ms: s.end,
+            end_ms: s.end.map(|own| end.get(&i).copied().unwrap_or(own)),
             error: s.error,
             message: s.message.clone(),
             depth: match s.kind {
