@@ -61,17 +61,29 @@ ambits -p <clone> --log-dir <logs> -s <session> report --phases phases.json
 }
 ```
 
-Each lane is drawn above the agents' lanes, in the order given. A span that
+List the lanes outermost first: each is drawn above the agents' lanes, in
+the order given, indented and shaded by its place in that order. A span that
 overlaps an earlier one in its lane goes on a row below it, so a phase run
 inside another sits under it. Markers are drawn across every lane.
 
 Under the lanes, one list holds the harness's spans and markers and the
-session's calls as a single tree. A lane with `nest: true` is the tree's
-backbone: a call, a marker, or a span of another lane goes under the shortest
-of its spans open when it started (one of its own spans only under a longer
-one), each of its spans says how many calls it holds ("no calls" when none),
-and a call sits under its turn's prompt when the two share a span. Whatever
-no `nest` span holds stays at the top, in time order. Every row opens the
+session's calls as a single tree, built from the lane order and the times:
+
+- A span goes under the shortest span of an earlier lane, or a longer one of
+  its own lane, that covers at least half of it: a run holds its phases, and
+  a phase the turns run in it.
+- A prompt and the span of the latest lane that it and the prompt each cover
+  at least half of are one row, the span's with the prompt's first line, so a
+  harness's turn and the prompt that began it are not listed twice.
+- A call goes under its prompt, or its delegation; a call or prompt with
+  neither goes under the shortest span of a `nest: true` lane open when it
+  started. Each `nest` span, and each row holding calls, says how many it
+  holds ("no calls" when none).
+- A marker with a `tool_name` attribute goes on the call of that tool it fell
+  within, as a badge and in the call's details; any other marker goes under
+  the shortest span open at its time.
+
+Whatever nothing holds stays at the top, in time order. Every row opens the
 same way: a phase or marker shows its kind, lane, times and `attrs` in the
 grid a call uses for its arguments. Times are epoch milliseconds, the clock span times use;
 `nest`, `markers`, `attrs` and `incomplete` may be left out. `incomplete: true` says the harness

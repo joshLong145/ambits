@@ -76,6 +76,12 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
 .span.delegate { background: var(--delegate); } .span.other { background: var(--other); }
 .span.error { outline: 2px solid var(--bad); }
 .span.phase { background: var(--phase); }
+.span.phase.l1 { background: color-mix(in srgb, var(--phase) 75%, var(--panel)); }
+.span.phase.l2 { background: color-mix(in srgb, var(--phase) 50%, var(--panel)); }
+.chip.tier { border-color: var(--phase); background: color-mix(in srgb, var(--phase) 35%, transparent); }
+.chip.tier.l1 { background: color-mix(in srgb, var(--phase) 22%, transparent); }
+.chip.tier.l2 { background: color-mix(in srgb, var(--phase) 10%, transparent); }
+.calls .row .sub { color: var(--muted); flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lane.host .label { color: var(--ink); }
 .lanes .sep { border-top: 1px solid var(--line); margin: 6px 0; }
 .instant { position: absolute; top: 0; bottom: 0; width: 0; border-left: 1px dashed var(--muted); }
@@ -83,10 +89,12 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
 .instant.marker { border-left: 2px solid var(--bad); }
 .legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
 .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+.legend i.span { position: static; top: auto; height: 10px; min-width: 0; }
 .calls .row { scroll-margin-top: 56px; display: flex; gap: 8px; padding: 3px 8px; border-top: 1px solid var(--line); cursor: pointer; align-items: baseline; }
 .calls .row:hover, .calls .row.sel { background: var(--d1); }
 .calls .row .t { color: var(--muted); font-size: 12px; flex: 0 0 64px; }
-.calls .row .n { overflow-wrap: anywhere; }
+.calls .row .n { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.calls .row .counts, .calls .row .chip { flex: none; white-space: nowrap; }
 .calls .row.prompt .n { font-weight: 600; }
 .calls .row.host { background: var(--bg); }
 .calls .row.nest .n { font-weight: 600; }
@@ -348,8 +356,7 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
 
     if (P.incomplete) s.append(el("div", { class: "notice", text: "The harness could not record its whole timeline, so a phase missing here may still have run." }));
     s.append(el("div", { class: "legend" }, ...[...(phaseSpans.length ? ["phase"] : []), "prompt", "read", "write", "delegate", "other"].map(k => {
-      const sw = el("i", { class: "span " + k }); sw.style.position = "static";
-      return el("span", null, sw, k);
+      return el("span", null, el("i", { class: "span " + k }), k);
     }), el("span", { text: clock(t0) + " → " + clock(t1) })));
 
     const lanes = el("div", { class: "lanes" });
@@ -365,8 +372,10 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
     // Every row of the list below, by key: a call `c<i>`, a harness span
     // `h<lane>-<span>`, a marker `m<n>`. Details are built when first opened.
     const entries = new Map();
+    // A row that stands for another, as a turn row for the prompt merged into it.
+    const alias = new Map();
     function toggle(key, open) {
-      const e = entries.get(key);
+      const e = entries.get(alias.get(key) || key);
       if (!e || !e.row) return;
       const wanted = open === undefined ? !e.box : open;
       if (wanted && !e.box) {
@@ -378,15 +387,16 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
       }
       e.row.setAttribute("aria-expanded", String(Boolean(e.box)));
       e.row.classList.toggle("sel", Boolean(e.box));
-      if (e.bar) e.bar.classList.toggle("sel", Boolean(e.box));
+      for (const b of [e.bar, e.also]) if (b) b.classList.toggle("sel", Boolean(e.box));
     }
-    const reveal = key => { toggle(key, true); const e = entries.get(key); if (e && e.row) e.row.scrollIntoView({ block: "start" }); };
+    const reveal = key => { toggle(key, true); const e = entries.get(alias.get(key) || key); if (e && e.row) e.row.scrollIntoView({ block: "start" }); };
 
     // Each harness lane stacks what overlaps into rows, so a phase that runs
     // inside another sits on the row below it.
     const hostItems = [];
+    const shade = li => " l" + Math.min(li, 2);
     P.lanes.forEach((lane, li) => {
-      const items = lane.spans.map((p, si) => ({ p, lane: lane.name, nest: Boolean(lane.nest), key: "h" + li + "-" + si }))
+      const items = lane.spans.map((p, si) => ({ p, li, lane: lane.name, nest: Boolean(lane.nest), key: "h" + li + "-" + si }))
         .sort((a, b) => a.p.start_ms - b.p.start_ms || b.p.end_ms - a.p.end_ms);
       const rowEnds = [];
       for (const item of items) {
@@ -398,7 +408,7 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
       const tracks = rowEnds.length ? rowEnds.map(() => el("div", { class: "track" })) : [el("div", { class: "track" })];
       for (const item of items) {
         const label = lane.name + " · " + item.p.name;
-        const b = el("button", { class: "span phase", title: label + " · " + (item.p.end_ms - item.p.start_ms) + " ms", "aria-label": label, on: { click: () => reveal(item.key) } });
+        const b = el("button", { class: "span phase" + shade(li), title: label + " · " + (item.p.end_ms - item.p.start_ms) + " ms", "aria-label": label, on: { click: () => reveal(item.key) } });
         b.style.left = at(item.p.start_ms) + "%";
         b.style.width = Math.max(0.25, at(item.p.end_ms) - at(item.p.start_ms)) + "%";
         tracks[item.row].append(b);
@@ -407,7 +417,9 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
       }
       tracks.forEach((track, r) => {
         markersOn(track);
-        lanes.append(el("div", { class: "lane host" }, el("div", { class: "label", title: lane.name, text: r ? "" : lane.name }), track));
+        const label = el("div", { class: "label", title: lane.name, text: r ? "" : (li ? "└ " : "") + lane.name });
+        label.style.paddingLeft = 10 * Math.max(0, li - 1) + "px";
+        lanes.append(el("div", { class: "lane host" }, label, track));
       });
     });
     if (P.lanes.length && R.spans.length) lanes.append(el("div", { class: "sep" }));
@@ -428,7 +440,10 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
     };
     const took = (start, end) => clock(start) + (end === null || end === undefined ? " · no result" : " · " + (end - start) + " ms");
 
-    function detailOf(x) {
+    const markerRows = (dl, ms) => {
+      for (const m of ms) dl.append(el("dt", { text: "Marker" }), el("dd", null, el("span", { class: "chip removed", text: m.name }), " " + clock(m.t_ms), m.attrs.length ? pairs(m.attrs.map(a => [a.key, a.value])) : null));
+    };
+    function detailOf(x, ms) {
       const dl = detailList([["Kind", x.kind + (x.depth ? " · " + x.depth : "")], ["Tool", x.tool], ["Agent", nameOf(x.agent)],
         ["When", took(x.start_ms, x.end_ms)],
         ["File", x.file], ["Symbol", x.symbol], ["Started", x.child_agent ? nameOf(x.child_agent) : null], ["Error", x.message]]);
@@ -442,12 +457,17 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
       if (x.content) dl.append(el("dt", { text: titles[x.content.type] || x.content.type }), el("dd", null, contentView(x.content)));
       const w = R.writes.find(w => w.span === x.i);
       if (w) dl.append(el("dt", { text: "Write" }), el("dd", null, el("a", { href: "#w-" + w.op, class: "chip " + w.status, text: "see write · " + w.status, on: { click: ev => { ev.preventDefault(); jumpToWrite(w.op); } } })));
+      markerRows(dl, ms || []);
       return el("div", { class: "expand" }, dl);
     }
-    function hostDetail(item, calls) {
+    function hostDetail(item, calls, prompt) {
       const dl = detailList([["Kind", "phase"], ["Lane", item.lane], ["When", took(item.p.start_ms, item.p.end_ms)],
-        ["Ended", clock(item.p.end_ms)], ["Calls", item.nest ? String(calls) : null]]);
+        ["Ended", clock(item.p.end_ms)], ["Calls", calls || item.nest || prompt ? String(calls) : null]]);
       if (item.p.attrs.length) dl.append(el("dt", { text: "Attributes" }), el("dd", null, pairs(item.p.attrs.map(a => [a.key, a.value]))));
+      if (prompt) {
+        dl.append(el("dt", { text: "Prompt" }), el("dd", null, took(prompt.start_ms, prompt.end_ms) + " · " + nameOf(prompt.agent)));
+        if (prompt.detail) dl.append(el("dt", { text: "Prompt text" }), el("dd", null, el("pre", { class: "mono", text: prompt.detail })));
+      }
       return el("div", { class: "expand" }, dl);
     }
     function markerDetail(m) {
@@ -498,29 +518,57 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
       lanes.append(el("div", { class: "lane" }, el("div", { class: "label", title: agent, text: nameOf(agent) }), track));
     }
 
-    // One list: harness spans, markers and calls as one tree. Each goes
-    // under the shortest span of a `nest` lane open when it started (a span
-    // only under a longer one), and a call under its own parent call (its
-    // turn's prompt) when the two share that span; the rest stay at the top.
+    // One list: harness spans, markers and calls as one tree. Lanes are listed
+    // outermost first, so a span goes under the shortest span of an earlier
+    // lane, or a longer one of its own, covering at least half of it. A prompt
+    // and the deepest-lane span it mostly shares are one row. A call goes under
+    // its parent call (its prompt, or a delegation) when the two have the same
+    // place, else under the shortest `nest` span open when it started. A marker
+    // naming a tool goes on that tool's call it fell in; any other marker under
+    // the shortest span open at its time.
+    const len = p => p.end_ms - p.start_ms;
+    const covers = (p, a, b) => b > a
+      ? 2 * Math.max(0, Math.min(p.end_ms, b) - Math.max(p.start_ms, a)) >= b - a
+      : p.start_ms <= a && a <= p.end_ms;
+    const shortest = items => items.reduce((best, c) => !best || len(c.p) < len(best.p) || (len(c.p) === len(best.p) && c.p.start_ms > best.p.start_ms) ? c : best, null);
+    const openAt = (items, t) => shortest(items.filter(c => c.p.start_ms <= t && t <= c.p.end_ms));
+
+    const merged = new Map();
+    for (const x of R.spans) {
+      if (x.kind !== "prompt" || !x.end_ms) continue;
+      const own = { start_ms: x.start_ms, end_ms: x.end_ms };
+      const pair = hostItems.filter(c => !merged.has(c.key) && covers(c.p, x.start_ms, x.end_ms) && covers(own, c.p.start_ms, c.p.end_ms))
+        .reduce((best, c) => !best || c.li > best.li || (c.li === best.li && len(c.p) < len(best.p)) ? c : best, null);
+      if (pair) { merged.set(pair.key, x); alias.set("c" + x.i, pair.key); entries.get(pair.key).also = entries.get("c" + x.i).bar; }
+    }
+    const markersOf = new Map();
+    const loose = [];
+    P.markers.forEach((m, n) => {
+      const tool = (m.attrs.find(a => a.key === "tool_name") || {}).value;
+      const call = tool && R.spans.filter(x => x.tool === tool && x.start_ms <= m.t_ms && m.t_ms <= (x.end_ms || x.start_ms))
+        .reduce((best, x) => !best || x.start_ms > best.start_ms ? x : best, null);
+      if (call) markersOf.set(call.i, [...(markersOf.get(call.i) || []), m]);
+      else loose.push({ key: "m" + n, t: m.t_ms, len: 0, marker: m });
+    });
+
     const nodes = [
-      ...hostItems.map(item => ({ key: item.key, t: item.p.start_ms, len: item.p.end_ms - item.p.start_ms, item })),
-      ...P.markers.map((m, n) => ({ key: "m" + n, t: m.t_ms, len: 0, marker: m })),
-      ...R.spans.map(x => ({ key: "c" + x.i, t: x.start_ms, len: (x.end_ms || x.start_ms) - x.start_ms, call: x })),
+      ...hostItems.map(item => ({ key: item.key, t: item.p.start_ms, len: len(item.p), item, prompt: merged.get(item.key) })),
+      ...loose,
+      ...R.spans.filter(x => !alias.has("c" + x.i)).map(x => ({ key: "c" + x.i, t: x.start_ms, len: (x.end_ms || x.start_ms) - x.start_ms, call: x })),
     ];
-    const nests = nodes.filter(n => n.item && n.item.nest);
-    const nestOf = node => {
-      let best = null;
-      for (const c of nests) {
-        if (c === node || c.t > node.t || node.t > c.item.p.end_ms) continue;
-        if (node.item && !(c.len > node.len || (c.len === node.len && c.t < node.t))) continue;
-        if (!best || c.len < best.len || (c.len === best.len && c.t > best.t)) best = c;
-      }
-      return best;
-    };
     const nodeByKey = new Map(nodes.map(n => [n.key, n]));
-    const home = new Map(nodes.map(n => [n.key, nestOf(n)]));
+    const nests = hostItems.filter(c => c.nest);
+    const hostOf = item => shortest(hostItems.filter(c => c !== item && (c.li < item.li || (c.li === item.li && len(c.p) > len(item.p))) && covers(c.p, item.p.start_ms, item.p.end_ms)));
+    const placeOf = n => {
+      if (n.item) return hostOf(n.item);
+      if (n.marker) return openAt(hostItems, n.t);
+      return openAt(nests, n.t);
+    };
+    const home = new Map(nodes.map(n => { const h = placeOf(n); return [n.key, h ? nodeByKey.get(h.key) : null]; }));
     const parentOf = n => {
-      const up = n.call ? nodeByKey.get("c" + n.call.parent) : null;
+      if (!n.call || n.call.parent === null) return home.get(n.key);
+      const up = nodeByKey.get(alias.get("c" + n.call.parent) || "c" + n.call.parent);
+      if (up && up.item) return up;
       return up && home.get(up.key) === home.get(n.key) ? up : home.get(n.key);
     };
     const kids = new Map(nodes.map(n => [n.key, []]));
@@ -540,18 +588,20 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
     };
     function render(n, depth) {
       if (n.call) {
-        const x = n.call;
+        const x = n.call, ms = markersOf.get(x.i) || [];
         row(n.key, x.kind + (x.error ? " error" : ""), [el("span", { class: "t mono", text: clock(x.start_ms) }), el("span", { class: "chip", text: x.kind }),
-          el("span", { class: "n", text: x.name }), el("span", { class: "counts", text: x.end_ms ? (x.end_ms - x.start_ms) + " ms" : "no result" })], depth).detail = () => detailOf(x);
+          el("span", { class: "n", title: x.name, text: x.name }), el("span", { class: "counts", text: x.end_ms ? (x.end_ms - x.start_ms) + " ms" : "no result" }),
+          ...ms.map(m => el("span", { class: "chip removed", text: m.name }))], depth).detail = () => detailOf(x, ms);
       } else if (n.marker) {
         const m = n.marker;
         row(n.key, "marker", [el("span", { class: "t mono", text: clock(m.t_ms) }), el("span", { class: "chip removed", text: "marker" }),
           el("span", { class: "n", text: m.name })], depth).detail = () => markerDetail(m);
       } else {
         const it = n.item, calls = callsIn(n);
-        const count = it.nest ? " · " + (calls ? calls + " call" + (calls === 1 ? "" : "s") : "no calls") : "";
-        row(n.key, "host" + (it.nest ? " nest" : ""), [el("span", { class: "t mono", text: clock(it.p.start_ms) }), el("span", { class: "chip", text: it.lane }),
-          el("span", { class: "n", text: it.p.name }), el("span", { class: "counts", text: n.len + " ms" + count })], depth).detail = () => hostDetail(it, calls);
+        const count = calls || it.nest || n.prompt ? " · " + (calls ? calls + " call" + (calls === 1 ? "" : "s") : "no calls") : "";
+        row(n.key, "host" + (it.nest || n.prompt ? " nest" : ""), [el("span", { class: "t mono", text: clock(it.p.start_ms) }), el("span", { class: "chip tier" + shade(it.li), text: it.lane }),
+          el("span", { class: "n", text: it.p.name }), n.prompt ? el("span", { class: "sub", title: n.prompt.name, text: n.prompt.name }) : null,
+          el("span", { class: "counts", text: n.len + " ms" + count })], depth).detail = () => hostDetail(it, calls, n.prompt);
       }
       for (const k of kids.get(n.key).sort(byTime)) render(k, depth + 1);
     }
