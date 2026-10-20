@@ -1,6 +1,6 @@
 [package]
 name = "ambits"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2021"
 # The locked ratatui 0.29 pulls in instability 0.3.11 and darling 0.23, which
 # need 1.88; a `--locked` build fails on anything older.
