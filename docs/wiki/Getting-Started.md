@@ -13,8 +13,8 @@ for x86_64 and aarch64, and macOS builds for Apple Silicon and Intel. Each is a
 against.
 
 ```bash
-tar -xzf ambits-0.21.0-aarch64-apple-darwin.tar.gz
-mv ambits-0.21.0-aarch64-apple-darwin/ambits ~/.local/bin/
+tar -xzf ambits-0.25.0-aarch64-apple-darwin.tar.gz
+mv ambits-0.25.0-aarch64-apple-darwin/ambits ~/.local/bin/
 ambits --version
 ```
 
