@@ -3,6 +3,8 @@
 Every read is tracked per symbol and per agent, at the depth the tool implies —
 a `Read` gives full body, a grep match gives overview, a glob gives name only
 (the full mapping is data; see [Configuration](Configuration#tool-mappings)).
+Edits are not reads: an agent that changed a symbol has not necessarily read
+it, so edits are recorded separately as [writes](Agent-Writes).
 `restore-context` reports that history:
 
 ```bash
@@ -29,6 +31,9 @@ since is dropped, because the agent's memory of it is stale.
 A symbol that moved between files is annotated `(was <old path>)`. ambits
 identifies symbols by content as well as by path, so hoisting a helper into a
 shared module does not lose it.
+
+Not to be confused with [`ambits restore`](Snapshots#restoring), which puts
+a *snapshot's* coverage into a session.
 
 ## Options
 
@@ -66,9 +71,20 @@ context.
 
 ambits parses `show` invocations out of the session log and credits the
 symbols they name, so reading efficiently costs nothing in coverage versus a
-plain `Read`. `--no-body` credits name-level only — the agent learned where a
-symbol is, not what it says. `rg`/`grep` credit the symbols whose matching
-lines they printed; see [Searching Code](Searching-Code#searching-is-reading).
+plain `Read`. A `show` prints the whole definition, so what is inside the
+symbol — an impl's or trait impl's methods, a Markdown section's
+subsections — is credited with it, unless `--max-bytes` may have cut it
+short, when only the symbol named is. `--no-body` credits name-level only —
+the agent learned where a symbol is, not what it says. Ids are read as the
+shell reads them, so a quoted one with spaces (`'src/a.rs::impl App'`,
+`'docs/x.md::Guide/Getting started'`) is one id. `rg`/`grep` credit the symbols their printed
+matches sit in at name level — seen, not read; see
+[Searching Code](Searching-Code#searching-is-seeing-not-reading).
+
+Each `ambits` invocation in a command is credited on its own:
+`ambits show A --no-body && ambits show B` reads `B` in full. An invocation is
+found by the word `ambits`, so one run through a shell variable (`$B show …`)
+is not seen at all.
 
 Credit is best-effort: it is reconstructed from the logged command text, so a
 selector passed through a shell variable or command substitution is not

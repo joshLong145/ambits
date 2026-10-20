@@ -21,6 +21,22 @@ pub enum AppEvent {
     /// file tree only ever grew: a removed file kept its row until restart.
     FileRemoved(PathBuf),
     Tick,
+    /// An agent write, attributed off the render thread by the worker that
+    /// `TuiSession` spawns (spec §1), ready to journal into `session` — the
+    /// session it happened in, which a switch may since have left.
+    WriteRecorded {
+        session: std::sync::Arc<str>,
+        record: Box<ambits::writes::WriteRecord>,
+    },
+    /// The commits made during the session, found off the render thread by
+    /// the worker `TuiSession` spawns for the trace view.
+    CommitsFound(Vec<ambits::git::Commit>),
+    /// A call's content, read from its log off the render thread by the
+    /// worker `TuiSession` spawns. Held in memory only (spec §9.6).
+    ContentLoaded {
+        key: ambits::app::ContentKey,
+        content: Option<ambits::ingest::content::CallDetail>,
+    },
 }
 
 /// Spawn a thread that polls crossterm key events and sends them to the channel.

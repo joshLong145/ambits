@@ -2,8 +2,9 @@
 name = "ambits"
 version = "0.20.0"
 edition = "2021"
-# `Option::is_none_or` (src/ui/activity.rs) stabilized here.
-rust-version = "1.82"
+# The locked ratatui 0.29 pulls in instability 0.3.11 and darling 0.23, which
+# need 1.88; a `--locked` build fails on anything older.
+rust-version = "1.88"
 description = "command line utility for symbols used by Claude agents"
 repository = "https://github.com/joshLong145/ambits"
 license = "MIT"
@@ -23,6 +24,7 @@ streaming-iterator = "0.1"
 tree-sitter-rust = "0.23"
 tree-sitter-python = "0.23"
 tree-sitter-typescript = "0.23"
+tree-sitter-java = "0.23"
 tree-sitter-md = "0.5.3"
 ignore = "0.4"
 notify = "7"
@@ -32,15 +34,30 @@ serde_json = "1"
 color-eyre = "0.6"
 serde-pickle = "1.2"
 flume = "0.12"
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
 blake3 = "1"
 regex = "1"
 dhat = { version = "0.3", optional = true }
 log = { version = "0.4", features = ["kv"] }
 env_logger = "0.11"
+unicode-normalization = "0.1.25"
+unicode-width = "0.2"
+fs4 = { version = "1.1.0", features = ["sync"] }
+# SHA-256 for the report page's CSP hashes, the only digest CSP accepts.
+sha2 = "0.10"
+
+# One shipped binary, built rarely: smaller and faster beats a quick build.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
 
 [features]
 dhat-heap = ["dep:dhat"]
+
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW and O_NONBLOCK, so a store file is never a symlink or a FIFO (§9.1).
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,14 +1,13 @@
-use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::Frame;
 
 use ambits::app::App;
 use ambits::tracking::alignment::FileAlignment;
 
 use super::colors;
-use super::stats::short_id;
 
 /// Render the sub-agent alignment popup over `area`. The caller must verify
 /// `app.show_alignment_overlay` before calling.
@@ -29,7 +28,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 lines.push(Line::from(""));
             }
             lines.push(Line::from(Span::styled(
-                format!("{}  \u{2194}  {}", short_id(&pair.agent_a), short_id(&pair.agent_b)),
+                format!(
+                    "{}  \u{2194}  {}",
+                    super::fit(&app.agent_title(&pair.agent_a), 28),
+                    super::fit(&app.agent_title(&pair.agent_b), 28)
+                ),
                 Style::default().add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(vec![
@@ -64,7 +67,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             // then Aligned) so the files needing attention are at the top.
             for entry in &pair.files {
                 let (label, color) = match entry.status {
-                    FileAlignment::DepthMismatch => ("DepthMismatch", colors::FILE_PARTIALLY_COVERED),
+                    FileAlignment::DepthMismatch => {
+                        ("DepthMismatch", colors::FILE_PARTIALLY_COVERED)
+                    }
                     FileAlignment::Unshared => ("Unshared", colors::DEPTH_UNSEEN),
                     FileAlignment::Aligned => ("Aligned", colors::FILE_FULLY_COVERED),
                 };
@@ -92,14 +97,20 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let title = format!(
         " Sub-agent alignment — {} pair{} ",
         app.agent_alignment.len(),
-        if app.agent_alignment.len() == 1 { "" } else { "s" }
+        if app.agent_alignment.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
     );
 
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(paragraph, popup_area);
 }
 
@@ -115,4 +126,3 @@ fn score_color(score: f64) -> Color {
         colors::PCT_LOW
     }
 }
-

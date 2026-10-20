@@ -61,23 +61,21 @@
 //!
 //! ## One writer
 //!
-//! The TUI is the *only* process that ever opens a journal for writing.
-//! `ambits find` briefly was a second writer — it showed source too, so it
-//! seemed fair for it to record what it showed — first sharing the primary
-//! file under an `O_APPEND` safety net, then (once that stopped feeling
-//! sound to lean on as the only guarantee) writing its own shard,
-//! `<session>.find.ndjson`, so the two processes never touched the same file
-//! at all. Both were real fixes to a real problem, but they were fixing the
-//! wrong layer: the actual goal was never "make two writers safe," it was
-//! "never need to ask whether two writers are safe." `find` no longer writes
-//! to the journal. A search run with no TUI attached to the session earns no
-//! coverage credit — an accepted, deliberate trade. Re-deriving credit from
-//! the session log after the fact was considered and rejected: replaying a
-//! `find` command and re-running its search would stamp *today's* file
-//! content against a read that happened whenever the TUI's tailer catches up
-//! to it, which is exactly the "vacuous comparison" this journal exists to
-//! avoid (see "Why this exists," above) — the very failure mode a `find`-only
-//! journal write was supposed to prevent in the first place.
+//! A session's primary journal has one writer at a time, and the file lock
+//! [`Journal::open`] takes enforces it: a second opener gets an error rather
+//! than interleaving its appends with the first's. Two processes write it:
+//! the TUI, and `ambits cache sync` for a run with no terminal, which does
+//! exactly what the TUI does at launch (replay the logs, fold in the journal,
+//! sync) and then exits. Both stamp a replayed read with the symbol's hash
+//! at replay time, so a sync run once at the end of a session records what
+//! the code looked like then, not at each read.
+//!
+//! `ambits find` briefly was another writer, first sharing the primary file
+//! under `O_APPEND`, then writing its own shard, `<session>.find.ndjson`. It
+//! no longer writes at all: re-running a search to credit its reads would
+//! stamp today's content against a read that happened whenever the replay
+//! caught up to it, which is the "vacuous comparison" this journal exists to
+//! avoid (see "Why this exists," above).
 //!
 //! [`Journal::open_shard`], [`session_shard_paths`], and
 //! [`read_journal_session`] are kept rather than torn back out: they cost
@@ -103,11 +101,13 @@ use crate::tracking::{ContextLedger, ReadDepth};
 ///
 /// - **v1** — one record per symbol, no agent attribution.
 /// - **v2** — one record per `(symbol, agent)`, plus `host` in the manifest.
+/// - **v3** — adds `write` records (agent writes, spec §2.6) and `history`
+///   records (kept, ignored by the fold). Reads are unchanged.
 ///
 /// Older versions stay readable: `a` is optional and the manifest fields are
 /// `#[serde(default)]`, so a v1 file folds into the same symbol-level view and
 /// only loses per-agent detail. See [`MIN_READABLE_SCHEMA_VERSION`].
-pub const SUPPORTED_SCHEMA_VERSION: u32 = 2;
+pub const SUPPORTED_SCHEMA_VERSION: u32 = 3;
 
 /// Oldest on-disk version this build can still fold. Reading an older journal
 /// is always preferable to discarding it — the symbol-level read set, which is
@@ -123,8 +123,7 @@ pub const JOURNAL_SUBDIR: &str = ".ambits/coverage";
 /// legacy `.ambit/coverage/`. Every reader and the writer go through here, so
 /// whichever runs first performs the one-time move.
 pub fn journal_dir(project_root: &Path) -> PathBuf {
-    crate::state_dir::migrate_legacy_journals(project_root);
-    project_root.join(JOURNAL_SUBDIR)
+    crate::state_dir::coverage_dir(project_root)
 }
 
 /// Default interval between ledger diffs.
@@ -218,14 +217,14 @@ impl EnvironmentManifest {
             tree_fingerprint: encode_hash(&tree_fingerprint(tree)),
             ambit_version: env!("CARGO_PKG_VERSION").to_string(),
             backend: backend.to_string(),
-            // Diagnostic only; keep in step with Cargo.toml when grammars move.
-            parsers: vec![
-                "tree-sitter=0.24".into(),
-                "rust=0.23".into(),
-                "python=0.23".into(),
-                "typescript=0.23".into(),
-            ],
-            tool_config_version: Some(crate::ingest::tool_config::ToolMappingConfig::SUPPORTED_VERSION),
+            // Diagnostic only; generated from Cargo.lock at build time.
+            parsers: crate::parser::GRAMMARS
+                .iter()
+                .map(|(n, v)| format!("{n}={v}"))
+                .collect(),
+            tool_config_version: Some(
+                crate::ingest::tool_config::ToolMappingConfig::SUPPORTED_VERSION,
+            ),
             filter,
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
@@ -301,6 +300,22 @@ pub enum Record {
         /// read still counts — it just cannot be filtered by agent.
         #[serde(rename = "a", default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
+    },
+    /// An agent write (v3). One per `(session, op)`; the highest `av` wins.
+    Write(Box<crate::writes::WriteRecord>),
+    /// A fact kept for the record but not folded into current state (v3):
+    /// stale remote reads, restored writes, merge conflicts (spec §2.6).
+    /// Local-only, never copied into snapshot objects.
+    History {
+        of: String,
+        #[serde(flatten)]
+        rest: serde_json::Map<String, serde_json::Value>,
+    },
+    /// A pull merged `remote`'s snapshot `tip` into this session (§12.3):
+    /// the next snapshot takes it as a second parent. Local-only.
+    Merge {
+        remote: String,
+        tip: String,
     },
 }
 
@@ -388,6 +403,22 @@ pub struct JournalContents {
     /// Per-`(symbol, agent)` view, for restoring agent-filtered coverage.
     /// Empty for v1 journals, which carried no attribution.
     pub agent_reads: HashMap<AgentReadKey, ([u8; 32], ReadDepth)>,
+    /// Agent writes by `op`, keeping the record with the highest `av`
+    /// (spec §2.6). Empty before v3.
+    pub writes: std::collections::BTreeMap<String, crate::writes::WriteRecord>,
+    /// `op` of every write kept as history (`history{of:"write"}`, from a
+    /// restore). Not folded into `writes` — history never is — but known, so
+    /// restoring again appends nothing.
+    pub history_writes: std::collections::BTreeSet<String>,
+    /// `op` of every write kept as a pull conflict (`history{of:"write",
+    /// conflict:true}`), so pulling again keeps it once.
+    pub conflict_writes: std::collections::BTreeSet<String>,
+    /// `(symbol, hash)` of every read kept as history (`history{of:"read"}`,
+    /// a stale remote read), so pulling again appends nothing.
+    pub history_reads: std::collections::BTreeSet<(String, String)>,
+    /// Remote snapshots pulled into this session (`merge` records): the next
+    /// snapshot's extra parents, until they are its ancestors.
+    pub merges: std::collections::BTreeSet<String>,
     pub warnings: Vec<String>,
 }
 
@@ -420,16 +451,38 @@ fn fold(
 /// *interior* line warns and is skipped. Losing one record costs one symbol's
 /// coverage; refusing to read the file costs all of it.
 pub fn read_journal(path: &Path) -> JournalContents {
-    let mut out = JournalContents::default();
+    match std::fs::read_to_string(path) {
+        Ok(content) => fold_journal_text(path, &content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => JournalContents::default(),
+        Err(e) => JournalContents {
+            warnings: vec![format!("{}: {e}", path.display())],
+            ..Default::default()
+        },
+    }
+}
 
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return out,
-        Err(e) => {
-            out.warnings.push(format!("{}: {e}", path.display()));
-            return out;
-        }
-    };
+/// [`read_journal`] over text already in hand; `path` labels warnings.
+/// Snapshots fold exactly the bytes they digest (spec §6.2), so they read a
+/// shard once and pass its text here.
+pub fn fold_journal_text(path: &Path, content: &str) -> JournalContents {
+    fold_lines(path, content, Records::All)
+}
+
+/// Which records a fold parses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Records {
+    All,
+    /// Headers and writes only: reads, which outnumber writes several times
+    /// over, are counted but skipped unparsed, by their `{"kind":"read"`
+    /// prefix (serde writes the tag first; `the_record_tag_is_serialized_first`
+    /// holds it to that).
+    Writes,
+}
+
+/// The one journal fold, with one schema rule: a header outside the
+/// readable range discards the whole shard.
+fn fold_lines(path: &Path, content: &str, records: Records) -> JournalContents {
+    let mut out = JournalContents::default();
 
     let lines: Vec<&str> = content.lines().collect();
     let last_index = lines.len().saturating_sub(1);
@@ -441,6 +494,9 @@ pub fn read_journal(path: &Path) -> JournalContents {
             continue;
         }
         out.records += 1;
+        if records == Records::Writes && line.trim_start().starts_with(r#"{"kind":"read""#) {
+            continue;
+        }
         let record: Record = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(e) => {
@@ -490,10 +546,38 @@ pub fn read_journal(path: &Path) -> JournalContents {
                     i + 1
                 )),
             },
+            Record::Write(record) => fold_write(&mut out.writes, *record),
+            Record::History { of, rest } => {
+                let field = |k: &str| rest.get(k).and_then(|v| v.as_str()).map(String::from);
+                let conflict = rest.get("conflict").and_then(|v| v.as_bool()) == Some(true);
+                match of.as_str() {
+                    "write" if conflict => out.conflict_writes.extend(field("op")),
+                    "write" => out.history_writes.extend(field("op")),
+                    "read" => out.history_reads.extend(field("sym").zip(field("h"))),
+                    _ => {}
+                }
+            }
+            Record::Merge { tip, .. } => {
+                out.merges.insert(tip);
+            }
         }
     }
 
     out
+}
+
+/// Keep one write per `op`: the highest attribution version wins, so a write
+/// re-attributed under newer rules replaces its older record (spec §2.6).
+pub(crate) fn fold_write(
+    writes: &mut std::collections::BTreeMap<String, crate::writes::WriteRecord>,
+    record: crate::writes::WriteRecord,
+) {
+    match writes.get(&record.op) {
+        Some(existing) if existing.av >= record.av => {}
+        _ => {
+            writes.insert(record.op.clone(), record);
+        }
+    }
 }
 
 /// Every on-disk shard of `session_id`'s journal under `dir` (the
@@ -545,20 +629,56 @@ pub fn session_shard_paths(dir: &Path, session_id: &str) -> Vec<PathBuf> {
 pub fn read_journal_session(dir: &Path, session_id: &str) -> JournalContents {
     let mut out = JournalContents::default();
     for path in session_shard_paths(dir, session_id) {
-        let shard = read_journal(&path);
-        out.records += shard.records;
-        out.warnings.extend(shard.warnings);
-        if shard.header.is_some() {
-            out.header = shard.header;
-        }
-        for (id, (hash, depth)) in shard.reads {
-            fold(out.reads.entry(id), hash, depth);
-        }
-        for (key, (hash, depth)) in shard.agent_reads {
-            fold(out.agent_reads.entry(key), hash, depth);
+        merge_shard(&mut out, read_journal(&path));
+    }
+    out
+}
+
+/// Only the write records of `session_id`'s journal, folded by `op` (highest
+/// `av` wins) — for `ambits touched`, which needs nothing else. Read records,
+/// which outnumber writes several times over, are skipped by their prefix
+/// without being parsed. A shard with an unreadable schema contributes
+/// nothing, as in [`read_journal`].
+pub fn read_session_writes(
+    dir: &Path,
+    session_id: &str,
+) -> std::collections::BTreeMap<String, crate::writes::WriteRecord> {
+    let mut out = std::collections::BTreeMap::new();
+    for path in session_shard_paths(dir, session_id) {
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for record in fold_lines(&path, &content, Records::Writes)
+            .writes
+            .into_values()
+        {
+            fold_write(&mut out, record);
         }
     }
     out
+}
+
+/// Fold one shard's contents into a session's, with the same rules
+/// [`fold`] applies within a file.
+pub fn merge_shard(out: &mut JournalContents, shard: JournalContents) {
+    out.records += shard.records;
+    out.warnings.extend(shard.warnings);
+    if shard.header.is_some() {
+        out.header = shard.header;
+    }
+    for (id, (hash, depth)) in shard.reads {
+        fold(out.reads.entry(id), hash, depth);
+    }
+    for (key, (hash, depth)) in shard.agent_reads {
+        fold(out.agent_reads.entry(key), hash, depth);
+    }
+    for record in shard.writes.into_values() {
+        fold_write(&mut out.writes, record);
+    }
+    out.history_writes.extend(shard.history_writes);
+    out.history_reads.extend(shard.history_reads);
+    out.conflict_writes.extend(shard.conflict_writes);
+    out.merges.extend(shard.merges);
 }
 
 // ---------------------------------------------------------------------------
@@ -569,6 +689,7 @@ pub fn read_journal_session(dir: &Path, session_id: &str) -> JournalContents {
 #[derive(Debug)]
 pub struct Journal {
     path: PathBuf,
+    session_id: String,
     file: Option<File>,
     /// What is already on disk, so a diff can skip unchanged entries.
     ///
@@ -579,6 +700,9 @@ pub struct Journal {
     /// Distinct symbols on disk, for [`Journal::len`]. Tracked separately so
     /// the count stays a symbol count rather than a record count.
     symbols: std::collections::HashSet<String>,
+    /// `op` → attribution version of every write already journaled, in any of
+    /// the session's shards — so replaying a log never duplicates a write.
+    written_ops: HashMap<String, u32>,
     interval: Duration,
     last_sync: Instant,
     /// Set when writing fails. Journaling then stops for the rest of the run
@@ -586,6 +710,41 @@ pub struct Journal {
     /// TUI down with it.
     error: Option<String>,
     warnings: Vec<String>,
+}
+
+/// Append `records` to `session`'s `shard` (`<session>.<shard>.ndjson`),
+/// in order; an error names the shard if any cannot be written. For the
+/// writers that add a batch at once — restore, pull.
+pub fn append_shard(
+    project_root: &Path,
+    session: &str,
+    shard: &str,
+    records: &[Record],
+    manifest: impl FnOnce() -> EnvironmentManifest,
+) -> color_eyre::Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let mut journal = Journal::open_shard(project_root, session, shard, Duration::ZERO, manifest);
+    for record in records {
+        if !journal.append(record) {
+            color_eyre::eyre::bail!(
+                "cannot write the {shard} shard {}",
+                journal.path().display()
+            );
+        }
+    }
+    Ok(())
+}
+
+impl JournalContents {
+    /// Whether `agent` already has `symbol` at `hash`, at `depth` or deeper:
+    /// a read that would add nothing.
+    pub fn knows_read(&self, symbol: &str, agent: &str, hash: &[u8; 32], depth: ReadDepth) -> bool {
+        self.agent_reads
+            .get(&(symbol.to_string(), agent.to_string()))
+            .is_some_and(|(h, d)| h == hash && *d >= depth)
+    }
 }
 
 impl Journal {
@@ -644,9 +803,11 @@ impl Journal {
 
         let mut journal = Self {
             path: path.clone(),
+            session_id: session_id.to_string(),
             file: None,
             journaled: HashMap::new(),
             symbols: std::collections::HashSet::new(),
+            written_ops: HashMap::new(),
             interval,
             last_sync: Instant::now(),
             error: None,
@@ -667,6 +828,13 @@ impl Journal {
         // one-time cost that upgrades the file in place rather than stranding
         // its history behind a version gate.
         journal.journaled = existing.agent_reads;
+        // Writes dedupe across every shard of the session (spec §2.6), not
+        // just this file: the TUI replays the whole log at startup.
+        journal.written_ops = read_journal_session(&dir, session_id)
+            .writes
+            .into_values()
+            .map(|w| (w.op, w.av))
+            .collect();
 
         let file = match OpenOptions::new().create(true).append(true).open(&path) {
             Ok(f) => f,
@@ -675,6 +843,25 @@ impl Journal {
                 return journal;
             }
         };
+        // The primary journal is held until this writer drops, so a second
+        // writer of it (a TUI and `cache sync`) is refused rather than
+        // interleaved. Shards keep sharing whole-line appends.
+        match shard.map_or_else(|| fs4::FileExt::try_lock(&file), |_| Ok(())) {
+            Ok(()) => {}
+            Err(fs4::TryLockError::WouldBlock) => {
+                journal.error = Some(format!(
+                    "{} is open for writing by another ambits process",
+                    path.display()
+                ));
+                return journal;
+            }
+            Err(fs4::TryLockError::Error(e)) => {
+                journal.warnings.push(format!(
+                    "{}: cannot lock ({e}); another writer would not be refused",
+                    path.display()
+                ));
+            }
+        }
         journal.file = Some(file);
 
         // Append a fresh header when the file has none, or when its header
@@ -705,9 +892,20 @@ impl Journal {
         &self.path
     }
 
+    /// The session this journal belongs to.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     /// Non-fatal complaints accumulated so far (corrupt lines, write failures).
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    /// Why journaling stopped, once opening or a write has failed; the
+    /// journal then writes nothing more for the rest of the process.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
     }
 
     /// Number of distinct symbols currently recorded on disk.
@@ -725,6 +923,27 @@ impl Journal {
             return 0;
         }
         self.sync(ledger)
+    }
+
+    /// Append an agent write, unless the session already holds that `op` at
+    /// the same or a newer attribution version. Returns whether it was
+    /// written.
+    pub fn record_write(&mut self, record: &crate::writes::WriteRecord) -> bool {
+        if self.error.is_some() {
+            return false;
+        }
+        if self
+            .written_ops
+            .get(&record.op)
+            .is_some_and(|&av| av >= record.av)
+        {
+            return false;
+        }
+        if !self.write(&Record::Write(Box::new(record.clone()))) {
+            return false;
+        }
+        self.written_ops.insert(record.op.clone(), record.av);
+        true
     }
 
     /// Append a record for every ledger entry whose read-state has changed
@@ -784,6 +1003,13 @@ impl Journal {
 
     /// Serialize and append one record. Returns `false` once journaling has
     /// been disabled by an error.
+    /// Append `record` as it is. For writers of their own shard (`restore`)
+    /// that decide what is new themselves; `false` if it could not be
+    /// written.
+    pub fn append(&mut self, record: &Record) -> bool {
+        self.error.is_none() && self.write(record)
+    }
+
     fn write(&mut self, record: &Record) -> bool {
         let Some(file) = self.file.as_mut() else {
             return false;
@@ -826,8 +1052,8 @@ fn timestamp() -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::helpers::*;
     use super::*;
+    use crate::helpers::*;
     use crate::symbols::merkle::content_hash;
 
     fn manifest() -> EnvironmentManifest {
@@ -862,8 +1088,33 @@ mod tests {
             panic!("the manifest must not be built when the header is current")
         });
         let mut ledger = ContextLedger::new();
-        ledger.record("a.rs::x".into(), ReadDepth::FullBody, content_hash("b"), "ag".into(), 5);
+        ledger.record(
+            "a.rs::x".into(),
+            ReadDepth::FullBody,
+            content_hash("b"),
+            "ag".into(),
+            5,
+        );
         assert_eq!(second.sync(&ledger), 1, "and it still appends reads");
+    }
+
+    #[test]
+    fn a_second_writer_of_the_primary_journal_is_refused_while_the_first_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Journal::open(dir.path(), "sess", Duration::ZERO, manifest);
+        assert_eq!(first.error(), None);
+
+        let second = Journal::open(dir.path(), "sess", Duration::ZERO, manifest);
+        assert!(
+            second
+                .error()
+                .is_some_and(|e| e.contains("another ambits process")),
+            "{:?}",
+            second.error()
+        );
+
+        drop(second);
+        drop(first);
     }
 
     /// Different writer *kinds* (the TUI, `find`) no longer share a file — see
@@ -878,13 +1129,24 @@ mod tests {
         // `&Path` is Copy, so each `move` closure takes its own copy of the
         // reference and the `TempDir` itself outlives the scope.
         let root = dir.path();
-        drop(Journal::open_shard(root, "sess", "find", Duration::from_millis(0), manifest));
+        drop(Journal::open_shard(
+            root,
+            "sess",
+            "find",
+            Duration::from_millis(0),
+            manifest,
+        ));
 
         std::thread::scope(|scope| {
             for writer in 0..4 {
                 scope.spawn(move || {
-                    let mut journal =
-                        Journal::open_shard(root, "sess", "find", Duration::from_millis(0), manifest);
+                    let mut journal = Journal::open_shard(
+                        root,
+                        "sess",
+                        "find",
+                        Duration::from_millis(0),
+                        manifest,
+                    );
                     let mut ledger = ContextLedger::new();
                     for i in 0..25 {
                         ledger.record(
@@ -946,7 +1208,8 @@ mod tests {
             "agent-cli".into(),
             5,
         );
-        Journal::open_shard(root, "sess", "find", Duration::from_millis(0), manifest).sync(&find_ledger);
+        Journal::open_shard(root, "sess", "find", Duration::from_millis(0), manifest)
+            .sync(&find_ledger);
 
         let dir_path = crate::cache::journal_dir(root);
         assert_eq!(
@@ -1004,7 +1267,11 @@ mod tests {
     fn decode_rejects_malformed_hashes() {
         assert_eq!(decode_hash("deadbeef"), None, "missing algorithm prefix");
         assert_eq!(decode_hash("b3:xyz"), None, "wrong length");
-        assert_eq!(decode_hash(&format!("b3:{}", "z".repeat(64))), None, "non-hex");
+        assert_eq!(
+            decode_hash(&format!("b3:{}", "z".repeat(64))),
+            None,
+            "non-hex"
+        );
     }
 
     #[test]
@@ -1084,7 +1351,10 @@ mod tests {
             contents.agent_reads.is_empty(),
             "no attribution existed to recover"
         );
-        assert!(contents.warnings.is_empty(), "an old version is not a fault");
+        assert!(
+            contents.warnings.is_empty(),
+            "an old version is not a fault"
+        );
     }
 
     /// A record carrying a new hash supersedes earlier depths rather than
@@ -1203,7 +1473,13 @@ mod tests {
     fn reopening_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let mut ledger = ContextLedger::new();
-        ledger.record("a.rs::x".into(), ReadDepth::FullBody, content_hash("b"), "ag".into(), 5);
+        ledger.record(
+            "a.rs::x".into(),
+            ReadDepth::FullBody,
+            content_hash("b"),
+            "ag".into(),
+            5,
+        );
 
         let mut j = journal_in(dir.path());
         j.sync(&ledger);
@@ -1220,7 +1496,13 @@ mod tests {
     fn torn_final_line_is_dropped_silently() {
         let dir = tempfile::tempdir().unwrap();
         let mut ledger = ContextLedger::new();
-        ledger.record("a.rs::x".into(), ReadDepth::FullBody, content_hash("b"), "ag".into(), 5);
+        ledger.record(
+            "a.rs::x".into(),
+            ReadDepth::FullBody,
+            content_hash("b"),
+            "ag".into(),
+            5,
+        );
         let mut j = journal_in(dir.path());
         j.sync(&ledger);
         let path = j.path().to_path_buf();
@@ -1233,7 +1515,10 @@ mod tests {
 
         let contents = read_journal(&path);
         assert_eq!(contents.reads.len(), 1);
-        assert!(contents.warnings.is_empty(), "a torn tail is expected, not an error");
+        assert!(
+            contents.warnings.is_empty(),
+            "a torn tail is expected, not an error"
+        );
     }
 
     #[test]
@@ -1291,10 +1576,255 @@ mod tests {
     fn interval_gates_syncing() {
         let dir = tempfile::tempdir().unwrap();
         let mut ledger = ContextLedger::new();
-        ledger.record("a.rs::x".into(), ReadDepth::FullBody, content_hash("b"), "ag".into(), 5);
+        ledger.record(
+            "a.rs::x".into(),
+            ReadDepth::FullBody,
+            content_hash("b"),
+            "ag".into(),
+            5,
+        );
 
         let mut j = Journal::open(dir.path(), "sess", Duration::from_secs(3600), manifest);
         assert_eq!(j.maybe_sync(&ledger), 0, "interval has not elapsed");
         assert_eq!(j.sync(&ledger), 1, "explicit sync ignores the interval");
+    }
+}
+
+/// Journal v3 write records (spec §2.6).
+#[cfg(test)]
+mod write_record_tests {
+    use super::*;
+    use crate::writes::{Level, WriteRecord};
+
+    fn record(op: &str, av: u32, sym: &str) -> WriteRecord {
+        WriteRecord {
+            op: op.into(),
+            av,
+            a: "agent-1".into(),
+            t: "2026-09-26T10:00:01Z".into(),
+            tool: "Edit".into(),
+            file: "src/lib.rs".into(),
+            level: Level::Symbol,
+            syms: vec![(sym.into(), "b3:00".into())],
+            ..Default::default()
+        }
+    }
+
+    fn manifest() -> EnvironmentManifest {
+        EnvironmentManifest {
+            project_root: "/p".into(),
+            tree_fingerprint: "b3:00".into(),
+            ambit_version: "test".into(),
+            backend: "tree-sitter".into(),
+            parsers: vec![],
+            tool_config_version: None,
+            filter: None,
+            os: "test".into(),
+            arch: "test".into(),
+            host: "test".into(),
+        }
+    }
+
+    fn open(root: &Path, shard: Option<&str>) -> Journal {
+        Journal::open_at(root, "sess", shard, Duration::ZERO, manifest)
+    }
+
+    /// `touched`'s writes-only scan must agree with the full fold, across
+    /// shards and attribution versions, without parsing a single read.
+    #[test]
+    fn the_writes_only_scan_agrees_with_the_full_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut main = open(dir.path(), None);
+        main.record_write(&record("toolu_1", 1, "src/lib.rs::a"));
+        main.record_write(&record("toolu_2", 1, "src/lib.rs::b"));
+        let mut shard = open(dir.path(), Some("find"));
+        shard.record_write(&record("toolu_1", 2, "src/lib.rs::c"));
+        drop((main, shard));
+        let path = journal_dir(dir.path()).join("sess.ndjson");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(
+            "{\"kind\":\"read\",\"sym\":\"src/lib.rs::a\",\"h\":\"b3:00\",\"d\":\"full_body\"}\n",
+        );
+        std::fs::write(&path, text).unwrap();
+
+        let jdir = journal_dir(dir.path());
+        let fast = read_session_writes(&jdir, "sess");
+        assert_eq!(fast, read_journal_session(&jdir, "sess").writes);
+        assert_eq!(fast["toolu_1"].av, 2);
+        assert_eq!(fast.len(), 2);
+    }
+
+    /// The writes-only fold skips reads by their serialized prefix; that
+    /// holds only while serde writes the `kind` tag first.
+    #[test]
+    fn the_record_tag_is_serialized_first() {
+        let read = Record::Read {
+            symbol_id: "a::b".into(),
+            hash: "b3:00".into(),
+            depth: DepthDto::FullBody,
+            agent: None,
+        };
+        assert!(serde_json::to_string(&read)
+            .unwrap()
+            .starts_with(r#"{"kind":"read""#));
+        let write = Record::Write(Box::new(record("toolu_1", 2, "src/lib.rs::a")));
+        assert!(serde_json::to_string(&write)
+            .unwrap()
+            .starts_with(r#"{"kind":"write""#));
+    }
+
+    /// A later header does not revive a shard an unreadable one discarded:
+    /// the writes-only fold follows the full fold's rule exactly.
+    #[test]
+    fn both_folds_agree_on_a_shard_with_a_bad_then_good_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let jdir = journal_dir(dir.path());
+        std::fs::create_dir_all(&jdir).unwrap();
+        let header = |v: u32| {
+            format!(
+            "{{\"kind\":\"header\",\"schema_version\":{v},\"created_at\":\"0\",\"session_id\":\"sess\",\"project_root\":\"/p\",\"tree_fingerprint\":\"b3:00\",\"ambit_version\":\"0\",\"backend\":\"x\",\"os\":\"x\",\"arch\":\"x\"}}"
+        )
+        };
+        let write = serde_json::to_string(&Record::Write(Box::new(record(
+            "toolu_1",
+            2,
+            "src/lib.rs::a",
+        ))))
+        .unwrap();
+        std::fs::write(
+            jdir.join("sess.ndjson"),
+            format!(
+                "{}\n{}\n{write}\n",
+                header(SUPPORTED_SCHEMA_VERSION + 1),
+                header(SUPPORTED_SCHEMA_VERSION)
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_session_writes(&jdir, "sess"),
+            read_journal_session(&jdir, "sess").writes
+        );
+    }
+
+    #[test]
+    fn the_writes_only_scan_skips_an_unreadable_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let jdir = journal_dir(dir.path());
+        std::fs::create_dir_all(&jdir).unwrap();
+        let future = format!(
+            "{{\"kind\":\"header\",\"schema_version\":{},\"created_at\":\"0\",\"session_id\":\"sess\",\"project_root\":\"/p\",\"tree_fingerprint\":\"b3:00\",\"ambit_version\":\"0\",\"backend\":\"x\",\"os\":\"x\",\"arch\":\"x\"}}\n{}\n",
+            SUPPORTED_SCHEMA_VERSION + 1,
+            serde_json::to_string(&Record::Write(Box::new(record("toolu_1", 2, "src/lib.rs::a")))).unwrap()
+        );
+        std::fs::write(jdir.join("sess.ndjson"), future).unwrap();
+        assert!(read_session_writes(&jdir, "sess").is_empty());
+    }
+
+    #[test]
+    fn writes_round_trip_and_are_read_back_by_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut j = open(dir.path(), None);
+        assert!(j.record_write(&record("toolu_1", 1, "src/lib.rs::a")));
+        let contents = read_journal_session(&journal_dir(dir.path()), "sess");
+        assert_eq!(contents.writes.len(), 1);
+        assert_eq!(
+            contents.writes["toolu_1"],
+            record("toolu_1", 1, "src/lib.rs::a")
+        );
+        assert_eq!(
+            contents.header.as_ref().map(|h| h.0),
+            Some(SUPPORTED_SCHEMA_VERSION)
+        );
+    }
+
+    /// The TUI replays the whole log at startup; an op already on disk —
+    /// in any shard — is not written again.
+    #[test]
+    fn a_write_is_journaled_once_across_reopens_and_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(open(dir.path(), Some("pull")).record_write(&record(
+            "toolu_1",
+            1,
+            "src/lib.rs::a"
+        )));
+
+        let mut primary = open(dir.path(), None);
+        assert!(
+            !primary.record_write(&record("toolu_1", 1, "src/lib.rs::a")),
+            "already in the pull shard"
+        );
+        assert!(primary.record_write(&record("toolu_2", 1, "src/lib.rs::b")));
+        drop(primary);
+        assert!(!open(dir.path(), None).record_write(&record("toolu_2", 1, "src/lib.rs::b")));
+
+        let contents = read_journal_session(&journal_dir(dir.path()), "sess");
+        assert_eq!(contents.writes.len(), 2);
+    }
+
+    /// Re-attribution under newer rules replaces the old record.
+    #[test]
+    fn the_highest_attribution_version_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut j = open(dir.path(), None);
+        assert!(j.record_write(&record("toolu_1", 1, "src/lib.rs::old")));
+        assert!(j.record_write(&record("toolu_1", 2, "src/lib.rs::new")));
+        assert!(
+            !j.record_write(&record("toolu_1", 1, "src/lib.rs::old")),
+            "an older version never wins"
+        );
+        let contents = read_journal_session(&journal_dir(dir.path()), "sess");
+        assert_eq!(contents.writes["toolu_1"].av, 2);
+        assert_eq!(contents.writes["toolu_1"].syms[0].0, "src/lib.rs::new");
+    }
+
+    /// History records are kept but never folded into current state.
+    #[test]
+    fn history_records_are_ignored_by_the_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = journal_dir(dir.path()).join("sess.ndjson");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "{\"kind\":\"history\",\"of\":\"read\",\"sym\":\"src/a.rs::x\",\"h\":\"b3:00\",\"d\":\"full_body\"}\n",
+        )
+        .unwrap();
+        let contents = read_journal(&path);
+        assert!(contents.warnings.is_empty(), "{:?}", contents.warnings);
+        assert!(contents.reads.is_empty() && contents.writes.is_empty());
+    }
+
+    /// A v2 journal keeps working: its reads load, and the first v3 writer
+    /// appends a v3 header (the one-time change spec §6.2 documents).
+    #[test]
+    fn a_v2_journal_is_read_and_upgraded_by_appending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = journal_dir(dir.path()).join("sess.ndjson");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let header = Record::Header(Box::new(HeaderRecord {
+            schema_version: 2,
+            created_at: "t".into(),
+            session_id: "sess".into(),
+            environment: manifest(),
+        }));
+        let read = Record::Read {
+            symbol_id: "src/a.rs::x".into(),
+            hash: encode_hash(&[0; 32]),
+            depth: DepthDto::FullBody,
+            agent: Some("ag".into()),
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&read).unwrap()
+            ),
+        )
+        .unwrap();
+
+        drop(open(dir.path(), None));
+        let contents = read_journal(&path);
+        assert_eq!(contents.reads.len(), 1);
+        assert_eq!(contents.header.map(|h| h.0), Some(SUPPORTED_SCHEMA_VERSION));
     }
 }

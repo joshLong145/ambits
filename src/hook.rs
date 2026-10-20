@@ -96,8 +96,14 @@ pub fn install(global: bool, project: Option<PathBuf>) -> Result<()> {
                 // Refuse to guess at a malformed file. Losing the user's
                 // settings is far worse than making them paste four lines.
                 ambits::try_eprintln!("[ambit] {} is not valid JSON: {e}", settings_path.display());
-                ambits::try_eprintln!("[ambit] Not modifying it. Add this to \"hooks\" yourself:\n");
-                writeln!(out, "{}", serde_json::to_string_pretty(&hook_entry(&project_root))?)?;
+                ambits::try_eprintln!(
+                    "[ambit] Not modifying it. Add this to \"hooks\" yourself:\n"
+                );
+                writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string_pretty(&hook_entry(&project_root))?
+                )?;
                 return Ok(());
             }
         },
@@ -120,12 +126,17 @@ pub fn install(global: bool, project: Option<PathBuf>) -> Result<()> {
         .entry("hooks")
         .or_insert_with(|| json!({}))
         .as_object_mut()
-        .ok_or_else(|| color_eyre::eyre::eyre!("\"hooks\" in {} is not an object", settings_path.display()))?
+        .ok_or_else(|| {
+            color_eyre::eyre::eyre!("\"hooks\" in {} is not an object", settings_path.display())
+        })?
         .entry("SessionStart")
         .or_insert_with(|| json!([]))
         .as_array_mut()
         .ok_or_else(|| {
-            color_eyre::eyre::eyre!("\"hooks.SessionStart\" in {} is not an array", settings_path.display())
+            color_eyre::eyre::eyre!(
+                "\"hooks.SessionStart\" in {} is not an array",
+                settings_path.display()
+            )
         })?;
 
     // Replace a previous ambit entry rather than appending a second one, so
@@ -146,21 +157,36 @@ pub fn install(global: bool, project: Option<PathBuf>) -> Result<()> {
 
     if action != "already installed" {
         if let Some(dir) = settings_path.parent() {
-            std::fs::create_dir_all(dir)
-                .wrap_err_with(|| format!("creating {}", dir.display()))?;
+            std::fs::create_dir_all(dir).wrap_err_with(|| format!("creating {}", dir.display()))?;
         }
-        std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)? + "\n")
-            .wrap_err_with(|| format!("writing {}", settings_path.display()))?;
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings)? + "\n",
+        )
+        .wrap_err_with(|| format!("writing {}", settings_path.display()))?;
     }
 
-    writeln!(out, "SessionStart hook {action}: {}", settings_path.display())?;
+    writeln!(
+        out,
+        "SessionStart hook {action}: {}",
+        settings_path.display()
+    )?;
     writeln!(out, "  {}", hook_command(&project_root))?;
     writeln!(out)?;
-    writeln!(out, "After a compaction, Claude Code will run this and inject the symbols")?;
+    writeln!(
+        out,
+        "After a compaction, Claude Code will run this and inject the symbols"
+    )?;
     writeln!(out, "this session has already read.")?;
     writeln!(out)?;
-    writeln!(out, "Requires `ambits` on PATH. Coverage must have been journaled by the")?;
-    writeln!(out, "TUI for this session, otherwise the digest is reconstructed from")?;
+    writeln!(
+        out,
+        "Requires `ambits` on PATH. Coverage must have been journaled by the"
+    )?;
+    writeln!(
+        out,
+        "TUI for this session, otherwise the digest is reconstructed from"
+    )?;
     writeln!(out, "session logs and says so.")?;
 
     Ok(())

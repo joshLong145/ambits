@@ -116,20 +116,32 @@ impl ContextLedger {
         agent_id: String,
         token_count: usize,
     ) {
-        let entry = self.entries.entry(symbol_id.clone()).or_insert_with(|| ContextEntry {
-            symbol_id: symbol_id.clone(),
-            depth: ReadDepth::Unseen,
-            provenance: Provenance::Live,
-            stale: false,
-            content_hash_at_read: [0u8; 32],
-            timestamp: Instant::now(),
-            agent_id: String::new(),
-            token_count: 0,
-            agent_depths: HashMap::new(),
-        });
+        // Recording nothing seen must not re-establish provenance below: that
+        // would clear `stale` and adopt the current hash for a symbol nobody
+        // looked at (spec §2.7).
+        if !depth.is_seen() {
+            return;
+        }
+        let entry = self
+            .entries
+            .entry(symbol_id.clone())
+            .or_insert_with(|| ContextEntry {
+                symbol_id: symbol_id.clone(),
+                depth: ReadDepth::Unseen,
+                provenance: Provenance::Live,
+                stale: false,
+                content_hash_at_read: [0u8; 32],
+                timestamp: Instant::now(),
+                agent_id: String::new(),
+                token_count: 0,
+                agent_depths: HashMap::new(),
+            });
 
         // Update per-agent depth (only upgrade, never downgrade).
-        let agent_depth = entry.agent_depths.entry(agent_id.clone()).or_insert(ReadDepth::Unseen);
+        let agent_depth = entry
+            .agent_depths
+            .entry(agent_id.clone())
+            .or_insert(ReadDepth::Unseen);
         if depth > *agent_depth {
             log::debug!(
                 target: "ambits::symbol_update",
@@ -234,21 +246,27 @@ impl ContextLedger {
         agent_id: String,
     ) -> bool {
         let inserted = !self.entries.contains_key(&symbol_id);
-        let entry = self.entries.entry(symbol_id.clone()).or_insert_with(|| ContextEntry {
-            symbol_id,
-            depth: ReadDepth::Unseen,
-            // A journaled read is by definition from before this process
-            // started, so no live context holds it.
-            provenance: Provenance::Restored,
-            stale: false,
-            content_hash_at_read: hash_at_read,
-            timestamp: Instant::now(),
-            agent_id: agent_id.clone(),
-            token_count: 0,
-            agent_depths: HashMap::new(),
-        });
+        let entry = self
+            .entries
+            .entry(symbol_id.clone())
+            .or_insert_with(|| ContextEntry {
+                symbol_id,
+                depth: ReadDepth::Unseen,
+                // A journaled read is by definition from before this process
+                // started, so no live context holds it.
+                provenance: Provenance::Restored,
+                stale: false,
+                content_hash_at_read: hash_at_read,
+                timestamp: Instant::now(),
+                agent_id: agent_id.clone(),
+                token_count: 0,
+                agent_depths: HashMap::new(),
+            });
 
-        let agent_depth = entry.agent_depths.entry(agent_id).or_insert(ReadDepth::Unseen);
+        let agent_depth = entry
+            .agent_depths
+            .entry(agent_id)
+            .or_insert(ReadDepth::Unseen);
         if depth > *agent_depth {
             *agent_depth = depth;
         }
@@ -266,7 +284,10 @@ impl ContextLedger {
     /// Whether the symbol has been read and has since drifted. `false` for
     /// untracked symbols.
     pub fn is_stale(&self, symbol_id: &str) -> bool {
-        self.entries.get(symbol_id).map(|e| e.stale).unwrap_or(false)
+        self.entries
+            .get(symbol_id)
+            .map(|e| e.stale)
+            .unwrap_or(false)
     }
 
     /// Provenance of a tracked symbol, or `None` if it is untracked.
@@ -304,7 +325,10 @@ impl ContextLedger {
 
     /// Count of seen entries currently flagged stale.
     pub fn total_stale(&self) -> usize {
-        self.entries.values().filter(|e| e.stale && e.depth.is_seen()).count()
+        self.entries
+            .values()
+            .filter(|e| e.stale && e.depth.is_seen())
+            .count()
     }
 
     pub fn total_seen(&self) -> usize {
@@ -367,10 +391,7 @@ impl ContextLedger {
 }
 
 /// Collect all symbol IDs and their content hashes into `map` (recursive).
-pub fn collect_symbol_hashes(
-    symbols: &[SymbolNode],
-    map: &mut HashMap<String, [u8; 32]>,
-) {
+pub fn collect_symbol_hashes(symbols: &[SymbolNode], map: &mut HashMap<String, [u8; 32]>) {
     for sym in symbols {
         map.insert(sym.id.clone(), sym.content_hash);
         collect_symbol_hashes(&sym.children, map);
@@ -530,8 +551,14 @@ mod tests {
         ledger.record("s1".into(), ReadDepth::FullBody, h, "agent_b".into(), 10);
 
         // Per-agent depths are independent.
-        assert_eq!(ledger.depth_of_for_agent("s1", "agent_a"), ReadDepth::Overview);
-        assert_eq!(ledger.depth_of_for_agent("s1", "agent_b"), ReadDepth::FullBody);
+        assert_eq!(
+            ledger.depth_of_for_agent("s1", "agent_a"),
+            ReadDepth::Overview
+        );
+        assert_eq!(
+            ledger.depth_of_for_agent("s1", "agent_b"),
+            ReadDepth::FullBody
+        );
 
         // Aggregate is max across agents.
         assert_eq!(ledger.depth_of("s1"), ReadDepth::FullBody);
@@ -546,18 +573,33 @@ mod tests {
         ledger.record("s1".into(), ReadDepth::Overview, h, "agent_a".into(), 5);
 
         // Agent depth should not downgrade.
-        assert_eq!(ledger.depth_of_for_agent("s1", "agent_a"), ReadDepth::FullBody);
+        assert_eq!(
+            ledger.depth_of_for_agent("s1", "agent_a"),
+            ReadDepth::FullBody
+        );
     }
 
     #[test]
     fn depth_of_for_agent_defaults_unseen() {
         let ledger = ContextLedger::new();
-        assert_eq!(ledger.depth_of_for_agent("nonexistent", "agent_a"), ReadDepth::Unseen);
+        assert_eq!(
+            ledger.depth_of_for_agent("nonexistent", "agent_a"),
+            ReadDepth::Unseen
+        );
 
         // Symbol exists but agent doesn't.
         let mut ledger = ContextLedger::new();
-        ledger.record("s1".into(), ReadDepth::Overview, hash("v1"), "agent_a".into(), 5);
-        assert_eq!(ledger.depth_of_for_agent("s1", "agent_b"), ReadDepth::Unseen);
+        ledger.record(
+            "s1".into(),
+            ReadDepth::Overview,
+            hash("v1"),
+            "agent_a".into(),
+            5,
+        );
+        assert_eq!(
+            ledger.depth_of_for_agent("s1", "agent_b"),
+            ReadDepth::Unseen
+        );
     }
 
     #[test]
@@ -596,8 +638,14 @@ mod tests {
         assert!(ledger.is_stale("s1"));
         assert_eq!(ledger.total_stale(), 1);
         assert_eq!(ledger.depth_of("s1"), ReadDepth::FullBody);
-        assert_eq!(ledger.depth_of_for_agent("s1", "agent_a"), ReadDepth::FullBody);
-        assert_eq!(ledger.depth_of_for_agent("s1", "agent_b"), ReadDepth::Overview);
+        assert_eq!(
+            ledger.depth_of_for_agent("s1", "agent_a"),
+            ReadDepth::FullBody
+        );
+        assert_eq!(
+            ledger.depth_of_for_agent("s1", "agent_b"),
+            ReadDepth::Overview
+        );
     }
 
     #[test]

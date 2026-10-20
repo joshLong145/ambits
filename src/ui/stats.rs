@@ -1,8 +1,8 @@
-use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::Frame;
 
 use ambits::app::{App, FocusPanel};
 use ambits::tracking::ReadDepth;
@@ -10,14 +10,14 @@ use ambits::tracking::ReadDepth;
 use super::colors;
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let border_style = if app.focus == FocusPanel::Stats {
+    let border_style = if app.focus == FocusPanel::Right {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
     };
 
     let block = Block::default()
-        .title(" Coverage Stats ")
+        .title(" Session · i: inspector ")
         .borders(Borders::ALL)
         .border_style(border_style);
 
@@ -54,20 +54,41 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             ),
         ]),
         Line::from(""),
-        stat_line("  Full Body", count_for(ReadDepth::FullBody), colors::DEPTH_FULL_BODY),
-        stat_line("  Signature", count_for(ReadDepth::Signature), colors::DEPTH_SIGNATURE),
-        stat_line("  Overview ", count_for(ReadDepth::Overview), colors::DEPTH_OVERVIEW),
-        stat_line("  Name Only", count_for(ReadDepth::NameOnly), colors::DEPTH_NAME_ONLY),
+        stat_line(
+            "  Full Body",
+            count_for(ReadDepth::FullBody),
+            colors::DEPTH_FULL_BODY,
+        ),
+        stat_line(
+            "  Signature",
+            count_for(ReadDepth::Signature),
+            colors::DEPTH_SIGNATURE,
+        ),
+        stat_line(
+            "  Overview ",
+            count_for(ReadDepth::Overview),
+            colors::DEPTH_OVERVIEW,
+        ),
+        stat_line(
+            "  Name Only",
+            count_for(ReadDepth::NameOnly),
+            colors::DEPTH_NAME_ONLY,
+        ),
         // Staleness and restored-ness cut across the depth buckets rather than
         // being buckets themselves, so these counts overlap the four above by
         // design.
         stat_line("  Stale    ", app.ledger.total_stale(), colors::DEPTH_STALE),
-        stat_line("  Restored ", app.ledger.total_restored(), colors::ACCENT_MUTED),
+        stat_line(
+            "  Restored ",
+            app.ledger.total_restored(),
+            colors::ACCENT_MUTED,
+        ),
         stat_line(
             "  Unseen   ",
             total.saturating_sub(seen),
             colors::DEPTH_UNSEEN,
         ),
+        written_line(app),
         Line::from(""),
         Line::from(vec![
             Span::raw("  Files: "),
@@ -76,10 +97,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::White),
             ),
             Span::raw("  Symbols: "),
-            Span::styled(
-                format!("{}", total),
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(format!("{}", total), Style::default().fg(Color::White)),
         ]),
     ];
 
@@ -147,19 +165,29 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let flat = app.flattened_agents();
     if !flat.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  Agents: {} ", flat.len()),
-                Style::default().fg(Color::White),
-            ),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            format!("  Agents: {} ", flat.len()),
+            Style::default().fg(Color::White),
+        )]));
 
         // "All" entry
-        let stats_focused = app.focus == FocusPanel::Stats;
+        let stats_focused = app.focus == FocusPanel::Right;
         let all_active = app.agent_filter.is_none();
         let all_cursor = stats_focused && app.agent_selection_index == 0;
-        let all_marker = if all_active { "\u{25b6} " } else if all_cursor { "> " } else { "  " };
-        let all_color = if all_active { Color::Yellow } else if all_cursor { Color::White } else { colors::ACCENT_MUTED };
+        let all_marker = if all_active {
+            "\u{25b6} "
+        } else if all_cursor {
+            "> "
+        } else {
+            "  "
+        };
+        let all_color = if all_active {
+            Color::Yellow
+        } else if all_cursor {
+            Color::White
+        } else {
+            colors::ACCENT_MUTED
+        };
         let all_pct = if total > 0 {
             (app.ledger.total_seen() as f64 / total as f64 * 100.0) as u32
         } else {
@@ -167,7 +195,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         };
         lines.push(Line::from(vec![
             Span::styled(format!("  {}", all_marker), Style::default().fg(all_color)),
-            Span::styled("[All]", Style::default().fg(all_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[All]",
+                Style::default().fg(all_color).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 format!("  Seen: {}%", all_pct),
                 Style::default().fg(Color::DarkGray),
@@ -178,13 +209,23 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         for (i, (agent_id, indent)) in flat.iter().enumerate() {
             let is_active = app.agent_filter.as_deref() == Some(agent_id.as_str());
             let is_cursor = stats_focused && app.agent_selection_index == i + 1;
-            let marker = if is_active { "\u{25b6} " } else if is_cursor { "> " } else { "  " };
-            let color = if is_active { Color::Yellow } else if is_cursor { Color::White } else { colors::ACCENT_MUTED };
+            let marker = if is_active {
+                "\u{25b6} "
+            } else if is_cursor {
+                "> "
+            } else {
+                "  "
+            };
+            let color = if is_active {
+                Color::Yellow
+            } else if is_cursor {
+                Color::White
+            } else {
+                colors::ACCENT_MUTED
+            };
 
             // Determine if this is the last sibling at its indent level.
-            let is_last_sibling = flat[i + 1..]
-                .iter()
-                .all(|(_, d)| *d != *indent)
+            let is_last_sibling = flat[i + 1..].iter().all(|(_, d)| *d != *indent)
                 || flat[i + 1..]
                     .iter()
                     .take_while(|(_, d)| *d >= *indent)
@@ -196,9 +237,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             for level in 0..*indent {
                 // Check if there's a later entry at this level (meaning the
                 // ancestor at this level still has siblings below us).
-                let ancestor_continues = flat[i + 1..]
-                    .iter()
-                    .any(|(_, d)| *d == level);
+                let ancestor_continues = flat[i + 1..].iter().any(|(_, d)| *d == level);
                 if ancestor_continues {
                     prefix.push_str("\u{2502} ");
                 } else {
@@ -212,7 +251,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 "\u{251c}\u{2500} "
             };
 
-            let display_name = short_id(agent_id);
+            let display_name = super::fit(&app.agent_title(agent_id), 32);
 
             // Per-agent seen%
             let agent_seen = app.ledger.total_seen_for_agent(agent_id);
@@ -238,7 +277,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
     // Scroll to keep the selected agent visible when the panel is focused.
     let visible_height = area.height.saturating_sub(2) as usize; // -2 for borders
-    let scroll_offset = if app.focus == FocusPanel::Stats && !flat.is_empty() {
+    let scroll_offset = if app.focus == FocusPanel::Right && !flat.is_empty() {
         // The agent list starts after the fixed header lines.
         // "All" entry is at header_lines, agents start at header_lines + 1.
         let header_lines = lines.len().saturating_sub(flat.len() + 1); // +1 for "All"
@@ -258,12 +297,24 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(paragraph, area);
 }
 
+/// `  ✎ Written:     N  in M files`, for the filtered agent when one is.
+fn written_line(app: &App) -> Line<'static> {
+    let by_file = app.writes.by_file(app.agent_filter.as_deref());
+    let mut line = stat_line(
+        "  ✎ Written",
+        by_file.values().map(Vec::len).sum(),
+        colors::WRITE_UNKNOWN,
+    );
+    line.spans.push(Span::styled(
+        format!("  in {} files", by_file.len()),
+        Style::default().fg(Color::DarkGray),
+    ));
+    line
+}
+
 fn stat_line(label: &str, count: usize, color: Color) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!("{}: ", label),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!("{}: ", label), Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{:>5}", count), Style::default().fg(color)),
     ])
 }
@@ -294,27 +345,37 @@ fn coverage_color(pct: u32) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use ambits::symbols::{FileSymbols, ProjectTree, SymbolCategory, SymbolNode};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
-    use ambits::symbols::{ProjectTree, FileSymbols, SymbolCategory, SymbolNode};
+    use std::path::PathBuf;
 
     fn sym(id: &str, name: &str) -> SymbolNode {
         let hash = ambits::symbols::merkle::content_hash(name);
         SymbolNode {
-            id: id.into(), name: name.into(), category: SymbolCategory::Function,
-            label: "fn", file_path: std::sync::Arc::new(PathBuf::new()),
-            byte_range: 0..100, line_range: 1..10, content_hash: hash,
-            merkle_hash: hash, children: Vec::new(), estimated_tokens: 30,
+            id: id.into(),
+            name: name.into(),
+            category: SymbolCategory::Function,
+            label: "fn",
+            file_path: std::sync::Arc::new(PathBuf::new()),
+            byte_range: 0..100,
+            line_range: 1..10,
+            head_line: 1,
+            content_hash: hash,
+            merkle_hash: hash,
+            children: Vec::new(),
+            estimated_tokens: 30,
         }
     }
 
     fn test_app() -> App {
         let tree = ProjectTree {
             root: PathBuf::from("/test"),
-            files: vec![
-                FileSymbols { file_path: "mock/a.rs".into(), symbols: vec![sym("a1", "alpha")], total_lines: 50 },
-            ],
+            files: vec![FileSymbols {
+                file_path: "mock/a.rs".into(),
+                symbols: vec![sym("a1", "alpha")],
+                total_lines: 50,
+            }],
         };
         App::new(tree, PathBuf::from("/test"))
     }
@@ -353,10 +414,7 @@ mod tests {
         );
         assert_eq!(short_id("short"), "short");
         assert_eq!(short_id("a63c858997b4e6124"), "a63c858997b4e6124");
-        assert_eq!(
-            short_id("exactly20characters0"),
-            "exactly20characters0"
-        );
+        assert_eq!(short_id("exactly20characters0"), "exactly20characters0");
     }
 
     #[test]
@@ -386,7 +444,8 @@ mod tests {
     #[test]
     fn render_shows_full_coverage() {
         let mut app = test_app();
-        app.ledger.record("a1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+        app.ledger
+            .record("a1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
         app.rebuild_tree_rows();
 
         let backend = TestBackend::new(40, 20);

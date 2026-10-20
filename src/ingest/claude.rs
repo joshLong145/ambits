@@ -1,12 +1,19 @@
+use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde_json::Value;
-use crate::tracking::ReadDepth;
-use super::{AgentToolCall, CompactionMetadata, EventTailer, SessionEvent, SessionIngester, TailedCompaction, TailerOutput, ToolCallMapper};
+use super::content::{CallContent, CallDetail, ContentKind};
 use super::tool_config::ToolMappingConfig;
+use super::Caller;
+use super::{
+    AgentToolCall, CompactionMetadata, Effect, EventTailer, FileReplay, Handoff, Hunk,
+    SessionEvent, SessionIngester, TailedCompaction, TailerOutput, ToolCallMapper, WriteEvent,
+    WriteSource,
+};
+use crate::tracking::ReadDepth;
+use serde_json::Value;
 
 /// Derive the Claude Code log directory for a given project path.
 /// Probes two slug variants to stay resilient across Claude Code versions:
@@ -17,9 +24,7 @@ pub fn log_dir_for_project(project_path: &Path) -> Option<PathBuf> {
     let home = dirs_home()?;
     let base = home.join(".claude").join("projects");
 
-    let slug_primary = canonical
-        .to_string_lossy()
-        .replace(['/', '.'], "-");
+    let slug_primary = canonical.to_string_lossy().replace(['/', '.'], "-");
     let dir_primary = base.join(&slug_primary);
     if dir_primary.is_dir() {
         return Some(dir_primary);
@@ -39,7 +44,8 @@ fn dirs_home() -> Option<PathBuf> {
 }
 
 /// Find the most recent session ID by scanning for UUID-named .jsonl files
-/// and selecting the one with the most recent modification time.
+/// and selecting the one that saw something happen last (see
+/// [`last_activity`]).
 pub fn find_latest_session(log_dir: &Path) -> Option<String> {
     find_session_from_files(log_dir)
 }
@@ -66,16 +72,65 @@ fn find_session_from_files(log_dir: &Path) -> Option<String> {
             if meta.len() == 0 {
                 return None;
             }
-            let mtime = meta.modified().ok()?;
-            Some((stem.to_string(), mtime))
+            Some((stem.to_string(), last_activity(&path, &meta)?))
         })
-        .max_by_key(|(_, mtime)| *mtime)
+        .max_by_key(|(_, at)| *at)
         .map(|(session_id, _)| session_id)
+}
+
+/// How much of a log's end is read for its last timestamp: the last few
+/// entries, unless one of them is a very large tool result.
+const ACTIVITY_TAIL: u64 = 256 * 1024;
+
+/// When the session logged at `path` last saw something happen, in
+/// milliseconds: the timestamp of its last entry that has one. Not its
+/// modification time — Claude Code appends untimestamped bookkeeping (a
+/// title, the last prompt, the cost) to a session long finished, which made
+/// a dead session look like the latest one. Falls back to the modification
+/// time for a log whose tail holds no timestamp. Kept per file until its
+/// size or modification time changes: the TUI asks every tick.
+fn last_activity(path: &Path, meta: &fs::Metadata) -> Option<u64> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Seen = HashMap<PathBuf, (std::time::SystemTime, u64, u64)>;
+    static SEEN: OnceLock<Mutex<Seen>> = OnceLock::new();
+    let modified = meta.modified().ok()?;
+    let mut seen = SEEN.get_or_init(Default::default).lock().ok()?;
+    if let Some(&(at_modified, len, at)) = seen.get(path) {
+        if at_modified == modified && len == meta.len() {
+            return Some(at);
+        }
+    }
+    let by_mtime = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    let at = last_timestamp(path, meta.len()).unwrap_or(by_mtime);
+    seen.insert(path.to_path_buf(), (modified, meta.len(), at));
+    Some(at)
+}
+
+/// The timestamp of the last entry in the log at `path` (`len` bytes long)
+/// that has one, from its tail.
+fn last_timestamp(path: &Path, len: u64) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    let from = len.saturating_sub(ACTIVITY_TAIL);
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    let tail = String::from_utf8_lossy(&tail);
+    // Whole lines only: the first may have been cut by the seek.
+    let lines: Vec<&str> = tail.lines().skip(usize::from(from > 0)).collect();
+    lines.into_iter().rev().find_map(|line| {
+        let entry: Value = serde_json::from_str(line).ok()?;
+        crate::time::parse_rfc3339_millis(entry.get("timestamp")?.as_str()?)
+    })
 }
 
 /// Check if a string looks like a UUID (8-4-4-4-12 hex chars, exactly 36 bytes).
 /// Uses direct byte-position checks — no allocation.
-fn is_uuid(s: &str) -> bool {
+pub fn is_uuid(s: &str) -> bool {
     let b = s.as_bytes();
     if b.len() != 36 {
         return false;
@@ -84,9 +139,9 @@ fn is_uuid(s: &str) -> bool {
     if b[8] != b'-' || b[13] != b'-' || b[18] != b'-' || b[23] != b'-' {
         return false;
     }
-    b.iter().enumerate().all(|(i, &c)| {
-        matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit()
-    })
+    b.iter()
+        .enumerate()
+        .all(|(i, &c)| matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit())
 }
 
 /// List all JSONL files in the log directory that belong to a session
@@ -110,37 +165,24 @@ fn is_uuid(s: &str) -> bool {
 /// complete before the main session reaches the token threshold for a
 /// compaction, so this heuristic covers the common case.
 pub fn session_log_files(log_dir: &Path, session_id: &str) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-
-    // New format: <log_dir>/<session-id>/subagents/agent-*.jsonl
-    // All files in this directory belong to the session by definition.
-    let subagents_dir = log_dir.join(session_id).join("subagents");
-    if subagents_dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(&subagents_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
-                if name.starts_with("agent-")
-                    && name.ends_with(".jsonl")
-                    && !name.starts_with("agent-acompact-")
-                {
-                    files.push(path);
-                }
-            }
-        }
-    }
+    // New format: <log_dir>/<session-id>/subagents/**/agent-*.jsonl
+    // All files under this directory belong to the session by definition.
+    let mut files: Vec<PathBuf> = subagent_logs(&log_dir.join(session_id).join("subagents"))
+        .into_iter()
+        .filter(|path| {
+            !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .starts_with("agent-acompact-")
+        })
+        .collect();
 
     // Old format: <log_dir>/agent-*.jsonl (check sessionId in first lines).
     if let Ok(entries) = fs::read_dir(log_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.starts_with("agent-")
                 && name.ends_with(".jsonl")
                 && !name.starts_with("agent-acompact-")
@@ -159,6 +201,34 @@ pub fn session_log_files(log_dir: &Path, session_id: &str) -> Vec<PathBuf> {
     }
 
     files
+}
+
+/// Every `agent-*.jsonl` under `subagents`, at any depth and in path order:
+/// Claude Code nests a workflow's agents in `subagents/workflows/<run-id>/`.
+fn subagent_logs(subagents: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut dirs = vec![subagents.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // `file_type` does not follow symlinks, so a link cannot loop the walk.
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => dirs.push(path),
+                Ok(t) if t.is_file() => {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if name.starts_with("agent-") && name.ends_with(".jsonl") {
+                        found.push(path);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 fn agent_belongs_to_session(path: &Path, session_id: &str) -> bool {
@@ -276,14 +346,799 @@ pub fn extract_agent_label(path: &Path) -> String {
 pub enum ParsedLine {
     Events(Vec<AgentToolCall>),
     /// `type:"user", isCompactSummary:true` — carries the post-compaction summary text.
-    Compacted { summary: String, timestamp: String },
+    Compacted {
+        summary: String,
+        timestamp: String,
+    },
     /// `type:"system", subtype:"compact_boundary"` — carries token metadata.
     /// In Claude Code logs this record always precedes the `Compacted` record by
     /// one line, so callers buffer the metadata and attach it to the next
     /// `Compacted` event.
-    CompactBoundary { metadata: CompactionMetadata, timestamp: String },
+    CompactBoundary {
+        metadata: CompactionMetadata,
+        timestamp: String,
+    },
     SessionCleared,
+    /// `type:"user"` line carrying tool results — how a write tool's outcome
+    /// (and its `toolUseResult` detail) reaches us. Correlated with the call
+    /// by [`ResultCorrelator`].
+    ToolResults(Vec<ToolResult>),
+    /// `type:"queue-operation"` enqueuing a `<task-notification>`: a
+    /// background agent stopped, long after its call's own result.
+    AgentStopped {
+        tool_use_id: Arc<str>,
+        agent: Arc<str>,
+        timestamp: String,
+        status: String,
+    },
+    /// `type:"user"` text the user typed: a turn begins.
+    Prompt {
+        agent: Option<Arc<str>>,
+        text: String,
+        timestamp: String,
+    },
     Ignored,
+}
+
+/// One `tool_result` block from a `type:"user"` line.
+#[derive(Debug, Clone)]
+pub struct ToolResult {
+    pub tool_use_id: Arc<str>,
+    /// The tool failed or was rejected (`is_error`, or a string
+    /// `toolUseResult` such as a rejection or "String to replace not found").
+    pub is_error: bool,
+    /// The line's `toolUseResult`, when it is an object and unambiguously
+    /// belongs to this block (the line holds a single `tool_result`).
+    pub detail: Option<Value>,
+    pub timestamp: String,
+    /// For a failed call, why, in one line.
+    pub message: Option<String>,
+    /// The block's `content`, taken rather than copied, until the
+    /// correlator has read what it needs from it.
+    pub content: Option<Value>,
+    /// Symbols the output names, filled in by the correlator for a call
+    /// whose output credits them (`ambits rg`).
+    pub shown: Vec<(String, ReadDepth)>,
+    /// File lines the output printed, filled in by the correlator for a
+    /// line-numbered search.
+    pub printed: Vec<(PathBuf, u32)>,
+}
+
+/// Pairs the calls whose results matter with those results: a write's, to
+/// attribute it (spec §1); a search's, to credit the symbols its output
+/// named.
+///
+/// A result line names only its `tool_use_id`; the tool, path and agent live
+/// on the earlier `tool_use` line. So the pairing is stateful: callers that
+/// walk a log in order — the batch parser, and the tailer across polls —
+/// feed calls in with [`note_calls`](Self::note_calls) and results with
+/// [`resolve`](Self::resolve).
+///
+/// Bounded: a call whose result never comes (an interrupted session) would
+/// otherwise stay for the tailer's whole life. Past [`Self::MAX_PENDING`]
+/// the oldest call is forgotten, and its write, if it ever completes, is
+/// not journaled.
+#[derive(Debug, Default)]
+pub struct ResultCorrelator {
+    /// Each pending call with the order it was noted in.
+    pending: std::collections::HashMap<Arc<str>, (u64, AgentToolCall)>,
+    next_seq: u64,
+}
+
+impl ResultCorrelator {
+    /// Far above the handful of writes that can be in flight at once.
+    pub const MAX_PENDING: usize = 1024;
+
+    /// The write and search calls still awaiting results, oldest first, for
+    /// handing to a tailer.
+    pub fn into_pending(self) -> Vec<AgentToolCall> {
+        let mut pending: Vec<_> = self.pending.into_values().collect();
+        pending.sort_by_key(|(seq, _)| *seq);
+        pending.into_iter().map(|(_, call)| call).collect()
+    }
+
+    /// Remember write and search calls until their results arrive.
+    pub fn note_calls(&mut self, calls: &[AgentToolCall]) {
+        for call in calls {
+            let write = call.effect == Effect::Write && call.file_path.is_some();
+            if !write && call.result_depth.is_none() && call.searches.is_empty() {
+                continue;
+            }
+            let Some(id) = &call.tool_use_id else {
+                continue;
+            };
+            self.pending
+                .insert(id.clone(), (self.next_seq, call.clone()));
+            self.next_seq += 1;
+            if self.pending.len() > Self::MAX_PENDING {
+                // O(n) at the cap, which only a stream of unanswered calls reaches.
+                let oldest = self
+                    .pending
+                    .iter()
+                    .min_by_key(|(_, (seq, _))| *seq)
+                    .map(|(id, _)| id.clone());
+                if let Some(oldest) = oldest {
+                    self.pending.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    /// Settle the pending calls these results answer: a search's names the
+    /// symbols its output showed (in `shown`), a write's becomes a write
+    /// event. Failed or rejected writes are dropped: nothing changed on disk.
+    /// A search's output is credited even when the command failed — it was
+    /// shown all the same, and an error prints no symbols.
+    pub fn resolve(&mut self, results: &mut [ToolResult]) -> Vec<WriteEvent> {
+        let mut out = Vec::new();
+        for result in results.iter_mut() {
+            let Some((_, call)) = self.pending.remove(&result.tool_use_id) else {
+                continue;
+            };
+            if let Some(depth) = call.result_depth {
+                let text = result
+                    .content
+                    .as_ref()
+                    .and_then(content_text)
+                    .unwrap_or_default();
+                result.shown = crate::search::shown_selectors(&text)
+                    .into_iter()
+                    .map(|id| (id, depth))
+                    .collect();
+                continue;
+            }
+            if !call.searches.is_empty() {
+                let text = result
+                    .content
+                    .as_ref()
+                    .and_then(content_text)
+                    .unwrap_or_default();
+                result.printed = super::command_reads::printed_lines(&text, &call.searches);
+                continue;
+            }
+            if result.is_error {
+                continue;
+            }
+            let Some(path) = call.file_path else { continue };
+            out.push(WriteEvent {
+                op: result.tool_use_id.clone(),
+                agent_id: call.agent_id,
+                tool_name: call.tool_name,
+                path,
+                timestamp: result.timestamp.clone(),
+                source: result
+                    .detail
+                    .as_ref()
+                    .map(write_source)
+                    .unwrap_or(WriteSource::Opaque),
+            });
+        }
+        out
+    }
+}
+
+/// Classify a `toolUseResult` object by shape (spec §2.2). Anything that is
+/// not a recognizable `Edit` or `Write` result is `Opaque`: file-level only.
+fn write_source(detail: &Value) -> WriteSource {
+    let text = |k: &str| detail.get(k).and_then(|v| v.as_str()).map(String::from);
+    let flag = |k: &str| detail.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+    let hunks = parse_hunks(detail.get("structuredPatch"));
+
+    if let (Some(old), Some(new)) = (text("oldString"), text("newString")) {
+        return WriteSource::Edit {
+            original: text("originalFile"),
+            old,
+            new,
+            replace_all: flag("replaceAll"),
+            hunks,
+            user_modified: flag("userModified"),
+        };
+    }
+    if let Some(content) = text("content") {
+        if let Some(kind @ ("create" | "update")) = detail.get("type").and_then(|v| v.as_str()) {
+            return WriteSource::Write {
+                original: text("originalFile"),
+                content,
+                create: kind == "create",
+                hunks,
+                user_modified: flag("userModified"),
+            };
+        }
+    }
+    WriteSource::Opaque
+}
+
+/// `structuredPatch` → hunks, all or nothing: `None` when the patch is
+/// missing, or any hunk is malformed or has a line that is not context, `+`,
+/// `-` or a `\` annotation. A partial patch would under-report the change,
+/// so it is no patch at all (spec §2.2).
+fn parse_hunks(patch: Option<&Value>) -> Option<Vec<Hunk>> {
+    let Some(Value::Array(hunks)) = patch else {
+        return None;
+    };
+    hunks
+        .iter()
+        .map(|h| {
+            let lines = h
+                .get("lines")?
+                .as_array()?
+                .iter()
+                .map(|l| {
+                    let l = l.as_str()?;
+                    matches!(l.as_bytes().first(), Some(b' ' | b'+' | b'-' | b'\\'))
+                        .then(|| l.to_string())
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(Hunk {
+                old_start: u32::try_from(h.get("oldStart")?.as_u64()?).ok()?,
+                new_start: u32::try_from(h.get("newStart")?.as_u64()?).ok()?,
+                lines,
+            })
+        })
+        .collect()
+}
+
+/// Whether a `tool_result` block says its call failed: `is_error`, or the
+/// line's `toolUseResult` is text that reads as a failure — which says so
+/// only when the line holds this one result. Text alone is not enough:
+/// `StructuredOutput` succeeds with "Structured output provided successfully".
+fn result_failed(block: &Value, detail: Option<&Value>, single: bool) -> bool {
+    block
+        .get("is_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || (single && detail.and_then(Value::as_str).is_some_and(reads_as_failure))
+}
+
+/// Claude Code's failure text: it starts `Error`, is wrapped in
+/// `<tool_use_error>`, or is its message for a call the user rejected.
+fn reads_as_failure(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("Error")
+        || text.contains("<tool_use_error>")
+        || text.starts_with("The user doesn't want to proceed")
+}
+
+/// Every `tool_result` block on a `type:"user"` line.
+///
+/// Takes `toolUseResult` out of `obj` rather than cloning it: for a `Read`
+/// or `Bash` it holds the whole output, and most results are dropped unpaired.
+fn parse_tool_results(obj: &mut Value) -> Vec<ToolResult> {
+    let mut detail = obj.get_mut("toolUseResult").map(Value::take);
+    let timestamp = obj
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let Some(Value::Array(blocks)) = obj.pointer_mut("/message/content") else {
+        return Vec::new();
+    };
+    let is_result = |b: &Value| b.get("type").and_then(|v| v.as_str()) == Some("tool_result");
+    // `toolUseResult` is one per line; it can only be attributed to a block
+    // when there is exactly one.
+    let single = blocks.iter().filter(|b| is_result(b)).count() == 1;
+    // A string `toolUseResult` is the tool's own error message.
+    let detail_text = detail.as_ref().filter(|d| single && d.is_string()).cloned();
+    blocks
+        .iter_mut()
+        .filter(|b| is_result(b))
+        .filter_map(|b| {
+            let id = b.get("tool_use_id")?.as_str()?;
+            let is_error = result_failed(b, detail.as_ref(), single);
+            let tool_use_id = Arc::from(id);
+            // Moved out, not copied: a `Read`'s holds the whole file.
+            let content = b.get_mut("content").map(Value::take);
+            Some(ToolResult {
+                tool_use_id,
+                is_error,
+                detail: detail.take().filter(|d| single && d.is_object()),
+                timestamp: timestamp.clone(),
+                // The content has the error and the output that explains it
+                // (a bare "Error: Exit code 1" in `toolUseResult` does not).
+                message: is_error
+                    .then(|| {
+                        content
+                            .as_ref()
+                            .and_then(error_summary)
+                            .or_else(|| detail_text.as_ref().and_then(error_summary))
+                    })
+                    .flatten(),
+                content,
+                shown: Vec::new(),
+                printed: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+/// How much of each log's end is read to find the call running this
+/// process: its `tool_use` line is written before the command runs, and is
+/// near the end — only results of calls made alongside it can follow.
+const CALLER_TAIL: u64 = 512 * 1024;
+
+/// The agent of `session_id` whose running call started this process
+/// (`args`: its arguments, without the program), found in the session's
+/// logs in `log_dir`: the main log, `<session>.jsonl`, and each subagent's,
+/// `<session>/subagents/agent-<id>.jsonl`. A call is running while its
+/// `tool_use` has no `tool_result`; it is this process when its command
+/// runs `ambits` with these arguments, in order.
+///
+/// Exactly one agent must match. None — an unfamiliar layout, a command the
+/// shell rewrote — or several — two agents running the same command at
+/// once — is not known, and says why. Nothing in the environment names the
+/// agent: Claude Code sets the session (`CLAUDE_CODE_SESSION_ID`), not the
+/// agent, and `CLAUDE_CODE_CHILD_SESSION` is set in the main agent too.
+pub fn calling_agent(log_dir: &Path, session_id: &str, args: &[String]) -> Caller {
+    let subagent_files = subagent_logs(&log_dir.join(session_id).join("subagents"));
+    let mut logs: Vec<(PathBuf, Option<String>)> =
+        vec![(log_dir.join(format!("{session_id}.jsonl")), None)];
+    for path in &subagent_files {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        if let Some(id) = stem.strip_prefix("agent-") {
+            logs.push((path.clone(), Some(id.to_string())));
+        }
+    }
+    let found: Vec<(PathBuf, Option<String>)> = logs
+        .into_iter()
+        .filter(|(path, _)| runs_pending(path, args))
+        .collect();
+    match found.as_slice() {
+        [(_, None)] => Caller::Agent {
+            id: session_id.to_string(),
+            parent: None,
+        },
+        [(path, Some(id))] => Caller::Agent {
+            id: id.clone(),
+            parent: Some(parent_of(path, &subagent_files, id, session_id)),
+        },
+        [] => Caller::Unknown("no running call in the session's logs is this command".into()),
+        many => Caller::Unknown(format!(
+            "{} agents are running this same command",
+            many.len()
+        )),
+    }
+}
+
+/// Whether the end of the log at `path` holds a running call whose command
+/// could have started a process with `args`.
+fn runs_pending(path: &Path, args: &[String]) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let from = len.saturating_sub(CALLER_TAIL);
+    if file.seek(SeekFrom::Start(from)).is_err() {
+        return false;
+    }
+    let mut tail = Vec::new();
+    if file.read_to_end(&mut tail).is_err() {
+        return false;
+    }
+    let tail = String::from_utf8_lossy(&tail);
+    // Past the first line when it was cut by the seek.
+    let lines = tail.lines().skip(usize::from(from > 0));
+    let mut calls: Vec<(String, String)> = Vec::new();
+    let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in lines.filter(|l| l.contains("\"tool_use\"") || l.contains("\"tool_result\"")) {
+        let Ok(obj) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(Value::Array(blocks)) = obj.pointer("/message/content") else {
+            continue;
+        };
+        for block in blocks {
+            let text = |key: &str| block.get(key).and_then(Value::as_str).map(String::from);
+            match block.get("type").and_then(Value::as_str) {
+                Some("tool_use") => {
+                    if let (Some(id), Some(command)) = (
+                        text("id"),
+                        block.pointer("/input/command").and_then(Value::as_str),
+                    ) {
+                        calls.push((id, command.to_string()));
+                    }
+                }
+                Some("tool_result") => {
+                    answered.extend(text("tool_use_id"));
+                }
+                _ => {}
+            }
+        }
+    }
+    calls
+        .iter()
+        .any(|(id, command)| !answered.contains(id) && command_runs(command, args))
+}
+
+/// Whether shell `command` could have started a process with `args`: it
+/// runs `ambits`, and holds each argument, in order. The shell has taken the
+/// quotes off the arguments, not the command, so each is found as text.
+fn command_runs(command: &str, args: &[String]) -> bool {
+    let Some(at) = command.find("ambits") else {
+        return false;
+    };
+    let mut rest = &command[at + "ambits".len()..];
+    for arg in args {
+        match rest.find(arg.as_str()) {
+            Some(i) => rest = &rest[i + arg.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+/// The agent that started subagent `id`: the main agent, for one it
+/// started itself (`spawnDepth` 1 in its `.meta.json`); else the subagent
+/// whose log holds the call that started it.
+fn parent_of(log: &Path, subagent_files: &[PathBuf], id: &str, session_id: &str) -> String {
+    let meta_path = log.with_file_name(format!("agent-{id}.meta.json"));
+    let meta: Option<Value> = fs::read_to_string(meta_path)
+        .ok()
+        .and_then(|m| serde_json::from_str(&m).ok());
+    let depth = meta
+        .as_ref()
+        .and_then(|m| m.get("spawnDepth"))
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let started_by = meta
+        .as_ref()
+        .and_then(|m| m.get("toolUseId"))
+        .and_then(Value::as_str)
+        .map(|t| format!("\"id\":\"{t}\""));
+    let (true, Some(needle)) = (depth > 1, started_by) else {
+        return session_id.to_string();
+    };
+    subagent_files
+        .iter()
+        .find(|p| fs::read_to_string(p).is_ok_and(|log| log.contains(&needle)))
+        .and_then(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.trim_start_matches("agent-").to_string())
+        })
+        .unwrap_or_else(|| session_id.to_string())
+}
+
+/// A `tool_result`'s content as text: a string, or its text blocks joined.
+fn content_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(blocks) => Some(
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    }
+}
+
+/// Call `id` as its log recorded it — its arguments, and what it read,
+/// wrote or returned — from its lines in `files` (the session's logs): its
+/// `tool_use` input and its `tool_result`. `None` when the log has neither
+/// yet. Only lines naming `id` are parsed; nothing is kept but what is
+/// returned, and nothing is logged (spec §9.6).
+pub fn call_detail(files: &[PathBuf], id: &str, kind: ContentKind) -> Option<CallDetail> {
+    let mut input: Option<Value> = None;
+    let mut result: Option<ToolResult> = None;
+    let mut buf = Vec::new();
+    for path in files {
+        let Ok(file) = fs::File::open(path) else {
+            continue;
+        };
+        let mut reader = BufReader::new(file);
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let Ok(line) = std::str::from_utf8(&buf) else {
+                continue;
+            };
+            if !line.contains(id) {
+                continue;
+            }
+            let Ok(mut obj) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if let Some(Value::Array(blocks)) = obj.pointer_mut("/message/content") {
+                let call = blocks.iter_mut().find(|b| {
+                    b.get("type").and_then(Value::as_str) == Some("tool_use")
+                        && b.get("id").and_then(Value::as_str) == Some(id)
+                });
+                if let Some(call) = call {
+                    input = call.get_mut("input").map(Value::take);
+                }
+            }
+            // Read as the tailer reads it, so the two agree on which result
+            // a line's `toolUseResult` belongs to, and whether it failed.
+            if let Some(r) = parse_tool_results(&mut obj)
+                .into_iter()
+                .find(|r| &*r.tool_use_id == id)
+            {
+                result = Some(r);
+            }
+            if input.is_some() && result.is_some() {
+                break;
+            }
+        }
+        if input.is_some() || result.is_some() {
+            break;
+        }
+    }
+    if input.is_none() && result.is_none() {
+        return None;
+    }
+    Some(assemble_detail(kind, input.as_ref(), result.as_ref()))
+}
+
+/// [`call_detail`] for every call in `wanted` at once, in one pass over
+/// `files`: a call the logs have neither half of is absent. For display
+/// only, as `call_detail` is.
+pub fn call_details(
+    files: &[PathBuf],
+    wanted: &HashMap<String, ContentKind>,
+) -> HashMap<String, CallDetail> {
+    let mut inputs: HashMap<String, Value> = HashMap::new();
+    let mut results: HashMap<String, ToolResult> = HashMap::new();
+    let mut buf = Vec::new();
+    for path in files {
+        let Ok(file) = fs::File::open(path) else {
+            continue;
+        };
+        let mut reader = BufReader::new(file);
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let Ok(line) = std::str::from_utf8(&buf) else {
+                continue;
+            };
+            if !line.contains("\"tool_use") && !line.contains("\"tool_result") {
+                continue;
+            }
+            let Ok(mut obj) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if let Some(Value::Array(blocks)) = obj.pointer_mut("/message/content") {
+                for block in blocks
+                    .iter_mut()
+                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+                {
+                    let Some(id) = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| wanted.contains_key(*id))
+                        .map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    if let Some(input) = block.get_mut("input").map(Value::take) {
+                        inputs.entry(id).or_insert(input);
+                    }
+                }
+            }
+            for r in parse_tool_results(&mut obj)
+                .into_iter()
+                .filter(|r| wanted.contains_key(&*r.tool_use_id))
+            {
+                results.entry(r.tool_use_id.to_string()).or_insert(r);
+            }
+        }
+    }
+    wanted
+        .iter()
+        .filter(|(id, _)| inputs.contains_key(*id) || results.contains_key(*id))
+        .map(|(id, kind)| {
+            (
+                id.clone(),
+                assemble_detail(*kind, inputs.get(id), results.get(id)),
+            )
+        })
+        .collect()
+}
+
+fn assemble_detail(
+    kind: ContentKind,
+    input: Option<&Value>,
+    result: Option<&ToolResult>,
+) -> CallDetail {
+    CallDetail {
+        args: input.map(super::content::args).unwrap_or_default(),
+        content: build_content(
+            kind,
+            input,
+            result.map(|r| {
+                (
+                    r.content.as_ref().unwrap_or(&Value::Null),
+                    r.detail.as_ref(),
+                    r.is_error,
+                )
+            }),
+        ),
+    }
+}
+
+/// A call's content from its input and its result (content, `toolUseResult`
+/// object, failed).
+fn build_content(
+    kind: ContentKind,
+    input: Option<&Value>,
+    result: Option<(&Value, Option<&Value>, bool)>,
+) -> Option<CallContent> {
+    use super::content::{DiffLine, Hunk as Change};
+    let output = |content: &Value| {
+        let (lines, cut) = CallContent::capped(&content_text(content)?);
+        Some(CallContent::Output { lines, cut })
+    };
+    match kind {
+        ContentKind::Write => {
+            // The tool's own patch, when it succeeded and recorded one.
+            if let Some((_, Some(detail), false)) = result {
+                let exact = |hunks: &Option<Vec<Hunk>>| {
+                    hunks
+                        .as_ref()
+                        .filter(|h| !h.is_empty())
+                        .map(|h| CallContent::change(h.iter().map(Change::from).collect(), true))
+                };
+                match write_source(detail) {
+                    WriteSource::Edit { hunks, .. } => {
+                        if let Some(c) = exact(&hunks) {
+                            return Some(c);
+                        }
+                    }
+                    WriteSource::Write {
+                        content,
+                        create: true,
+                        ..
+                    } => {
+                        let lines = content
+                            .lines()
+                            .map(|l| DiffLine::Added(l.to_string()))
+                            .collect();
+                        return Some(CallContent::change(
+                            vec![Change {
+                                old_start: Some(0),
+                                new_start: Some(1),
+                                lines,
+                            }],
+                            true,
+                        ));
+                    }
+                    WriteSource::Write { hunks, .. } => {
+                        if let Some(c) = exact(&hunks) {
+                            return Some(c);
+                        }
+                    }
+                    WriteSource::Opaque => {}
+                }
+            }
+            // Else what it asked for.
+            let input = input?;
+            let text = |k: &str| input.get(k).and_then(Value::as_str);
+            let asked = |old: &str, new: &str| Change {
+                old_start: None,
+                new_start: None,
+                lines: old
+                    .lines()
+                    .map(|l| DiffLine::Removed(l.to_string()))
+                    .chain(new.lines().map(|l| DiffLine::Added(l.to_string())))
+                    .collect(),
+            };
+            let hunks = if let (Some(old), Some(new)) = (text("old_string"), text("new_string")) {
+                vec![asked(old, new)]
+            } else if let Some(Value::Array(edits)) = input.get("edits") {
+                edits
+                    .iter()
+                    .filter_map(|e| {
+                        Some(asked(
+                            e.get("old_string")?.as_str()?,
+                            e.get("new_string")?.as_str()?,
+                        ))
+                    })
+                    .collect()
+            } else if let Some(new) = text("content")
+                .or_else(|| text("body"))
+                .or_else(|| text("new_source"))
+            {
+                vec![asked("", new)]
+            } else {
+                return result.and_then(|(content, _, _)| output(content));
+            };
+            Some(CallContent::change(hunks, false))
+        }
+        ContentKind::Read => {
+            let (content, detail, error) = result?;
+            if !error {
+                if let Some(file) = detail.and_then(|d| d.get("file")) {
+                    if let Some(text) = file.get("content").and_then(Value::as_str) {
+                        let start = file
+                            .get("startLine")
+                            .and_then(Value::as_u64)
+                            .and_then(|n| u32::try_from(n).ok())
+                            .unwrap_or(1);
+                        let (lines, cut) = CallContent::capped(text);
+                        return Some(CallContent::Read { start, lines, cut });
+                    }
+                }
+            }
+            output(content)
+        }
+        ContentKind::Other => output(result?.0),
+    }
+}
+
+impl From<&Hunk> for super::content::Hunk {
+    /// A `structuredPatch` hunk: its prefixed lines as diff lines (a `\`
+    /// annotation, "No newline at end of file", is dropped).
+    fn from(h: &Hunk) -> Self {
+        use super::content::DiffLine;
+        let lines = h
+            .lines
+            .iter()
+            .filter_map(|l| match l.split_at(l.len().min(1)) {
+                ("+", rest) => Some(DiffLine::Added(rest.to_string())),
+                ("-", rest) => Some(DiffLine::Removed(rest.to_string())),
+                (" ", rest) => Some(DiffLine::Same(rest.to_string())),
+                _ => None,
+            })
+            .collect();
+        Self {
+            old_start: Some(h.old_start),
+            new_start: Some(h.new_start),
+            lines,
+        }
+    }
+}
+
+/// Why a tool failed, from its result's content, in one line of at most 200
+/// characters: a rejection named as one, `<tool_use_error>` tags dropped,
+/// and a bare `Exit code N` joined with the first line of output after it.
+/// Only this line is kept, never the rest of the output.
+pub fn error_summary(content: &Value) -> Option<String> {
+    let text = content_text(content)?
+        .replace("<tool_use_error>", "")
+        .replace("</tool_use_error>", "");
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = lines.next()?;
+    let first = first.strip_prefix("Error: ").unwrap_or(first);
+    let line = if first.starts_with("The user doesn't want to proceed")
+        || first == "User rejected tool use"
+    {
+        "rejected by the user".to_string()
+    } else if first.starts_with("Permission for this tool use was denied") {
+        "permission denied".to_string()
+    } else if first.starts_with("Exit code") {
+        // The line that names the error — a traceback's last, a compiler's
+        // first `error` — else the last line of output.
+        let rest: Vec<&str> = lines.collect();
+        let named = rest
+            .iter()
+            .find(|l| l.to_lowercase().contains("error") && !l.starts_with("Traceback"))
+            .or(rest.last());
+        match named {
+            Some(next) => format!("{first}: {next}"),
+            None => first.to_string(),
+        }
+    } else {
+        first.to_string()
+    };
+    let line: String = line
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    Some(if line.chars().count() > 200 {
+        format!("{}…", line.chars().take(199).collect::<String>())
+    } else {
+        line
+    })
 }
 
 /// Parse all events from a JSONL log file.
@@ -296,93 +1151,177 @@ fn parse_log_file_with_mapper(
     mapper: &dyn ToolCallMapper,
     project_root: Option<&Path>,
 ) -> Vec<SessionEvent> {
-    let mut events: Vec<SessionEvent> = Vec::new();
-    let file = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return events,
+    replay_log_file(path, mapper, project_root).events
+}
+
+/// Parse a whole log file, recording where it stopped and which write calls
+/// still await their results, so a tailer can take over exactly there.
+fn replay_log_file(
+    path: &Path,
+    mapper: &dyn ToolCallMapper,
+    project_root: Option<&Path>,
+) -> FileReplay {
+    let Ok(file) = fs::File::open(path) else {
+        return FileReplay::default();
     };
-
-    let default_id = path
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-
     let mut reader = BufReader::new(file);
-
-    // Read the first line once to extract the agent label and worktree cwd.
-    // This avoids a second file open for extract_agent_label / extract_cwd.
-    let mut first_line = String::new();
-    let _ = reader.read_line(&mut first_line);
-    let first_trimmed = first_line.trim();
-
-    let first_parsed: Option<Value> = serde_json::from_str(first_trimmed).ok();
-    let label: Arc<str> = match first_parsed.as_ref() {
-        Some(obj) => {
-            let content = obj.pointer("/message/content").and_then(|v| v.as_str()).unwrap_or("");
-            if content.is_empty() {
-                Arc::from(default_label(path).as_str())
-            } else {
-                let line_content = content.lines().next().unwrap_or(content);
-                if line_content.len() <= 50 {
-                    Arc::from(line_content)
-                } else {
-                    Arc::from(format!("{}...", &line_content[..47]).as_str())
-                }
-            }
+    let mut feed = LineFeed::for_file(path, project_root);
+    let mut writes = ResultCorrelator::default();
+    let mut events: Vec<SessionEvent> = Vec::new();
+    let mut offset = 0u64;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => offset += n as u64,
         }
-        None => Arc::from(default_label(path).as_str()),
-    };
+        feed.feed(&line, mapper, &mut writes, &mut events);
+    }
+    FileReplay {
+        events,
+        offset,
+        awaiting: writes.into_pending(),
+    }
+}
 
-    // Detect worktree: cwd in the first record differs from the project root.
-    let cwd_remap: Option<(PathBuf, PathBuf)> = project_root.and_then(|root| {
-        let obj = first_parsed.as_ref()?;
-        let cwd = PathBuf::from(obj.get("cwd")?.as_str()?);
-        if cwd != root { Some((cwd, root.to_path_buf())) } else { None }
-    });
+/// Turns one log file's lines into events. The one implementation behind
+/// both the batch replay and the live tailer, so a line means the same
+/// thing whichever reads it: same agent id and label, same worktree path
+/// remapping, same compaction pairing, same write correlation.
+struct LineFeed {
+    default_id: String,
+    label: Arc<str>,
+    /// `(worktree, project)` when the session ran in a worktree of the
+    /// project: tool paths are rewritten from one to the other.
+    remap: Option<(PathBuf, PathBuf)>,
+    /// The most recent `compact_boundary`. Claude Code writes it just before
+    /// its `isCompactSummary` line, and the two may arrive in different polls.
+    pending_metadata: Option<CompactionMetadata>,
+}
 
-    // Seek back to start so all lines — including line 1 — are processed for events.
-    let _ = reader.seek(SeekFrom::Start(0));
+impl LineFeed {
+    /// Set up for `path`, from its first line: the agent's label and, given
+    /// the project root, whether it ran in a worktree.
+    fn for_file(path: &Path, project_root: Option<&Path>) -> Self {
+        // A subagent's file is `agent-<id>.jsonl`, but its lines — and the
+        // delegation that started it — name it `<id>`: the file's name is not
+        // the agent's.
+        let stem = path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        let default_id = stem.strip_prefix("agent-").unwrap_or(stem).to_string();
+        // A project inside the session's cwd (a harness launching from a
+        // workspace above its clones) is not a worktree: its tool paths
+        // already name the project, and stripping the cwd would prefix them
+        // with the clone's directory name.
+        let remap = project_root.and_then(|root| {
+            let cwd = extract_cwd(path)?;
+            (cwd != root && !root.starts_with(&cwd)).then(|| (cwd, root.to_path_buf()))
+        });
+        Self {
+            default_id,
+            label: Arc::from(extract_agent_label(path).as_str()),
+            remap,
+            pending_metadata: None,
+        }
+    }
 
-    // Buffer the most-recent compact_boundary record. Claude Code emits the
-    // boundary immediately before the corresponding `isCompactSummary` line, so
-    // we attach the buffered metadata to the next `Compacted` event we see.
-    let mut pending_metadata: Option<CompactionMetadata> = None;
-
-    for line in reader.lines().map_while(Result::ok) {
-        match parse_jsonl_line(line.trim(), &default_id, mapper) {
-            ParsedLine::Events(mut line_events) => {
-                if let Some((ref worktree, ref project)) = cwd_remap {
-                    for ev in &mut line_events {
-                        if let Some(ref fp) = ev.file_path {
-                            ev.file_path = Some(remap_path(fp, worktree, project));
+    /// Feed one line, appending whatever events it completes to `out`.
+    fn feed(
+        &mut self,
+        line: &str,
+        mapper: &dyn ToolCallMapper,
+        writes: &mut ResultCorrelator,
+        out: &mut Vec<SessionEvent>,
+    ) {
+        match parse_jsonl_line(line.trim(), &self.default_id, mapper) {
+            ParsedLine::Events(mut calls) => {
+                for call in &mut calls {
+                    if let Some((worktree, project)) = &self.remap {
+                        if let Some(fp) = &call.file_path {
+                            call.file_path = Some(remap_path(fp, worktree, project));
+                        }
+                        for read in &mut call.file_reads {
+                            read.path = remap_path(&read.path, worktree, project);
+                        }
+                        for search in &mut call.searches {
+                            search.dir = remap_path(&search.dir, worktree, project);
+                            search.file = search
+                                .file
+                                .as_deref()
+                                .map(|f| remap_path(f, worktree, project));
                         }
                     }
+                    call.label = self.label.clone();
                 }
-                for ev in &mut line_events {
-                    ev.label = label.clone();
+                writes.note_calls(&calls);
+                out.extend(calls.into_iter().map(SessionEvent::ToolCall));
+            }
+            ParsedLine::ToolResults(mut results) => {
+                // A write's path comes from its call, remapped above.
+                let written = writes.resolve(&mut results);
+                for r in &mut results {
+                    let child_agent = r
+                        .detail
+                        .as_ref()
+                        .and_then(|d| d.get("agentId"))
+                        .and_then(|v| v.as_str())
+                        .map(Arc::from);
+                    out.push(SessionEvent::ToolFinished(super::ToolFinished {
+                        id: r.tool_use_id.clone(),
+                        agent_id: Arc::from(self.default_id.as_str()),
+                        timestamp: r.timestamp.clone(),
+                        error: r.is_error,
+                        child_agent,
+                        message: r.message.clone(),
+                        shown: std::mem::take(&mut r.shown),
+                        printed: std::mem::take(&mut r.printed),
+                    }));
                 }
-                events.extend(line_events.into_iter().map(SessionEvent::ToolCall));
+                out.extend(written.into_iter().map(SessionEvent::Write));
             }
-            ParsedLine::CompactBoundary { metadata, .. } => {
-                pending_metadata = Some(metadata);
-            }
-            ParsedLine::Compacted { summary, timestamp } => {
-                let agent_id: Arc<str> = Arc::from(default_id.as_str());
-                events.push(SessionEvent::Compacted {
-                    summary,
+            ParsedLine::CompactBoundary { metadata, .. } => self.pending_metadata = Some(metadata),
+            ParsedLine::Compacted { summary, timestamp } => out.push(SessionEvent::Compacted {
+                summary,
+                timestamp,
+                agent_id: Arc::from(self.default_id.as_str()),
+                metadata: self.pending_metadata.take(),
+            }),
+            ParsedLine::SessionCleared => out.push(SessionEvent::SessionCleared),
+            ParsedLine::AgentStopped {
+                tool_use_id,
+                agent,
+                timestamp,
+                status,
+            } => {
+                // Background shells notify too: say what the notification said.
+                let error = status != "completed";
+                out.push(SessionEvent::ToolFinished(super::ToolFinished {
+                    id: tool_use_id,
+                    agent_id: Arc::from(self.default_id.as_str()),
                     timestamp,
-                    agent_id,
-                    metadata: pending_metadata.take(),
-                });
+                    error,
+                    child_agent: Some(agent),
+                    message: error
+                        .then(|| format!("ended: {}", crate::objects::printable(&status))),
+                    shown: Vec::new(),
+                    printed: Vec::new(),
+                }))
             }
-            ParsedLine::SessionCleared => {
-                events.push(SessionEvent::SessionCleared);
-            }
+            ParsedLine::Prompt {
+                agent,
+                text,
+                timestamp,
+            } => out.push(SessionEvent::Prompt(super::Prompt {
+                agent_id: agent.unwrap_or_else(|| Arc::from(self.default_id.as_str())),
+                timestamp,
+                text,
+            })),
             ParsedLine::Ignored => {}
         }
     }
-    events
 }
 
 /// Parse the `compactMetadata` block from a `compact_boundary` system record.
@@ -398,15 +1337,104 @@ fn parse_compact_metadata(meta: &Value) -> Option<CompactionMetadata> {
     })
 }
 
+/// A prompt the user typed. Claude Code marks one `origin.kind: "human"`;
+/// a log without `origin` falls back to plain text that is neither meta,
+/// a subagent's (sidechain) opening prompt, nor injected (`<…>` tags other
+/// than a slash command).
+fn parse_prompt(obj: &Value) -> Option<ParsedLine> {
+    if obj.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        || obj.get("isMeta").and_then(Value::as_bool) == Some(true)
+    {
+        return None;
+    }
+    let text = match obj.pointer("/message/content")? {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    let command = text.contains("<command-name>");
+    match obj.pointer("/origin/kind").and_then(Value::as_str) {
+        Some(kind) if kind != "human" => return None,
+        Some(_) => {}
+        None if text.trim_start().starts_with('<') && !command => return None,
+        None if text.starts_with("[Request interrupted") => return None,
+        None => {}
+    }
+    let text = if command {
+        let tag = |name: &str| {
+            text.split_once(&format!("<{name}>"))
+                .and_then(|(_, rest)| rest.split_once(&format!("</{name}>")))
+                .map(|(v, _)| v.trim())
+        };
+        [tag("command-name"), tag("command-args")]
+            .into_iter()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        text.trim().to_string()
+    };
+    if text.is_empty() {
+        return None;
+    }
+    let agent = obj.get("sessionId").and_then(Value::as_str).map(Arc::from);
+    let timestamp = obj
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Some(ParsedLine::Prompt {
+        agent,
+        text,
+        timestamp,
+    })
+}
+
+/// A `<task-notification>` as Claude Code enqueues it when a background
+/// agent stops. Only the enqueue counts: its timestamp is the stop, and the
+/// later `remove` is just the main agent picking it up.
+fn parse_agent_stopped(obj: &Value) -> Option<ParsedLine> {
+    if obj.get("operation")?.as_str()? != "enqueue" {
+        return None;
+    }
+    let content = obj.get("content")?.as_str()?;
+    let tag = |name: &str| {
+        let (open, close) = (format!("<{name}>"), format!("</{name}>"));
+        let start = content.find(&open)? + open.len();
+        Some(content[start..].split_once(&close)?.0.trim())
+    };
+    tag("task-notification")?;
+    Some(ParsedLine::AgentStopped {
+        tool_use_id: Arc::from(tag("tool-use-id")?),
+        agent: Arc::from(tag("task-id")?),
+        timestamp: obj.get("timestamp")?.as_str()?.to_string(),
+        status: tag("status").unwrap_or("unknown").to_string(),
+    })
+}
+
 /// Parse a single JSONL line from a Claude Code session log.
 /// Returns a `ParsedLine` indicating tool call events, a session clear signal, or nothing.
-pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCallMapper) -> ParsedLine {
-    let obj: Value = match serde_json::from_str(line) {
+pub fn parse_jsonl_line(
+    line: &str,
+    default_agent_id: &str,
+    mapper: &dyn ToolCallMapper,
+) -> ParsedLine {
+    let mut obj: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return ParsedLine::Ignored,
     };
 
     let msg_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    if msg_type == "queue-operation" {
+        return parse_agent_stopped(&obj).unwrap_or(ParsedLine::Ignored);
+    }
 
     // Detect the compaction boundary marker (precedes the summary by one line).
     if msg_type == "system"
@@ -419,7 +1447,10 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
             .to_string();
         let metadata = obj.get("compactMetadata").and_then(parse_compact_metadata);
         return match metadata {
-            Some(metadata) => ParsedLine::CompactBoundary { metadata, timestamp },
+            Some(metadata) => ParsedLine::CompactBoundary {
+                metadata,
+                timestamp,
+            },
             None => ParsedLine::Ignored,
         };
     }
@@ -448,7 +1479,15 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
         if content.contains("<command-name>/clear</command-name>") {
             return ParsedLine::SessionCleared;
         }
-        return ParsedLine::Ignored;
+        if let Some(prompt) = parse_prompt(&obj) {
+            return prompt;
+        }
+        let results = parse_tool_results(&mut obj);
+        return if results.is_empty() {
+            ParsedLine::Ignored
+        } else {
+            ParsedLine::ToolResults(results)
+        };
     }
 
     if msg_type != "assistant" {
@@ -493,6 +1532,7 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
             "tool_use recognized"
         );
 
+        let tool_use_id: Option<Arc<str>> = block.get("id").and_then(|v| v.as_str()).map(Arc::from);
         let event = match mapper.map_tool_call(tool_name, &input, &agent_id, &timestamp_str) {
             Some(event) => {
                 log::debug!(
@@ -517,10 +1557,49 @@ pub fn parse_jsonl_line(line: &str, default_agent_id: &str, mapper: &dyn ToolCal
                     target_lines: None,
                     target_selectors: Vec::new(),
                     label: agent_id.clone(),
+                    tool_use_id: None,
+                    effect: Effect::Read,
+                    summary: None,
+                    result_depth: None,
+                    file_reads: Vec::new(),
+                    searches: Vec::new(),
                 }
             }
         };
-        events.push(event);
+        let summary = input
+            .get("description")
+            .and_then(Value::as_str)
+            .map(|d| d.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|d| !d.is_empty());
+        // A command's paths are relative to the shell's directory, which
+        // the record names as it was when the call was made.
+        let cwd = obj.get("cwd").and_then(Value::as_str).map(Path::new);
+        let file_reads = event
+            .file_reads
+            .iter()
+            .map(|r| super::command_reads::FileRead {
+                path: super::command_reads::resolve(&r.path, cwd),
+                ..r.clone()
+            })
+            .collect();
+        let searches = event
+            .searches
+            .iter()
+            .map(|q| super::command_reads::Search {
+                dir: super::command_reads::resolve(&q.dir, cwd),
+                file: q
+                    .file
+                    .as_deref()
+                    .map(|f| super::command_reads::resolve(f, cwd)),
+            })
+            .collect();
+        events.push(AgentToolCall {
+            tool_use_id,
+            summary,
+            file_reads,
+            searches,
+            ..event
+        });
     }
 
     ParsedLine::Events(events)
@@ -660,17 +1739,23 @@ pub fn map_tool_call(
         .iter()
         .find_map(|k| input.get(k).and_then(|v| v.as_str()));
 
-    // Resolve read depth via centralised DepthSpec logic.
-    let read_depth = mapping
-        .depth
-        .as_ref()
-        .expect("depth must be Some after load/merge — MissingDepth stanzas are dropped")
-        .resolve(input);
+    // Resolve read depth via centralised DepthSpec logic. A write stanza has
+    // no depth and grants no read credit (spec D9).
+    let effect = mapping.effect();
+    let read_depth = match effect {
+        Effect::Write => ReadDepth::Unseen,
+        Effect::Read => mapping
+            .depth
+            .as_ref()
+            .expect("a read stanza has a depth after load/merge — MissingDepth stanzas are dropped")
+            .resolve(input),
+    };
 
     // For TodoWrite-style tools: if no pattern_keys matched, try to extract the
     // first todo item's "content" field as a display label.
     let first_todo_content: Option<&str> = if pattern_val.is_none() {
-        input.get("todos")
+        input
+            .get("todos")
             .and_then(|v| v.as_array())
             .and_then(|arr| arr.first())
             .and_then(|t| t.get("content"))
@@ -683,9 +1768,7 @@ pub fn map_tool_call(
     //   1. Resolved pattern_keys value (e.g. "command", "file_mask")
     //   2. First todo content (TodoWrite)
     //   3. file_path_str fallback (e.g. list_dir with no pattern key)
-    let display_val: Option<&str> = pattern_val
-        .or(first_todo_content)
-        .or(file_path_str);
+    let display_val: Option<&str> = pattern_val.or(first_todo_content).or(file_path_str);
 
     let description = render_description(
         &mapping.description,
@@ -712,17 +1795,30 @@ pub fn map_tool_call(
     // metadata lookup and a full one.
     let (target_selectors, read_depth) = match selectors {
         Some(sel) => {
-            let deepest = sel.iter().map(|(_, d)| *d).max().unwrap_or(read_depth);
+            let deepest = sel.iter().map(|s| s.depth).max().unwrap_or(read_depth);
             (sel, deepest)
         }
         None => (Vec::new(), read_depth),
     };
 
-    // Extract target_lines.
+    // The lines a call asked for, half-open: an offset alone reads the
+    // tool's default number of lines, a limit alone starts at line 1, and
+    // neither is the whole file.
     let target_lines = mapping.target_lines.as_ref().and_then(|spec| {
-        let offset = input.get(&spec.offset_key)?.as_u64()? as u32;
-        let limit  = input.get(&spec.limit_key)?.as_u64()? as u32;
-        Some(offset..offset + limit)
+        let as_line = |key: &str| {
+            input
+                .get(key)
+                .and_then(Value::as_u64)
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+        };
+        let (offset, limit) = (as_line(&spec.offset_key), as_line(&spec.limit_key));
+        let limit = match (offset, limit) {
+            (None, None) => return None,
+            (_, Some(limit)) => limit,
+            (Some(_), None) => spec.default_limit?,
+        };
+        let start = offset.unwrap_or(1).max(1);
+        Some(start..start.saturating_add(limit))
     });
 
     // Intern agent_id once and share between agent_id and label fields.
@@ -739,6 +1835,26 @@ pub fn map_tool_call(
         target_lines,
         target_selectors,
         label: agent_arc,
+        result_depth: mapping
+            .result_selectors
+            .as_ref()
+            .and_then(|spec| spec.applies(input)),
+        file_reads: mapping
+            .command_reads
+            .as_ref()
+            .and_then(|key| input.get(key)?.as_str())
+            .map(super::command_reads::file_reads)
+            .unwrap_or_default(),
+        searches: mapping
+            .command_reads
+            .as_ref()
+            .and_then(|key| input.get(key)?.as_str())
+            .map(super::command_reads::searches)
+            .unwrap_or_default(),
+        // Set by `parse_jsonl_line`, which sees the tool_use block's id.
+        tool_use_id: None,
+        effect,
+        summary: None,
     })
 }
 
@@ -753,7 +1869,7 @@ fn short_path(path: &str) -> String {
     let before = &trimmed[..last_sep];
     let second = match before.rfind('/') {
         Some(p) => &before[p + 1..],
-        None    => before,
+        None => before,
     };
     format!("{second}/{last}")
 }
@@ -763,10 +1879,14 @@ pub struct LogTailer {
     files: Vec<PathBuf>,
     positions: std::collections::HashMap<PathBuf, u64>,
     mapper: Arc<dyn ToolCallMapper>,
-    /// Most-recent `compact_boundary` metadata, held until the matching
-    /// `isCompactSummary` line arrives (usually within the same poll, but kept
-    /// across polls in case the writer flushes them separately).
-    pending_metadata: Option<CompactionMetadata>,
+    /// Per-file line state (label, worktree remap, pending compaction),
+    /// set up when a file is first read and kept across polls.
+    feeds: std::collections::HashMap<PathBuf, LineFeed>,
+    /// The project, for recognizing a session run in a worktree of it.
+    project_root: Option<PathBuf>,
+    /// Write calls awaiting their results, kept across polls: a result can
+    /// land in a later poll than its call.
+    writes: ResultCorrelator,
 }
 
 impl LogTailer {
@@ -785,10 +1905,32 @@ impl LogTailer {
             let start = fs::metadata(f).map(|m| m.len()).unwrap_or(0);
             positions.insert(f.clone(), start);
         }
-        Self { files, positions, mapper, pending_metadata: None }
+        Self {
+            files,
+            positions,
+            mapper,
+            feeds: Default::default(),
+            project_root: None,
+            writes: ResultCorrelator::default(),
+        }
     }
 
-
+    /// Continue exactly where a batch replay stopped: each file from its
+    /// replay offset, still awaiting the replay's unresolved write calls.
+    pub fn resume(handoff: Handoff, mapper: Arc<dyn ToolCallMapper>) -> Self {
+        let mut writes = ResultCorrelator::default();
+        writes.note_calls(&handoff.awaiting);
+        let files = handoff.files.iter().map(|(f, _)| f.clone()).collect();
+        let positions = handoff.files.into_iter().collect();
+        Self {
+            files,
+            positions,
+            mapper,
+            feeds: Default::default(),
+            project_root: handoff.project_root,
+            writes,
+        }
+    }
 
     /// Add a new file to tail (e.g., a newly created agent log).
     pub fn add_file(&mut self, path: PathBuf) {
@@ -802,31 +1944,21 @@ impl LogTailer {
     /// Returns a `TailerOutput` with any new agent tool call events and a
     /// `session_cleared` flag set to `true` if a `/clear` command was detected.
     pub fn read_new_events(&mut self) -> TailerOutput {
-        let mut output = TailerOutput {
-            events: Vec::new(),
-            compactions: Vec::new(),
-            session_cleared: false,
-        };
-
+        let mut events: Vec<SessionEvent> = Vec::new();
         // Index-based loop so we can update `positions` via `get_mut` without
         // cloning the `PathBuf` key on every iteration.
         for i in 0..self.files.len() {
-            let pos = self.positions.get(&self.files[i]).copied().unwrap_or(0);
-            let current_len = fs::metadata(&self.files[i])
-                .map(|m| m.len())
-                .unwrap_or(0);
-
+            let path = &self.files[i];
+            let pos = self.positions.get(path).copied().unwrap_or(0);
+            let current_len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             if current_len <= pos {
                 continue;
             }
-
-            let default_id = self.files[i]
-                .file_stem()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-
-            if let Ok(file) = fs::File::open(&self.files[i]) {
+            let feed = self
+                .feeds
+                .entry(path.clone())
+                .or_insert_with(|| LineFeed::for_file(path, self.project_root.as_deref()));
+            if let Ok(file) = fs::File::open(path) {
                 use std::io::{Seek, SeekFrom};
                 let mut reader = BufReader::new(file);
                 if reader.seek(SeekFrom::Start(pos)).is_ok() {
@@ -834,34 +1966,45 @@ impl LogTailer {
                     loop {
                         line.clear();
                         match reader.read_line(&mut line) {
-                            Ok(0) => break,
-                            Ok(_) => match parse_jsonl_line(line.trim(), &default_id, &*self.mapper) {
-                                ParsedLine::Events(events) => output.events.extend(events),
-                                ParsedLine::SessionCleared => output.session_cleared = true,
-                                ParsedLine::CompactBoundary { metadata, .. } => {
-                                    self.pending_metadata = Some(metadata);
-                                }
-                                ParsedLine::Compacted { summary, timestamp } => {
-                                    output.compactions.push(TailedCompaction {
-                                        summary,
-                                        timestamp,
-                                        agent_id: Arc::from(default_id.as_str()),
-                                        metadata: self.pending_metadata.take(),
-                                    });
-                                }
-                                ParsedLine::Ignored => {}
-                            },
-                            Err(_) => break,
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => feed.feed(&line, &*self.mapper, &mut self.writes, &mut events),
                         }
                     }
                 }
             }
-
             // Insert rather than `get_mut`: an absent key must start tracking
             // from here, not silently keep re-reading from 0.
             self.positions.insert(self.files[i].clone(), current_len);
         }
 
+        let mut output = TailerOutput {
+            events: Vec::new(),
+            compactions: Vec::new(),
+            session_cleared: false,
+            writes: Vec::new(),
+            finished: Vec::new(),
+            prompts: Vec::new(),
+        };
+        for event in events {
+            match event {
+                SessionEvent::ToolCall(call) => output.events.push(call),
+                SessionEvent::Write(write) => output.writes.push(write),
+                SessionEvent::Compacted {
+                    summary,
+                    timestamp,
+                    agent_id,
+                    metadata,
+                } => output.compactions.push(TailedCompaction {
+                    summary,
+                    timestamp,
+                    agent_id,
+                    metadata,
+                }),
+                SessionEvent::SessionCleared => output.session_cleared = true,
+                SessionEvent::ToolFinished(f) => output.finished.push(f),
+                SessionEvent::Prompt(p) => output.prompts.push(p),
+            }
+        }
         output
     }
 }
@@ -904,6 +2047,25 @@ impl SessionIngester for ClaudeIngester {
     fn new_tailer(&self, files: Vec<PathBuf>) -> Box<dyn EventTailer> {
         Box::new(LogTailer::new(files, Arc::clone(&self.mapper)))
     }
+    fn replay_log_file(&self, path: &Path, project_root: &Path) -> FileReplay {
+        replay_log_file(path, &*self.mapper, Some(project_root))
+    }
+    fn resume_tailer(&self, handoff: Handoff) -> Box<dyn EventTailer> {
+        Box::new(LogTailer::resume(handoff, Arc::clone(&self.mapper)))
+    }
+    fn call_detail(&self, files: &[PathBuf], id: &str, kind: ContentKind) -> Option<CallDetail> {
+        call_detail(files, id, kind)
+    }
+    fn call_details(
+        &self,
+        files: &[PathBuf],
+        wanted: &HashMap<String, ContentKind>,
+    ) -> HashMap<String, CallDetail> {
+        call_details(files, wanted)
+    }
+    fn calling_agent(&self, log_dir: &Path, session_id: &str, args: &[String]) -> Caller {
+        calling_agent(log_dir, session_id, args)
+    }
 }
 
 impl EventTailer for LogTailer {
@@ -919,6 +2081,311 @@ impl EventTailer for LogTailer {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// A log of one call and its result, for `call_content`.
+    fn content_log(dir: &Path, name: &str, input: &str, result: &str, detail: &str) -> PathBuf {
+        let path = dir.join(name);
+        let call = format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_1","name":"Edit","input":{input}}}]}}}}"#
+        );
+        let other =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"unrelated"}]}}"#;
+        let res = format!(
+            r#"{{"type":"user","toolUseResult":{detail},"message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":{result}}}]}}}}"#
+        );
+        std::fs::write(&path, format!("{other}\n{call}\n{other}\n{res}\n")).unwrap();
+        path
+    }
+
+    /// `AMBITS_LOG=<file> AMBITS_ID=<tool_use_id> cargo test --lib -- --ignored
+    /// --nocapture content_from_a_real_log`: how long a lookup takes.
+    #[test]
+    #[ignore]
+    fn content_from_a_real_log() {
+        let (Ok(log), Ok(id)) = (std::env::var("AMBITS_LOG"), std::env::var("AMBITS_ID")) else {
+            return;
+        };
+        for kind in [ContentKind::Write, ContentKind::Read] {
+            let t = std::time::Instant::now();
+            let got = call_detail(&[PathBuf::from(&log)], &id, kind);
+            eprintln!(
+                "{kind:?}: {:?} in {:?}",
+                got.map(|c| c.rows(100).len()),
+                t.elapsed()
+            );
+        }
+    }
+
+    /// A `toolUseResult` that reads as a failure fails the call only when
+    /// the line holds that one result; `is_error` always does.
+    #[test]
+    fn one_rule_says_a_result_failed() {
+        let ok = serde_json::json!({"type": "tool_result", "tool_use_id": "a"});
+        let err = serde_json::json!({"type": "tool_result", "tool_use_id": "a", "is_error": true});
+        let text = serde_json::json!("Error: String to replace not found");
+        assert!(result_failed(&ok, Some(&text), true));
+        assert!(
+            !result_failed(&ok, Some(&text), false),
+            "whose message it is, is unknown"
+        );
+        let wrapped = serde_json::json!(
+            "<tool_use_error>String to replace not found in file.</tool_use_error>"
+        );
+        assert!(result_failed(&ok, Some(&wrapped), true));
+        assert!(!result_failed(
+            &ok,
+            Some(&serde_json::json!({"type": "text"})),
+            true
+        ));
+        assert!(result_failed(&err, None, false));
+    }
+
+    /// As Claude Code logs it: a plain-text result with no `is_error`.
+    #[test]
+    fn structured_output_that_succeeded_is_not_a_failure() {
+        let ok = serde_json::json!({"type": "tool_result", "tool_use_id": "a", "content": "Structured output provided successfully"});
+        assert!(!result_failed(
+            &ok,
+            Some(&serde_json::json!(
+                "Structured output provided successfully"
+            )),
+            true
+        ));
+        let rejected =
+            serde_json::json!({"type": "tool_result", "tool_use_id": "a", "is_error": true});
+        let schema = serde_json::json!("Error: Output does not match required schema: /root_cause: must NOT have more than 2500 characters");
+        assert!(
+            result_failed(&rejected, Some(&schema), true),
+            "a schema rejection still fails"
+        );
+    }
+
+    #[test]
+    fn an_edit_shows_its_own_patch() {
+        use super::super::content::{DiffLine, Hunk as Change};
+        let dir = tempfile::tempdir().unwrap();
+        let log = content_log(
+            dir.path(),
+            "a.jsonl",
+            r#"{"file_path":"/p/a.rs","old_string":"x","new_string":"y"}"#,
+            r#""ok""#,
+            r#"{"oldString":"x","newString":"y","structuredPatch":[{"oldStart":3,"oldLines":2,"newStart":3,"newLines":2,"lines":[" a","-x","+y","\\ No newline at end of file"]}]}"#,
+        );
+        let got = call_detail(&[log], "toolu_1", ContentKind::Write)
+            .unwrap()
+            .content
+            .unwrap();
+        let hunk = Change {
+            old_start: Some(3),
+            new_start: Some(3),
+            lines: vec![
+                DiffLine::Same("a".into()),
+                DiffLine::Removed("x".into()),
+                DiffLine::Added("y".into()),
+            ],
+        };
+        assert_eq!(
+            got,
+            CallContent::Change {
+                hunks: vec![hunk],
+                exact: true,
+                cut: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_failed_edit_shows_what_it_tried() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = content_log(
+            dir.path(),
+            "a.jsonl",
+            r#"{"file_path":"/p/a.rs","old_string":"x\ny","new_string":"z"}"#,
+            r#""String to replace not found""#,
+            r#""Error: String to replace not found""#,
+        );
+        let Some(CallContent::Change { hunks, exact, .. }) =
+            call_detail(&[log], "toolu_1", ContentKind::Write)
+                .unwrap()
+                .content
+        else {
+            panic!("a change")
+        };
+        assert!(!exact);
+        assert_eq!(hunks[0].header(), "@@ -2 +1 lines @@");
+    }
+
+    /// A line answering two calls carries one `toolUseResult`, which cannot
+    /// be told apart: neither call shows it as its own.
+    #[test]
+    fn a_line_answering_two_calls_lends_neither_the_others_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jsonl");
+        let call = |id: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Read","input":{{"file_path":"/p/{id}.rs"}}}}]}}}}"#
+            )
+        };
+        let both = r#"{"type":"user","toolUseResult":{"type":"text","file":{"filePath":"/p/b.rs","content":"B's text","startLine":1}},"message":{"content":[{"type":"tool_result","tool_use_id":"a","content":"1\tA's text"},{"type":"tool_result","tool_use_id":"b","content":"1\tB's text"}]}}"#;
+        std::fs::write(&path, format!("{}\n{}\n{both}\n", call("a"), call("b"))).unwrap();
+        let got = call_detail(&[path], "a", ContentKind::Read)
+            .unwrap()
+            .content;
+        assert_eq!(
+            got,
+            Some(CallContent::Output {
+                lines: vec!["1\tA's text".into()],
+                cut: 0
+            }),
+            "its own result, not b's detail"
+        );
+    }
+
+    #[test]
+    fn a_read_shows_the_text_it_saw_from_its_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = content_log(
+            dir.path(),
+            "a.jsonl",
+            r#"{"file_path":"/p/a.rs"}"#,
+            r#""40\tfn a() {}""#,
+            r#"{"type":"text","file":{"filePath":"/p/a.rs","content":"fn a() {}\n}","startLine":40}}"#,
+        );
+        let got = call_detail(&[log], "toolu_1", ContentKind::Read)
+            .unwrap()
+            .content
+            .unwrap();
+        assert_eq!(
+            got,
+            CallContent::Read {
+                start: 40,
+                lines: vec!["fn a() {}".into(), "}".into()],
+                cut: 0
+            }
+        );
+        assert!(
+            call_detail(&[dir.path().join("a.jsonl")], "toolu_2", ContentKind::Read).is_none(),
+            "another call's"
+        );
+    }
+
+    #[test]
+    fn a_command_shows_its_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = content_log(
+            dir.path(),
+            "a.jsonl",
+            r#"{"command":"ls"}"#,
+            r#"[{"type":"text","text":"a\nb"}]"#,
+            "null",
+        );
+        let got = call_detail(&[log], "toolu_1", ContentKind::Other).unwrap();
+        assert_eq!(
+            got.content,
+            Some(CallContent::Output {
+                lines: vec!["a".into(), "b".into()],
+                cut: 0
+            })
+        );
+        assert_eq!(
+            (got.args[0].key.as_str(), got.args[0].value.as_str()),
+            ("command", "ls"),
+            "with its arguments"
+        );
+    }
+
+    /// A Read's range follows Claude Code's defaults for the half it leaves out.
+    #[test]
+    fn a_read_names_the_lines_it_returns() {
+        let config = ToolMappingConfig::builtin().expect("builtin config");
+        let lines = |input: serde_json::Value| {
+            map_tool_call(&config, "Read", &input, "a", "t")
+                .unwrap()
+                .target_lines
+        };
+        assert_eq!(
+            lines(serde_json::json!({"file_path": "/p/a.rs", "offset": 95, "limit": 60})),
+            Some(95..155)
+        );
+        assert_eq!(
+            lines(serde_json::json!({"file_path": "/p/a.rs", "offset": 300})),
+            Some(300..2300),
+            "an offset alone: 2000 lines"
+        );
+        assert_eq!(
+            lines(serde_json::json!({"file_path": "/p/a.rs", "limit": 40})),
+            Some(1..41),
+            "a limit alone: from line 1"
+        );
+        assert_eq!(
+            lines(serde_json::json!({"file_path": "/p/a.rs"})),
+            None,
+            "neither: the whole file"
+        );
+    }
+
+    /// One pass for many calls finds what one lookup per call does.
+    #[test]
+    fn call_details_agrees_with_call_detail_for_every_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let call = |id: &str, name: &str, input: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"{name}","input":{input}}}]}}}}"#
+            )
+        };
+        let result = |id: &str, content: &str, detail: &str| {
+            format!(
+                r#"{{"type":"user","toolUseResult":{detail},"message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","content":{content}}}]}}}}"#
+            )
+        };
+        let both = r#"{"type":"user","toolUseResult":{"type":"text","file":{"filePath":"/p/b.rs","content":"B","startLine":1}},"message":{"content":[{"type":"tool_result","tool_use_id":"a","content":"1\tA"},{"type":"tool_result","tool_use_id":"b","content":"1\tB"}]}}"#;
+        let lines = [
+            call(
+                "e",
+                "Edit",
+                r#"{"file_path":"/p/a.rs","old_string":"x","new_string":"y"}"#,
+            ),
+            result(
+                "e",
+                r#""ok""#,
+                r#"{"structuredPatch":[{"oldStart":3,"oldLines":1,"newStart":3,"newLines":1,"lines":["-x","+y"]}]}"#,
+            ),
+            call("r", "Read", r#"{"file_path":"/p/a.rs"}"#),
+            result(
+                "r",
+                r#""40\tfn a() {}""#,
+                r#"{"type":"text","file":{"filePath":"/p/a.rs","content":"fn a() {}","startLine":40}}"#,
+            ),
+            call("c", "Bash", r#"{"command":"ls"}"#),
+            result("c", r#"[{"type":"text","text":"a\nb"}]"#, "null"),
+            call("a", "Read", r#"{"file_path":"/p/a.rs"}"#),
+            call("b", "Read", r#"{"file_path":"/p/b.rs"}"#),
+            both.to_string(),
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let wanted: HashMap<String, ContentKind> = [
+            ("e", ContentKind::Write),
+            ("r", ContentKind::Read),
+            ("c", ContentKind::Other),
+            ("a", ContentKind::Read),
+            ("b", ContentKind::Read),
+            ("absent", ContentKind::Read),
+        ]
+        .into_iter()
+        .map(|(id, k)| (id.to_string(), k))
+        .collect();
+        let files = [path];
+        let batch = call_details(&files, &wanted);
+        for (id, kind) in &wanted {
+            assert_eq!(
+                batch.get(id),
+                call_detail(&files, id, *kind).as_ref(),
+                "{id}"
+            );
+        }
+        assert!(!batch.contains_key("absent"));
+    }
 
     /// Convenience: unwrap `ParsedLine::Events` for tests that don't care about clear detection.
     fn parse_events(line: &str, agent_id: &str) -> Vec<AgentToolCall> {
@@ -990,17 +2457,52 @@ mod tests {
         fs::write(&f2, r#"{"type":"user","sessionId":"bbb"}"#).unwrap();
 
         // Also create an agent file that should NOT be picked.
-        fs::write(
-            tmp.path().join("agent-abc123.jsonl"),
-            r#"{"type":"user"}"#,
+        fs::write(tmp.path().join("agent-abc123.jsonl"), r#"{"type":"user"}"#).unwrap();
+
+        // Also create an empty UUID file that should be skipped.
+        fs::File::create(
+            tmp.path()
+                .join("00000000-0000-0000-0000-000000000000.jsonl"),
         )
         .unwrap();
 
-        // Also create an empty UUID file that should be skipped.
-        fs::File::create(tmp.path().join("00000000-0000-0000-0000-000000000000.jsonl")).unwrap();
-
         let result = find_session_from_files(tmp.path());
         assert_eq!(result, Some(uuid2.to_string()));
+    }
+
+    /// A finished session that Claude Code later touched — bookkeeping
+    /// appended, no timestamps, a newer modification time — is not the
+    /// latest: the session that last saw something happen is.
+    #[test]
+    fn the_latest_session_is_the_one_that_last_saw_something_happen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = "11111111-2222-3333-4444-555555555555";
+        let dead = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        fs::write(
+            tmp.path().join(format!("{live}.jsonl")),
+            r#"{"type":"user","timestamp":"2026-09-30T21:00:00Z"}"#.to_string() + "\n",
+        )
+        .unwrap();
+        let dead_log = [
+            r#"{"type":"user","timestamp":"2026-09-28T14:50:00Z"}"#,
+            r#"{"type":"continued-in","timestamp":"2026-09-28T14:54:49Z","continuedInSessionId":"11111111-2222-3333-4444-555555555555"}"#,
+            r#"{"type":"ai-title","title":"x"}"#,
+            r#"{"type":"cost-state","totalCostUSD":1.0}"#,
+        ];
+        fs::write(
+            tmp.path().join(format!("{dead}.jsonl")),
+            dead_log.join("\n") + "\n",
+        )
+        .unwrap();
+        // Touched last, as Claude Code does a finished session.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        fs::File::options()
+            .append(true)
+            .open(tmp.path().join(format!("{dead}.jsonl")))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_eq!(find_session_from_files(tmp.path()), Some(live.to_string()));
     }
 
     #[test]
@@ -1045,7 +2547,11 @@ mod tests {
 
         // Agent file that belongs to a different session.
         let agent_other = tmp.path().join("agent-other01.jsonl");
-        fs::write(&agent_other, r#"{"type":"user","sessionId":"different-session"}"#).unwrap();
+        fs::write(
+            &agent_other,
+            r#"{"type":"user","sessionId":"different-session"}"#,
+        )
+        .unwrap();
 
         let files = session_log_files(tmp.path(), session);
         assert!(files.contains(&main_file));
@@ -1059,17 +2565,36 @@ mod tests {
 
     #[test]
     fn map_edit_tool() {
-        let line = jsonl_assistant("mcp__acp__Edit", r#"{"file_path":"/src/app.rs","old_string":"a","new_string":"b"}"#);
+        let line = jsonl_assistant(
+            "mcp__acp__Edit",
+            r#"{"file_path":"/src/app.rs","old_string":"a","new_string":"b"}"#,
+        );
         let events = parse_events(&line, "d");
-        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
-        assert_eq!(events[0].file_path.as_ref().unwrap(), &PathBuf::from("/src/app.rs"));
+        assert_eq!(
+            events[0].read_depth,
+            ReadDepth::Unseen,
+            "a write grants no read credit (D9)"
+        );
+        assert_eq!(events[0].effect, Effect::Write);
+        assert_eq!(
+            events[0].file_path.as_ref().unwrap(),
+            &PathBuf::from("/src/app.rs")
+        );
     }
 
     #[test]
     fn map_write_tool() {
-        let line = jsonl_assistant("mcp__acp__Write", r#"{"file_path":"/src/new.rs","content":"fn main(){}"}"#);
+        let line = jsonl_assistant(
+            "mcp__acp__Write",
+            r#"{"file_path":"/src/new.rs","content":"fn main(){}"}"#,
+        );
         let events = parse_events(&line, "d");
-        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+        assert_eq!(
+            events[0].read_depth,
+            ReadDepth::Unseen,
+            "a write grants no read credit (D9)"
+        );
+        assert_eq!(events[0].effect, Effect::Write);
     }
 
     #[test]
@@ -1086,7 +2611,10 @@ mod tests {
 
     #[test]
     fn map_find_file() {
-        let line = jsonl_assistant("mcp__serena__find_file", r#"{"file_mask":"*.rs","relative_path":"src"}"#);
+        let line = jsonl_assistant(
+            "mcp__serena__find_file",
+            r#"{"file_mask":"*.rs","relative_path":"src"}"#,
+        );
         let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::NameOnly);
         assert!(
@@ -1099,7 +2627,10 @@ mod tests {
     #[test]
     fn map_list_dir_shows_path_not_question_mark() {
         // list_dir has no pattern key — description should fall back to the path.
-        let line = jsonl_assistant("mcp__serena__list_dir", r#"{"relative_path":"src/ingest","recursive":false}"#);
+        let line = jsonl_assistant(
+            "mcp__serena__list_dir",
+            r#"{"relative_path":"src/ingest","recursive":false}"#,
+        );
         let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::NameOnly);
         assert!(
@@ -1116,15 +2647,24 @@ mod tests {
 
     #[test]
     fn map_symbols_overview() {
-        let line = jsonl_assistant("mcp__serena__get_symbols_overview", r#"{"relative_path":"src/app.rs"}"#);
+        let line = jsonl_assistant(
+            "mcp__serena__get_symbols_overview",
+            r#"{"relative_path":"src/app.rs"}"#,
+        );
         let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::Overview);
-        assert_eq!(events[0].file_path.as_ref().unwrap(), &PathBuf::from("src/app.rs"));
+        assert_eq!(
+            events[0].file_path.as_ref().unwrap(),
+            &PathBuf::from("src/app.rs")
+        );
     }
 
     #[test]
     fn map_find_symbol_no_body() {
-        let line = jsonl_assistant("mcp__serena__find_symbol", r#"{"name_path_pattern":"App","relative_path":"src/app.rs","include_body":false}"#);
+        let line = jsonl_assistant(
+            "mcp__serena__find_symbol",
+            r#"{"name_path_pattern":"App","relative_path":"src/app.rs","include_body":false}"#,
+        );
         let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::Signature);
         assert_eq!(events[0].target_symbol.as_deref(), Some("App"));
@@ -1132,7 +2672,10 @@ mod tests {
 
     #[test]
     fn map_find_symbol_with_body() {
-        let line = jsonl_assistant("mcp__serena__find_symbol", r#"{"name_path_pattern":"App/new","relative_path":"src/app.rs","include_body":true}"#);
+        let line = jsonl_assistant(
+            "mcp__serena__find_symbol",
+            r#"{"name_path_pattern":"App/new","relative_path":"src/app.rs","include_body":true}"#,
+        );
         let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::FullBody);
         assert_eq!(events[0].target_symbol.as_deref(), Some("App/new"));
@@ -1140,7 +2683,10 @@ mod tests {
 
     #[test]
     fn map_find_referencing() {
-        let line = jsonl_assistant("mcp__serena__find_referencing_symbols", r#"{"name_path":"ProjectTree","relative_path":"src/symbols/mod.rs"}"#);
+        let line = jsonl_assistant(
+            "mcp__serena__find_referencing_symbols",
+            r#"{"name_path":"ProjectTree","relative_path":"src/symbols/mod.rs"}"#,
+        );
         let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::Overview);
         assert_eq!(events[0].target_symbol.as_deref(), Some("ProjectTree"));
@@ -1148,34 +2694,69 @@ mod tests {
 
     #[test]
     fn map_replace_symbol() {
-        let line = jsonl_assistant("mcp__serena__replace_symbol_body", r#"{"name_path":"App/new","relative_path":"src/app.rs","body":"pub fn new() {}"}"#);
+        let line = jsonl_assistant(
+            "mcp__serena__replace_symbol_body",
+            r#"{"name_path":"App/new","relative_path":"src/app.rs","body":"pub fn new() {}"}"#,
+        );
         let events = parse_events(&line, "d");
-        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+        assert_eq!(
+            events[0].read_depth,
+            ReadDepth::Unseen,
+            "a write grants no read credit (D9)"
+        );
+        assert_eq!(events[0].effect, Effect::Write);
         assert_eq!(events[0].target_symbol.as_deref(), Some("App/new"));
     }
 
     #[test]
     fn map_insert_after() {
-        let line = jsonl_assistant("mcp__serena__insert_after_symbol", r#"{"name_path":"App","relative_path":"src/app.rs","body":"fn foo() {}"}"#);
+        let line = jsonl_assistant(
+            "mcp__serena__insert_after_symbol",
+            r#"{"name_path":"App","relative_path":"src/app.rs","body":"fn foo() {}"}"#,
+        );
         let events = parse_events(&line, "d");
-        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+        assert_eq!(
+            events[0].read_depth,
+            ReadDepth::Unseen,
+            "a write grants no read credit (D9)"
+        );
+        assert_eq!(events[0].effect, Effect::Write);
         assert_eq!(events[0].target_symbol.as_deref(), Some("App"));
     }
 
     #[test]
     fn map_rename_symbol() {
-        let line = jsonl_assistant("mcp__serena__rename_symbol", r#"{"name_path":"old_fn","relative_path":"src/app.rs","new_name":"new_fn"}"#);
+        let line = jsonl_assistant(
+            "mcp__serena__rename_symbol",
+            r#"{"name_path":"old_fn","relative_path":"src/app.rs","new_name":"new_fn"}"#,
+        );
         let events = parse_events(&line, "d");
-        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
+        assert_eq!(
+            events[0].read_depth,
+            ReadDepth::Unseen,
+            "a write grants no read credit (D9)"
+        );
+        assert_eq!(events[0].effect, Effect::Write);
         assert_eq!(events[0].target_symbol.as_deref(), Some("old_fn"));
     }
 
     #[test]
     fn map_notebook_edit() {
-        let line = jsonl_assistant("NotebookEdit", r#"{"notebook_path":"/nb/analysis.ipynb","new_source":"print(1)"}"#);
+        let line = jsonl_assistant(
+            "NotebookEdit",
+            r#"{"notebook_path":"/nb/analysis.ipynb","new_source":"print(1)"}"#,
+        );
         let events = parse_events(&line, "d");
-        assert_eq!(events[0].read_depth, ReadDepth::FullBody);
-        assert_eq!(events[0].file_path.as_ref().unwrap(), &PathBuf::from("/nb/analysis.ipynb"));
+        assert_eq!(
+            events[0].read_depth,
+            ReadDepth::Unseen,
+            "a write grants no read credit (D9)"
+        );
+        assert_eq!(events[0].effect, Effect::Write);
+        assert_eq!(
+            events[0].file_path.as_ref().unwrap(),
+            &PathBuf::from("/nb/analysis.ipynb")
+        );
     }
 
     #[test]
@@ -1188,7 +2769,10 @@ mod tests {
 
     #[test]
     fn read_with_offset_limit() {
-        let line = jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/src/main.rs","offset":10,"limit":20}"#);
+        let line = jsonl_assistant(
+            "mcp__acp__Read",
+            r#"{"file_path":"/src/main.rs","offset":10,"limit":20}"#,
+        );
         let events = parse_events(&line, "d");
         assert_eq!(events[0].read_depth, ReadDepth::FullBody);
         assert_eq!(events[0].target_lines, Some(10..30));
@@ -1215,14 +2799,31 @@ mod tests {
         let log = tmp.path().join("test.jsonl");
         let mut f = fs::File::create(&log).unwrap();
         writeln!(f, "{}", jsonl_user_msg()).unwrap();
-        writeln!(f, "{}", jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/a.rs"}"#)).unwrap();
+        writeln!(
+            f,
+            "{}",
+            jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/a.rs"}"#)
+        )
+        .unwrap();
         writeln!(f, "{}", jsonl_user_msg()).unwrap();
         writeln!(f, "{}", jsonl_assistant("Grep", r#"{"pattern":"x"}"#)).unwrap();
         drop(f);
 
         let config = ToolMappingConfig::builtin().expect("builtin config");
         let events = parse_log_file(&log, &config);
-        assert_eq!(events.len(), 2);
+        let calls = events
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::ToolCall(_)))
+            .count();
+        let prompts = events
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::Prompt(_)))
+            .count();
+        assert_eq!(
+            (calls, prompts),
+            (2, 2),
+            "the user's messages are prompts, not calls"
+        );
     }
 
     #[test]
@@ -1273,8 +2874,11 @@ mod tests {
     fn extract_label_main_session_file() {
         // Main session files don't have "agent-" prefix.
         let tmp = tempfile::tempdir().unwrap();
-        let log = tmp.path().join("abcd1234-abcd-abcd-abcd-abcd12345678.jsonl");
-        let content = r#"{"type":"user","message":{"role":"user","content":"Hello"},"sessionId":"abcd1234"}"#;
+        let log = tmp
+            .path()
+            .join("abcd1234-abcd-abcd-abcd-abcd12345678.jsonl");
+        let content =
+            r#"{"type":"user","message":{"role":"user","content":"Hello"},"sessionId":"abcd1234"}"#;
         fs::write(&log, content).unwrap();
 
         let label = extract_agent_label(&log);
@@ -1287,9 +2891,14 @@ mod tests {
         let log = tmp.path().join("agent-test123.jsonl");
         let mut f = fs::File::create(&log).unwrap();
         // First line: user message with task prompt.
-        writeln!(f, r#"{{"agentId":"test123","type":"user","message":{{"role":"user","content":"Check the coverage"}},"sessionId":"sess-1","timestamp":"2025-01-01T00:00:00Z"}}"#).unwrap();
+        writeln!(f, r#"{{"agentId":"test123","isSidechain":true,"type":"user","message":{{"role":"user","content":"Check the coverage"}},"sessionId":"sess-1","timestamp":"2025-01-01T00:00:00Z"}}"#).unwrap();
         // Second line: assistant with a tool call.
-        writeln!(f, "{}", jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/a.rs"}"#)).unwrap();
+        writeln!(
+            f,
+            "{}",
+            jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/a.rs"}"#)
+        )
+        .unwrap();
         drop(f);
 
         let config = ToolMappingConfig::builtin().unwrap();
@@ -1336,7 +2945,10 @@ mod tests {
         // Exact JSONL shape observed in the wild (empty command-args).
         let line = r#"{"type":"user","sessionId":"abc","message":{"role":"user","content":"<command-name>/clear</command-name>\n            <command-message>clear</command-message>\n            <command-args></command-args>"}}"#;
         let config = ToolMappingConfig::builtin().expect("builtin config");
-        assert!(matches!(parse_jsonl_line(line, "d", &config), ParsedLine::SessionCleared));
+        assert!(matches!(
+            parse_jsonl_line(line, "d", &config),
+            ParsedLine::SessionCleared
+        ));
     }
 
     #[test]
@@ -1344,15 +2956,85 @@ mod tests {
         // /clear invoked with explicit args (as seen in some sessions: command-args=clear).
         let line = r#"{"type":"user","sessionId":"abc","message":{"role":"user","content":"<command-name>/clear</command-name>\n            <command-message>clear</command-message>\n            <command-args>clear</command-args>"}}"#;
         let config = ToolMappingConfig::builtin().expect("builtin config");
-        assert!(matches!(parse_jsonl_line(line, "d", &config), ParsedLine::SessionCleared));
+        assert!(matches!(
+            parse_jsonl_line(line, "d", &config),
+            ParsedLine::SessionCleared
+        ));
     }
 
     #[test]
-    fn parse_compact_command_returns_ignored() {
-        // /compact must NOT trigger SessionCleared.
+    fn parse_compact_command_is_a_prompt_not_a_clear() {
+        // /compact must NOT trigger SessionCleared; the user typed it.
         let line = r#"{"type":"user","sessionId":"abc","message":{"role":"user","content":"<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>"}}"#;
         let config = ToolMappingConfig::builtin().expect("builtin config");
-        assert!(matches!(parse_jsonl_line(line, "d", &config), ParsedLine::Ignored));
+        assert!(
+            matches!(parse_jsonl_line(line, "d", &config), ParsedLine::Prompt { text, .. } if text == "/compact")
+        );
+    }
+
+    /// What the user typed is a prompt; what Claude Code injected, a
+    /// subagent's opening prompt, and meta text are not.
+    #[test]
+    fn only_what_the_user_typed_is_a_prompt() {
+        let config = ToolMappingConfig::builtin().expect("builtin config");
+        let prompt =
+            |line: serde_json::Value| match parse_jsonl_line(&line.to_string(), "d", &config) {
+                ParsedLine::Prompt { text, agent, .. } => {
+                    Some((text, agent.map(|a| a.to_string())))
+                }
+                _ => None,
+            };
+        let user = |content: serde_json::Value, extra: serde_json::Value| {
+            let mut line = serde_json::json!({"type": "user", "sessionId": "s1", "timestamp": "2026-09-27T10:00:00Z", "message": {"role": "user", "content": content}});
+            line.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            line
+        };
+        use serde_json::json;
+        assert_eq!(
+            prompt(user(
+                json!("fix the bug"),
+                json!({"origin": {"kind": "human"}})
+            )),
+            Some(("fix the bug".into(), Some("s1".into())))
+        );
+        assert_eq!(
+            prompt(user(
+                json!([{"type": "text", "text": "with an image"}]),
+                json!({})
+            ))
+            .map(|p| p.0),
+            Some("with an image".into())
+        );
+        assert_eq!(
+            prompt(user(
+                json!("<task-notification>…"),
+                json!({"origin": {"kind": "task-notification"}})
+            )),
+            None
+        );
+        assert_eq!(
+            prompt(user(json!("<task-notification>…"), json!({}))),
+            None,
+            "no origin: a tag is injected"
+        );
+        assert_eq!(
+            prompt(user(json!("go"), json!({"isSidechain": true}))),
+            None,
+            "a subagent's prompt"
+        );
+        assert_eq!(
+            prompt(user(json!("skill text"), json!({"isMeta": true}))),
+            None
+        );
+        assert_eq!(
+            prompt(user(
+                json!([{"type": "text", "text": "[Request interrupted by user]"}]),
+                json!({})
+            )),
+            None
+        );
     }
 
     #[test]
@@ -1362,7 +3044,8 @@ mod tests {
 
         // Create an empty file first so the tailer starts at position 0.
         fs::write(&log, "").unwrap();
-        let config: Arc<dyn ToolCallMapper> = Arc::new(ToolMappingConfig::builtin().expect("builtin config"));
+        let config: Arc<dyn ToolCallMapper> =
+            Arc::new(ToolMappingConfig::builtin().expect("builtin config"));
         let mut tailer = LogTailer::new(vec![log.clone()], config);
 
         // Now append the /clear line as "new" content.
@@ -1381,7 +3064,8 @@ mod tests {
 
         // Create an empty file first so the tailer starts at position 0.
         fs::write(&log, "").unwrap();
-        let config: Arc<dyn ToolCallMapper> = Arc::new(ToolMappingConfig::builtin().expect("builtin config"));
+        let config: Arc<dyn ToolCallMapper> =
+            Arc::new(ToolMappingConfig::builtin().expect("builtin config"));
         let mut tailer = LogTailer::new(vec![log.clone()], config);
 
         // Append a /clear line followed by a tool use as "new" content.
@@ -1436,7 +3120,10 @@ description  = "CustomRead {custom_file}"
         // The old key "file_path" should now be unknown → None (path_required = true by default).
         let old_input = serde_json::json!({ "file_path": "/foo/bar.rs" });
         let missing = map_tool_call(&merged, "Read", &old_input, "agent1", "2025-01-01");
-        assert!(missing.is_none(), "Read with old key should return None after override");
+        assert!(
+            missing.is_none(),
+            "Read with old key should return None after override"
+        );
     }
 
     /// A merged config with a novel user tool should dispatch it end-to-end.
@@ -1479,24 +3166,36 @@ description  = "UserTool {target}"
     fn extract_slug_reads_from_first_record() {
         let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join("session.jsonl");
-        fs::write(&log, r#"{"type":"user","slug":"crispy-crunching-nova","sessionId":"abc"}"#).unwrap();
-        assert_eq!(extract_session_slug(&log), Some("crispy-crunching-nova".into()));
+        fs::write(
+            &log,
+            r#"{"type":"user","slug":"crispy-crunching-nova","sessionId":"abc"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            extract_session_slug(&log),
+            Some("crispy-crunching-nova".into())
+        );
     }
 
     #[test]
     fn extract_slug_skips_records_without_slug() {
         let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join("session.jsonl");
-        fs::write(&log,
+        fs::write(
+            &log,
             "{\"type\":\"queue-operation\",\"sessionId\":\"abc\"}\n\
-             {\"type\":\"user\",\"slug\":\"amber-dancing-fox\",\"sessionId\":\"abc\"}\n"
-        ).unwrap();
+             {\"type\":\"user\",\"slug\":\"amber-dancing-fox\",\"sessionId\":\"abc\"}\n",
+        )
+        .unwrap();
         assert_eq!(extract_session_slug(&log), Some("amber-dancing-fox".into()));
     }
 
     #[test]
     fn extract_slug_returns_none_for_missing_file() {
-        assert_eq!(extract_session_slug(Path::new("/nonexistent/session.jsonl")), None);
+        assert_eq!(
+            extract_session_slug(Path::new("/nonexistent/session.jsonl")),
+            None
+        );
     }
 
     #[test]
@@ -1511,15 +3210,54 @@ description  = "UserTool {target}"
     fn extract_cwd_reads_first_record() {
         let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join("agent.jsonl");
-        fs::write(&log, r#"{"type":"user","cwd":"/tmp/worktree-xyz","sessionId":"s1"}"#).unwrap();
+        fs::write(
+            &log,
+            r#"{"type":"user","cwd":"/tmp/worktree-xyz","sessionId":"s1"}"#,
+        )
+        .unwrap();
         assert_eq!(extract_cwd(&log), Some(PathBuf::from("/tmp/worktree-xyz")));
+    }
+
+    fn feed_remap(cwd: &str, project: &str) -> Option<(PathBuf, PathBuf)> {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("s.jsonl");
+        fs::write(
+            &log,
+            format!(r#"{{"type":"user","cwd":"{cwd}","sessionId":"s1"}}"#),
+        )
+        .unwrap();
+        LineFeed::for_file(&log, Some(Path::new(project))).remap
+    }
+
+    #[test]
+    fn a_project_inside_the_sessions_cwd_is_not_remapped() {
+        assert_eq!(
+            feed_remap("/workspace/run-1", "/workspace/run-1/repo"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_worktree_elsewhere_is_remapped_to_the_project() {
+        assert_eq!(
+            feed_remap("/tmp/worktree-abc", "/home/user/myproject"),
+            Some((
+                PathBuf::from("/tmp/worktree-abc"),
+                PathBuf::from("/home/user/myproject")
+            )),
+        );
+    }
+
+    #[test]
+    fn a_worktree_nested_in_the_project_is_still_remapped() {
+        assert!(feed_remap("/p/.claude/worktrees/x", "/p").is_some());
     }
 
     #[test]
     fn remap_path_strips_worktree_prefix() {
         let worktree = PathBuf::from("/tmp/worktree-abc");
-        let project  = PathBuf::from("/home/user/myproject");
-        let file     = PathBuf::from("/tmp/worktree-abc/src/main.rs");
+        let project = PathBuf::from("/home/user/myproject");
+        let file = PathBuf::from("/tmp/worktree-abc/src/main.rs");
         assert_eq!(
             remap_path(&file, &worktree, &project),
             PathBuf::from("/home/user/myproject/src/main.rs"),
@@ -1529,8 +3267,8 @@ description  = "UserTool {target}"
     #[test]
     fn remap_path_unchanged_when_no_prefix_match() {
         let worktree = PathBuf::from("/tmp/worktree-abc");
-        let project  = PathBuf::from("/home/user/myproject");
-        let file     = PathBuf::from("/home/user/myproject/src/main.rs");
+        let project = PathBuf::from("/home/user/myproject");
+        let file = PathBuf::from("/home/user/myproject/src/main.rs");
         assert_eq!(remap_path(&file, &worktree, &project), file);
     }
 
@@ -1555,20 +3293,51 @@ description  = "UserTool {target}"
     }
 
     #[test]
+    fn session_log_files_finds_agents_nested_under_workflows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = "abcd1234-abcd-abcd-abcd-abcd12345678";
+        let nested = tmp.path().join(session).join("subagents/workflows/run-1");
+        fs::create_dir_all(&nested).unwrap();
+        let agent = nested.join("agent-w1.jsonl");
+        fs::write(&agent, r#"{"type":"user"}"#).unwrap();
+        fs::write(nested.join("agent-w1.meta.json"), "{}").unwrap();
+        let main_file = tmp.path().join(format!("{session}.jsonl"));
+        fs::write(&main_file, r#"{"type":"user"}"#).unwrap();
+
+        assert_eq!(
+            session_log_files(tmp.path(), session),
+            vec![agent, main_file]
+        );
+    }
+
+    #[test]
     fn parse_log_file_remaps_worktree_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let worktree = tmp.path().join("worktree");
-        let project  = tmp.path().join("project");
+        let project = tmp.path().join("project");
         fs::create_dir_all(&worktree).unwrap();
         fs::create_dir_all(&project).unwrap();
 
         let log = worktree.join("agent.jsonl");
         let mut f = fs::File::create(&log).unwrap();
-        writeln!(f, r#"{{"type":"user","cwd":"{}","sessionId":"s1"}}"#,
-            worktree.to_str().unwrap()).unwrap();
-        writeln!(f, "{}", jsonl_assistant("mcp__acp__Read", &format!(
-            r#"{{"file_path":"{}/src/main.rs"}}"#, worktree.to_str().unwrap()
-        ))).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","cwd":"{}","sessionId":"s1"}}"#,
+            worktree.to_str().unwrap()
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            jsonl_assistant(
+                "mcp__acp__Read",
+                &format!(
+                    r#"{{"file_path":"{}/src/main.rs"}}"#,
+                    worktree.to_str().unwrap()
+                )
+            )
+        )
+        .unwrap();
         drop(f);
 
         let config = ToolMappingConfig::builtin().unwrap();
@@ -1589,11 +3358,24 @@ description  = "UserTool {target}"
 
         let log = project.join("session.jsonl");
         let mut f = fs::File::create(&log).unwrap();
-        writeln!(f, r#"{{"type":"user","cwd":"{}","sessionId":"s1"}}"#,
-            project.to_str().unwrap()).unwrap();
-        writeln!(f, "{}", jsonl_assistant("mcp__acp__Read", &format!(
-            r#"{{"file_path":"{}/src/main.rs"}}"#, project.to_str().unwrap()
-        ))).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","cwd":"{}","sessionId":"s1"}}"#,
+            project.to_str().unwrap()
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            jsonl_assistant(
+                "mcp__acp__Read",
+                &format!(
+                    r#"{{"file_path":"{}/src/main.rs"}}"#,
+                    project.to_str().unwrap()
+                )
+            )
+        )
+        .unwrap();
         drop(f);
 
         let config = ToolMappingConfig::builtin().unwrap();
@@ -1619,50 +3401,77 @@ description  = "UserTool {target}"
 
     #[test]
     fn bash_cat_gets_full_body() {
-        assert_eq!(bash_event("cat src/main.rs").read_depth, ReadDepth::FullBody);
+        assert_eq!(
+            bash_event("cat src/main.rs").read_depth,
+            ReadDepth::FullBody
+        );
     }
 
     #[test]
     fn bash_head_gets_signature() {
-        assert_eq!(bash_event("head -n 20 src/lib.rs").read_depth, ReadDepth::Signature);
+        assert_eq!(
+            bash_event("head -n 20 src/lib.rs").read_depth,
+            ReadDepth::Signature
+        );
     }
 
     #[test]
     fn bash_tail_gets_signature() {
-        assert_eq!(bash_event("tail -n 50 logs/output.log").read_depth, ReadDepth::Signature);
+        assert_eq!(
+            bash_event("tail -n 50 logs/output.log").read_depth,
+            ReadDepth::Signature
+        );
     }
 
     #[test]
     fn bash_grep_gets_overview() {
-        assert_eq!(bash_event("grep 'fn main' src/").read_depth, ReadDepth::Overview);
+        assert_eq!(
+            bash_event("grep 'fn main' src/").read_depth,
+            ReadDepth::Overview
+        );
     }
 
     #[test]
     fn bash_rg_gets_overview() {
-        assert_eq!(bash_event("rg 'ReadDepth' --type rust").read_depth, ReadDepth::Overview);
+        assert_eq!(
+            bash_event("rg 'ReadDepth' --type rust").read_depth,
+            ReadDepth::Overview
+        );
     }
 
     #[test]
     fn bash_git_gets_unseen() {
         assert_eq!(bash_event("git status").read_depth, ReadDepth::Unseen);
-        assert_eq!(bash_event("git log --oneline -10").read_depth, ReadDepth::Unseen);
+        assert_eq!(
+            bash_event("git log --oneline -10").read_depth,
+            ReadDepth::Unseen
+        );
     }
 
     #[test]
     fn bash_unknown_command_gets_name_only() {
         // Unrecognised commands fall back to the PatternMatch default (NameOnly).
-        assert_eq!(bash_event("cargo build --release").read_depth, ReadDepth::NameOnly);
+        assert_eq!(
+            bash_event("cargo build --release").read_depth,
+            ReadDepth::NameOnly
+        );
         assert_eq!(bash_event("npm install").read_depth, ReadDepth::NameOnly);
     }
 
     #[test]
     fn bash_ugrep_gets_overview() {
-        assert_eq!(bash_event("ugrep 'fn main' src/").read_depth, ReadDepth::Overview);
+        assert_eq!(
+            bash_event("ugrep 'fn main' src/").read_depth,
+            ReadDepth::Overview
+        );
     }
 
     #[test]
     fn bash_bfs_gets_name_only() {
-        assert_eq!(bash_event("bfs . -name '*.rs'").read_depth, ReadDepth::NameOnly);
+        assert_eq!(
+            bash_event("bfs . -name '*.rs'").read_depth,
+            ReadDepth::NameOnly
+        );
     }
 
     #[test]
@@ -1673,16 +3482,25 @@ description  = "UserTool {target}"
         let config = ToolMappingConfig::builtin().expect("builtin config");
         match parse_jsonl_line(line, "default", &config) {
             ParsedLine::Compacted { summary, timestamp } => {
-                assert!(summary.contains("CLI parser"), "summary should contain compaction text, got: {summary:?}");
+                assert!(
+                    summary.contains("CLI parser"),
+                    "summary should contain compaction text, got: {summary:?}"
+                );
                 assert_eq!(timestamp, "2026-05-11T20:59:25.329Z");
             }
-            other => panic!("expected ParsedLine::Compacted, got {:?}", match other {
-                ParsedLine::Events(_) => "Events",
-                ParsedLine::Compacted { .. } => "Compacted",
-                ParsedLine::CompactBoundary { .. } => "CompactBoundary",
-                ParsedLine::SessionCleared => "SessionCleared",
-                ParsedLine::Ignored => "Ignored",
-            }),
+            other => panic!(
+                "expected ParsedLine::Compacted, got {:?}",
+                match other {
+                    ParsedLine::Events(_) => "Events",
+                    ParsedLine::Compacted { .. } => "Compacted",
+                    ParsedLine::CompactBoundary { .. } => "CompactBoundary",
+                    ParsedLine::SessionCleared => "SessionCleared",
+                    ParsedLine::ToolResults(_) => "ToolResults",
+                    ParsedLine::AgentStopped { .. } => "AgentStopped",
+                    ParsedLine::Prompt { .. } => "Prompt",
+                    ParsedLine::Ignored => "Ignored",
+                }
+            ),
         }
     }
 
@@ -1724,7 +3542,10 @@ description  = "UserTool {target}"
         let line = r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-05-11T20:59:25.328Z","compactMetadata":{"trigger":"manual","preTokens":195684,"postTokens":6416,"durationMs":64699}}"#;
         let config = ToolMappingConfig::builtin().unwrap();
         match parse_jsonl_line(line, "d", &config) {
-            ParsedLine::CompactBoundary { metadata, timestamp } => {
+            ParsedLine::CompactBoundary {
+                metadata,
+                timestamp,
+            } => {
                 assert_eq!(metadata.trigger, "manual");
                 assert_eq!(metadata.pre_tokens, 195684);
                 assert_eq!(metadata.post_tokens, 6416);
@@ -1741,7 +3562,10 @@ description  = "UserTool {target}"
         // as a half-populated CompactBoundary).
         let line = r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-05-11T20:59:25.328Z","compactMetadata":{"preTokens":100}}"#;
         let config = ToolMappingConfig::builtin().unwrap();
-        assert!(matches!(parse_jsonl_line(line, "d", &config), ParsedLine::Ignored));
+        assert!(matches!(
+            parse_jsonl_line(line, "d", &config),
+            ParsedLine::Ignored
+        ));
     }
 
     #[test]
@@ -1754,9 +3578,18 @@ description  = "UserTool {target}"
 
         let config = ToolMappingConfig::builtin().unwrap();
         let events = parse_log_file(&log, &config);
-        assert_eq!(events.len(), 1, "boundary should be folded into the summary");
+        assert_eq!(
+            events.len(),
+            1,
+            "boundary should be folded into the summary"
+        );
         match &events[0] {
-            SessionEvent::Compacted { metadata, summary, timestamp, .. } => {
+            SessionEvent::Compacted {
+                metadata,
+                summary,
+                timestamp,
+                ..
+            } => {
                 let m = metadata.as_ref().expect("metadata should be attached");
                 assert_eq!(m.trigger, "manual");
                 assert_eq!(m.pre_tokens, 195684);
@@ -1796,7 +3629,11 @@ description  = "UserTool {target}"
         let boundary = r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-05-11T20:59:25.328Z","compactMetadata":{"trigger":"auto","preTokens":50000,"postTokens":5000,"durationMs":12345}}"#;
         fs::write(&log, format!("{boundary}\n")).unwrap();
         let out1 = tailer.read_new_events();
-        assert_eq!(out1.compactions.len(), 0, "boundary alone should not surface a compaction");
+        assert_eq!(
+            out1.compactions.len(),
+            0,
+            "boundary alone should not surface a compaction"
+        );
 
         // Poll 2: the summary record arrives — metadata from the buffered
         // boundary should be attached.
@@ -1804,8 +3641,724 @@ description  = "UserTool {target}"
         fs::write(&log, format!("{boundary}\n{summary}\n")).unwrap();
         let out2 = tailer.read_new_events();
         assert_eq!(out2.compactions.len(), 1);
-        let m = out2.compactions[0].metadata.as_ref().expect("metadata pairs across polls");
+        let m = out2.compactions[0]
+            .metadata
+            .as_ref()
+            .expect("metadata pairs across polls");
         assert_eq!(m.trigger, "auto");
         assert_eq!(m.pre_tokens, 50000);
+    }
+}
+
+/// Write ingestion (spec §1): tool results parsed and correlated with their
+/// write calls by `tool_use_id`. Lines are shaped like real Claude Code logs.
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// Built-ins with `Edit` and `Write` declared as writes, as a user would
+    /// in `tools.toml` (the built-in stanzas flip in a later step).
+    fn write_config() -> ToolMappingConfig {
+        let user: ToolMappingConfig = toml::from_str(
+            r#"
+            version = 1
+            [[tool]]
+            names = ["Edit"]
+            path_keys = ["file_path"]
+            effect = "write"
+            description = "Edit {file_path}"
+            [[tool]]
+            names = ["Write"]
+            path_keys = ["file_path"]
+            effect = "write"
+            description = "Write {file_path}"
+            "#,
+        )
+        .expect("valid toml");
+        let mut warnings = Vec::new();
+        let cfg =
+            ToolMappingConfig::merge(ToolMappingConfig::builtin().unwrap(), user, &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        cfg
+    }
+
+    fn call(id: &str, tool: &str, path: &str) -> String {
+        serde_json::json!({
+            "type": "assistant", "sessionId": "s1", "timestamp": "2026-09-26T10:00:00Z",
+            "message": {"content": [{"type": "tool_use", "id": id, "name": tool,
+                "input": {"file_path": path, "old_string": "x", "new_string": "y"}}]}
+        })
+        .to_string()
+    }
+
+    fn result(id: &str, detail: serde_json::Value, is_error: bool) -> String {
+        serde_json::json!({
+            "type": "user", "timestamp": "2026-09-26T10:00:01Z",
+            // As in real logs, a failure's content carries its error text.
+            "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": detail.as_str().filter(|_| is_error).unwrap_or("ok"), "is_error": is_error}]},
+            "toolUseResult": detail
+        })
+        .to_string()
+    }
+
+    fn edit_detail(original: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "filePath": "/p/src/a.rs", "oldString": "x", "newString": "y", "replaceAll": false,
+            "originalFile": original, "userModified": false,
+            "structuredPatch": [{"oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1, "lines": ["-x", "+y"]}]
+        })
+    }
+
+    fn bash(id: &str, command: &str) -> String {
+        serde_json::json!({
+            "type": "assistant", "sessionId": "s1", "timestamp": "2026-09-26T10:00:00Z",
+            "message": {"content": [{"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}]}
+        })
+        .to_string()
+    }
+
+    fn output(id: &str, text: &str) -> String {
+        serde_json::json!({
+            "type": "user", "timestamp": "2026-09-26T10:00:01Z",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": [{"type": "text", "text": text}]}]},
+            "toolUseResult": {"stdout": text, "stderr": ""}
+        })
+        .to_string()
+    }
+
+    /// A session's logs: its main log and each subagent's, with a meta file.
+    fn session_logs(dir: &Path, main: &[String], subagents: &[(&str, u64, &str, &[String])]) {
+        std::fs::write(dir.join("s.jsonl"), main.join("\n") + "\n").unwrap();
+        let sub = dir.join("s").join("subagents");
+        let _ = std::fs::remove_dir_all(&sub);
+        std::fs::create_dir_all(&sub).unwrap();
+        for (id, depth, started_by, lines) in subagents {
+            std::fs::write(
+                sub.join(format!("agent-{id}.jsonl")),
+                lines.join("\n") + "\n",
+            )
+            .unwrap();
+            std::fs::write(
+                sub.join(format!("agent-{id}.meta.json")),
+                format!(r#"{{"spawnDepth":{depth},"toolUseId":"{started_by}"}}"#),
+            )
+            .unwrap();
+        }
+    }
+
+    /// The agent running `ambits` is the one whose call for it has no result
+    /// yet; its parent comes from its meta file, or — nested — from the log
+    /// that started it.
+    #[test]
+    fn the_calling_agent_is_the_one_waiting_on_this_command() {
+        let args: Vec<String> = ["-p", ".", "rg", "^\\s+fn run", "src"]
+            .map(String::from)
+            .to_vec();
+        let running = bash("r1", "cd x && ambits -p . rg '^\\s+fn run' src | head");
+        let done = [
+            bash("d1", "ambits -p . rg '^\\s+fn run' src"),
+            output("d1", ""),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+
+        session_logs(
+            dir.path(),
+            &done,
+            &[("a1", 1, "t0", std::slice::from_ref(&running))],
+        );
+        assert_eq!(
+            calling_agent(dir.path(), "s", &args),
+            Caller::Agent {
+                id: "a1".into(),
+                parent: Some("s".into())
+            }
+        );
+
+        session_logs(
+            dir.path(),
+            std::slice::from_ref(&running),
+            &[("a1", 1, "t0", &[])],
+        );
+        assert_eq!(
+            calling_agent(dir.path(), "s", &args),
+            Caller::Agent {
+                id: "s".into(),
+                parent: None
+            },
+            "the main agent"
+        );
+
+        let spawn = serde_json::json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t9", "name": "Agent", "input": {"prompt": "x"}}]}}).to_string();
+        session_logs(
+            dir.path(),
+            &[],
+            &[
+                ("a1", 1, "t0", std::slice::from_ref(&spawn)),
+                ("a2", 2, "t9", std::slice::from_ref(&running)),
+            ],
+        );
+        assert_eq!(
+            calling_agent(dir.path(), "s", &args),
+            Caller::Agent {
+                id: "a2".into(),
+                parent: Some("a1".into())
+            },
+            "started by a subagent"
+        );
+
+        session_logs(
+            dir.path(),
+            std::slice::from_ref(&running),
+            &[("a1", 1, "t0", std::slice::from_ref(&running))],
+        );
+        assert!(
+            matches!(calling_agent(dir.path(), "s", &args), Caller::Unknown(why) if why.contains("2 agents"))
+        );
+
+        session_logs(dir.path(), &[], &[("a1", 1, "t0", &[spawn])]);
+        let nested = dir.path().join("s/subagents/workflows/run-1");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("agent-a3.jsonl"), running.clone() + "\n").unwrap();
+        std::fs::write(
+            nested.join("agent-a3.meta.json"),
+            r#"{"spawnDepth":2,"toolUseId":"t9"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            calling_agent(dir.path(), "s", &args),
+            Caller::Agent {
+                id: "a3".into(),
+                parent: Some("a1".into())
+            },
+            "nested under a workflow"
+        );
+        let other: Vec<String> = ["-p", ".", "rg", "other"].map(String::from).to_vec();
+        assert!(matches!(
+            calling_agent(dir.path(), "s", &other),
+            Caller::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn a_command_runs_ambits_with_its_arguments_in_order() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(command_runs(
+            "ambits -p . rg 'fn x' src",
+            &args(&["-p", ".", "rg", "fn x", "src"])
+        ));
+        assert!(
+            !command_runs("ambits -p . rg src 'fn x'", &args(&["rg", "fn x", "src"])),
+            "out of order"
+        );
+        assert!(
+            !command_runs("rg 'fn x' src", &args(&["rg", "fn x", "src"])),
+            "not ambits"
+        );
+    }
+
+    /// A search's result names the symbols it printed, at name depth; the
+    /// same lines in anything else's output (a `cat` of these docs) name
+    /// nothing.
+    #[test]
+    fn a_search_credits_the_symbols_its_output_named() {
+        let printed = "src/a.rs:3:5:[— App/run]     fn run() {}\nsrc/a.rs:1:1:[-] use x;\nsrc/a.rs:9:2:[full App/stop]  stop()";
+        let lines = [
+            bash("s1", "ambits -p . rg 'run|stop' src | head -20"),
+            output("s1", printed),
+            bash("c1", "cat docs/wiki/Searching-Code.md"),
+            output("c1", printed),
+            bash("p1", "ambits -p . show 'src/a.rs::App' | rg run"),
+            output("p1", printed),
+        ];
+        let shown: Vec<(String, Vec<(String, ReadDepth)>)> = parse(&lines)
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::ToolFinished(f) => Some((f.id.to_string(), f.shown)),
+                _ => None,
+            })
+            .collect();
+        let name = |id: &str| (id.to_string(), ReadDepth::NameOnly);
+        assert_eq!(
+            shown,
+            vec![
+                (
+                    "s1".to_string(),
+                    vec![name("src/a.rs::App/run"), name("src/a.rs::App/stop")]
+                ),
+                ("c1".to_string(), vec![]),
+                ("p1".to_string(), vec![]),
+            ]
+        );
+    }
+
+    fn parse(lines: &[String]) -> Vec<SessionEvent> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.jsonl");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        parse_log_file_with_mapper(&path, &write_config(), None)
+    }
+
+    fn writes(events: &[SessionEvent]) -> Vec<&WriteEvent> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Write(w) => Some(w),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tool_use_carries_its_id() {
+        let line = call("toolu_1", "Edit", "/p/src/a.rs");
+        match parse_jsonl_line(&line, "d", &write_config()) {
+            ParsedLine::Events(evs) => {
+                assert_eq!(evs[0].tool_use_id.as_deref(), Some("toolu_1"));
+                assert_eq!(evs[0].effect, Effect::Write);
+                assert_eq!(
+                    evs[0].read_depth,
+                    ReadDepth::Unseen,
+                    "a write grants no read credit"
+                );
+            }
+            _ => panic!("expected events"),
+        }
+    }
+
+    #[test]
+    fn an_edit_result_becomes_a_write_with_its_source() {
+        let events = parse(&[
+            call("toolu_1", "Edit", "/p/src/a.rs"),
+            result("toolu_1", edit_detail(Some("x\n")), false),
+        ]);
+        let w = writes(&events);
+        assert_eq!(w.len(), 1);
+        assert_eq!(&*w[0].op, "toolu_1");
+        assert_eq!(w[0].path, PathBuf::from("/p/src/a.rs"));
+        match &w[0].source {
+            WriteSource::Edit {
+                original,
+                old,
+                new,
+                replace_all,
+                hunks,
+                user_modified,
+            } => {
+                assert_eq!(original.as_deref(), Some("x\n"));
+                assert_eq!(
+                    (old.as_str(), new.as_str(), *replace_all, *user_modified),
+                    ("x", "y", false, false)
+                );
+                assert_eq!(
+                    hunks,
+                    &Some(vec![Hunk {
+                        old_start: 1,
+                        new_start: 1,
+                        lines: vec!["-x".into(), "+y".into()]
+                    }])
+                );
+            }
+            other => panic!("expected an Edit source, got {other:?}"),
+        }
+    }
+
+    /// Most logged edits omit `originalFile`; the write is still recorded.
+    #[test]
+    fn an_edit_without_original_file_is_still_a_write() {
+        let events = parse(&[
+            call("toolu_1", "Edit", "/p/src/a.rs"),
+            result("toolu_1", edit_detail(None), false),
+        ]);
+        match &writes(&events)[0].source {
+            WriteSource::Edit { original: None, .. } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_write_create_is_classified() {
+        let detail = serde_json::json!({"type": "create", "filePath": "/p/src/b.rs", "content": "fn b() {}\n",
+            "structuredPatch": [], "originalFile": null});
+        let events = parse(&[
+            call("toolu_2", "Write", "/p/src/b.rs"),
+            result("toolu_2", detail, false),
+        ]);
+        match &writes(&events)[0].source {
+            WriteSource::Write {
+                create: true,
+                original: None,
+                content,
+                ..
+            } => assert_eq!(content, "fn b() {}\n"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Failed and rejected writes changed nothing, so they are not writes.
+    #[test]
+    fn errors_and_rejections_are_dropped() {
+        let rejected = serde_json::json!("The user doesn't want to proceed with this tool use.");
+        let events = parse(&[
+            call("toolu_1", "Edit", "/p/src/a.rs"),
+            result("toolu_1", edit_detail(Some("x\n")), true),
+            call("toolu_2", "Edit", "/p/src/a.rs"),
+            result("toolu_2", rejected, false),
+        ]);
+        assert!(writes(&events).is_empty());
+    }
+
+    /// Reads are unaffected, and a result for a read tool is not a write.
+    #[test]
+    fn read_tool_results_produce_no_writes() {
+        let read = serde_json::json!({
+            "type": "assistant", "sessionId": "s1", "timestamp": "t",
+            "message": {"content": [{"type": "tool_use", "id": "toolu_9", "name": "Read", "input": {"file_path": "/p/src/a.rs"}}]}
+        })
+        .to_string();
+        let detail = serde_json::json!({"type": "text", "file": {"filePath": "/p/src/a.rs"}});
+        let events = parse(&[read, result("toolu_9", detail, false)]);
+        assert!(writes(&events).is_empty());
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::ToolCall(_))));
+    }
+
+    #[test]
+    fn an_unrecognized_result_shape_is_opaque() {
+        let events = parse(&[
+            call("toolu_1", "Edit", "/p/src/a.rs"),
+            result("toolu_1", serde_json::json!({"ok": true}), false),
+        ]);
+        assert_eq!(writes(&events)[0].source, WriteSource::Opaque);
+    }
+
+    /// A call and its result can arrive in different polls.
+    #[test]
+    fn the_tailer_pairs_a_call_and_result_across_polls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut tailer = LogTailer::new(vec![path.clone()], Arc::new(write_config()));
+
+        let append = |line: String| {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(f, "{line}").unwrap();
+        };
+        append(call("toolu_1", "Edit", "/p/src/a.rs"));
+        let first = tailer.read_new_events();
+        assert_eq!(first.events.len(), 1);
+        assert!(first.writes.is_empty(), "no result yet");
+
+        append(result("toolu_1", edit_detail(Some("x\n")), false));
+        let second = tailer.read_new_events();
+        assert_eq!(second.writes.len(), 1);
+        assert_eq!(&*second.writes[0].op, "toolu_1");
+    }
+
+    /// Replay `lines`, then resume a tailer from the replay's handoff.
+    fn replay_then_tail(dir: &Path, lines: &[String]) -> (PathBuf, FileReplay, LogTailer) {
+        let path = dir.join("s1.jsonl");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let config: Arc<dyn ToolCallMapper> = Arc::new(write_config());
+        let replay = replay_log_file(&path, &*config, None);
+        let handoff = Handoff {
+            files: vec![(path.clone(), replay.offset)],
+            awaiting: replay.awaiting.clone(),
+            project_root: None,
+        };
+        let tailer = LogTailer::resume(handoff, config);
+        (path, replay, tailer)
+    }
+
+    fn append(path: &Path, line: String) {
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(f, "{line}").unwrap();
+    }
+
+    /// A write whose call the replay saw but whose result lands later — a
+    /// permission prompt at startup — is still paired, by the tailer.
+    #[test]
+    fn a_result_after_the_replay_pairs_with_the_replayed_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, replay, mut tailer) =
+            replay_then_tail(dir.path(), &[call("toolu_1", "Edit", "/p/src/a.rs")]);
+        assert_eq!(replay.awaiting.len(), 1);
+
+        append(&path, result("toolu_1", edit_detail(Some("x\n")), false));
+        let polled = tailer.read_new_events();
+        assert_eq!(polled.writes.len(), 1);
+        assert_eq!(&*polled.writes[0].op, "toolu_1");
+    }
+
+    /// The tailer starts where the replay stopped: a line landing between
+    /// the two is read once, not skipped and not repeated.
+    #[test]
+    fn the_tailer_continues_exactly_where_the_replay_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, replay, mut tailer) =
+            replay_then_tail(dir.path(), &[call("toolu_1", "Edit", "/p/src/a.rs")]);
+        assert_eq!(replay.offset, std::fs::metadata(&path).unwrap().len());
+
+        append(&path, call("toolu_2", "Edit", "/p/src/b.rs"));
+        let polled = tailer.read_new_events();
+        let ids: Vec<_> = polled
+            .events
+            .iter()
+            .map(|e| e.tool_use_id.as_deref())
+            .collect();
+        assert_eq!(ids, vec![Some("toolu_2")]);
+    }
+
+    /// A rejected write resolved in the replay emits nothing and must not be
+    /// left awaiting a result that already came.
+    #[test]
+    fn a_rejected_write_is_not_awaited() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, replay, _) = replay_then_tail(
+            dir.path(),
+            &[
+                call("toolu_1", "Edit", "/p/src/a.rs"),
+                result("toolu_1", serde_json::json!("rejected"), true),
+            ],
+        );
+        assert!(replay.awaiting.is_empty());
+        assert!(writes(&replay.events).is_empty());
+    }
+
+    fn write_call(id: &str) -> AgentToolCall {
+        match parse_jsonl_line(&call(id, "Edit", "/p/src/a.rs"), "d", &write_config()) {
+            ParsedLine::Events(mut evs) => evs.remove(0),
+            _ => unreachable!(),
+        }
+    }
+
+    fn pending_ids(c: ResultCorrelator) -> Vec<String> {
+        c.into_pending()
+            .into_iter()
+            .map(|c| c.tool_use_id.unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_correlator_forgets_the_oldest_call_past_its_cap() {
+        let mut c = ResultCorrelator::default();
+        let calls: Vec<_> = (0..=ResultCorrelator::MAX_PENDING)
+            .map(|i| write_call(&format!("t{i}")))
+            .collect();
+        c.note_calls(&calls);
+        let ids = pending_ids(c);
+        assert_eq!(ids.len(), ResultCorrelator::MAX_PENDING);
+        assert_eq!(ids[0], "t1", "t0 was the oldest");
+    }
+
+    /// Resolved calls free their slot: a long run of answered writes never
+    /// evicts anything.
+    #[test]
+    fn resolved_calls_do_not_count_toward_the_cap() {
+        let mut c = ResultCorrelator::default();
+        for i in 0..3 * ResultCorrelator::MAX_PENDING {
+            let id = format!("t{i}");
+            c.note_calls(&[write_call(&id)]);
+            let done = ToolResult {
+                tool_use_id: Arc::from(id.as_str()),
+                is_error: false,
+                detail: None,
+                timestamp: String::new(),
+                message: None,
+                content: None,
+                shown: Vec::new(),
+                printed: Vec::new(),
+            };
+            assert_eq!(c.resolve(&mut [done]).len(), 1);
+        }
+        c.note_calls(&[write_call("last")]);
+        assert_eq!(pending_ids(c), vec!["last"]);
+    }
+
+    #[test]
+    fn a_call_noted_twice_is_pending_once() {
+        let mut c = ResultCorrelator::default();
+        c.note_calls(&[write_call("t1"), write_call("t1")]);
+        assert_eq!(pending_ids(c), vec!["t1"]);
+    }
+
+    /// Live tailing maps a worktree session's paths to the project exactly
+    /// as the startup replay does: a write made live in a worktree used to
+    /// keep its worktree path and be dropped as outside the project.
+    #[test]
+    fn the_tailer_remaps_a_worktree_session_like_the_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.jsonl");
+        let first = serde_json::json!({"type": "user", "cwd": "/work/tree", "message": {"content": "task"}}).to_string();
+        std::fs::write(&path, format!("{first}\n")).unwrap();
+        let config: Arc<dyn ToolCallMapper> = Arc::new(write_config());
+        let replay = replay_log_file(&path, &*config, Some(Path::new("/proj")));
+        let handoff = Handoff {
+            files: vec![(path.clone(), replay.offset)],
+            awaiting: replay.awaiting,
+            project_root: Some(PathBuf::from("/proj")),
+        };
+        let mut tailer = LogTailer::resume(handoff, config);
+
+        append(&path, call("toolu_1", "Edit", "/work/tree/src/a.rs"));
+        append(&path, result("toolu_1", edit_detail(None), false));
+        let polled = tailer.read_new_events();
+        assert_eq!(
+            polled.events[0].file_path.as_deref(),
+            Some(Path::new("/proj/src/a.rs"))
+        );
+        assert_eq!(polled.writes[0].path, PathBuf::from("/proj/src/a.rs"));
+        assert_eq!(
+            &*polled.events[0].label, "task",
+            "labelled like the replay too"
+        );
+    }
+
+    /// Every result closes its call, errors included; a delegation's names
+    /// the subagent it started, as `agent-<agentId>`.
+    #[test]
+    fn every_result_finishes_its_call_and_delegations_name_their_agent() {
+        let events = parse(&[
+            call("toolu_1", "Edit", "/p/src/a.rs"),
+            result(
+                "toolu_1",
+                serde_json::json!("String to replace not found"),
+                true,
+            ),
+            result(
+                "toolu_2",
+                serde_json::json!({"agentId": "a2f", "status": "async_launched"}),
+                false,
+            ),
+        ]);
+        let finished: Vec<&crate::ingest::ToolFinished> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::ToolFinished(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finished.len(), 2);
+        assert!(finished[0].error);
+        assert_eq!(
+            finished[0].message.as_deref(),
+            Some("String to replace not found"),
+            "why, carried to the trace"
+        );
+        assert_eq!(finished[1].child_agent.as_deref(), Some("a2f"));
+    }
+
+    /// A background agent's stop is enqueued as a task notification: it ends
+    /// the delegation that launched it. The pickup (`remove`) does not.
+    #[test]
+    fn an_enqueued_task_notification_ends_the_delegation() {
+        let config = ToolMappingConfig::builtin().expect("builtin config");
+        let line = |op: &str, status: &str| {
+            serde_json::json!({
+                "type": "queue-operation",
+                "operation": op,
+                "timestamp": "2026-09-26T19:39:16.480Z",
+                "content": format!("<task-notification>\n<task-id>a03c</task-id>\n<tool-use-id>toolu_9</tool-use-id>\n<status>{status}</status>\n</task-notification>"),
+            })
+            .to_string()
+        };
+        match parse_jsonl_line(&line("enqueue", "completed"), "d", &config) {
+            ParsedLine::AgentStopped {
+                tool_use_id,
+                agent,
+                timestamp,
+                status,
+            } => {
+                assert_eq!(
+                    (&*tool_use_id, &*agent, timestamp.as_str(), status.as_str()),
+                    ("toolu_9", "a03c", "2026-09-26T19:39:16.480Z", "completed")
+                );
+            }
+            _ => panic!("expected AgentStopped"),
+        }
+        assert!(
+            matches!(parse_jsonl_line(&line("enqueue", "failed"), "d", &config), ParsedLine::AgentStopped { status, .. } if status == "failed")
+        );
+        assert!(matches!(
+            parse_jsonl_line(&line("remove", "completed"), "d", &config),
+            ParsedLine::Ignored
+        ));
+    }
+
+    /// The shapes Claude Code logs for a failed call, each down to one line.
+    #[test]
+    fn a_failure_is_summed_up_in_one_line() {
+        use serde_json::json;
+        let one = |v: serde_json::Value| error_summary(&v);
+        assert_eq!(one(json!("<tool_use_error>String to replace not found in file.\nString: foo</tool_use_error>")).as_deref(), Some("String to replace not found in file."));
+        assert_eq!(
+            one(json!(
+                "Exit code 1\n\nerror[E0308]: mismatched types\n  --> src/a.rs"
+            ))
+            .as_deref(),
+            Some("Exit code 1: error[E0308]: mismatched types")
+        );
+        assert_eq!(one(json!("Exit code 2")).as_deref(), Some("Exit code 2"));
+        assert_eq!(
+            one(json!("Exit code 1\nTraceback (most recent call last):\n  File \"<string>\", line 1\nModuleNotFoundError: No module named 'pyte'")).as_deref(),
+            Some("Exit code 1: ModuleNotFoundError: No module named 'pyte'")
+        );
+        assert_eq!(
+            one(json!("Exit code 1\nwarming up\ndone, sort of")).as_deref(),
+            Some("Exit code 1: done, sort of"),
+            "no error named: the last line"
+        );
+        assert_eq!(
+            one(json!("Error: Exit code 2")).as_deref(),
+            Some("Exit code 2")
+        );
+        assert_eq!(
+            one(json!("User rejected tool use")).as_deref(),
+            Some("rejected by the user")
+        );
+        assert_eq!(
+            one(json!(
+                "Permission for this tool use was denied. The tool use was rejected"
+            ))
+            .as_deref(),
+            Some("permission denied")
+        );
+        assert_eq!(
+            one(json!([{"type": "text", "text": "The user doesn't want to proceed with this tool use. The tool use was rejected"}])).as_deref(),
+            Some("rejected by the user")
+        );
+        assert_eq!(
+            one(json!("x".repeat(500))).map(|s| s.chars().count()),
+            Some(200)
+        );
+        assert_eq!(one(json!("bad\u{1b}[31m")).as_deref(), Some("bad [31m"));
+        assert_eq!(one(json!("   ")), None);
+    }
+
+    /// A partial patch would under-report the change, so any defect makes
+    /// the whole patch unusable (spec §2.2).
+    #[test]
+    fn a_structured_patch_is_all_or_nothing() {
+        use serde_json::json;
+        let good = json!({"oldStart": 1, "newStart": 1, "lines": ["-x", "+y", " z", "\\ No newline at end of file"]});
+        assert_eq!(parse_hunks(Some(&json!([good]))).map(|h| h.len()), Some(1));
+        assert_eq!(
+            parse_hunks(Some(&json!([]))),
+            Some(vec![]),
+            "an empty patch is still a patch"
+        );
+
+        let missing_start = json!({"newStart": 1, "lines": ["-x"]});
+        let bad_prefix = json!({"oldStart": 1, "newStart": 1, "lines": ["-x", "y"]});
+        let not_text = json!({"oldStart": 1, "newStart": 1, "lines": ["-x", 3]});
+        for bad in [missing_start, bad_prefix, not_text] {
+            assert_eq!(parse_hunks(Some(&json!([good, bad]))), None, "{bad}");
+        }
+        assert_eq!(parse_hunks(None), None);
+        assert_eq!(parse_hunks(Some(&json!("not an array"))), None);
     }
 }

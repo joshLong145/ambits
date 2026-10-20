@@ -30,11 +30,11 @@ use ambits::app::App;
 use ambits::filter::PathFilter;
 use ambits::ingest::tool_config::ToolMappingConfig;
 use ambits::ingest::{SessionIngester, ToolCallMapper};
-use events::AppEvent;
 use ambits::parser::ParserRegistry;
+use events::AppEvent;
 
 #[derive(ClapParser, Debug)]
-#[command(name = "ambits", about = "Visualize LLM agent context coverage")]
+#[command(name = "ambits", version = ambits::version(), about = "Visualize LLM agent context coverage")]
 struct Cli {
     /// Path to the project root to analyze. Defaults to the nearest enclosing
     /// directory containing `.git` or `.ambits`, else the current directory.
@@ -123,6 +123,12 @@ struct Cli {
     #[arg(long)]
     flush_interval_ms: Option<u64>,
 
+    /// Keep journals, snapshots and caches in this directory instead of the
+    /// project's `.ambits/`. Falls back to `$AMBITS_STATE_DIR`. The project's
+    /// `.ambits/tools.toml` is still read from the project.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -164,6 +170,139 @@ enum Commands {
         /// Output format.
         #[arg(long, value_enum, default_value = "markdown")]
         format: DigestFormat,
+    },
+
+    /// Record a snapshot of this session: its symbols, coverage and writes,
+    /// pinned to the current git commit and working-tree state.
+    ///
+    /// Snapshots are content-addressed objects under `.ambits/objects/`, and
+    /// the session's ref points at the latest. Running it again with nothing
+    /// changed writes nothing. Not to be confused with `restore-context`,
+    /// which prints what an agent has read.
+    Snapshot {
+        /// A message stored with the snapshot (in its local note).
+        #[arg(short, long)]
+        message: Option<String>,
+
+        /// Refuse when the working tree has uncommitted changes.
+        #[arg(long)]
+        require_clean: bool,
+    },
+
+    /// Restore a snapshot's coverage and writes into a session on this
+    /// machine.
+    ///
+    /// Reads still valid against the project as it is now are restored (moved
+    /// symbols followed); drifted ones are not. Writes are restored as history.
+    /// The session's ref is set to the snapshot, so its next snapshot descends
+    /// from it. Restoring twice changes nothing. Not `restore-context`, which
+    /// prints what this session has read.
+    Restore {
+        /// A session id, a snapshot id, or a unique prefix of one.
+        reference: String,
+
+        /// The session to restore into. Without it a new session id is minted.
+        #[arg(long)]
+        into: Option<String>,
+    },
+
+    /// Export the session as a trace: every tool call a span with its
+    /// duration, subagents nested under the call that started them.
+    ///
+    /// `otlp` is OpenTelemetry's JSON format, for Jaeger, Grafana Tempo or a
+    /// collector; `chrome` is the Chrome trace format, for Perfetto
+    /// (ui.perfetto.dev) and chrome://tracing. `--agent` narrows it to one
+    /// agent and what it delegated.
+    Trace {
+        /// Output format.
+        #[arg(long, value_enum, default_value = "otlp")]
+        format: TraceFormat,
+    },
+
+    /// Show snapshot history: time, git commit, dirty files, reads, writes,
+    /// parents and message.
+    Log {
+        /// A session id, a snapshot id, or a unique prefix of one (7+ hex
+        /// digits). Defaults to the current session.
+        reference: Option<String>,
+    },
+
+    /// Manage remotes: directories (a local disk or a mount) snapshots are
+    /// shared through.
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommands,
+    },
+
+    /// Copy this session's snapshot history to a remote and move its ref
+    /// there. Refuses to overwrite snapshots the remote has and you do not,
+    /// unless --force-with-lease and the remote is where you last saw it.
+    Push {
+        /// The remote; defaults to the only one, or `origin`.
+        remote: Option<String>,
+
+        /// Overwrite the remote's history of this session, if it still
+        /// holds what you last fetched.
+        #[arg(long)]
+        force_with_lease: bool,
+
+        /// Say what would be sent; send nothing.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remove a lock an interrupted push left on the remote: only if it
+        /// is over 10 minutes old, and then only if it is provably this
+        /// store's and dead, or you confirm.
+        #[arg(long)]
+        break_lock: bool,
+
+        /// Re-check the whole history on the remote, repairing anything that
+        /// no longer verifies, not only what is new.
+        #[arg(long)]
+        verify_all: bool,
+    },
+
+    /// Copy every session's snapshots from a remote, verifying each, and
+    /// record where the remote's sessions point (`<remote>/<session>`).
+    Fetch {
+        /// The remote; defaults to the only one, or `origin`.
+        remote: Option<String>,
+
+        /// Re-check every session's whole history here, repairing anything
+        /// that no longer verifies, not only what is new.
+        #[arg(long)]
+        verify_all: bool,
+    },
+
+    /// Fetch, then merge the remote's history of this session into it:
+    /// reads still valid here are added, stale ones kept as history, and the
+    /// next snapshot descends from both.
+    Pull {
+        /// The remote; defaults to the only one, or `origin`.
+        remote: Option<String>,
+
+        /// Fetch as `fetch --verify-all` does.
+        #[arg(long)]
+        verify_all: bool,
+    },
+
+    /// Maintain the links index (which commit agent writes landed in).
+    #[command(hide = true)]
+    Links {
+        #[command(subcommand)]
+        command: LinksCommands,
+    },
+
+    /// Delete snapshot objects that no ref or recent reflog entry reaches.
+    Gc {
+        /// Keep unreachable objects younger than this many days.
+        #[arg(long, default_value_t = ambits::objects::gc::DEFAULT_GRACE_DAYS)]
+        grace_days: u64,
+
+        /// Reflog entries older than this many days stop protecting the
+        /// snapshots they name.
+        #[arg(long, default_value_t = ambits::objects::refs::REFLOG_EXPIRY_DAYS)]
+        reflog_expiry_days: u64,
     },
 
     /// Print a symbol's definition as JSON, looked up by content hash or id.
@@ -222,6 +361,17 @@ enum Commands {
     #[command(disable_help_flag = true)]
     Grep(GrepArgs),
 
+    /// When an agent last wrote a file or symbol, across every session's
+    /// journal, and whether that version is still on disk.
+    Touched {
+        /// A project-relative path, or a symbol id (`<path>::<name-path>`).
+        target: String,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value = "text")]
+        format: TouchedFormat,
+    },
+
     /// List the call sites of a function, and which symbol each sits in.
     ///
     /// Call sites come from the grammar's own tags query, so a mention in a
@@ -239,7 +389,32 @@ enum Commands {
         format: CallersFormat,
     },
 
-    /// Inspect or remove the coverage journals under .ambits/coverage.
+    /// The session as one JSON document: its trace, what each agent read of
+    /// every symbol, and every write with its status and the commit it
+    /// landed in. Reads the journal when one exists; never writes it.
+    Report {
+        #[arg(long, value_enum, default_value = "json")]
+        format: ReportFormat,
+
+        /// Render this JSON report, which `report` printed earlier, instead
+        /// of building one: no session, logs or checkout are read. For a
+        /// harness that screens the JSON before publishing it.
+        #[arg(long)]
+        from_json: Option<PathBuf>,
+
+        /// Cut the document until it fits in this many bytes; what was cut
+        /// is listed in its `truncated` field.
+        #[arg(long, conflicts_with = "from_json")]
+        max_bytes: Option<usize>,
+
+        /// A timeline of the harness that ran the session — its phases,
+        /// turns and markers — to carry under `phases` and draw as lanes of
+        /// its own. See the Reports page for the document's shape.
+        #[arg(long, conflicts_with = "from_json")]
+        phases: Option<PathBuf>,
+    },
+
+    /// Inspect, remove or build the coverage journals under .ambits/coverage.
     Cache {
         #[command(subcommand)]
         command: CacheCommands,
@@ -249,153 +424,153 @@ enum Commands {
 /// `ambits rg` — ripgrep's flag set, plus the symbol column.
 #[derive(clap::Args, Debug)]
 struct RgArgs {
-        /// PATTERN, then optional PATHs. Every argument is a PATH when `-e` is
-        /// given, exactly as in ripgrep.
-        #[arg(value_name = "PATTERN|PATH")]
-        args: Vec<String>,
+    /// PATTERN, then optional PATHs. Every argument is a PATH when `-e` is
+    /// given, exactly as in ripgrep.
+    #[arg(value_name = "PATTERN|PATH")]
+    args: Vec<String>,
 
-        /// Additional pattern. Repeatable; combined as an alternation.
-        #[arg(short = 'e', long = "regexp", value_name = "PATTERN")]
-        regexp: Vec<String>,
+    /// Additional pattern. Repeatable; combined as an alternation.
+    #[arg(short = 'e', long = "regexp", value_name = "PATTERN")]
+    regexp: Vec<String>,
 
-        /// Treat patterns as literal strings.
-        #[arg(short = 'F', long)]
-        fixed_strings: bool,
+    /// Treat patterns as literal strings.
+    #[arg(short = 'F', long)]
+    fixed_strings: bool,
 
-        /// Case-insensitive matching.
-        #[arg(short, long)]
-        ignore_case: bool,
+    /// Case-insensitive matching.
+    #[arg(short, long)]
+    ignore_case: bool,
 
-        /// Match only whole words.
-        #[arg(short, long)]
-        word_regexp: bool,
+    /// Match only whole words.
+    #[arg(short, long)]
+    word_regexp: bool,
 
-        /// Match only whole lines. Takes precedence over --word-regexp.
-        #[arg(short = 'x', long)]
-        line_regexp: bool,
+    /// Match only whole lines. Takes precedence over --word-regexp.
+    #[arg(short = 'x', long)]
+    line_regexp: bool,
 
-        /// Allow patterns to match across line boundaries.
-        #[arg(short = 'U', long)]
-        multiline: bool,
+    /// Allow patterns to match across line boundaries.
+    #[arg(short = 'U', long)]
+    multiline: bool,
 
-        /// Report non-matching lines instead.
-        #[arg(short = 'v', long)]
-        invert_match: bool,
+    /// Report non-matching lines instead.
+    #[arg(short = 'v', long)]
+    invert_match: bool,
 
-        /// Include files matching this glob; prefix with ! to exclude.
-        #[arg(short, long, value_name = "GLOB")]
-        glob: Vec<String>,
+    /// Include files matching this glob; prefix with ! to exclude.
+    #[arg(short, long, value_name = "GLOB")]
+    glob: Vec<String>,
 
-        /// Restrict to a file type, e.g. rust, py, ts, md.
-        #[arg(short = 't', long = "type", value_name = "TYPE")]
-        file_type: Vec<String>,
+    /// Restrict to a file type, e.g. rust, py, ts, java, md.
+    #[arg(short = 't', long = "type", value_name = "TYPE")]
+    file_type: Vec<String>,
 
-        /// List every type name --type accepts, with the globs it expands
-        /// to, and exit. Takes no PATTERN.
-        #[arg(long)]
-        type_list: bool,
+    /// List every type name --type accepts, with the globs it expands
+    /// to, and exit. Takes no PATTERN.
+    #[arg(long)]
+    type_list: bool,
 
-        /// Additional pattern(s), one per line, read from a file.
-        /// Repeatable; combined with -e and PATTERN as one alternation.
-        #[arg(short = 'f', long = "file", value_name = "PATTERNFILE")]
-        pattern_file: Vec<PathBuf>,
+    /// Additional pattern(s), one per line, read from a file.
+    /// Repeatable; combined with -e and PATTERN as one alternation.
+    #[arg(short = 'f', long = "file", value_name = "PATTERNFILE")]
+    pattern_file: Vec<PathBuf>,
 
-        /// Print one line per match rather than grouping matches that share
-        /// a line — vim/emacs quickfix format. Also splits --json's
-        /// per-line events back into one per match, matching -o's existing
-        /// behavior there.
-        #[arg(long)]
-        vimgrep: bool,
+    /// Print one line per match rather than grouping matches that share
+    /// a line — vim/emacs quickfix format. Also splits --json's
+    /// per-line events back into one per match, matching -o's existing
+    /// behavior there.
+    #[arg(long)]
+    vimgrep: bool,
 
-        /// Lines of context after each match.
-        #[arg(short = 'A', long, default_value_t = 0, value_name = "N")]
-        after_context: usize,
+    /// Lines of context after each match.
+    #[arg(short = 'A', long, default_value_t = 0, value_name = "N")]
+    after_context: usize,
 
-        /// Lines of context before each match.
-        #[arg(short = 'B', long, default_value_t = 0, value_name = "N")]
-        before_context: usize,
+    /// Lines of context before each match.
+    #[arg(short = 'B', long, default_value_t = 0, value_name = "N")]
+    before_context: usize,
 
-        /// Lines of context around each match.
-        #[arg(short = 'C', long, value_name = "N")]
-        context: Option<usize>,
+    /// Lines of context around each match.
+    #[arg(short = 'C', long, value_name = "N")]
+    context: Option<usize>,
 
-        /// Show line numbers (default).
-        #[arg(short = 'n', long, overrides_with = "no_line_number")]
-        line_number: bool,
+    /// Show line numbers (default).
+    #[arg(short = 'n', long, overrides_with = "no_line_number")]
+    line_number: bool,
 
-        /// Hide line numbers.
-        #[arg(short = 'N', long)]
-        no_line_number: bool,
+    /// Hide line numbers.
+    #[arg(short = 'N', long)]
+    no_line_number: bool,
 
-        /// Hide the column of each match.
-        #[arg(long)]
-        no_column: bool,
+    /// Hide the column of each match.
+    #[arg(long)]
+    no_column: bool,
 
-        /// Print only the matched part of each line.
-        #[arg(short, long)]
-        only_matching: bool,
+    /// Print only the matched part of each line.
+    #[arg(short, long)]
+    only_matching: bool,
 
-        /// Print only the paths of files with a match.
-        #[arg(short = 'l', long, conflicts_with_all = ["count", "count_matches", "quiet"])]
-        files_with_matches: bool,
+    /// Print only the paths of files with a match.
+    #[arg(short = 'l', long, conflicts_with_all = ["count", "count_matches", "quiet"])]
+    files_with_matches: bool,
 
-        /// Print only the paths of files with *no* match — the complement of
-        /// `-l`, not of `-v`.
-        #[arg(long, conflicts_with_all = ["files_with_matches", "count", "count_matches", "quiet"])]
-        files_without_match: bool,
+    /// Print only the paths of files with *no* match — the complement of
+    /// `-l`, not of `-v`.
+    #[arg(long, conflicts_with_all = ["files_with_matches", "count", "count_matches", "quiet"])]
+    files_without_match: bool,
 
-        /// Print only a count of matching lines per file.
-        #[arg(short, long, conflicts_with_all = ["count_matches", "quiet"])]
-        count: bool,
+    /// Print only a count of matching lines per file.
+    #[arg(short, long, conflicts_with_all = ["count_matches", "quiet"])]
+    count: bool,
 
-        /// Print only a count of individual matches per file.
-        #[arg(long, conflicts_with = "quiet")]
-        count_matches: bool,
+    /// Print only a count of individual matches per file.
+    #[arg(long, conflicts_with = "quiet")]
+    count_matches: bool,
 
-        /// Print nothing; the exit code is the answer.
-        #[arg(short, long)]
-        quiet: bool,
+    /// Print nothing; the exit code is the answer.
+    #[arg(short, long)]
+    quiet: bool,
 
-        /// Stop after this many matches per file.
-        #[arg(short = 'm', long, value_name = "NUM")]
-        max_count: Option<usize>,
+    /// Stop after this many matches per file.
+    #[arg(short = 'm', long, value_name = "NUM")]
+    max_count: Option<usize>,
 
-        /// Truncate lines longer than this, marking the cut. 0 for unlimited.
-        #[arg(short = 'M', long, default_value_t = ambits::search::DEFAULT_MAX_COLUMNS, value_name = "NUM")]
-        max_columns: usize,
+    /// Truncate lines longer than this, marking the cut. 0 for unlimited.
+    #[arg(short = 'M', long, default_value_t = ambits::search::DEFAULT_MAX_COLUMNS, value_name = "NUM")]
+    max_columns: usize,
 
-        /// Cap total matches across all files. 0 for unlimited. Not a ripgrep
-        /// flag: unbounded output is a hazard in a context window.
-        #[arg(long, default_value_t = ambits::search::DEFAULT_HEAD_LIMIT, value_name = "NUM")]
-        head_limit: usize,
+    /// Cap total matches across all files. 0 for unlimited. Not a ripgrep
+    /// flag: unbounded output is a hazard in a context window.
+    #[arg(long, default_value_t = ambits::search::DEFAULT_HEAD_LIMIT, value_name = "NUM")]
+    head_limit: usize,
 
-        /// Search hidden files and directories.
-        #[arg(long)]
-        hidden: bool,
+    /// Search hidden files and directories.
+    #[arg(long)]
+    hidden: bool,
 
-        /// Ignore .gitignore and friends.
-        #[arg(long)]
-        no_ignore: bool,
+    /// Ignore .gitignore and friends.
+    #[arg(long)]
+    no_ignore: bool,
 
-        /// Group matches under a file heading (default on a terminal).
-        #[arg(long, overrides_with = "no_heading")]
-        heading: bool,
+    /// Group matches under a file heading (default on a terminal).
+    #[arg(long, overrides_with = "no_heading")]
+    heading: bool,
 
-        /// Print one flat `file:line:col:` line per match.
-        #[arg(long)]
-        no_heading: bool,
+    /// Print one flat `file:line:col:` line per match.
+    #[arg(long)]
+    no_heading: bool,
 
-        /// Omit the symbol column, for byte-identical ripgrep output.
-        #[arg(long)]
-        no_symbol: bool,
+    /// Omit the symbol column, for byte-identical ripgrep output.
+    #[arg(long)]
+    no_symbol: bool,
 
-        /// When to colorize output.
-        #[arg(long, value_enum, default_value = "auto", value_name = "WHEN")]
-        color: ColorWhen,
+    /// When to colorize output.
+    #[arg(long, value_enum, default_value = "auto", value_name = "WHEN")]
+    color: ColorWhen,
 
-        /// Emit ripgrep's JSON Lines events, with an added `symbol` field.
-        #[arg(long)]
-        json: bool,
+    /// Emit ripgrep's JSON Lines events, with an added `symbol` field.
+    #[arg(long)]
+    json: bool,
 }
 
 /// `ambits grep` — GNU grep's flag set over the same engine.
@@ -585,6 +760,31 @@ enum CacheCommands {
         #[arg(long)]
         all: bool,
     },
+
+    /// Bring the session's journal up to date from its logs, as the TUI would
+    /// on launch, then exit: every read, and every write attributed to the
+    /// symbols it changed. For runs with no terminal; fails while a TUI has
+    /// the session's journal open.
+    Sync {
+        #[arg(long, value_enum, default_value = "text")]
+        format: CacheSyncFormat,
+    },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum ReportFormat {
+    /// The schema-versioned document, on one line.
+    Json,
+    /// One self-contained page: no network, its own script only.
+    Html,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum CacheSyncFormat {
+    /// One line: the journal's path and what it now holds.
+    Text,
+    /// Schema-versioned JSON on a single line.
+    Json,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -593,6 +793,23 @@ enum ColorWhen {
     Auto,
     Always,
     Never,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum TraceFormat {
+    /// OTLP/JSON (`resourceSpans`), for OpenTelemetry tools (default).
+    Otlp,
+    /// Chrome trace events (`traceEvents`), for Perfetto and chrome://tracing.
+    Chrome,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum TouchedFormat {
+    /// The last write, and whether it is still on disk (default).
+    Text,
+    /// Schema-versioned JSON: `last_write` with session, op, agent, time,
+    /// tool, level and status, or null.
+    Json,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -630,7 +847,44 @@ enum HookCommands {
         /// Project directory to install for (defaults to the current directory).
         #[arg(long, short)]
         project: Option<PathBuf>,
+
+        /// Instead, install this repository's git post-commit hook, which
+        /// records which commit recent agent writes landed in.
+        #[arg(long, conflicts_with = "global")]
+        git: bool,
     },
+
+    /// Remove the git post-commit hook, restoring any hook it chained to.
+    Uninstall {
+        /// Required: the git hook is the only one `uninstall` removes.
+        #[arg(long, required = true)]
+        git: bool,
+
+        /// Repository directory (defaults to the current directory).
+        #[arg(long, short)]
+        project: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum LinksCommands {
+    /// Resolve where recent agent writes landed and record it in the links
+    /// index. Run by the git post-commit hook.
+    Refresh {
+        /// Look at writes from this many days back.
+        #[arg(long, default_value_t = ambits::linkage::REFRESH_WINDOW_DAYS)]
+        days: u64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RemoteCommands {
+    /// Add a remote: a directory path, created on the first push.
+    Add { name: String, path: PathBuf },
+    /// List remotes.
+    List,
+    /// Forget a remote (its copies of refs stay until gc).
+    Remove { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -686,8 +940,7 @@ fn assemble_patterns(
     // failure, so it propagates to the "2 on error" exit code rather than
     // panicking or being silently skipped.
     for path in pattern_files {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| eyre!("{}: {e}", path.display()))?;
+        let text = std::fs::read_to_string(path).map_err(|e| eyre!("{}: {e}", path.display()))?;
         patterns.extend(text.lines().filter(|l| !l.is_empty()).map(str::to_string));
     }
 
@@ -934,6 +1187,214 @@ fn execute(
     ambits::search::run(registry, &targets, &request.options, coverage)
 }
 
+/// A CLI flag given in days, as a duration.
+fn days_flag(n: u64, flag: &str) -> Result<Duration> {
+    ambits::time::days(n).ok_or_else(|| color_eyre::eyre::eyre!("{flag} {n} is too large"))
+}
+
+/// `ambits log`: the history of `reference`, or of the current session.
+/// The session a command works on, or an error saying how to name one.
+fn require_session<'a>(session: Option<&'a str>, to: &str) -> Result<&'a str> {
+    session.ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "no session to {to}: pass --session, or run inside a project with Claude Code logs"
+        )
+    })
+}
+
+fn run_remote(project_path: &Path, command: &RemoteCommands) -> Result<()> {
+    use ambits::remote::config;
+    let mut out = io::stdout().lock();
+    match command {
+        RemoteCommands::Add { name, path } => {
+            for warning in config::add(project_path, name, path)? {
+                eprintln!("warning: {warning}");
+            }
+        }
+        RemoteCommands::List => {
+            for (name, remote) in config::Config::load(project_path)?.remotes {
+                writeln!(out, "{name}\t{}", remote.path.display())?;
+            }
+        }
+        RemoteCommands::Remove { name } => config::remove(project_path, name)?,
+    }
+    Ok(())
+}
+
+fn verify(all: bool) -> ambits::remote::transfer::Verify {
+    if all {
+        ambits::remote::transfer::Verify::Everything
+    } else {
+        ambits::remote::transfer::Verify::Frontier
+    }
+}
+
+/// Ask on the terminal; no terminal, no.
+fn confirm(prompt: &str) -> bool {
+    use std::io::IsTerminal as _;
+    if !io::stdin().is_terminal() {
+        eprintln!("{prompt} (not asked: stdin is not a terminal)");
+        return false;
+    }
+    eprint!("{prompt} [y/N] ");
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer).is_ok() && matches!(answer.trim(), "y" | "Y" | "yes")
+}
+
+fn short(id: Option<&ambits::objects::ObjectId>) -> String {
+    id.map_or_else(|| "(none)".to_string(), |i| i.short())
+}
+
+fn print_push(out: &mut impl Write, outcome: &ambits::remote::PushOutcome) -> io::Result<()> {
+    use ambits::remote::PushOutcome;
+    match outcome {
+        PushOutcome::UpToDate {
+            remote,
+            tip,
+            links,
+            repaired,
+        } => {
+            write!(out, "{remote} is up to date ({})", tip.short())?;
+            if *links > 0 {
+                write!(out, "; {links} new link(s) sent")?;
+            }
+            if *repaired > 0 {
+                write!(out, "; {repaired} damaged object(s) on the remote repaired")?;
+            }
+            writeln!(out)
+        }
+        PushOutcome::Pushed {
+            remote,
+            from,
+            to,
+            objects,
+            links,
+            forced,
+            other_ignore,
+        } => {
+            writeln!(
+                out,
+                "{remote}: {} → {}{}; {objects} object(s), {links} link(s) sent",
+                short(from.as_ref()),
+                to.short(),
+                if *forced { " (forced)" } else { "" }
+            )?;
+            warn_ignore(*other_ignore)
+        }
+        PushOutcome::DryRun {
+            remote,
+            from,
+            to,
+            objects,
+            links,
+            other_ignore,
+        } => {
+            writeln!(
+                out,
+                "would push to {remote}: {} → {}; {objects} object(s), {links} link(s)",
+                short(from.as_ref()),
+                to.short()
+            )?;
+            warn_ignore(*other_ignore)
+        }
+    }
+}
+
+/// Snapshots are filtered when made: one made under other `[sync] ignore`
+/// rules holds what those let in.
+fn warn_ignore(n: usize) -> io::Result<()> {
+    if n > 0 {
+        eprintln!("warning: {n} snapshot(s) were made under different [sync] ignore rules than today's, and are sent as they were made");
+    }
+    Ok(())
+}
+
+fn print_fetch(out: &mut impl Write, report: &ambits::remote::FetchReport) -> io::Result<()> {
+    for m in &report.moved {
+        let forced = if m.forced {
+            "  (forced: the remote was overwritten; the old tip stays in the reflog)"
+        } else {
+            ""
+        };
+        writeln!(
+            out,
+            "{}/{}: {} → {}{forced}",
+            report.remote,
+            m.session,
+            short(m.from.as_ref()),
+            m.to.short()
+        )?;
+    }
+    for (session, why) in &report.failed {
+        writeln!(
+            out,
+            "{}/{session}: not fetched — {}",
+            report.remote,
+            ambits::objects::printable(why)
+        )?;
+    }
+    writeln!(
+        out,
+        "fetched from {}: {} session(s) moved, {} object(s), {} link(s)",
+        report.remote,
+        report.moved.len(),
+        report.objects,
+        report.links
+    )
+}
+
+fn print_pull(
+    out: &mut impl Write,
+    session: &str,
+    report: &ambits::remote::PullReport,
+) -> io::Result<()> {
+    use ambits::remote::PullOutcome;
+    print_fetch(out, &report.fetch)?;
+    let remote = &report.fetch.remote;
+    match &report.outcome {
+        PullOutcome::NotOnRemote => writeln!(out, "{remote} has no snapshots of session {session}"),
+        PullOutcome::UpToDate => writeln!(out, "already up to date with {remote}"),
+        PullOutcome::Behind => writeln!(
+            out,
+            "{remote} is ahead but adds nothing this session lacks; nothing merged"
+        ),
+        PullOutcome::Merged {
+            tip,
+            reads,
+            stale,
+            writes,
+            conflicts,
+            rejected,
+        } => {
+            writeln!(
+                out,
+                "merged {remote}/{} into {session}: {reads} read(s), {writes} write(s); {stale} stale read(s) and {conflicts} conflicting write(s) kept as history",
+                tip.short()
+            )?;
+            if *rejected > 0 {
+                writeln!(out, "{rejected} malformed remote record(s) left out")?;
+            }
+            writeln!(
+                out,
+                "the next `ambits snapshot` descends from {remote}/{}",
+                tip.short()
+            )
+        }
+    }
+}
+
+fn run_log(project_path: &Path, reference: Option<&str>) -> Result<()> {
+    use ambits::objects::snapshot;
+    let Some(reference) = reference else {
+        color_eyre::eyre::bail!("no session: pass a session or snapshot id, or --session");
+    };
+    let store = ambits::objects::store::Store::at(project_path);
+    let start = snapshot::resolve(&store, reference)?;
+    let entries = snapshot::history(&store, start)?;
+    snapshot::print_log(&mut io::stdout().lock(), &entries)?;
+    Ok(())
+}
+
 /// Build the project symbol tree with whichever backend was selected.
 ///
 /// Named because two call sites need it and they must not drift: `find`
@@ -987,8 +1448,41 @@ fn run() -> Result<()> {
         }
         Some(Commands::Hook { command }) => {
             return match command {
-                HookCommands::Install { global, project } => {
-                    hook::install(*global, project.clone())
+                HookCommands::Install {
+                    git: true, project, ..
+                } => {
+                    let dir = project.clone().unwrap_or(std::env::current_dir()?);
+                    let dir = dir.canonicalize().unwrap_or(dir);
+                    let exe = std::env::current_exe()?.canonicalize()?;
+                    let installed = ambits::git_hook::install(&dir, &exe)?;
+                    writeln!(
+                        io::stdout().lock(),
+                        "installed {}",
+                        installed.path.display()
+                    )?;
+                    if installed.in_work_tree {
+                        ambits::try_eprintln!(
+                            "[ambit] note: this hooks directory is inside the work tree and may be tracked; the hook names this machine's ambits path"
+                        );
+                    }
+                    Ok(())
+                }
+                HookCommands::Install {
+                    global, project, ..
+                } => hook::install(*global, project.clone()),
+                HookCommands::Uninstall { project, .. } => {
+                    let dir = project.clone().unwrap_or(std::env::current_dir()?);
+                    let removed = ambits::git_hook::uninstall(&dir)?;
+                    writeln!(
+                        io::stdout().lock(),
+                        "{}",
+                        if removed {
+                            "removed the git hook"
+                        } else {
+                            "no ambits git hook installed"
+                        }
+                    )?;
+                    Ok(())
                 }
             };
         }
@@ -1004,14 +1498,28 @@ fn run() -> Result<()> {
     };
     let project_path = project.canonicalize().unwrap_or(project);
 
+    if let Some(dir) = cli
+        .state_dir
+        .take()
+        .or_else(|| std::env::var_os(ambits::state_dir::STATE_DIR_ENV).map(PathBuf::from))
+    {
+        let dir = if dir.is_absolute() {
+            dir
+        } else {
+            std::env::current_dir()?.join(dir)
+        };
+        let _ = ambits::state_dir::set_override(dir);
+    }
+
     // Resolve tool call mapping config. Warnings go to stderr via `report_warnings`.
     let (tool_config, config_warnings) =
         ToolMappingConfig::resolve(cli.tools_config.as_deref(), &project_path);
 
-    // Capture the `[cache]`/`[editor]` stanzas before `tool_config` is
-    // coerced into the mapper trait object below and its concrete type is no
-    // longer reachable.
+    // Capture the `[cache]`/`[editor]`/`[sync]` stanzas before `tool_config`
+    // is coerced into the mapper trait object below and its concrete type is
+    // no longer reachable.
     let cache_cfg = tool_config.cache.clone();
+    let sync_cfg = tool_config.sync.clone();
     let editor_template = ambits::editor::resolve_editor_template(
         cli.editor.as_deref(),
         tool_config.editor.command.as_deref(),
@@ -1043,13 +1551,39 @@ fn run() -> Result<()> {
     // Dispatched before the tree scan: inspecting or deleting journal files
     // needs the project path and nothing else, and scanning first would make
     // `cache status` pay seconds for an answer it does not use.
+    // Like `cache`, reads journals plus at most one file; no scan needed.
+    if let Some(Commands::Touched { target, format }) = &command {
+        return ambits::touched::run(&project_path, target, matches!(format, TouchedFormat::Json));
+    }
+
+    if let Some(Commands::Report {
+        format,
+        from_json: Some(path),
+        ..
+    }) = &command
+    {
+        if *format != ReportFormat::Html {
+            color_eyre::eyre::bail!("--from-json renders a report; pass --format html");
+        }
+        let json = std::fs::read_to_string(path)
+            .map_err(|e| color_eyre::eyre::eyre!("{}: {e}", path.display()))?;
+        write!(
+            io::stdout().lock(),
+            "{}",
+            ambits::report::render_html(&json)?
+        )?;
+        return Ok(());
+    }
+
     if let Some(Commands::Cache { command }) = &command {
-        return match command {
-            CacheCommands::Status => ambits::cache::status(&project_path),
+        match command {
+            CacheCommands::Status => return ambits::cache::status(&project_path),
             CacheCommands::Clear { session, all } => {
-                ambits::cache::clear(&project_path, session.as_deref(), *all)
+                return ambits::cache::clear(&project_path, session.as_deref(), *all);
             }
-        };
+            // Needs the scanned tree and the session, so it is dispatched below.
+            CacheCommands::Sync { .. } => {}
+        }
     }
 
     let registry = ParserRegistry::new();
@@ -1063,7 +1597,14 @@ fn run() -> Result<()> {
         .clone()
         .or_else(|| ingester.log_dir_for_project(&project_path));
 
-    let session_id = cli.session.clone().or_else(|| {
+    // Run from a Claude Code session, the session is the one running us —
+    // named by the environment — when it is this project's; else the latest.
+    let running = std::env::var("CLAUDE_CODE_SESSION_ID").ok().filter(|sid| {
+        log_dir
+            .as_ref()
+            .is_some_and(|d| !ingester.session_log_files(d, sid).is_empty())
+    });
+    let session_id = cli.session.clone().or(running).or_else(|| {
         log_dir
             .as_ref()
             .and_then(|d| ingester.find_latest_session(d))
@@ -1071,11 +1612,169 @@ fn run() -> Result<()> {
 
     ambits::logging::init(cli.log_output.as_deref(), session_id.as_deref());
 
+    if let Some(Commands::Links {
+        command: LinksCommands::Refresh { days },
+    }) = &command
+    {
+        let window = days_flag(*days, "--days")?;
+        // Bounded, so a hook never leaves a process running for long.
+        let stats = ambits::linkage::refresh(&project_path, window, Duration::from_secs(30))?;
+        writeln!(
+            io::stdout().lock(),
+            "links: {} landed, {} uncommitted{}",
+            stats.landed,
+            stats.uncommitted,
+            if stats.stopped_early {
+                " (stopped at the time limit)"
+            } else {
+                ""
+            }
+        )?;
+        return Ok(());
+    }
+
+    // A trace needs only the session's logs.
+    if let Some(Commands::Trace { format }) = &command {
+        let session = require_session(session_id.as_deref(), "trace")?;
+        let files = log_dir
+            .as_ref()
+            .map(|d| ingester.session_log_files(d, session))
+            .unwrap_or_default();
+        if files.is_empty() {
+            color_eyre::eyre::bail!("no logs found for session {session}");
+        }
+        let events = files
+            .iter()
+            .flat_map(|f| ingester.parse_log_file_with_root(f, &project_path));
+        let mut trace = ambits::trace::Trace::from_events(events, &project_path);
+        if let Some((start, end)) = trace.range() {
+            trace.set_commits(&ambits::git::commits_between(&project_path, start, end));
+        }
+        let agent = cli.agent.as_deref();
+        let out = match format {
+            TraceFormat::Otlp => ambits::trace::export::otlp(&trace, session, agent),
+            TraceFormat::Chrome => ambits::trace::export::chrome(&trace, session, agent),
+        };
+        writeln!(io::stdout().lock(), "{out}")?;
+        return Ok(());
+    }
+
+    if let Some(Commands::Remote { command }) = &command {
+        return run_remote(&project_path, command);
+    }
+    if let Some(Commands::Push {
+        remote,
+        force_with_lease,
+        dry_run,
+        break_lock,
+        verify_all,
+    }) = &command
+    {
+        let session = require_session(session_id.as_deref(), "push")?;
+        if *break_lock {
+            let (_, store) = ambits::remote::open(&project_path, remote.as_deref())?;
+            let id = ambits::remote::config::Config::store_id(&project_path)?;
+            if let ambits::remote::lock::Broken::Broken(h) =
+                ambits::remote::lock::break_lock(&store, &id, confirm)?
+            {
+                eprintln!(
+                    "broke the remote lock held by pid {} since {}",
+                    h.pid,
+                    ambits::time::rfc3339(h.start)
+                );
+            }
+        }
+        let ignore = ambits::objects::sync_ignore::SyncIgnore::new(&sync_cfg)?;
+        let outcome = ambits::remote::push(&ambits::remote::PushRequest {
+            project_root: &project_path,
+            remote: remote.as_deref(),
+            session,
+            force_with_lease: *force_with_lease,
+            dry_run: *dry_run,
+            ignore: &ignore,
+            verify: verify(*verify_all),
+        })?;
+        print_push(&mut io::stdout().lock(), &outcome)?;
+        return Ok(());
+    }
+    if let Some(Commands::Fetch { remote, verify_all }) = &command {
+        let report = ambits::remote::fetch(&project_path, remote.as_deref(), verify(*verify_all))?;
+        print_fetch(&mut io::stdout().lock(), &report)?;
+        if !report.failed.is_empty() {
+            color_eyre::eyre::bail!(
+                "{} session(s) from {} did not verify and were not fetched",
+                report.failed.len(),
+                report.remote
+            );
+        }
+        return Ok(());
+    }
+
+    // Snapshot history and gc read only the store; no scan needed.
+    if let Some(Commands::Log { reference }) = &command {
+        return run_log(
+            &project_path,
+            reference.as_deref().or(session_id.as_deref()),
+        );
+    }
+    if let Some(Commands::Gc {
+        grace_days,
+        reflog_expiry_days,
+    }) = &command
+    {
+        let store = ambits::objects::store::Store::at(&project_path);
+        let stats = ambits::objects::gc::gc(
+            &store,
+            days_flag(*grace_days, "--grace-days")?,
+            days_flag(*reflog_expiry_days, "--reflog-expiry-days")?,
+        )?;
+        let mut out = io::stdout().lock();
+        writeln!(
+            out,
+            "gc: {} reachable, {} deleted, {} unreachable kept, {} reflog entries expired, {} notes and {} temp files removed",
+            stats.reachable,
+            stats.deleted.len(),
+            stats.kept,
+            stats.reflog_entries_expired,
+            stats.notes_removed,
+            stats.temp_files_removed
+        )?;
+        return Ok(());
+    }
+
     // Coverage context for `find` and `show`. Loaded once, from the journal
     // the TUI maintains, so both can report whether a symbol has already been
     // read. `None` when there is no session or no journal — which callers must
     // not confuse with "nothing has been read".
-    let coverage_index = ambits::restore::CoverageIndex::load(&project_path, session_id.as_deref());
+    //
+    // The depths are the calling agent's own reads — a subagent has not read
+    // what its parent did — found from the session's logs; `--agent` names
+    // another. When the caller cannot be told, they are the whole session's,
+    // and the JSON says why.
+    let scope = {
+        use ambits::restore::CoverageScope;
+        let looks_up = matches!(
+            command,
+            Some(Commands::Rg(_) | Commands::Grep(_) | Commands::Show { .. })
+        );
+        match (&cli.agent, log_dir.as_ref(), session_id.as_deref()) {
+            (Some(prefix), ..) => CoverageScope::Named(prefix.clone()),
+            (None, Some(dir), Some(sid)) if looks_up => {
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                match ingester.calling_agent(dir, sid, &args) {
+                    ambits::ingest::Caller::Agent { id, parent } => {
+                        CoverageScope::Agent { id, parent }
+                    }
+                    ambits::ingest::Caller::Unknown(reason) => CoverageScope::Session { reason },
+                }
+            }
+            _ => CoverageScope::Session {
+                reason: "no session log to tell the calling agent from".into(),
+            },
+        }
+    };
+    let coverage_index =
+        ambits::restore::CoverageIndex::load_scoped(&project_path, session_id.as_deref(), scope);
 
     // Both search dialects run before the project-wide scan, the way `cache`
     // does. A content search reads the files it walks and parses only the ones
@@ -1121,11 +1820,8 @@ fn run() -> Result<()> {
 
         match outcome {
             Ok(outcome) => {
-                // Neither dialect journals its own reads — the TUI is the sole
-                // journal writer (see journal.rs's module doc). A search run
-                // with no TUI attached to the session earns no coverage credit;
-                // that is an accepted trade for never having two processes able
-                // to write the same session's journal.
+                // Neither dialect journals its own reads (see journal.rs's
+                // module doc, "One writer").
                 if outcome.matched {
                     return Ok(());
                 }
@@ -1139,6 +1835,227 @@ fn run() -> Result<()> {
     }
 
     let project_tree = scan_tree(cli.serena, &registry, &project_path, filter.as_ref())?;
+
+    if let Some(Commands::Restore { reference, into }) = &command {
+        report_warnings(&config_warnings);
+        let report = ambits::objects::restore::restore(&ambits::objects::restore::Request {
+            project_root: &project_path,
+            reference,
+            into: into.as_deref(),
+            tree: &project_tree,
+            backend: if cli.serena { "serena" } else { "tree-sitter" },
+            filter: filter.as_ref().map(|f| f.display()),
+        })?;
+        ambits::objects::restore::print_report(&mut io::stdout().lock(), &report)?;
+        return Ok(());
+    }
+
+    if let Some(Commands::Pull { remote, verify_all }) = &command {
+        report_warnings(&config_warnings);
+        let session = require_session(session_id.as_deref(), "pull into")?;
+        let report = ambits::remote::pull(&ambits::remote::PullRequest {
+            project_root: &project_path,
+            remote: remote.as_deref(),
+            session,
+            tree: &project_tree,
+            backend: if cli.serena { "serena" } else { "tree-sitter" },
+            filter: filter.as_ref().map(|f| f.display()),
+            verify: verify(*verify_all),
+        })?;
+        print_pull(&mut io::stdout().lock(), session, &report)?;
+        return Ok(());
+    }
+
+    if let Some(Commands::Snapshot {
+        message,
+        require_clean,
+    }) = &command
+    {
+        report_warnings(&config_warnings);
+        let session = require_session(session_id.as_deref(), "snapshot")?;
+        let outcome = ambits::objects::snapshot::snapshot(&ambits::objects::snapshot::Request {
+            project_root: &project_path,
+            session,
+            tree: &project_tree,
+            sync: &sync_cfg,
+            message: message.as_deref(),
+            require_clean: *require_clean,
+        })?;
+        ambits::objects::snapshot::print_outcome(&mut io::stdout().lock(), &outcome)?;
+        return Ok(());
+    }
+
+    if let Some(Commands::Report {
+        format,
+        max_bytes,
+        phases,
+        ..
+    }) = &command
+    {
+        report_warnings(&config_warnings);
+        // Read before the session, so a bad document fails without a replay.
+        let phases = phases
+            .as_ref()
+            .map(|path| {
+                let json = std::fs::read_to_string(path)
+                    .map_err(|e| color_eyre::eyre::eyre!("{}: {e}", path.display()))?;
+                ambits::report::Phases::parse(&json)
+                    .map_err(|e| e.wrap_err(path.display().to_string()))
+            })
+            .transpose()?;
+        let session = require_session(session_id.as_deref(), "report on")?.to_string();
+        if log_dir
+            .as_ref()
+            .is_none_or(|d| ingester.session_log_files(d, &session).is_empty())
+        {
+            color_eyre::eyre::bail!("no logs for session {session}: pass --log-dir, or run inside a project with Claude Code logs");
+        }
+        let (mut app, _) = replayed_app(
+            project_tree,
+            &project_path,
+            filter,
+            &session_id,
+            &log_dir,
+            &*ingester,
+        );
+        app.rehydrate_from_journal();
+        let mut writes = ambits::journal::read_session_writes(
+            &ambits::journal::journal_dir(&project_path),
+            &session,
+        );
+        for (_, event) in recovered_writes(
+            &mut app,
+            log_dir.as_deref(),
+            &session,
+            &project_path,
+            &*ingester,
+        ) {
+            if let Some(record) =
+                ambits::writes::build_record(&event, &project_path, &registry, !cli.serena)
+            {
+                if writes
+                    .get(&record.op)
+                    .is_none_or(|known| known.av < record.av)
+                {
+                    writes.insert(record.op.clone(), record);
+                }
+            }
+        }
+        if let Some((start, end)) = app.trace.range() {
+            app.trace
+                .set_commits(&ambits::git::commits_between(&project_path, start, end));
+        }
+        let wanted: std::collections::HashMap<String, ambits::ingest::content::ContentKind> = app
+            .trace
+            .spans()
+            .iter()
+            .filter_map(|s| {
+                Some((
+                    s.id.as_deref()?.to_string(),
+                    ambits::report::content_kind(s.kind)?,
+                ))
+            })
+            .collect();
+        let log_files = log_dir
+            .as_ref()
+            .map(|d| ingester.session_log_files(d, &session))
+            .unwrap_or_default();
+        let details = ingester.call_details(&log_files, &wanted);
+        let mut report = ambits::report::build(ambits::report::Inputs {
+            project_root: &project_path,
+            session_id: &session,
+            tree: &app.project_tree,
+            ledger: &app.ledger,
+            trace: &app.trace,
+            agents: &app.agent_tree,
+            writes: writes.into_values().collect(),
+            registry: &registry,
+            details,
+            phases,
+        })?;
+        if let Some(max) = max_bytes {
+            ambits::report::fit(&mut report, *max)?;
+        }
+        let json = serde_json::to_string(&report)?;
+        let out = &mut io::stdout().lock();
+        match format {
+            ReportFormat::Json => writeln!(out, "{json}")?,
+            ReportFormat::Html => write!(out, "{}", ambits::report::render_html(&json)?)?,
+        }
+        return Ok(());
+    }
+
+    if let Some(Commands::Cache {
+        command: CacheCommands::Sync { format },
+    }) = &command
+    {
+        report_warnings(&config_warnings);
+        if !journal_enabled {
+            color_eyre::eyre::bail!("cache sync writes the journal, which --no-journal or `[cache] enabled = false` turns off");
+        }
+        let session = require_session(session_id.as_deref(), "sync")?.to_string();
+        if log_dir
+            .as_ref()
+            .is_none_or(|d| ingester.session_log_files(d, &session).is_empty())
+        {
+            color_eyre::eyre::bail!("no logs for session {session}: pass --log-dir, or run inside a project with Claude Code logs");
+        }
+        let (mut app, _) = replayed_app(
+            project_tree,
+            &project_path,
+            filter,
+            &session_id,
+            &log_dir,
+            &*ingester,
+        );
+        attach_journal(&mut app, journal_settings(cli.serena, Some(0)));
+        for (write_session, event) in recovered_writes(
+            &mut app,
+            log_dir.as_deref(),
+            &session,
+            &project_path,
+            &*ingester,
+        ) {
+            if let Some(record) =
+                ambits::writes::build_record(&event, &project_path, &registry, !cli.serena)
+            {
+                app.record_write(&write_session, record);
+            }
+        }
+        app.sync_journal();
+        let journal = app.journal.as_ref().ok_or_else(|| {
+            color_eyre::eyre::eyre!("no journal was opened for session {session}")
+        })?;
+        if let Some(error) = journal.error() {
+            color_eyre::eyre::bail!("cannot write the journal: {error}");
+        }
+        let held = ambits::journal::read_journal_session(
+            &ambits::journal::journal_dir(&project_path),
+            &session,
+        );
+        let out = &mut io::stdout().lock();
+        match format {
+            CacheSyncFormat::Text => writeln!(
+                out,
+                "journal {}: {} symbols read, {} writes",
+                journal.path().display(),
+                held.reads.len(),
+                held.writes.len()
+            )?,
+            CacheSyncFormat::Json => writeln!(
+                out,
+                "{}",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "session_id": session,
+                    "journal": journal.path(),
+                    "symbols_read": held.reads.len(),
+                    "writes": held.writes.len(),
+                })
+            )?,
+        }
+        return Ok(());
+    }
 
     if cli.dump {
         report_warnings(&config_warnings);
@@ -1212,62 +2129,27 @@ fn run() -> Result<()> {
     // terminal swallowing input with the panic message painted on an alternate
     // screen nobody would ever see again.
 
-    let mut app = App::new(project_tree, project_path.clone());
+    let (mut app, handoff) = replayed_app(
+        project_tree,
+        &project_path,
+        filter,
+        &session_id,
+        &log_dir,
+        &*ingester,
+    );
     app.set_editor_template(editor_template);
-    app.filter = filter.map(Arc::new);
-    app.set_session_id(session_id.clone());
-    app.session_slug = log_dir.as_ref()
-        .zip(session_id.as_ref())
-        .and_then(|(ld, sid)| ingester.session_slug(ld, sid));
-
-    // Pre-populate the ledger from existing session logs.
-    if let (Some(ref log_dir), Some(ref session_id)) = (&log_dir, &session_id) {
-        let log_files = ingester.session_log_files(log_dir, session_id);
-        for log_file in &log_files {
-            for event in ingester.parse_log_file_with_root(log_file, &project_path) {
-                match event {
-                    ingest::SessionEvent::ToolCall(tc) => app.process_agent_event(tc),
-                    ingest::SessionEvent::Compacted { summary, timestamp, agent_id, metadata } => {
-                        app.process_compaction(summary, timestamp, agent_id, metadata);
-                    }
-                    ingest::SessionEvent::SessionCleared => app.reset_session(),
-                }
-            }
-        }
-    }
 
     let serena_mode = cli.serena;
 
-    // Fold in the journal before opening it for writing. The replay above
-    // rebuilt *which* symbols were read but stamped each with the hash it has
-    // now, so nothing looks drifted; only the journal knows what they looked
-    // like at the time. Skipped entirely when journaling is off, since then
-    // there is no journal to trust.
-    if journal_enabled {
-        if let Some(stats) = app.rehydrate_from_journal() {
-            if stats.drifted > 0 || stats.inserted > 0 || stats.moved > 0 {
-                ambits::try_eprintln!(
-                    "[ambit] rehydrated from journal: {} corrected, {} recovered, {} moved, {} stale",
-                    stats.corrected, stats.inserted, stats.moved, stats.drifted
-                );
-            }
-        }
-    }
-
-    // Open the coverage journal *after* the startup replay above. `Journal::open`
-    // seeds its dedup map from what is already on disk, so the immediate sync
-    // below appends only genuinely new reads — which is what keeps relaunching
-    // ambit idempotent instead of re-appending the whole session every time.
     // CLI flags win over the `[cache]` stanza in tools.toml.
     if journal_enabled {
-        let interval = std::time::Duration::from_millis(
-            cli.flush_interval_ms
-                .or(cache_cfg.flush_interval_ms)
-                .unwrap_or(ambits::journal::DEFAULT_FLUSH_INTERVAL_MS),
+        attach_journal(
+            &mut app,
+            journal_settings(
+                serena_mode,
+                cli.flush_interval_ms.or(cache_cfg.flush_interval_ms),
+            ),
         );
-        let backend = if serena_mode { "serena" } else { "tree-sitter" };
-        report_warnings(app.enable_journal(backend, interval));
-        app.sync_journal();
     }
 
     // Terminal setup, as late as possible. The guard restores it on every
@@ -1281,7 +2163,20 @@ fn run() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_tui(&mut terminal, &mut app, &project_path, &log_dir, session_id, &registry, serena_mode, &ingester);
+    let starting = tui::StartingSession {
+        id: session_id,
+        handoff,
+    };
+    let result = run_tui(
+        &mut terminal,
+        &mut app,
+        &project_path,
+        &log_dir,
+        starting,
+        &registry,
+        serena_mode,
+        &ingester,
+    );
 
     // Capture the tail of the session. Records are written unbuffered, so this
     // is not a buffer flush — it is a final diff of anything read since the
@@ -1295,6 +2190,118 @@ fn run() -> Result<()> {
     terminal.show_cursor()?;
 
     result
+}
+
+/// A session's `App`: the tree, with every log the session has on disk
+/// replayed into its ledger, and where a tailer would continue from.
+fn replayed_app(
+    project_tree: ambits::symbols::ProjectTree,
+    project_path: &Path,
+    filter: Option<PathFilter>,
+    session_id: &Option<String>,
+    log_dir: &Option<PathBuf>,
+    ingester: &dyn SessionIngester,
+) -> (App, ingest::Handoff) {
+    let mut app = App::new(project_tree, project_path.to_path_buf());
+    app.filter = filter.map(Arc::new);
+    app.set_session_id(session_id.clone());
+    app.session_slug = log_dir
+        .as_ref()
+        .zip(session_id.as_ref())
+        .and_then(|(ld, sid)| ingester.session_slug(ld, sid));
+    let mut handoff = ingest::Handoff::default();
+    if let (Some(log_dir), Some(session_id)) = (log_dir, session_id) {
+        let log_files = ingester.session_log_files(log_dir, session_id);
+        handoff = tui::replay_session(&mut app, ingester, log_files, project_path);
+    }
+    (app, handoff)
+}
+
+/// The replayed session's queued writes, with the `originalFile` Claude Code
+/// left out of large files recovered from disk (`writes::recover_originals`).
+/// Undoing them needs every write made since, so the writes of the other
+/// sessions logged beside this one, and active after it, are read too.
+fn recovered_writes(
+    app: &mut App,
+    log_dir: Option<&Path>,
+    session: &str,
+    project_path: &Path,
+    ingester: &dyn SessionIngester,
+) -> Vec<(Arc<str>, ingest::WriteEvent)> {
+    let (sessions, mut events): (Vec<Arc<str>>, Vec<ingest::WriteEvent>) =
+        app.take_pending_writes().into_iter().unzip();
+    let later = log_dir
+        .map(|dir| later_writes(dir, session, project_path, ingester))
+        .unwrap_or_default();
+    ambits::writes::recover_originals(&mut events, &later, project_path);
+    sessions.into_iter().zip(events).collect()
+}
+
+/// Writes by the sessions in `log_dir` other than `session` whose logs were
+/// written to after its own.
+fn later_writes(
+    log_dir: &Path,
+    session: &str,
+    project_path: &Path,
+    ingester: &dyn SessionIngester,
+) -> Vec<ingest::WriteEvent> {
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let Some(since) = modified(&log_dir.join(format!("{session}.jsonl"))) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter_map(|p| {
+            let stem = p.file_stem()?.to_str()?.to_string();
+            (p.extension()? == "jsonl"
+                && stem != session
+                && ingest::claude::is_uuid(&stem)
+                && modified(&p)? >= since)
+                .then_some(stem)
+        })
+        .flat_map(|other| ingester.session_log_files(log_dir, &other))
+        .flat_map(|file| ingester.replay_log_file(&file, project_path).events)
+        .filter_map(|event| match event {
+            ingest::SessionEvent::Write(w) => Some(w),
+            _ => None,
+        })
+        .collect()
+}
+
+fn journal_settings(serena: bool, flush_interval_ms: Option<u64>) -> ambits::app::JournalSettings {
+    ambits::app::JournalSettings {
+        backend: if serena { "serena" } else { "tree-sitter" },
+        interval: Duration::from_millis(
+            flush_interval_ms.unwrap_or(ambits::journal::DEFAULT_FLUSH_INTERVAL_MS),
+        ),
+    }
+}
+
+/// Journal the replayed session: fold its journal into the ledger, then open
+/// it for appending. The replay rebuilt *which* symbols were read but stamped
+/// each with the hash it has now, so nothing looks drifted; only the journal
+/// knows what they looked like at the time. `Journal::open` seeds its dedup
+/// map from what is on disk, so the sync appends only genuinely new reads,
+/// which keeps relaunching idempotent.
+fn attach_journal(app: &mut App, settings: ambits::app::JournalSettings) {
+    app.set_journal_settings(Some(settings));
+    let attach = app.attach_journal();
+    if let Some(stats) = attach.rehydrated {
+        if stats.drifted > 0 || stats.inserted > 0 || stats.moved > 0 {
+            ambits::try_eprintln!(
+                "[ambit] rehydrated from journal: {} corrected, {} recovered, {} moved, {} stale",
+                stats.corrected,
+                stats.inserted,
+                stats.moved,
+                stats.drifted
+            );
+        }
+    }
+    report_warnings(attach.warnings);
 }
 
 /// Put the terminal back the way it was found.
@@ -1401,12 +2408,13 @@ fn run_restore_context(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     project_path: &Path,
     log_dir: &Option<PathBuf>,
-    session_id: Option<String>,
+    starting: tui::StartingSession,
     registry: &ParserRegistry,
     serena_mode: bool,
     ingester: &Arc<dyn SessionIngester>,
@@ -1419,7 +2427,7 @@ fn run_tui(
     let mut session = tui::TuiSession::new(
         project_path,
         log_dir,
-        session_id,
+        starting,
         registry.supported_extensions(),
         Arc::clone(ingester),
         serena_mode,
@@ -1441,9 +2449,13 @@ fn run_tui(
             Ok(AppEvent::Tick) => {
                 session.handle_tick(log_dir, app, serena_mode, project_path);
             }
+            Ok(AppEvent::WriteRecorded { session, record }) => app.record_write(&session, *record),
+            Ok(AppEvent::CommitsFound(commits)) => app.trace.set_commits(&commits),
+            Ok(AppEvent::ContentLoaded { key, content }) => app.set_call_content(key, content),
             Err(flume::RecvTimeoutError::Timeout) => {}
             Err(flume::RecvTimeoutError::Disconnected) => break,
         }
+        session.request_content(app);
 
         if let Some((path, line)) = app.pending_editor_request.take() {
             let template = app.editor_template.clone();
@@ -1531,6 +2543,9 @@ fn suspend_for_editor(
             AppEvent::Tick => {
                 session.handle_tick(log_dir, app, serena_mode, project_path);
             }
+            AppEvent::WriteRecorded { session, record } => app.record_write(&session, *record),
+            AppEvent::CommitsFound(commits) => app.trace.set_commits(&commits),
+            AppEvent::ContentLoaded { key, content } => app.set_call_content(key, content),
         }
     }
 

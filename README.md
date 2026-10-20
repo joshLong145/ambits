@@ -77,11 +77,27 @@ ambits -p . --coverage --format json | jq '.totals.full_percent'
 ```
 → [Coverage and Multi-Agent](https://github.com/joshLong145/ambits/wiki/Coverage-and-Multi-Agent)
 
+**Snapshots and sharing**: a session's reads and writes as durable, content-addressed history, shared through any directory:
+
+```bash
+ambits -p . snapshot && ambits -p . remote add origin /mnt/team/ambits && ambits -p . push
+ambits -p . fetch && ambits -p . restore origin/<session>   # on another machine
+```
+→ [Snapshots](https://github.com/joshLong145/ambits/wiki/Snapshots), [Sharing](https://github.com/joshLong145/ambits/wiki/Sharing)
+
+**Traces**: every tool call a span, subagents nested under their delegation, for any OpenTelemetry backend or Perfetto:
+
+```bash
+ambits -p . trace > session.otlp.json
+ambits -p . trace --format chrome > session.trace.json   # open in ui.perfetto.dev
+```
+→ [Traces](https://github.com/joshLong145/ambits/wiki/Traces)
+
 ## Languages
 
 | Backend | Languages |
 |---|---|
-| tree-sitter (default) | Rust, Python, TypeScript, Markdown |
+| tree-sitter (default) | Rust, Python, TypeScript, Java, Markdown |
 | [Serena](https://github.com/oraios/serena) (`--serena`) | Anything Serena supports |
 
 Search covers every text file; a file no parser handles simply has no symbols.
@@ -100,7 +116,7 @@ The wiki's source is [`docs/wiki/`](docs/wiki/); edit it there.
 
 ## Building from source
 
-Requires Rust 1.82+ (declared as `rust-version` in `Cargo.toml`).
+Requires Rust 1.88+ (declared as `rust-version` in `Cargo.toml`).
 
 ```bash
 cargo build --release

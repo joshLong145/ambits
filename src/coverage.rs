@@ -229,16 +229,16 @@ impl CoverageFormatter for TextFormatter {
         let mut output = String::new();
 
         // Header
-        let session_str = report
-            .session_id
-            .as_deref()
-            .unwrap_or("none");
+        let session_str = report.session_id.as_deref().unwrap_or("none");
         let agent_str = report
             .agent_id
             .as_deref()
             .map(|a| format!(", agent: {}", a))
             .unwrap_or_default();
-        output.push_str(&format!("Coverage Report (session: {}{})\n", session_str, agent_str));
+        output.push_str(&format!(
+            "Coverage Report (session: {}{})\n",
+            session_str, agent_str
+        ));
         if let Some(ref f) = report.filter {
             output.push_str(&format!("Filter: {f}\n"));
         }
@@ -524,6 +524,7 @@ impl CoverageFormatter for JsonFormatter {
 ///
 /// Resolves the log directory and session automatically when not provided.
 /// Supports optional agent-prefix filtering.
+#[allow(clippy::too_many_arguments)]
 pub fn run_report(
     project_path: &Path,
     project_tree: &ProjectTree,
@@ -572,7 +573,7 @@ pub fn run_report(
     // `mark_*_symbols` signature) but never read.
     let mut depth_cache = crate::tracking::alignment::DepthOrdinalCache::new();
     let mut known_agents: Vec<String> = Vec::new();
-    let mut files_accessed: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut files_accessed: BTreeSet<String> = BTreeSet::new();
     let mut tool_call_count: usize = 0;
     let mut compactions: Vec<CompactionSummary> = Vec::new();
     if let (Some(ref log_dir), Some(ref sid)) = (&log_dir, &session_id) {
@@ -583,13 +584,17 @@ pub fn run_report(
                 match event {
                     SessionEvent::ToolCall(tc) => {
                         tool_call_count += 1;
-                        if !known_agents.iter().any(|a: &String| a.as_str() == &*tc.agent_id) {
+                        if !known_agents
+                            .iter()
+                            .any(|a: &String| a.as_str() == &*tc.agent_id)
+                        {
                             known_agents.push(tc.agent_id.to_string());
                         }
-                        if let Some(ref file_path) = tc.file_path {
-                            files_accessed
-                                .insert(crate::app::normalize_tool_path(file_path, project_path));
-                        }
+                        files_accessed.extend(
+                            tc.file_path
+                                .as_deref()
+                                .and_then(|p| crate::objects::project_file(p, project_path)),
+                        );
                         crate::app::apply_tool_call(
                             project_tree,
                             project_path,
@@ -598,7 +603,12 @@ pub fn run_report(
                             &mut depth_cache,
                         );
                     }
-                    SessionEvent::Compacted { summary, timestamp, metadata, .. } => {
+                    SessionEvent::Compacted {
+                        summary,
+                        timestamp,
+                        metadata,
+                        ..
+                    } => {
                         let seen = ledger.total_seen();
                         let total = project_tree.total_symbols();
                         compactions.push(CompactionSummary {
@@ -606,10 +616,7 @@ pub fn run_report(
                             timestamp,
                             summary,
                             tool_calls_before: tool_call_count,
-                            files_before: files_accessed
-                                .iter()
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .collect(),
+                            files_before: files_accessed.iter().cloned().collect(),
                             symbols_seen_before: seen,
                             seen_percent_before: if total > 0 {
                                 seen as f64 / total as f64 * 100.0
@@ -643,6 +650,11 @@ pub fn run_report(
                         tool_call_count = 0;
                         compactions.clear();
                     }
+                    // Writes grant no read credit (spec D9).
+                    SessionEvent::ToolFinished(f) => {
+                        crate::app::apply_shown(project_tree, &f, &mut ledger, &mut depth_cache);
+                    }
+                    SessionEvent::Write(_) | SessionEvent::Prompt(_) => {}
                 }
             }
         }
@@ -694,7 +706,13 @@ pub fn dump_tree(
     filter: Option<&crate::filter::PathFilter>,
     depth: Option<usize>,
 ) -> std::io::Result<()> {
-    write_tree(&mut std::io::stdout().lock(), root, project_tree, filter, depth)
+    write_tree(
+        &mut std::io::stdout().lock(),
+        root,
+        project_tree,
+        filter,
+        depth,
+    )
 }
 
 /// The writer-generic core of [`dump_tree`], split out so the depth/`+N`
@@ -727,7 +745,12 @@ fn write_tree(
     writeln!(w)?;
 
     for file in &project_tree.files {
-        writeln!(w, "  {} ({} lines)", file.file_path.display(), file.total_lines)?;
+        writeln!(
+            w,
+            "  {} ({} lines)",
+            file.file_path.display(),
+            file.total_lines
+        )?;
         for sym in &file.symbols {
             write_symbol(w, sym, 4, depth)?;
         }
@@ -811,7 +834,10 @@ mod tests {
         let out = rendered(&tree, Some(0));
         assert!(out.contains("Foo"), "{out}");
         assert!(out.contains("+1"), "one hidden child noted: {out}");
-        assert!(!out.contains("method"), "the child itself is not printed: {out}");
+        assert!(
+            !out.contains("method"),
+            "the child itself is not printed: {out}"
+        );
     }
 
     /// `Some(1)`: children print, grandchildren do not — and a fully-shown
@@ -841,7 +867,10 @@ mod tests {
 
         let out = rendered(&tree, None);
         assert!(out.contains("inner"), "{out}");
-        assert!(!out.contains('+'), "nothing is hidden, so nothing is marked: {out}");
+        assert!(
+            !out.contains('+'),
+            "nothing is hidden, so nothing is marked: {out}"
+        );
     }
 
     /// A childless symbol never gets a `+N`, even at depth 0 — there is
@@ -858,19 +887,34 @@ mod tests {
 
     #[test]
     fn seen_percent_basic() {
-        let fc = FileCoverage { path: "a.rs".into(), total_symbols: 10, seen_count: 3, full_count: 1 };
+        let fc = FileCoverage {
+            path: "a.rs".into(),
+            total_symbols: 10,
+            seen_count: 3,
+            full_count: 1,
+        };
         assert!((fc.seen_percent() - 30.0).abs() < 0.01);
     }
 
     #[test]
     fn seen_percent_zero_total() {
-        let fc = FileCoverage { path: "a.rs".into(), total_symbols: 0, seen_count: 0, full_count: 0 };
+        let fc = FileCoverage {
+            path: "a.rs".into(),
+            total_symbols: 0,
+            seen_count: 0,
+            full_count: 0,
+        };
         assert!((fc.seen_percent()).abs() < 0.01);
     }
 
     #[test]
     fn full_percent_basic() {
-        let fc = FileCoverage { path: "a.rs".into(), total_symbols: 4, seen_count: 2, full_count: 2 };
+        let fc = FileCoverage {
+            path: "a.rs".into(),
+            total_symbols: 4,
+            seen_count: 2,
+            full_count: 2,
+        };
         assert!((fc.full_percent() - 50.0).abs() < 0.01);
     }
 
@@ -935,8 +979,20 @@ mod tests {
         let syms = vec![sym("s1", "s1"), sym("s2", "s2")];
 
         // Agent A reads s1 at FullBody, Agent B reads s2 at Overview.
-        ledger.record("s1".into(), ReadDepth::FullBody, [0; 32], "agent_a".into(), 10);
-        ledger.record("s2".into(), ReadDepth::Overview, [0; 32], "agent_b".into(), 5);
+        ledger.record(
+            "s1".into(),
+            ReadDepth::FullBody,
+            [0; 32],
+            "agent_a".into(),
+            10,
+        );
+        ledger.record(
+            "s2".into(),
+            ReadDepth::Overview,
+            [0; 32],
+            "agent_b".into(),
+            5,
+        );
 
         // Aggregate: both seen, 1 full.
         let (total, seen, full) = count_symbols(&syms, &ledger, None);
@@ -964,8 +1020,20 @@ mod tests {
         ]);
 
         // Agent A reads a1, Agent B reads b1.
-        ledger.record("a1".into(), ReadDepth::FullBody, [0; 32], "agent_a".into(), 10);
-        ledger.record("b1".into(), ReadDepth::FullBody, [0; 32], "agent_b".into(), 10);
+        ledger.record(
+            "a1".into(),
+            ReadDepth::FullBody,
+            [0; 32],
+            "agent_a".into(),
+            10,
+        );
+        ledger.record(
+            "b1".into(),
+            ReadDepth::FullBody,
+            [0; 32],
+            "agent_b".into(),
+            10,
+        );
 
         // Aggregate: both files covered.
         let report = CoverageReport::from_project(&tree, &ledger, None);
@@ -1036,7 +1104,10 @@ mod tests {
             compactions: Vec::new(),
         };
         let output = JsonFormatter.format(&report);
-        assert!(output.ends_with('\n'), "output must end with a trailing newline");
+        assert!(
+            output.ends_with('\n'),
+            "output must end with a trailing newline"
+        );
         let body = output.trim_end_matches('\n');
         assert!(!body.contains('\n'), "JSON body must be a single line");
     }
@@ -1078,8 +1149,10 @@ mod tests {
             compactions: Vec::new(),
         };
         let output = TextFormatter::default().format(&report);
-        assert!(!output.contains("Context Compactions"),
-            "compaction section must be absent when empty, got:\n{output}");
+        assert!(
+            !output.contains("Context Compactions"),
+            "compaction section must be absent when empty, got:\n{output}"
+        );
     }
 
     #[test]
@@ -1140,8 +1213,10 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files[0], "src/cli.rs");
         // `metadata` is absent (skip_serializing_if = "Option::is_none") when None.
-        assert!(entry.get("metadata").is_none(),
-            "metadata field should be omitted when None, got entry: {entry}");
+        assert!(
+            entry.get("metadata").is_none(),
+            "metadata field should be omitted when None, got entry: {entry}"
+        );
     }
 
     #[test]
@@ -1281,7 +1356,11 @@ mod tests {
     impl CoverageFormatter for Capture {
         fn format(&self, report: &CoverageReport) -> String {
             *self.totals.borrow_mut() = report.files.iter().fold((0, 0, 0), |acc, f| {
-                (acc.0 + f.total_symbols, acc.1 + f.seen_count, acc.2 + f.full_count)
+                (
+                    acc.0 + f.total_symbols,
+                    acc.1 + f.seen_count,
+                    acc.2 + f.full_count,
+                )
             });
             String::new()
         }
@@ -1299,6 +1378,12 @@ mod tests {
             target_lines: None,
             target_selectors: Vec::new(),
             label: "ag".into(),
+            tool_use_id: None,
+            effect: crate::ingest::Effect::Read,
+            summary: None,
+            result_depth: None,
+            file_reads: Vec::new(),
+            searches: Vec::new(),
         })
     }
 
@@ -1374,5 +1459,4 @@ mod tests {
 
         assert_eq!(seen, 1, "only the post-clear read survives");
     }
-
 }

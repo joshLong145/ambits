@@ -127,6 +127,122 @@ struct ResultDto<'a> {
     /// Every symbol matching the query, sorted by file then line. Empty means
     /// no match.
     matches: Vec<MatchDto<'a>>,
+    /// For an id that matched nothing, ids close to it (see [`suggest`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    suggestions: Vec<&'a str>,
+}
+
+/// The symbols each of `selectors` names in `tree`, in their order, each
+/// with its file: by id — the file the id names, walked once however many
+/// ids name it — or by content-hash prefix, every symbol's hash spelled out
+/// only when one is a hash. Ids are not unique, so every symbol with the id.
+///
+/// The one resolution of a selector: what `show` prints, what a `show` or a
+/// search is credited with, what the TUI logs and opens.
+pub fn find<'t>(tree: &'t ProjectTree, selectors: &[&str]) -> Vec<Vec<(&'t Path, &'t SymbolNode)>> {
+    let parsed: Vec<Selector> = selectors.iter().map(|s| parse_selector(s)).collect();
+    let mut out: Vec<Vec<(&'t Path, &'t SymbolNode)>> = vec![Vec::new(); selectors.len()];
+    let mut by_file: HashMap<&str, Vec<(usize, &str)>> = HashMap::new();
+    for (i, selector) in parsed.iter().enumerate() {
+        if let Selector::Id(id) = selector {
+            by_file
+                .entry(crate::symbols::split_id(id).0)
+                .or_default()
+                .push((i, id.as_str()));
+        }
+    }
+    // One pass over the files: finding a file by path normalises each path.
+    if !by_file.is_empty() {
+        for file in &tree.files {
+            let Some(ids) = by_file
+                .get(crate::objects::normalize_path(&file.file_path.to_string_lossy()).as_str())
+            else {
+                continue;
+            };
+            for sym in file.walk() {
+                for &(i, _) in ids.iter().filter(|(_, id)| sym.id == *id) {
+                    out[i].push((file.file_path.as_path(), sym));
+                }
+            }
+        }
+    }
+    if parsed.iter().any(|s| matches!(s, Selector::Hash(_))) {
+        for (path, sym) in tree.walk() {
+            let hex = hash_hex(&sym.content_hash);
+            for (i, selector) in parsed.iter().enumerate() {
+                if let Selector::Hash(prefix) = selector {
+                    if hex.starts_with(prefix.as_str()) {
+                        out[i].push((path, sym));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Suggestions for an id that matched nothing, at most.
+const SUGGESTIONS: usize = 5;
+
+/// A name-path segment as a guess would spell it: without generics
+/// (`ContentRow<'a>` is `ContentRow`), without an `impl ` prefix, in any case.
+fn loosely(segment: &str) -> String {
+    let segment = segment
+        .trim()
+        .strip_prefix("impl ")
+        .unwrap_or(segment.trim());
+    let mut depth = 0usize;
+    let bare: String = segment
+        .chars()
+        .filter(|c| {
+            match c {
+                '<' => depth += 1,
+                '>' => depth = depth.saturating_sub(1),
+                _ => return depth == 0,
+            }
+            false
+        })
+        .collect();
+    bare.trim().to_lowercase()
+}
+
+/// Ids near `id`, which matched nothing: in its file — or a file whose path
+/// ends with the one given — those whose name path ends with its segments,
+/// then those sharing its last one, compared [`loosely`]. So
+/// `ContentRow/new` finds `ContentRow<'a>/new`, and a heading's title finds
+/// its section however deep it sits (`Guide/Setup/Install` for `Install`).
+fn suggest<'a>(all: &[(&Path, &'a SymbolNode)], id: &str) -> Vec<&'a str> {
+    let (path, name) = crate::symbols::split_id(id);
+    let want: Vec<String> = name
+        .split('/')
+        .map(loosely)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let Some(last) = want.last() else {
+        return Vec::new();
+    };
+    let in_file = |file: &str| file == path || file.ends_with(&format!("/{path}"));
+    let (mut ends, mut shares) = (Vec::new(), Vec::new());
+    for (_, sym) in all {
+        let (file, name) = crate::symbols::split_id(&sym.id);
+        if !in_file(file) {
+            continue;
+        }
+        let segments: Vec<String> = name.split('/').map(loosely).collect();
+        if segments.ends_with(&want) {
+            ends.push(sym.id.as_str());
+        } else if segments.last() == Some(last) {
+            shares.push(sym.id.as_str());
+        }
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for id in ends.into_iter().chain(shares) {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out.truncate(SUGGESTIONS);
+    out
 }
 
 /// Present only when a coverage journal was loaded. Its absence is what tells
@@ -134,6 +250,13 @@ struct ResultDto<'a> {
 #[derive(Serialize)]
 pub(crate) struct CoverageDto<'a> {
     pub session_id: &'a str,
+    /// Whose reads the depths are: an agent's id, or `null` for the whole
+    /// session's — then `scope_reason` says why.
+    pub agent: Option<&'a str>,
+    /// The agent that started `agent`: pass it to `--agent` to see its reads.
+    pub parent_agent: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_reason: Option<&'a str>,
     pub symbols_read: usize,
 }
 
@@ -141,6 +264,9 @@ impl<'a> CoverageDto<'a> {
     pub fn of(index: Option<&'a crate::restore::CoverageIndex>) -> Option<Self> {
         index.map(|c| CoverageDto {
             session_id: c.session_id(),
+            agent: c.agent(),
+            parent_agent: c.parent(),
+            scope_reason: c.reason(),
             symbols_read: c.len(),
         })
     }
@@ -239,7 +365,14 @@ pub fn run(
     max_bytes: Option<usize>,
     coverage: Option<&crate::restore::CoverageIndex>,
 ) -> Result<()> {
-    let out = resolve(project_root, tree, queries, include_body, max_bytes, coverage);
+    let out = resolve(
+        project_root,
+        tree,
+        queries,
+        include_body,
+        max_bytes,
+        coverage,
+    );
     // Single line, like the other JSON surfaces, so it survives being piped
     // through line-oriented tooling.
     writeln!(
@@ -260,32 +393,16 @@ fn resolve<'a>(
     max_bytes: Option<usize>,
     coverage: Option<&'a crate::restore::CoverageIndex>,
 ) -> ShowDto<'a> {
-    let all = tree.walk();
-    // Hex once per symbol rather than once per (symbol, query).
-    let hashes: Vec<String> = all
-        .iter()
-        .map(|(_, s)| hash_hex(&s.content_hash))
-        .collect();
+    let names: Vec<&str> = queries.iter().map(String::as_str).collect();
+    let found = find(tree, &names);
+    // Every symbol, only to suggest ids for one that matched nothing.
+    let mut all: Option<Vec<(&Path, &SymbolNode)>> = None;
 
     let mut cache: HashMap<PathBuf, String> = HashMap::new();
     let mut results = Vec::with_capacity(queries.len());
 
-    for query in queries {
+    for (query, mut hits) in queries.iter().zip(found) {
         let selector = parse_selector(query);
-        let mut hits: Vec<(&Path, &SymbolNode)> = match &selector {
-            Selector::Hash(prefix) => all
-                .iter()
-                .zip(&hashes)
-                .filter(|(_, h)| h.starts_with(prefix.as_str()))
-                .map(|((f, s), _)| (*f, *s))
-                .collect(),
-            Selector::Id(id) => all
-                .iter()
-                .filter(|(_, s)| s.id == *id)
-                .map(|(f, s)| (*f, *s))
-                .collect(),
-            Selector::Unrecognized(_) => Vec::new(),
-        };
 
         // Stable output: the tree walk is deterministic, but sorting makes the
         // contract explicit rather than incidental.
@@ -295,6 +412,7 @@ fn resolve<'a>(
                 .then_with(|| a.1.id.cmp(&b.1.id))
         });
 
+        let hits_empty = hits.is_empty();
         let matches = hits
             .into_iter()
             .map(|(file, node)| {
@@ -311,7 +429,12 @@ fn resolve<'a>(
             })
             .collect();
 
+        let suggestions = match (&selector, hits_empty) {
+            (Selector::Id(id), true) => suggest(all.get_or_insert_with(|| tree.walk()), id),
+            _ => Vec::new(),
+        };
         results.push(ResultDto {
+            suggestions,
             query,
             selector: match selector {
                 Selector::Hash(_) => "hash",
@@ -331,8 +454,8 @@ fn resolve<'a>(
 
 #[cfg(test)]
 mod tests {
-    use crate::helpers::*;
     use super::*;
+    use crate::helpers::*;
 
     #[test]
     fn ids_are_recognized_by_their_separator() {
@@ -359,7 +482,10 @@ mod tests {
 
     #[test]
     fn short_prefixes_are_accepted_but_stubs_are_not() {
-        assert_eq!(parse_selector("deadbeef"), Selector::Hash("deadbeef".into()));
+        assert_eq!(
+            parse_selector("deadbeef"),
+            Selector::Hash("deadbeef".into())
+        );
         assert_eq!(
             parse_selector("deadbee"),
             Selector::Unrecognized("deadbee".into()),
@@ -408,11 +534,56 @@ mod tests {
         serde_json::to_value(resolve(root, tree, &queries, body, None, None)).unwrap()
     }
 
+    /// An id that matched nothing is answered with the ids it most likely
+    /// meant: generics and a shortened heading path forgiven.
+    #[test]
+    fn a_near_miss_suggests_the_ids_it_meant() {
+        let (dir, tree) = tmp_project(&[
+            ("a.rs", "struct Row<'a>(&'a str);\nimpl<'a> Row<'a> {\n    fn new(s: &'a str) -> Self { Row(s) }\n}\nfn new() {}\n"),
+            ("g.md", "# Guide\n\n## Setup\n\n### Install\n\ntext\n"),
+        ]);
+        let got = show(
+            dir.path(),
+            &tree,
+            &[
+                "a.rs::Row/new",
+                "g.md::Install",
+                "a.rs::Row<'a>/new",
+                "a.rs::Nothing/here",
+            ],
+            false,
+        );
+        let suggestions = |i: usize| {
+            got["results"][i]["suggestions"].as_array().map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            suggestions(0),
+            Some(vec![
+                "a.rs::Row<'a>/new".to_string(),
+                "a.rs::new".to_string()
+            ]),
+            "the method first, then the same name"
+        );
+        assert_eq!(
+            suggestions(1),
+            Some(vec!["g.md::Guide/Setup/Install".to_string()])
+        );
+        assert_eq!(suggestions(2), None, "a match needs none");
+        assert_eq!(suggestions(3), None, "nothing close");
+    }
+
     /// The definition must be the exact source span, not an approximation
     /// reconstructed from line numbers.
     #[test]
     fn the_definition_is_the_exact_source_span() {
-        let (dir, tree) = tmp_project(&[("a.rs", "fn before() {}\n\nfn target(x: u8) -> u8 {\n    x + 1\n}\n")]);
+        let (dir, tree) = tmp_project(&[(
+            "a.rs",
+            "fn before() {}\n\nfn target(x: u8) -> u8 {\n    x + 1\n}\n",
+        )]);
         let v = show(dir.path(), &tree, &["a.rs::target"], true);
         let m = &v["results"][0]["matches"][0];
         assert_eq!(
@@ -480,7 +651,12 @@ mod tests {
     #[test]
     fn a_miss_and_a_bad_selector_are_distinguishable() {
         let (dir, tree) = tmp_project(&[("a.rs", "fn only() {}\n")]);
-        let v = show(dir.path(), &tree, &["a.rs::nope", "wat", &"0".repeat(64)], false);
+        let v = show(
+            dir.path(),
+            &tree,
+            &["a.rs::nope", "wat", &"0".repeat(64)],
+            false,
+        );
         assert_eq!(v["results"][0]["selector"], "id");
         assert_eq!(v["results"][0]["matches"].as_array().unwrap().len(), 0);
         assert_eq!(v["results"][1]["selector"], "unrecognized");

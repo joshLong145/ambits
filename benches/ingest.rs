@@ -16,7 +16,11 @@ fn parse_jsonl_line_read(bencher: divan::Bencher) {
     let line = jsonl_read_line();
     let cfg = ToolMappingConfig::builtin().unwrap();
     bencher.bench(|| {
-        divan::black_box(parse_jsonl_line(divan::black_box(line), "default-agent", &cfg))
+        divan::black_box(parse_jsonl_line(
+            divan::black_box(line),
+            "default-agent",
+            &cfg,
+        ))
     });
 }
 
@@ -27,7 +31,11 @@ fn parse_jsonl_line_multi_tool(bencher: divan::Bencher) {
     let line = jsonl_multi_tool_line();
     let cfg = ToolMappingConfig::builtin().unwrap();
     bencher.bench(|| {
-        divan::black_box(parse_jsonl_line(divan::black_box(line.as_str()), "default-agent", &cfg))
+        divan::black_box(parse_jsonl_line(
+            divan::black_box(line.as_str()),
+            "default-agent",
+            &cfg,
+        ))
     });
 }
 
@@ -38,7 +46,11 @@ fn parse_jsonl_line_malformed(bencher: divan::Bencher) {
     let line = jsonl_malformed_line();
     let cfg = ToolMappingConfig::builtin().unwrap();
     bencher.bench(|| {
-        divan::black_box(parse_jsonl_line(divan::black_box(line), "default-agent", &cfg))
+        divan::black_box(parse_jsonl_line(
+            divan::black_box(line),
+            "default-agent",
+            &cfg,
+        ))
     });
 }
 

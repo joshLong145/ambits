@@ -3,9 +3,94 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 pub mod claude;
+pub mod command_reads;
+pub mod content;
 pub mod tool_config;
 
 use crate::tracking::ReadDepth;
+
+/// Whether a tool reads code or changes it (spec §2.1). Declared per tool
+/// stanza in `tools.toml`; a write grants no read credit (D9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effect {
+    #[default]
+    Read,
+    Write,
+}
+
+/// One diff hunk, as the session log records it. Re-exported from the
+/// attribution core so ingestion and attribution share one type.
+pub use crate::writes::Hunk;
+
+/// What a write tool's result tells us about the change (spec §2.2).
+///
+/// File contents live here only until attribution; they are never persisted
+/// or logged (spec §9.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteSource {
+    /// An `Edit`: `original` is `originalFile`, which the log omits for files
+    /// over ~10 KB; `writes::recover_originals` can then recover it, and
+    /// without it only a file-level write is possible.
+    Edit {
+        original: Option<String>,
+        old: String,
+        new: String,
+        replace_all: bool,
+        /// `structuredPatch`; `None` when missing or malformed, which makes
+        /// the write file-level.
+        hunks: Option<Vec<Hunk>>,
+        user_modified: bool,
+    },
+    /// A `Write`: the full new `content`; `original` is null on a create.
+    Write {
+        original: Option<String>,
+        content: String,
+        create: bool,
+        /// As for `Edit`; unused on a create.
+        hunks: Option<Vec<Hunk>>,
+        user_modified: bool,
+    },
+    /// A write tool whose result carries no usable text (Serena tools,
+    /// `NotebookEdit`, unrecognized shapes): file-level only.
+    Opaque,
+}
+
+/// A completed agent write: a write tool's call, correlated with its
+/// successful result by `op` (the tool call's `tool_use_id`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteEvent {
+    pub op: Arc<str>,
+    pub agent_id: Arc<str>,
+    pub tool_name: Arc<str>,
+    pub path: PathBuf,
+    pub timestamp: String,
+    pub source: WriteSource,
+}
+
+/// A symbol a lookup (`ambits show`) named, and what reading its output
+/// earns: the depth, and whether everything inside it was printed too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectorRead {
+    /// A symbol id or content hash.
+    pub selector: String,
+    pub depth: ReadDepth,
+    /// The whole definition was printed — an impl's every method, a
+    /// section's subsections — so what is inside it was read with it. Not
+    /// for `--no-body` (no source) or `--max-bytes` (perhaps cut short).
+    pub whole: bool,
+}
+
+impl SelectorRead {
+    /// `selector` at `depth`, nothing inside it read with it.
+    pub fn new(selector: impl Into<String>, depth: ReadDepth) -> Self {
+        SelectorRead {
+            selector: selector.into(),
+            depth,
+            whole: false,
+        }
+    }
+}
 
 /// A parsed agent tool call event.
 #[derive(Debug, Clone)]
@@ -33,10 +118,28 @@ pub struct AgentToolCall {
     /// Each carries its own depth: a single shell command may hold several
     /// invocations, one asking for definitions and another for metadata only,
     /// and they earn different credit.
-    pub target_selectors: Vec<(String, ReadDepth)>,
+    pub target_selectors: Vec<SelectorRead>,
     /// Human-readable label for the agent (e.g. "Explore parser and symbol types").
     /// Falls back to agent_id if no label could be extracted from the session log.
     pub label: Arc<str>,
+    /// The tool call's `tool_use_id`, which its result line refers back to.
+    /// `None` for calls whose log line carried no id.
+    pub tool_use_id: Option<Arc<str>>,
+    /// Read or write, from the tool's stanza. A write carries
+    /// `ReadDepth::Unseen`: it grants no read credit (D9).
+    pub effect: Effect,
+    /// What the call is for, in the agent's own words, when its tool takes
+    /// one: Bash's `description`. Names it in the trace view.
+    pub summary: Option<String>,
+    /// When its output names symbols it showed (`ambits rg`), the depth
+    /// each earns once the result arrives (see `ResultSelectorSpec`).
+    pub result_depth: Option<ReadDepth>,
+    /// The file lines a shell command printed (`sed -n 10,40p a.rs`), each
+    /// credited as a read of those lines (see `ToolMapping::command_reads`).
+    pub file_reads: Vec<command_reads::FileRead>,
+    /// The line-numbered searches a shell command ran (`grep -n`), whose
+    /// printed lines the result credits (see `ToolFinished::printed`).
+    pub searches: Vec<command_reads::Search>,
 }
 
 /// Point-in-time ledger snapshot captured at a compaction boundary.
@@ -83,6 +186,46 @@ pub enum SessionEvent {
         metadata: Option<CompactionMetadata>,
     },
     SessionCleared,
+    /// A write tool call that completed successfully (spec §1).
+    Write(WriteEvent),
+    /// Any tool call's result arrived: when it ended, and how.
+    ToolFinished(ToolFinished),
+    /// The user asked something: the start of a turn, whose tool calls
+    /// the trace nests under it.
+    Prompt(Prompt),
+}
+
+/// A prompt the user typed (not a tool result, a notification, or text
+/// Claude Code injected).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prompt {
+    /// The agent it was put to: the session's own.
+    pub agent_id: Arc<str>,
+    pub timestamp: String,
+    /// What was asked; a slash command as `/name args`.
+    pub text: String,
+}
+
+/// The end of a tool call, paired with its start by `id` (`tool_use_id`).
+/// What gives a call a duration in the trace view and export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolFinished {
+    pub id: Arc<str>,
+    pub agent_id: Arc<str>,
+    pub timestamp: String,
+    /// The tool failed or was rejected.
+    pub error: bool,
+    /// For a delegation (`Agent`/`Task`), the subagent it started, by the
+    /// bare id its events carry, when the result says.
+    pub child_agent: Option<Arc<str>>,
+    /// Why it failed, in one line (see `claude::error_summary`).
+    pub message: Option<String>,
+    /// Symbols its output showed, and the depth each earns: an `ambits rg`
+    /// match names the symbol it sits in (see `ResultSelectorSpec`).
+    pub shown: Vec<(String, ReadDepth)>,
+    /// File lines a line-numbered search printed (`path:N:`), each a
+    /// candidate the caller keeps only when it names a file it knows.
+    pub printed: Vec<(PathBuf, u32)>,
 }
 
 /// A compaction event surfaced by the incremental tailer (no ledger snapshot
@@ -94,11 +237,40 @@ pub struct TailedCompaction {
     pub metadata: Option<CompactionMetadata>,
 }
 
+/// A batch replay of one log file: its events, and where a tailer should
+/// continue so that nothing is read twice or missed.
+#[derive(Default)]
+pub struct FileReplay {
+    pub events: Vec<SessionEvent>,
+    /// Byte offset the replay read up to.
+    pub offset: u64,
+    /// Write calls whose results the replay had not reached (spec §1): a
+    /// permission prompt or a long write can straddle the handoff.
+    pub awaiting: Vec<AgentToolCall>,
+}
+
+/// What a session's replay hands to the tailer that follows it.
+#[derive(Default)]
+pub struct Handoff {
+    /// Each log file, with the offset its replay stopped at.
+    pub files: Vec<(PathBuf, u64)>,
+    pub awaiting: Vec<AgentToolCall>,
+    /// The project, so the tailer maps a worktree session's paths to it
+    /// exactly as the replay did.
+    pub project_root: Option<PathBuf>,
+}
+
 /// Output from a single incremental poll of an event tailer.
 pub struct TailerOutput {
     pub events: Vec<AgentToolCall>,
     pub compactions: Vec<TailedCompaction>,
     pub session_cleared: bool,
+    /// Write tool calls whose successful result arrived in this poll.
+    pub writes: Vec<WriteEvent>,
+    /// Every tool call whose result arrived in this poll.
+    pub finished: Vec<ToolFinished>,
+    /// Prompts typed in this poll.
+    pub prompts: Vec<Prompt>,
 }
 
 /// Maps a raw tool call (name + JSON input) to an `AgentToolCall`.
@@ -111,6 +283,17 @@ pub trait ToolCallMapper: Send + Sync {
         agent_id: &str,
         timestamp_str: &str,
     ) -> Option<AgentToolCall>;
+}
+
+/// Which agent of a session is running this process, as its logs tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Caller {
+    /// The agent whose running call is this process, by the id its reads are
+    /// journaled under, and the agent that started it (`None` for the
+    /// session's own agent).
+    Agent { id: String, parent: Option<String> },
+    /// Not known, and why.
+    Unknown(String),
 }
 
 /// Stateless session-format operations: discovery, listing, batch parsing.
@@ -140,6 +323,61 @@ pub trait SessionIngester: Send + Sync {
     fn parse_log_file_with_root(&self, path: &Path, project_root: &Path) -> Vec<SessionEvent> {
         let _ = project_root;
         self.parse_log_file(path)
+    }
+
+    /// Replay a log file for a tailer to continue from ([`Self::resume_tailer`]).
+    /// Default: parse it, and hand over the file's end afterwards with
+    /// nothing awaited — lines landing in between are missed, which is what
+    /// implementations override this to avoid.
+    fn replay_log_file(&self, path: &Path, project_root: &Path) -> FileReplay {
+        let events = self.parse_log_file_with_root(path, project_root);
+        let offset = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        FileReplay {
+            events,
+            offset,
+            awaiting: Vec::new(),
+        }
+    }
+
+    /// A tailer that continues exactly where a replay stopped. Default: a
+    /// fresh tailer from each file's current end.
+    fn resume_tailer(&self, handoff: Handoff) -> Box<dyn EventTailer> {
+        self.new_tailer(handoff.files.into_iter().map(|(file, _)| file).collect())
+    }
+
+    /// The agent of `session_id` running this process — whose call started
+    /// a process with `args` (its arguments, without the program) — from
+    /// the session's logs in `log_dir`. Default: not known.
+    fn calling_agent(&self, log_dir: &Path, session_id: &str, args: &[String]) -> Caller {
+        let _ = (log_dir, session_id, args);
+        Caller::Unknown("this log format does not say which agent is calling".into())
+    }
+
+    /// Call `id`'s arguments and what it read or wrote, from the session's
+    /// log `files`: for display, or a report, never the journal or a
+    /// snapshot (spec §9.6).
+    /// Default: not available.
+    fn call_detail(
+        &self,
+        files: &[PathBuf],
+        id: &str,
+        kind: content::ContentKind,
+    ) -> Option<content::CallDetail> {
+        let _ = (files, id, kind);
+        None
+    }
+
+    /// [`Self::call_detail`] for every call in `wanted`, keyed by id; a call
+    /// the logs have nothing for is absent. Default: one call at a time.
+    fn call_details(
+        &self,
+        files: &[PathBuf],
+        wanted: &std::collections::HashMap<String, content::ContentKind>,
+    ) -> std::collections::HashMap<String, content::CallDetail> {
+        wanted
+            .iter()
+            .filter_map(|(id, kind)| Some((id.clone(), self.call_detail(files, id, *kind)?)))
+            .collect()
     }
 }
 

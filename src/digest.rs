@@ -109,12 +109,10 @@ fn symbol_label(sym: &RestoredSymbol) -> String {
     let Some(ref old_id) = sym.moved_from else {
         return base;
     };
-    match crate::restore::split_symbol_id(old_id) {
-        Some((old_file, _)) if Path::new(old_file) != sym.file_path => {
-            format!("{base} (was {old_file})")
-        }
-        Some((_, old_name)) => format!("{base} (was {old_name})"),
-        None => format!("{base} (was {old_id})"),
+    match crate::symbols::split_id(old_id) {
+        ("", _) => format!("{base} (was {old_id})"),
+        (old_file, _) if Path::new(old_file) != sym.file_path => format!("{base} (was {old_file})"),
+        (_, old_name) => format!("{base} (was {old_name})"),
     }
 }
 
@@ -139,7 +137,6 @@ fn fit_names(names: &[String], budget: usize) -> (String, usize) {
     }
     (out, 0)
 }
-
 
 /// Markdown digest, intended to be pasted or piped straight into a session.
 #[derive(Debug, Clone, Default)]
@@ -240,7 +237,11 @@ fn append_omissions(out: &mut String, report: &RestoreReport) {
     // withheld; saying *why* would assert more than the output is prepared to
     // stand behind. What the reader can act on is that the file is not covered.
     if !outcome.drifted.is_empty() {
-        let mut files: Vec<&Path> = outcome.drifted.iter().map(|s| s.file_path.as_path()).collect();
+        let mut files: Vec<&Path> = outcome
+            .drifted
+            .iter()
+            .map(|s| s.file_path.as_path())
+            .collect();
         files.sort_unstable();
         files.dedup();
         let list: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
@@ -492,7 +493,10 @@ mod tests {
         let r = report(vec![sym], RestoreSource::Journal);
 
         let out = MarkdownFormatter.format(&r, DEFAULT_MAX_TOKENS);
-        assert!(out.contains("### src/digest.rs"), "grouped by where it is now");
+        assert!(
+            out.contains("### src/digest.rs"),
+            "grouped by where it is now"
+        );
         assert!(out.contains("format_tokens:126-132 (was src/ui/stats.rs)"));
     }
 
@@ -513,7 +517,10 @@ mod tests {
     fn json_carries_moved_from_only_when_set() {
         let mut moved = restored("b.rs", "x", 10);
         moved.moved_from = Some("a.rs::x".into());
-        let r = report(vec![moved, restored("b.rs", "y", 10)], RestoreSource::Journal);
+        let r = report(
+            vec![moved, restored("b.rs", "y", 10)],
+            RestoreSource::Journal,
+        );
 
         let out = JsonFormatter.format(&r, DEFAULT_MAX_TOKENS);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -564,15 +571,24 @@ mod tests {
 
         let big = MarkdownFormatter.format(&r, 4_000);
         let small = MarkdownFormatter.format(&r, 60);
-        assert!(small.len() < big.len(), "a smaller budget yields less output");
+        assert!(
+            small.len() < big.len(),
+            "a smaller budget yields less output"
+        );
         assert!(small.contains("omitted to stay within"));
-        assert!(!big.contains("omitted to stay within"), "a large budget fits everything");
+        assert!(
+            !big.contains("omitted to stay within"),
+            "a large budget fits everything"
+        );
     }
 
     /// A single oversized file is still emitted — an empty digest helps nobody.
     #[test]
     fn always_emits_at_least_one_file() {
-        let r = report(vec![restored("a.rs", &"x".repeat(500), 10)], RestoreSource::Journal);
+        let r = report(
+            vec![restored("a.rs", &"x".repeat(500), 10)],
+            RestoreSource::Journal,
+        );
         let out = MarkdownFormatter.format(&r, 1);
         assert!(out.contains("a.rs"));
     }
@@ -613,7 +629,10 @@ mod tests {
 
     #[test]
     fn session_log_source_names_its_provenance() {
-        let logs = report(vec![restored("a.rs", "one", 10)], RestoreSource::SessionLogs);
+        let logs = report(
+            vec![restored("a.rs", "one", 10)],
+            RestoreSource::SessionLogs,
+        );
         let out = MarkdownFormatter.format(&logs, DEFAULT_MAX_TOKENS);
         assert!(out.contains("reconstructed from session logs"));
 
@@ -632,7 +651,10 @@ mod tests {
     /// "nothing was left out".
     #[test]
     fn omissions_are_suppressed_for_the_unverified_source() {
-        let mut r = report(vec![restored("a.rs", "one", 10)], RestoreSource::SessionLogs);
+        let mut r = report(
+            vec![restored("a.rs", "one", 10)],
+            RestoreSource::SessionLogs,
+        );
         r.outcome.drifted.push(OmittedSymbol {
             symbol_id: "b.rs::x".into(),
             file_path: PathBuf::from("b.rs"),
@@ -678,7 +700,9 @@ mod tests {
         let out = HookFormatter.format(&r, DEFAULT_MAX_TOKENS);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
-        let ctx = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
         assert!(ctx.contains("### a.rs"), "markdown body is carried through");
         // Must be one line: Claude Code parses stdout as a single JSON value.
         assert!(!out.contains('\n'));
@@ -718,7 +742,10 @@ mod tests {
 
     #[test]
     fn json_flags_the_unverified_source() {
-        let r = report(vec![restored("a.rs", "one", 10)], RestoreSource::SessionLogs);
+        let r = report(
+            vec![restored("a.rs", "one", 10)],
+            RestoreSource::SessionLogs,
+        );
         let out = JsonFormatter.format(&r, DEFAULT_MAX_TOKENS);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["source"], "session_logs");
@@ -731,13 +758,10 @@ mod tests {
             .map(|i| restored(&format!("f{i}.rs"), &format!("symbol_number_{i}"), 100))
             .collect();
         let r = report(syms, RestoreSource::Journal);
-        let small: serde_json::Value =
-            serde_json::from_str(&JsonFormatter.format(&r, 5)).unwrap();
+        let small: serde_json::Value = serde_json::from_str(&JsonFormatter.format(&r, 5)).unwrap();
         let big: serde_json::Value =
             serde_json::from_str(&JsonFormatter.format(&r, 4_000)).unwrap();
-        assert!(
-            small["files"].as_array().unwrap().len() < big["files"].as_array().unwrap().len()
-        );
+        assert!(small["files"].as_array().unwrap().len() < big["files"].as_array().unwrap().len());
         // The headline count always reflects everything restored, not just
         // what fit — otherwise a truncated digest would misreport coverage.
         assert_eq!(small["restored_symbols"], 40);

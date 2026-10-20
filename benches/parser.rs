@@ -4,13 +4,13 @@ mod fixtures;
 use std::path::Path;
 
 use ambits::coverage::CoverageReport;
-use ambits::parser::LanguageParser;
 use ambits::parser::python::PythonParser;
 use ambits::parser::rust::RustParser;
 use ambits::parser::typescript::TypescriptParser;
-use ambits::tracking::{ContextLedger, ReadDepth};
+use ambits::parser::LanguageParser;
 use ambits::symbols::ProjectTree;
-use fixtures::{py_source, ts_source, rust_source};
+use ambits::tracking::{ContextLedger, ReadDepth};
+use fixtures::{py_source, rust_source, ts_source};
 
 fn main() {
     divan::main();
@@ -23,7 +23,11 @@ fn rust_parse_file(bencher: divan::Bencher, size: &&str) {
     let path = Path::new("src/bench.rs");
     let parser = RustParser::new();
     bencher.bench(|| {
-        divan::black_box(parser.parse_file(divan::black_box(path), divan::black_box(source)).unwrap())
+        divan::black_box(
+            parser
+                .parse_file(divan::black_box(path), divan::black_box(source))
+                .unwrap(),
+        )
     });
 }
 
@@ -35,7 +39,11 @@ fn typescript_parse_file(bencher: divan::Bencher, size: &&str) {
     let path = Path::new("src/bench.ts");
     let parser = TypescriptParser::new();
     bencher.bench(|| {
-        divan::black_box(parser.parse_file(divan::black_box(path), divan::black_box(source)).unwrap())
+        divan::black_box(
+            parser
+                .parse_file(divan::black_box(path), divan::black_box(source))
+                .unwrap(),
+        )
     });
 }
 
@@ -47,7 +55,11 @@ fn python_parse_file(bencher: divan::Bencher, size: &&str) {
     let path = Path::new("src/bench.py");
     let parser = PythonParser::new();
     bencher.bench(|| {
-        divan::black_box(parser.parse_file(divan::black_box(path), divan::black_box(source)).unwrap())
+        divan::black_box(
+            parser
+                .parse_file(divan::black_box(path), divan::black_box(source))
+                .unwrap(),
+        )
     });
 }
 
@@ -67,7 +79,13 @@ fn typescript_parse_and_coverage(bencher: divan::Bencher, size: &&str) {
         let mut ledger = ContextLedger::new();
         let hash = [0u8; 32];
         for sym in &file_syms.symbols {
-            ledger.record(sym.id.clone(), ReadDepth::FullBody, hash, "agent".to_string(), sym.estimated_tokens as usize);
+            ledger.record(
+                sym.id.clone(),
+                ReadDepth::FullBody,
+                hash,
+                "agent".to_string(),
+                sym.estimated_tokens as usize,
+            );
         }
 
         // 3. Build project tree from the single file

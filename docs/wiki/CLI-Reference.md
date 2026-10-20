@@ -13,9 +13,20 @@ collects them in one place.
 | `ambits -p <path> callers <name>…` | [Call sites](Finding-Callers) and their enclosing symbol |
 | `ambits -p <path> show <selector>…` | [Symbol definitions](Reading-by-Symbol) as JSON |
 | `ambits -p <path> restore-context` | [This session's read history](Restoring-Context) |
+| `ambits -p <path> touched <file\|symbol-id>` | [When an agent last wrote it](Agent-Writes), and whether that version is still on disk |
+| `ambits -p <path> snapshot` | [Record a snapshot](Snapshots) of this session |
+| `ambits -p <path> log [ref]` | [Snapshot history](Snapshots#history) |
+| `ambits -p <path> restore <ref> [--into <session>]` | [Restore a snapshot](Snapshots#restoring) into a session |
+| `ambits -p <path> trace [--format otlp\|chrome]` | [Export the session as a trace](Traces) |
+| `ambits -p <path> report [--format json\|html] [--max-bytes N]` | [The session as one JSON document or page](Reports): trace, reads, writes |
+| `ambits -p <path> remote add\|list\|remove` | [Remotes](Sharing#configuration): directories snapshots are shared through |
+| `ambits -p <path> push [remote]` | [Push](Sharing#push) this session's snapshots |
+| `ambits -p <path> fetch [remote]` | [Fetch](Sharing#fetch) every session's snapshots |
+| `ambits -p <path> pull [remote]` | [Pull](Sharing#pull): fetch, and merge into this session |
+| `ambits -p <path> gc` | Delete [unreachable snapshot objects](Snapshots#garbage-collection) |
 | `ambits -p <path> --coverage` | [Coverage report](Coverage-and-Multi-Agent) |
 | `ambits -p <path> --dump` | Print the symbol tree |
-| `ambits -p <path> cache status\|clear` | Inspect or remove [read journals](Configuration#the-read-journal) |
+| `ambits -p <path> cache status\|clear\|sync` | Inspect, remove or [build without a TUI](Configuration#the-read-journal) read journals |
 | `ambits hook install` | Register the post-compaction hook |
 | `ambits skill install` | Install the Claude Code skill |
 
@@ -25,7 +36,7 @@ collects them in one place.
 |---|---|
 | `-p`, `--project <PATH>` | Project root. Defaults to the nearest enclosing directory with `.git` or `.ambits`, else the current directory |
 | `-s`, `--session <ID>` | Session to track (auto-detects the latest) |
-| `-a`, `--agent <ID>` | Filter coverage to one agent (prefix match) |
+| `-a`, `--agent <ID>` | Filter coverage to one agent (prefix match). For `rg`, `grep` and `show`, whose read depths to report — by default, the agent running the command ([Reading by Symbol](Reading-by-Symbol#whose-reads)) |
 | `--log-dir <DIR>` | Claude Code log directory (auto-derived) |
 | `--dump` | Print the symbol tree to stdout instead of launching the TUI |
 | `--depth <N>` | With `--dump`, levels of children to show (default `0`; hidden children marked `+N`) |
@@ -39,6 +50,7 @@ collects them in one place.
 | `--editor <TEMPLATE>` | [Editor](TUI#opening-a-symbol-in-your-editor) for `Enter` in the TUI |
 | `--no-journal` | Disable the read journal |
 | `--flush-interval-ms <MS>` | Journal write interval (default 5000) |
+| `--state-dir <DIR>` | Keep journals, snapshots and caches in `DIR` instead of `.ambits/` (also `$AMBITS_STATE_DIR`) |
 | `--log-output <DIR>` | Write a JSON-lines [debug log](Configuration#debug-logging) per session |
 
 ## `ambits rg`
@@ -86,6 +98,73 @@ hex characters).
 `ambits -p . restore-context [--max-tokens N] [--format markdown|json|hook]` —
 default budget 3000 tokens, default format `markdown`.
 
+## `ambits touched`
+
+`ambits -p . touched [--format text|json] <file|symbol-id>` — the latest agent
+write across every session's journal, and whether it is `current`, `changed`,
+`removed`, or `unknown` (a file-level edit, no hash to compare), and the
+[commit it landed in](Agent-Writes#which-commit-it-landed-in) (JSON:
+`last_write.landed.state` is `verified`, `unverified`, `partial`,
+`uncommitted` or `no_repository`, with `commits`). A symbol covers everything
+nested under it, and counts only symbol-level writes. Exits 0 whether or not
+a write was found (JSON: `"last_write": null`).
+
+## `ambits snapshot`
+
+`ambits -p . snapshot [-m MESSAGE] [--require-clean]` — prints the new
+snapshot, or `nothing changed: <id>` when nothing did. See [Snapshots](Snapshots).
+
+## `ambits log`
+
+`ambits -p . log [REF]` — `REF` is a session id, a snapshot id or a unique
+prefix (7+ hex digits); the current session by default.
+
+## `ambits restore`
+
+`ambits -p . restore REF [--into SESSION]` — `REF` as for `log`, or
+`<remote>/<session>` after a fetch. Without
+`--into`, a new session id is minted and printed. Distinct from
+`restore-context`, which prints what the current session has read.
+
+## `ambits trace`
+
+`ambits -p . trace [--format otlp|chrome]` — the session (`--session`, or the
+latest) and its subagents as a trace on stdout; default `otlp`. `--agent`
+keeps one agent's subtree. See [Traces](Traces).
+
+## `ambits report`
+
+`ambits -p . report [--format json|html] [--max-bytes N] [--phases <file>]`
+— the session (`--session`, or the latest) as one JSON document on stdout, or
+with `--format html` as a self-contained page: its trace, each agent's reads
+of every symbol, and every write with its status and the commit it landed in.
+Reads the journal when there is one; writes nothing. `--phases` adds the
+timeline of the harness that ran the session, drawn as lanes of its own.
+`report --format html --from-json <file>` renders a saved document instead.
+See [Reports](Reports).
+
+## `ambits remote`
+
+`ambits -p . remote add <name> <path>`, `remote list`, `remote remove <name>`.
+See [Sharing](Sharing).
+
+## `ambits push`
+
+`ambits -p . push [remote] [--force-with-lease] [--dry-run] [--break-lock] [--verify-all]` —
+the remote defaults to the only one, or `origin`; the session to `--session`
+or the latest.
+
+## `ambits fetch` / `ambits pull`
+
+`ambits -p . fetch [remote] [--verify-all]`, `ambits -p . pull [remote] [--verify-all]`. After a fetch,
+`<remote>/<session>` names a remote's session wherever a snapshot reference
+is taken (`log`, `restore`).
+
+## `ambits gc`
+
+`ambits -p . gc [--grace-days N] [--reflog-expiry-days N]` — defaults 14
+and 90 days.
+
 ## `ambits cache`
 
 | Command | Description |
@@ -93,6 +172,7 @@ default budget 3000 tokens, default format `markdown`.
 | `cache status` | Journals on disk, with size and age |
 | `cache clear --session <ID>` | Delete one session's journal |
 | `cache clear --all` | Delete every journal for this project |
+| `cache sync [--format text\|json]` | Journal the session from its logs, as the TUI does at launch, and exit |
 
 ## `ambits hook install`
 
@@ -100,6 +180,10 @@ default budget 3000 tokens, default format `markdown`.
 |---|---|
 | `-p`, `--project <DIR>` | Project to install for (default: current directory) |
 | `-g`, `--global` | Install to `~/.claude/settings.json` instead |
+| `--git` | Install the repository's [git post-commit hook](Agent-Writes#which-commit-it-landed-in) instead |
+
+`ambits hook uninstall --git [-p DIR]` removes the git hook and restores any
+hook it chained to.
 
 ## `ambits skill install`
 

@@ -7,9 +7,20 @@ While the [TUI](TUI) runs it maintains an append-only NDJSON record at
 including the content hash the symbol had at the time. This is what lets
 `restore-context` answer after the fact, and it survives restarts.
 
-The TUI is the only writer: a search or `show` run with no TUI attached to the
-session earns no coverage credit. That is a deliberate trade for never needing
-two processes to reason about writing the same journal.
+A search or `show` writes no journal itself. Where no TUI runs, such as an
+agent harness on a CI runner or in a container, `cache sync` builds the same
+journal after the fact: it replays the session's logs exactly as the TUI does
+at launch, journals every read and every write, and exits.
+
+```bash
+ambits -p <clone> --log-dir <logs> -s <session> --state-dir <dir> cache sync --format json
+# {"journal":"…/coverage/<session>.ndjson","schema_version":1,"session_id":"…","symbols_read":12,"writes":3}
+```
+
+A replayed read is stamped with the symbol's content as it is when the sync
+runs, so run it before the checkout changes further. Running it again appends
+only what is new. One process writes a session's journal at a time: while the
+TUI has it open, `cache sync` fails rather than writing alongside it.
 
 ```bash
 ambits -p . cache status              # journals on disk, size and age
@@ -30,6 +41,19 @@ the UNVERIFIED session-log fallback.
 | Write interval | `--flush-interval-ms N` | `[cache] flush_interval_ms = N` |
 
 CLI flags win over the config file.
+
+### Keeping state outside the project
+
+Everything under `.ambits/` except `tools.toml` — journals, snapshot objects,
+refs, links and caches — moves to another directory with `--state-dir <DIR>`
+or `AMBITS_STATE_DIR=<DIR>`; the flag wins. A relative path resolves against
+the working directory. The project's `.ambits/tools.toml` is still read from
+the project, and nothing is written there. Use it when the checkout is one an
+agent commits from, so ambits state can never be staged by `git add -A`.
+
+Every command of a session must name the same directory: one that does not
+reads and writes `.ambits/` as usual and will not see the other's journals.
+Legacy `.ambit/coverage/` journals are not migrated into an external directory.
 
 ## Restricting scope
 
@@ -89,9 +113,34 @@ description   = "MyCustomReader {path}"
 | `pattern_keys` | Input keys that may hold a search pattern |
 | `path_required` | Default `true`; set `false` for tools where the path is an optional filter (Glob, Grep, Bash) |
 | `depth` | How deeply a call reads the symbols it touches (below) |
+| `effect` | `"read"` (default) or `"write"`. A stanza has **exactly one** of a `depth` or `effect = "write"`: writes grant no read credit. See [Agent Writes](Agent-Writes) |
 | `description` | Activity-feed line; `{key}` interpolates an input value |
 | `extends` | Name of a built-in stanza to inherit unset fields from |
-| `target_symbol`, `target_lines`, `target_selectors` | Narrow the read to specific symbols rather than the whole file; see the built-ins |
+| `target_symbol`, `target_lines`, `target_selectors` | Narrow the read to specific symbols rather than the whole file; see the built-ins. `target_lines = { offset_key, limit_key, default_limit }` names the lines a call returned; `default_limit` is how many a call giving only an offset returns (the built-in `Read` sets 2000) |
+| `result_selectors` | Credit the symbols a command's **output** names, when its result arrives: `{ key, requires, subcommands, depth }`. The built-in `Bash` stanza credits `ambits rg`/`grep` matches at `NameOnly` |
+| `command_reads` | Input key holding a shell command whose printed file lines are credited as a read of those lines: `sed -n A,Bp`, `head`, `tail`, `cat` and `nl`, in a `;`/`&&`/`\|\|` chain and after a `cd`, relative to the shell's directory. A line-numbered search there (`grep -n`, `grep -rn`, `rg -n`) credits the symbol on each line its output printed, matches and `-A/-B/-C` context alike, at `NameOnly` when the result arrives. A command it cannot follow with certainty (a variable, a glob, a heredoc) earns nothing. The built-in `Bash` stanza sets it to `"command"` |
+
+A call that names lines earns its depth only for the symbols wholly inside
+them. One it shows part of earns no more than `Signature` when the lines
+start at or before the line that names it and reach that line, and no more
+than `Overview` when they start below it, so reading 20 lines of a 500-line
+class does not count as reading the class. A symbol's span includes the
+comments, attributes and decorators above it, and lines showing only those,
+not the line naming it, earn nothing.
+
+A tool that **changes** files is declared a write instead of given a depth:
+
+```toml
+[[tool]]
+names       = ["MyEditor"]
+path_keys   = ["path"]
+effect      = "write"
+description = "MyEditor {path}"
+```
+
+The built-in writes are `Edit`, `Write`, `MultiEdit`, `NotebookEdit` and
+Serena's editing tools. `extends` inherits an unset `effect`, and a stanza
+that turns a read tool into a write does not inherit its depth.
 
 Depths are `Unseen`, `NameOnly`, `Overview`, `Signature`, `FullBody`. A
 `depth` is one of:
@@ -134,20 +183,43 @@ enabled           = true    # default
 flush_interval_ms = 5000    # default
 ```
 
+### Sync
+
+```toml
+[sync]
+ignore = ["secrets/**", "vendor/"]      # .gitignore syntax
+```
+
+Paths [snapshots](Snapshots#leaving-things-out) leave out entirely. A project's
+list replaces an earlier layer's, except that patterns in the user-global
+`~/.config/ambit/tools.toml` always apply and cannot be negated.
+
 ## Parsing backends
 
 | Backend | Languages |
 |---|---|
-| tree-sitter (default) | Rust, Python, TypeScript, Markdown |
+| tree-sitter (default) | Rust, Python, TypeScript, Java, Markdown |
 | [Serena](https://github.com/oraios/serena) MCP | Any language Serena supports |
 
 ```bash
 ambits -p . --serena
 ```
 
+Python symbols are functions, classes and their methods, module-level
+annotated or `UPPER_SNAKE_CASE` assignments, and `type` aliases. A function or
+class defined inside a function's body, even under `if`, `for`, `with` or
+`try`, is a symbol nested under that function (`worker.py::Worker/run/_handle_sigterm`);
+the function's local variables are not.
+
 Markdown symbols are ATX headings (`#` through `######`), nested by level; a
 heading's span runs to the next heading of equal or shallower depth. Content
 before the first heading becomes a `preamble` symbol.
+
+Java symbols are classes, interfaces, enums, records and `@interface` types,
+nested to any depth, with their methods, constructors and fields (one symbol
+per declared variable): `Shapes.java::Shapes/Renderer/visible`. Overloads share
+an id and are told apart by content hash. Enum constants, and anything inside a
+method body, are not symbols.
 
 ## Claude Code skill
 

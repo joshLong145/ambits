@@ -46,6 +46,7 @@ fn sym(id: &str, name: &str) -> SymbolNode {
         file_path: Arc::new(PathBuf::new()),
         byte_range: 0..100,
         line_range: 1..10,
+        head_line: 1,
         content_hash: hash,
         merkle_hash: hash,
         children: Vec::new(),
@@ -117,7 +118,13 @@ fn make_app(files: Vec<FileSymbols>) -> App {
 #[test]
 fn full_pipeline_read() {
     let files = vec![
-        file("mock/file_a.rs", vec![sym("mock/file_a.rs::foo", "foo"), sym("mock/file_a.rs::bar", "bar")]),
+        file(
+            "mock/file_a.rs",
+            vec![
+                sym("mock/file_a.rs::foo", "foo"),
+                sym("mock/file_a.rs::bar", "bar"),
+            ],
+        ),
         file("mock/file_b.rs", vec![sym("mock/file_b.rs::baz", "baz")]),
     ];
     let mut app = make_app(files);
@@ -133,11 +140,19 @@ fn full_pipeline_read() {
 
     let report = CoverageReport::from_project(&app.project_tree, &app.ledger, None);
     // mock/file_a: 2 symbols, all FullBody → 100%. mock/file_b: 0%.
-    let fa = report.files.iter().find(|f| f.path == "mock/file_a.rs").unwrap();
+    let fa = report
+        .files
+        .iter()
+        .find(|f| f.path == "mock/file_a.rs")
+        .unwrap();
     assert_eq!(fa.full_count, 2);
     assert_eq!(fa.full_percent(), 100.0);
 
-    let fb = report.files.iter().find(|f| f.path == "mock/file_b.rs").unwrap();
+    let fb = report
+        .files
+        .iter()
+        .find(|f| f.path == "mock/file_b.rs")
+        .unwrap();
     assert_eq!(fb.full_count, 0);
     assert_eq!(fb.full_percent(), 0.0);
 }
@@ -145,9 +160,13 @@ fn full_pipeline_read() {
 /// find_symbol with target → only the targeted symbol is marked, rest stays Unseen.
 #[test]
 fn targeted_symbol_partial() {
-    let files = vec![
-        file("mock/f.rs", vec![sym("mock/f.rs::alpha", "alpha"), sym("mock/f.rs::beta", "beta")]),
-    ];
+    let files = vec![file(
+        "mock/f.rs",
+        vec![
+            sym("mock/f.rs::alpha", "alpha"),
+            sym("mock/f.rs::beta", "beta"),
+        ],
+    )];
     let mut app = make_app(files);
 
     let tmp = write_jsonl(&[jsonl_find_symbol("mock/f.rs", "beta", true)]);
@@ -169,15 +188,13 @@ fn targeted_symbol_partial() {
 /// Grep (NameOnly) then Read (FullBody) then Grep again → final depth stays FullBody.
 #[test]
 fn depth_upgrade_invariant() {
-    let files = vec![
-        file("mock/f.rs", vec![sym("mock/f.rs::x", "x")]),
-    ];
+    let files = vec![file("mock/f.rs", vec![sym("mock/f.rs::x", "x")])];
     let mut app = make_app(files);
 
     let lines = vec![
-        jsonl_grep("pattern"),                      // NameOnly, no file targeting
-        jsonl_read("/test/project/mock/f.rs"),       // FullBody
-        jsonl_grep("pattern"),                      // NameOnly again — must NOT downgrade
+        jsonl_grep("pattern"),                 // NameOnly, no file targeting
+        jsonl_read("/test/project/mock/f.rs"), // FullBody
+        jsonl_grep("pattern"),                 // NameOnly again — must NOT downgrade
     ];
     let tmp = write_jsonl(&lines);
     let events = tool_calls(parse_log_file(tmp.path(), &builtin_cfg()));
@@ -218,32 +235,57 @@ fn multi_agent_session() {
 fn parse_log_file_e2e() {
     let lines = vec![
         jsonl_read("/some/file.rs"),
-        // A user message line that should be ignored:
+        // A user message: a prompt, not a tool call.
         r#"{"type":"user","message":{"role":"user","content":"hello"}}"#.to_string(),
         jsonl_grep("foo"),
         jsonl_find_symbol("bar.rs", "baz", false),
     ];
     let tmp = write_jsonl(&lines);
     let events = parse_log_file(tmp.path(), &builtin_cfg());
-    // User message is ignored; the other 3 produce events.
-    assert_eq!(events.len(), 3);
+    let calls = events
+        .iter()
+        .filter(|e| matches!(e, ambits::ingest::SessionEvent::ToolCall(_)))
+        .count();
+    let prompts = events
+        .iter()
+        .filter(|e| matches!(e, ambits::ingest::SessionEvent::Prompt(_)))
+        .count();
+    assert_eq!((calls, prompts), (3, 1));
 }
 
 /// Three files at 0%, 50%, 100% → sorted ascending by full_percent in report.
 #[test]
 fn coverage_sort_order() {
     let files = vec![
-        file("mock/a.rs", vec![sym("mock/a.rs::a1", "a1"), sym("mock/a.rs::a2", "a2")]),
-        file("mock/b.rs", vec![sym("mock/b.rs::b1", "b1"), sym("mock/b.rs::b2", "b2")]),
+        file(
+            "mock/a.rs",
+            vec![sym("mock/a.rs::a1", "a1"), sym("mock/a.rs::a2", "a2")],
+        ),
+        file(
+            "mock/b.rs",
+            vec![sym("mock/b.rs::b1", "b1"), sym("mock/b.rs::b2", "b2")],
+        ),
         file("mock/c.rs", vec![sym("mock/c.rs::c1", "c1")]),
     ];
     let tree = project(files);
     let mut ledger = ContextLedger::new();
 
     // mock/b.rs: 50% (1 of 2 full).
-    ledger.record("mock/b.rs::b1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+    ledger.record(
+        "mock/b.rs::b1".into(),
+        ReadDepth::FullBody,
+        [0; 32],
+        "ag".into(),
+        10,
+    );
     // mock/c.rs: 100%.
-    ledger.record("mock/c.rs::c1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+    ledger.record(
+        "mock/c.rs::c1".into(),
+        ReadDepth::FullBody,
+        [0; 32],
+        "ag".into(),
+        10,
+    );
     // mock/a.rs: 0%.
 
     let report = CoverageReport::from_project(&tree, &ledger, None);
@@ -278,12 +320,19 @@ fn stale_detection() {
 /// TextFormatter output contains expected structural elements.
 #[test]
 fn text_formatter_structure() {
-    let files = vec![
-        file("mock/main.rs", vec![sym("mock/main.rs::main", "main")]),
-    ];
+    let files = vec![file(
+        "mock/main.rs",
+        vec![sym("mock/main.rs::main", "main")],
+    )];
     let tree = project(files);
     let mut ledger = ContextLedger::new();
-    ledger.record("mock/main.rs::main".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+    ledger.record(
+        "mock/main.rs::main".into(),
+        ReadDepth::FullBody,
+        [0; 32],
+        "ag".into(),
+        10,
+    );
 
     let mut report = CoverageReport::from_project(&tree, &ledger, None);
     report.session_id = Some("test-session-123".into());
@@ -291,20 +340,27 @@ fn text_formatter_structure() {
     let formatter = TextFormatter::default();
     let output = formatter.format(&report);
 
-    assert!(output.contains("test-session-123"), "should contain session id");
+    assert!(
+        output.contains("test-session-123"),
+        "should contain session id"
+    );
     assert!(output.contains("File"), "should contain header");
     assert!(output.contains("Symbols"), "should contain header");
     assert!(output.contains("mock/main.rs"), "should contain file path");
     assert!(output.contains("TOTAL"), "should contain total row");
-    assert!(output.contains("100%"), "should show 100% for full coverage");
+    assert!(
+        output.contains("100%"),
+        "should show 100% for full coverage"
+    );
 }
 
 /// JsonFormatter emits the documented schema with totals, files, and schema_version.
 #[test]
 fn json_formatter_structure() {
-    let files = vec![
-        file("mock/main.rs", vec![sym("mock/main.rs::main", "main")]),
-    ];
+    let files = vec![file(
+        "mock/main.rs",
+        vec![sym("mock/main.rs::main", "main")],
+    )];
     let tree = project(files);
     let mut ledger = ContextLedger::new();
     ledger.record(
@@ -346,7 +402,13 @@ fn json_formatter_agent_filter() {
     let files = vec![file("a.rs", vec![sym("a.rs::x", "x")])];
     let tree = project(files);
     let mut ledger = ContextLedger::new();
-    ledger.record("a.rs::x".into(), ReadDepth::FullBody, [0; 32], "agent-foo".into(), 10);
+    ledger.record(
+        "a.rs::x".into(),
+        ReadDepth::FullBody,
+        [0; 32],
+        "agent-foo".into(),
+        10,
+    );
 
     let report_no_filter = CoverageReport::from_project(&tree, &ledger, None);
     let v: serde_json::Value =
@@ -406,11 +468,19 @@ fn journal_records_symbols_read_through_app() {
         target_lines: None,
         target_selectors: Vec::new(),
         label: "ag".into(),
+        tool_use_id: None,
+        effect: ambits::ingest::Effect::Read,
+        summary: None,
+        result_depth: None,
+        file_reads: Vec::new(),
+        searches: Vec::new(),
     };
     app.process_agent_event(call.clone());
     app.sync_journal();
 
-    let path = root.join(ambits::journal::JOURNAL_SUBDIR).join("sess-1.ndjson");
+    let path = root
+        .join(ambits::journal::JOURNAL_SUBDIR)
+        .join("sess-1.ndjson");
     let contents = ambits::journal::read_journal(&path);
     assert!(contents.warnings.is_empty(), "{:?}", contents.warnings);
     assert!(contents.header.is_some(), "header written");
@@ -453,13 +523,25 @@ fn journal_survives_compaction() {
         target_lines: None,
         target_selectors: Vec::new(),
         label: "ag".into(),
+        tool_use_id: None,
+        effect: ambits::ingest::Effect::Read,
+        summary: None,
+        result_depth: None,
+        file_reads: Vec::new(),
+        searches: Vec::new(),
     });
     app.process_compaction("summary".into(), "ts".into(), "ag".into(), None);
     app.sync_journal();
 
-    let path = root.join(ambits::journal::JOURNAL_SUBDIR).join("sess-2.ndjson");
+    let path = root
+        .join(ambits::journal::JOURNAL_SUBDIR)
+        .join("sess-2.ndjson");
     let contents = ambits::journal::read_journal(&path);
-    assert_eq!(contents.reads.len(), 1, "pre-compaction read is still recorded");
+    assert_eq!(
+        contents.reads.len(),
+        1,
+        "pre-compaction read is still recorded"
+    );
     assert!(app.ledger.is_restored("a.rs::x"));
 }
 
@@ -479,6 +561,12 @@ fn read_call(root: &std::path::Path, rel: &str) -> AgentToolCall {
         target_lines: None,
         target_selectors: Vec::new(),
         label: "ag".into(),
+        tool_use_id: None,
+        effect: ambits::ingest::Effect::Read,
+        summary: None,
+        result_depth: None,
+        file_reads: Vec::new(),
+        searches: Vec::new(),
     }
 }
 
@@ -512,7 +600,11 @@ fn journal_round_trips_to_the_ledgers_seen_set() {
 
     let outcome = ambits::restore::classify(&contents.reads, &tree);
 
-    let mut restored: Vec<&str> = outcome.restored.iter().map(|s| s.symbol_id.as_str()).collect();
+    let mut restored: Vec<&str> = outcome
+        .restored
+        .iter()
+        .map(|s| s.symbol_id.as_str())
+        .collect();
     restored.sort();
     let mut expected: Vec<&str> = app
         .ledger
@@ -523,7 +615,10 @@ fn journal_round_trips_to_the_ledgers_seen_set() {
         .collect();
     expected.sort();
 
-    assert_eq!(restored, expected, "journal round-trips the ledger's seen set");
+    assert_eq!(
+        restored, expected,
+        "journal round-trips the ledger's seen set"
+    );
     assert!(outcome.drifted.is_empty() && outcome.removed.is_empty());
     // A file nobody read is simply absent, not "omitted".
     assert!(!restored.contains(&"untouched.rs::q"));
@@ -539,7 +634,10 @@ fn edited_symbols_are_withheld_but_neighbours_survive() {
 
     let tree = ProjectTree {
         root: root.clone(),
-        files: vec![file("a.rs", vec![sym("a.rs::kept", "kept"), sym("a.rs::edited", "edited")])],
+        files: vec![file(
+            "a.rs",
+            vec![sym("a.rs::kept", "kept"), sym("a.rs::edited", "edited")],
+        )],
     };
 
     let mut app = App::new(tree.clone(), root.clone());
@@ -552,7 +650,9 @@ fn edited_symbols_are_withheld_but_neighbours_survive() {
     let mut rescanned = tree.clone();
     rescanned.files[0].symbols[1].content_hash = content_hash("a brand new body");
 
-    let path = root.join(ambits::journal::JOURNAL_SUBDIR).join("drift.ndjson");
+    let path = root
+        .join(ambits::journal::JOURNAL_SUBDIR)
+        .join("drift.ndjson");
     let contents = ambits::journal::read_journal(&path);
     let outcome = ambits::restore::classify(&contents.reads, &rescanned);
 
@@ -586,7 +686,9 @@ fn deleted_symbols_are_reported_as_removed() {
         files: vec![file("a.rs", vec![])],
     };
 
-    let path = root.join(ambits::journal::JOURNAL_SUBDIR).join("gone.ndjson");
+    let path = root
+        .join(ambits::journal::JOURNAL_SUBDIR)
+        .join("gone.ndjson");
     let contents = ambits::journal::read_journal(&path);
     let outcome = ambits::restore::classify(&contents.reads, &rescanned);
 

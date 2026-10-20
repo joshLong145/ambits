@@ -94,16 +94,49 @@ Flags it cannot honour say so rather than pretending:
 `--json` emits ripgrep's JSON Lines events with an added `symbol` field; see
 the [CLI Reference](CLI-Reference#ambits-rg) for the full flag list.
 
-## Searching is reading
+The depth in the bracket is the calling agent's own: a subagent sees what it
+has read, not its parent's reads — see
+[Reading by Symbol → Whose reads](Reading-by-Symbol#whose-reads).
 
-A search prints source into an agent's context, so it records what it showed:
-every symbol whose matching line was printed is journaled as read, at the hash
-it was searched at. Modes that print no source — `-q`, `-l`, `-c` — record
-nothing, and neither do matches cut past `--head-limit`. The journal is a
-record of what was *seen*, not of what the process computed.
+## Searching is seeing, not reading
 
-Credit is only recorded while the TUI is running for the session — see
-[Configuration → The read journal](Configuration#the-read-journal).
+A search prints matching lines, not definitions. Each symbol a printed match
+sits in is credited at **name** depth — seen, so it counts toward Seen%, but
+never toward Full% and never lowering a deeper read. Matches past
+`--head-limit`, context lines, and modes that print no symbols (`-l`, `-c`,
+`-q`) credit nothing; `--json` credits each match's `symbol.id`.
+
+The credit is taken from the search's output as the session log recorded it
+— what the agent was shown — so nothing is searched again. Only the output
+of a command that runs `ambits rg` or `ambits grep` is read this way, so a
+`cat` of text that looks like search output credits nothing on its own; but
+the whole of such a command's output is read, so in `ambits rg x && cat
+notes.txt` a match line in `notes.txt` counts too.
+
+A match that starts in a line's indentation (`^\s+fn run`) is attributed to
+the item on that line, not the one around it, so an outline search names —
+and credits — each method.
+
+To read what a search found, fetch it with [`ambits show`](Reading-by-Symbol)
+— the id is the file and the bracket's name path,
+`src/symbols/mod.rs::FileSymbols/enclosing` — which is credited as a full read
+(`--no-body`: name level).
+
+Credit is recorded from the session log while the TUI is running for the
+session — see [Configuration → The read journal](Configuration#the-read-journal).
+
+## Markdown
+
+Every heading in a Markdown file is a symbol, nested under the headings above
+it, so a match in a document names its section:
+
+```
+docs/wiki/Sharing.md:53:51:[— Sharing/Push] … `ambits push --break-lock` removes it …
+```
+
+`ambits -p . show 'docs/wiki/Sharing.md::Sharing/Push'` returns that section,
+from its heading to the next of the same or a higher level; `rg '^#{1,3} '
+<file>` lists a document's outline with what has been read of it.
 
 ## The pipeline runs backwards
 

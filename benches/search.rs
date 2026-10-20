@@ -12,8 +12,8 @@ mod fixtures;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use ambits::search::{search, Matcher, Options};
 use ambits::parser::ParserRegistry;
+use ambits::search::{search, Matcher, Options};
 use fixtures::rust_source;
 
 fn main() {
@@ -106,7 +106,11 @@ fn search_with_matches(bencher: divan::Bencher, files: &usize) {
 fn compile_pattern(bencher: divan::Bencher, shape: &&str) {
     let opts = match *shape {
         "literal" => options("depth_of"),
-        "alternation" => Options::new(vec!["depth_of".into(), "content_hash".into(), "fn \\w+".into()]),
+        "alternation" => Options::new(vec![
+            "depth_of".into(),
+            "content_hash".into(),
+            "fn \\w+".into(),
+        ]),
         _ => options(r"(?:pub\s+)?fn\s+[a-z_]+\([^)]*\)\s*->\s*[A-Za-z<>:]+"),
     };
     bencher.bench(|| divan::black_box(Matcher::new(divan::black_box(&opts)).unwrap()));

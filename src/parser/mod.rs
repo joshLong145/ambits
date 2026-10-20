@@ -1,3 +1,4 @@
+pub mod java;
 pub mod markdown;
 pub mod python;
 pub mod rust;
@@ -23,6 +24,17 @@ pub struct SymbolMeta {
     pub label: &'static str,
 }
 
+/// The 1-based line that names the symbol `node` declares: its `name`
+/// field's, else the node's own first line, which lies below any comments
+/// or attributes glued above it.
+pub fn head_line(node: tree_sitter::Node<'_>) -> u32 {
+    node.child_by_field_name("name")
+        .unwrap_or(node)
+        .start_position()
+        .row as u32
+        + 1
+}
+
 /// The earliest node in an unbroken run of comments immediately above
 /// `node` — no blank line, no other node between one and the next — or
 /// `None` if `node` has no such comment directly above it.
@@ -31,7 +43,7 @@ pub struct SymbolMeta {
 /// rule is contiguity, not comment syntax: a plain `//` note glued to what
 /// follows reads as being about it too, so it is swept in exactly like a doc
 /// comment would be. `comment_kinds` names the grammar's comment node kinds
-/// (Rust distinguishes `line_comment`/`block_comment`; Python and
+/// (Rust and Java distinguish `line_comment`/`block_comment`; Python and
 /// TypeScript each use a single `comment` kind), since that differs per
 /// language and nothing else in this walk does.
 ///
@@ -117,6 +129,10 @@ fn documents_enclosing_scope(comment: tree_sitter::Node) -> bool {
         .any(|child| child.kind() == "inner_doc_comment_marker");
     found
 }
+
+// The tree-sitter crate versions this binary was built with, from
+// `Cargo.lock` (see `build.rs`), for the journal's environment manifest.
+include!(concat!(env!("OUT_DIR"), "/grammars.rs"));
 
 /// Trait for language-specific parsers.
 /// Implement this trait to add support for a new language.
@@ -236,6 +252,7 @@ impl ParserRegistry {
         registry.register(Box::new(rust::RustParser::new()));
         registry.register(Box::new(python::PythonParser::new()));
         registry.register(Box::new(typescript::TypescriptParser::new()));
+        registry.register(Box::new(java::JavaParser::new()));
         registry.register(Box::new(markdown::MarkdownParser::new()));
         registry
     }
@@ -267,11 +284,7 @@ impl ParserRegistry {
     /// If `filter` is `Some`, files whose project-relative path does not
     /// satisfy the filter are skipped *before* I/O — excluded files are not
     /// read from disk or parsed.
-    pub fn scan_project(
-        &self,
-        root: &Path,
-        filter: Option<&PathFilter>,
-    ) -> Result<ProjectTree> {
+    pub fn scan_project(&self, root: &Path, filter: Option<&PathFilter>) -> Result<ProjectTree> {
         // Walk first, parse second. Measured on this repo, walking the tree is
         // effectively free — restricting the parse to a single file costs the
         // same as parsing none — while parsing every file is ~95ms of the

@@ -23,11 +23,15 @@ addresses both halves of that:
 - [Finding Callers](Finding-Callers) — call sites from the grammar, not from text
 - [Reading by Symbol](Reading-by-Symbol) — `show`: definitions as JSON, by id or hash
 - [Restoring Context](Restoring-Context) — `restore-context` and the post-compaction hook
+- [Agent Writes](Agent-Writes) — which files and symbols agents changed; `touched`
 - [Portability](Portability) — the formats, and where the provider-specific seams are
 
 **For you**
 - [TUI](TUI) — panels, keybindings, colors, opening symbols in your editor
 - [Coverage and Multi-Agent](Coverage-and-Multi-Agent) — reports, JSON, sub-agent filtering and alignment
+- [Snapshots](Snapshots) — durable, content-addressed history of a session; `snapshot`, `log`, `gc`
+- [Sharing](Sharing) — share snapshots through a remote directory; `remote`, `push`, `fetch`, `pull`
+- [Traces](Traces) — a session's tool calls as an OpenTelemetry or Perfetto trace; `trace`
 - [Configuration](Configuration) — the read journal, scope filters, `tools.toml`, backends, logging
 
 **Reference**

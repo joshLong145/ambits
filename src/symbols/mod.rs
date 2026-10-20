@@ -71,6 +71,9 @@ pub struct SymbolNode {
     pub byte_range: Range<u32>,
     /// 1-based inclusive line range. `u32` for the same reason as `byte_range`.
     pub line_range: Range<u32>,
+    /// The line that names the symbol, inside `line_range`, which also holds
+    /// the comments, attributes and decorators above it.
+    pub head_line: u32,
     pub content_hash: [u8; 32],
     pub merkle_hash: [u8; 32],
     pub children: Vec<SymbolNode>,
@@ -112,12 +115,20 @@ impl NameInterner {
 
 impl SymbolNode {
     pub fn total_symbols(&self) -> usize {
-        1 + self.children.iter().map(|c| c.total_symbols()).sum::<usize>()
+        1 + self
+            .children
+            .iter()
+            .map(|c| c.total_symbols())
+            .sum::<usize>()
     }
 
     pub fn total_tokens(&self) -> usize {
         self.estimated_tokens as usize
-            + self.children.iter().map(|c| c.total_tokens()).sum::<usize>()
+            + self
+                .children
+                .iter()
+                .map(|c| c.total_tokens())
+                .sum::<usize>()
     }
 
     /// The nesting path within the file, e.g. `App/process_compaction`.
@@ -126,10 +137,7 @@ impl SymbolNode {
     /// `<file>::` prefix. Deriving it here keeps the id's shape from being
     /// re-implemented by every caller that needs the other half.
     pub fn name_path(&self) -> &str {
-        match self.id.split_once("::") {
-            Some((_, name)) => name,
-            None => &self.id,
-        }
+        split_id(&self.id).1
     }
 }
 
@@ -161,16 +169,62 @@ impl FileSymbols {
 }
 
 /// Recursive half of [`FileSymbols::enclosing`].
-///
-/// Descends before returning, so the deepest containing symbol wins; a symbol
-/// whose children do not contain `byte` is itself the answer.
 fn enclosing(symbols: &[SymbolNode], byte: u32) -> Option<&SymbolNode> {
-    for sym in symbols {
-        if sym.byte_range.start <= byte && byte < sym.byte_range.end {
-            return enclosing(&sym.children, byte).or(Some(sym));
+    innermost(symbols, &|sym| {
+        sym.byte_range.start <= byte && byte < sym.byte_range.end
+    })
+}
+
+/// The deepest symbol `contains` accepts, descending only into symbols it
+/// accepts: the one containment search, whatever the position is measured
+/// in (a byte for `enclosing`, a line for write attribution). A symbol whose
+/// children do not contain the position is itself the answer.
+pub fn innermost<'a>(
+    symbols: &'a [SymbolNode],
+    contains: &dyn Fn(&SymbolNode) -> bool,
+) -> Option<&'a SymbolNode> {
+    let hit = symbols.iter().find(|s| contains(s))?;
+    innermost(&hit.children, contains).or(Some(hit))
+}
+
+impl FileSymbols {
+    /// Every symbol in the file, depth-first — the one descent through
+    /// `children` for a single file (see [`ProjectTree::walk`]).
+    pub fn walk(&self) -> Vec<&SymbolNode> {
+        walk_symbols(&self.symbols)
+    }
+}
+
+/// Every symbol in `symbols` and beneath them, depth-first.
+pub fn walk_symbols(symbols: &[SymbolNode]) -> Vec<&SymbolNode> {
+    fn descend<'a>(syms: &'a [SymbolNode], out: &mut Vec<&'a SymbolNode>) {
+        for sym in syms {
+            out.push(sym);
+            descend(&sym.children, out);
         }
     }
-    None
+    let mut out = Vec::new();
+    descend(symbols, &mut out);
+    out
+}
+
+/// Split a symbol id into its file and its name path within the file:
+/// `src/app.rs::App/new` → `("src/app.rs", "App/new")`. At the *first*
+/// `::`, since name paths can contain one (`impl fmt::Display for X`) and
+/// file paths in practice do not. An id without one is all name path.
+pub fn split_id(id: &str) -> (&str, &str) {
+    match id.split_once("::") {
+        Some((file, name_path)) => (file, name_path),
+        None => ("", id),
+    }
+}
+
+/// `name_path` is `ancestor` or nested inside it, by name path: `App`
+/// covers `App/handle_key` but not `Application`. Works on whole ids too.
+pub fn nested_in(name_path: &str, ancestor: &str) -> bool {
+    name_path
+        .strip_prefix(ancestor)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// The full project symbol tree, organized by directory structure.
@@ -181,6 +235,14 @@ pub struct ProjectTree {
 }
 
 impl ProjectTree {
+    /// The file whose project-relative path is `rel`, as records name files
+    /// (normalized, `/`-separated).
+    pub fn file(&self, rel: &str) -> Option<&FileSymbols> {
+        self.files
+            .iter()
+            .find(|f| crate::objects::normalize_path(&f.file_path.to_string_lossy()) == rel)
+    }
+
     /// Every symbol in the tree, depth-first, paired with its owning file.
     ///
     /// The single descent through `SymbolNode::children`. Four had accumulated
@@ -192,21 +254,14 @@ impl ProjectTree {
     /// folds immediately, and a borrowing recursive iterator would cost more in
     /// complexity than the allocation saves.
     pub fn walk(&self) -> Vec<(&Path, &SymbolNode)> {
-        fn descend<'a>(
-            file: &'a Path,
-            syms: &'a [SymbolNode],
-            out: &mut Vec<(&'a Path, &'a SymbolNode)>,
-        ) {
-            for sym in syms {
-                out.push((file, sym));
-                descend(file, &sym.children, out);
-            }
-        }
-        let mut out = Vec::new();
-        for file in &self.files {
-            descend(&file.file_path, &file.symbols, &mut out);
-        }
-        out
+        self.files
+            .iter()
+            .flat_map(|file| {
+                file.walk()
+                    .into_iter()
+                    .map(move |sym| (file.file_path.as_path(), sym))
+            })
+            .collect()
     }
 
     pub fn total_symbols(&self) -> usize {
@@ -221,7 +276,22 @@ impl ProjectTree {
 #[cfg(test)]
 mod tests {
     use crate::helpers::{file, sym_with_bytes, sym_with_children};
-    use crate::symbols::FileSymbols;
+    use crate::symbols::{nested_in, split_id, FileSymbols};
+
+    #[test]
+    fn ids_split_at_the_first_separator() {
+        assert_eq!(split_id("src/a.rs::App/run"), ("src/a.rs", "App/run"));
+        assert_eq!(
+            split_id("src/a.rs::impl fmt::Display for X"),
+            ("src/a.rs", "impl fmt::Display for X")
+        );
+        assert_eq!(split_id("no-separator"), ("", "no-separator"));
+        assert!(
+            nested_in("App/run", "App")
+                && nested_in("App", "App")
+                && !nested_in("Application", "App")
+        );
+    }
 
     /// `sym_with_children` leaves the parent spanning 0..100, so the child's
     /// 40..60 is genuinely nested inside it.

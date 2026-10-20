@@ -35,6 +35,150 @@ pub struct TuiSession {
     _project_watcher: notify::RecommendedWatcher,
     /// Holds the log-directory watcher alive (None if no log dir configured).
     _log_watcher: Option<notify::RecommendedWatcher>,
+    /// Hands write events, tagged with their session, to the attribution
+    /// worker (spec §1).
+    write_tx: flume::Sender<(Arc<str>, ambits::ingest::WriteEvent)>,
+    /// Asks the commit worker for the commits in a time range.
+    commit_tx: flume::Sender<(u64, u64)>,
+    /// When the trace view last asked for commits.
+    last_commit_scan: Option<std::time::Instant>,
+    /// Asks the content worker for a call's content.
+    content_tx: flume::Sender<ContentJob>,
+}
+
+/// How often the open trace view looks for new commits.
+const COMMIT_SCAN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Find commits on a worker thread: the render thread runs no git. Only the
+/// latest request of any that queued up is answered, as
+/// `AppEvent::CommitsFound`.
+fn spawn_commit_scanner(
+    project_root: PathBuf,
+    tx: flume::Sender<AppEvent>,
+) -> flume::Sender<(u64, u64)> {
+    let (commit_tx, commit_rx) = flume::unbounded::<(u64, u64)>();
+    std::thread::spawn(move || {
+        while let Ok(first) = commit_rx.recv() {
+            let (since, until) = commit_rx.try_iter().last().unwrap_or(first);
+            let commits = ambits::git::commits_between(&project_root, since, until);
+            if tx.send(AppEvent::CommitsFound(commits)).is_err() {
+                break;
+            }
+        }
+    });
+    commit_tx
+}
+
+/// A request for a call's content: the session whose logs hold it, which
+/// call, and what to make of it.
+type ContentJob = (
+    Option<String>,
+    ambits::app::ContentKey,
+    ambits::ingest::content::ContentKind,
+);
+
+/// Read calls' content from their logs on a worker thread: a log can be
+/// tens of megabytes. Only the latest request of any that queued up — the
+/// selection moving on — is answered, as `AppEvent::ContentLoaded`.
+fn spawn_content_loader(
+    ingester: Arc<dyn SessionIngester>,
+    log_dir: Option<PathBuf>,
+    tx: flume::Sender<AppEvent>,
+) -> flume::Sender<ContentJob> {
+    let (job_tx, job_rx) = flume::unbounded::<ContentJob>();
+    std::thread::spawn(move || {
+        while let Ok(first) = job_rx.recv() {
+            let (session, key, kind) = job_rx.try_iter().last().unwrap_or(first);
+            let files = match (&log_dir, &session) {
+                (Some(dir), Some(session)) => ingester.session_log_files(dir, session),
+                _ => Vec::new(),
+            };
+            let content = ingester.call_detail(&files, &key.id, kind);
+            if tx.send(AppEvent::ContentLoaded { key, content }).is_err() {
+                break;
+            }
+        }
+    });
+    job_tx
+}
+
+/// Attribute writes on a worker thread, never the render thread (spec §1):
+/// each costs up to two parses, and a replay can queue hundreds. Results come
+/// back to the TUI loop as `AppEvent::WriteRecorded`. The worker owns its own
+/// `ParserRegistry`, so nothing is shared across threads.
+fn spawn_write_attributor(
+    project_root: PathBuf,
+    symbol_level: bool,
+    tx: flume::Sender<AppEvent>,
+) -> flume::Sender<(Arc<str>, ambits::ingest::WriteEvent)> {
+    let (write_tx, write_rx) = flume::unbounded::<(Arc<str>, ambits::ingest::WriteEvent)>();
+    std::thread::spawn(move || {
+        let registry = ambits::parser::ParserRegistry::new();
+        for (session, event) in write_rx.iter() {
+            let Some(record) =
+                ambits::writes::build_record(&event, &project_root, &registry, symbol_level)
+            else {
+                continue;
+            };
+            if tx
+                .send(AppEvent::WriteRecorded {
+                    session,
+                    record: Box::new(record),
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    write_tx
+}
+
+/// Replay a session's logs into `app` — every tool call, compaction, clear
+/// and write already on disk — and return where its tailer continues.
+///
+/// The one replay loop, shared by startup and session switches.
+pub fn replay_session(
+    app: &mut App,
+    ingester: &dyn SessionIngester,
+    files: Vec<PathBuf>,
+    project_root: &Path,
+) -> ambits::ingest::Handoff {
+    use ambits::ingest::SessionEvent;
+    let mut handoff = ambits::ingest::Handoff {
+        project_root: Some(project_root.to_path_buf()),
+        ..Default::default()
+    };
+    for file in files {
+        let replay = ingester.replay_log_file(&file, project_root);
+        for event in replay.events {
+            match event {
+                SessionEvent::ToolCall(tc) => app.process_agent_event(tc),
+                SessionEvent::Compacted {
+                    summary,
+                    timestamp,
+                    agent_id,
+                    metadata,
+                } => {
+                    app.process_compaction(summary, timestamp, agent_id, metadata);
+                }
+                SessionEvent::SessionCleared => app.reset_session(),
+                SessionEvent::Write(w) => app.queue_write(w),
+                SessionEvent::ToolFinished(f) => app.process_tool_finished(&f),
+                SessionEvent::Prompt(p) => app.process_prompt(&p),
+            }
+        }
+        handoff.files.push((file, replay.offset));
+        handoff.awaiting.extend(replay.awaiting);
+    }
+    handoff
+}
+
+/// The session the TUI starts on, as replayed before it opened.
+pub struct StartingSession {
+    pub id: Option<String>,
+    /// Where the startup replay stopped; the tailer continues from here.
+    pub handoff: ambits::ingest::Handoff,
 }
 
 impl TuiSession {
@@ -42,7 +186,7 @@ impl TuiSession {
     pub fn new(
         project_path: &Path,
         log_dir: &Option<PathBuf>,
-        session_id: Option<String>,
+        starting: StartingSession,
         watched_extensions: std::collections::HashSet<String>,
         ingester: Arc<dyn SessionIngester>,
         serena_mode: bool,
@@ -79,14 +223,16 @@ impl TuiSession {
             })?;
         project_watcher.watch(project_path, RecursiveMode::Recursive)?;
 
-        // Log tailer — follows the current session's .jsonl files.
-        let log_tailer: Option<Box<dyn EventTailer>> =
-            if let (Some(ref ld), Some(ref sid)) = (log_dir, &session_id) {
-                let files = ingester.session_log_files(ld, sid);
-                Some(ingester.new_tailer(files))
-            } else {
-                None
-            };
+        // Log tailer — follows the current session's .jsonl files from where
+        // the startup replay stopped.
+        let StartingSession {
+            id: session_id,
+            handoff,
+        } = starting;
+        let log_tailer: Option<Box<dyn EventTailer>> = match (log_dir, &session_id) {
+            (Some(_), Some(_)) => Some(ingester.resume_tailer(handoff)),
+            _ => None,
+        };
 
         // Log directory watcher — fires Tick when .jsonl files appear or change.
         let log_watcher = if let Some(ref ld) = log_dir {
@@ -114,9 +260,7 @@ impl TuiSession {
         let pkl_mtimes: Vec<(PathBuf, SystemTime)> = if serena_mode {
             crate::serena::find_serena_caches(project_path)
                 .into_iter()
-                .filter_map(|p| {
-                    fs::metadata(&p).ok()?.modified().ok().map(|t| (p, t))
-                })
+                .filter_map(|p| fs::metadata(&p).ok()?.modified().ok().map(|t| (p, t)))
                 .collect()
         } else {
             Vec::new()
@@ -129,6 +273,12 @@ impl TuiSession {
             .map(|ld| existing_session_ids(ld))
             .unwrap_or_default();
 
+        // Serena mode's tree ids need not match a tree-sitter parse, so its
+        // writes are file-level (spec §2.5).
+        let write_tx = spawn_write_attributor(project_path.to_path_buf(), !serena_mode, tx.clone());
+        let commit_tx = spawn_commit_scanner(project_path.to_path_buf(), tx.clone());
+        let content_tx = spawn_content_loader(Arc::clone(&ingester), log_dir.clone(), tx.clone());
+
         Ok(Self {
             current_session_id: session_id,
             known_sessions,
@@ -137,7 +287,37 @@ impl TuiSession {
             pkl_mtimes,
             _project_watcher: project_watcher,
             _log_watcher: log_watcher,
+            write_tx,
+            commit_tx,
+            last_commit_scan: None,
+            content_tx,
         })
+    }
+
+    /// Ask the content worker for the selected call's content, if the app
+    /// wants it and has not asked yet.
+    pub fn request_content(&mut self, app: &mut App) {
+        if let Some((key, kind)) = app.content_request() {
+            let _ = self
+                .content_tx
+                .send((self.current_session_id.clone(), key, kind));
+        }
+    }
+
+    /// While the trace view is open, ask the commit worker, now and then, for
+    /// the commits made during the session.
+    fn scan_commits_if_due(&mut self, app: &App) {
+        if !app.trace_view.open
+            || self
+                .last_commit_scan
+                .is_some_and(|t| t.elapsed() < COMMIT_SCAN_EVERY)
+        {
+            return;
+        }
+        if let Some(range) = app.trace.range() {
+            let _ = self.commit_tx.send(range);
+            self.last_commit_scan = Some(std::time::Instant::now());
+        }
     }
 
     /// Handle a `Tick` event: detect new sessions, poll the tailer, and check Serena caches.
@@ -148,11 +328,48 @@ impl TuiSession {
         serena_mode: bool,
         project_path: &Path,
     ) {
+        self.scan_commits_if_due(app);
+
+        // Poll the tailer first. On a session switch below, this is the old
+        // session's last chance: anything it logged since the previous tick
+        // (reads, writes, their results) would otherwise be dropped with the
+        // tailer, and the outgoing journal sync would have nothing to flush.
+        if let Some(ref mut tailer) = self.log_tailer {
+            // Check for new agent files in the log directory.
+            if let (Some(ref ld), Some(ref sid)) = (log_dir, &self.current_session_id) {
+                let current_files = self.ingester.session_log_files(ld, sid);
+                for f in current_files {
+                    tailer.add_file(f);
+                }
+            }
+
+            let output = tailer.read_new_events();
+            for event in output.events {
+                app.process_agent_event(event);
+            }
+            for write in output.writes {
+                app.queue_write(write);
+            }
+            for finished in &output.finished {
+                app.process_tool_finished(finished);
+            }
+            for prompt in &output.prompts {
+                app.process_prompt(prompt);
+            }
+            for compaction in output.compactions {
+                app.process_compaction(
+                    compaction.summary,
+                    compaction.timestamp,
+                    compaction.agent_id,
+                    compaction.metadata,
+                );
+            }
+        }
+
         // Check if Claude Code has started a new session (e.g. after /clear).
         if let Some(ref ld) = log_dir {
             if let Some(latest) = self.ingester.find_latest_session(ld) {
-                let is_new_session =
-                    self.current_session_id.as_deref() != Some(latest.as_str());
+                let is_new_session = self.current_session_id.as_deref() != Some(latest.as_str());
                 // Appearance, not recency. `find_latest_session` ranks purely
                 // by mtime, and a log file's mtime moves for reasons unrelated
                 // to session activity — a session whose final line is
@@ -171,47 +388,39 @@ impl TuiSession {
                     // Adopt the id *before* resetting: the reset re-seeds the
                     // agent tree's root from it. See `App::switch_session`.
                     app.switch_session(self.current_session_id.clone());
-                    app.session_slug = log_dir.as_ref()
+                    app.session_slug = log_dir
+                        .as_ref()
                         .zip(self.current_session_id.as_ref())
                         .and_then(|(ld2, sid)| self.ingester.session_slug(ld2, sid));
 
-                    // Pre-populate from lines already written before this tick.
+                    // Pre-populate from lines already written before this
+                    // tick, then tail from exactly where that stopped.
                     let new_files = self.ingester.session_log_files(ld, &latest);
-                    for log_file in &new_files {
-                        for event in self.ingester.parse_log_file_with_root(log_file, project_path) {
-                            match event {
-                                ambits::ingest::SessionEvent::ToolCall(tc) => app.process_agent_event(tc),
-                                ambits::ingest::SessionEvent::Compacted { summary, timestamp, agent_id, metadata } => {
-                                    app.process_compaction(summary, timestamp, agent_id, metadata);
-                                }
-                                ambits::ingest::SessionEvent::SessionCleared => app.reset_session(),
-                            }
-                        }
-                    }
+                    let handoff = replay_session(app, &*self.ingester, new_files, project_path);
+                    self.log_tailer = Some(self.ingester.resume_tailer(handoff));
 
-                    // Replace the tailer.
-                    self.log_tailer = Some(self.ingester.new_tailer(new_files));
+                    // Same order as startup: journal after the replay.
+                    let attach = app.attach_journal();
+                    for warning in attach.warnings {
+                        log::warn!(target: "ambits::journal", "{warning}");
+                    }
+                    if let Some(stats) = attach.rehydrated {
+                        log::info!(
+                            target: "ambits::journal",
+                            corrected = stats.corrected, recovered = stats.inserted,
+                            moved = stats.moved, stale = stats.drifted;
+                            "rehydrated from journal"
+                        );
+                    }
                 }
             }
         }
 
-        // Poll log tailer for new events.
-        if let Some(ref mut tailer) = self.log_tailer {
-            // Check for new agent files in the log directory.
-            if let (Some(ref ld), Some(ref sid)) = (log_dir, &self.current_session_id) {
-                let current_files = self.ingester.session_log_files(ld, sid);
-                for f in current_files {
-                    tailer.add_file(f);
-                }
-            }
-
-            let output = tailer.read_new_events();
-            for event in output.events {
-                app.process_agent_event(event);
-            }
-            for compaction in output.compactions {
-                app.process_compaction(compaction.summary, compaction.timestamp, compaction.agent_id, compaction.metadata);
-            }
+        // Hand queued writes — from the tailer, a session switch, or startup
+        // replay — to the attribution worker. A send fails only if the worker
+        // died; the writes are then simply not journaled.
+        for write in app.take_pending_writes() {
+            let _ = self.write_tx.send(write);
         }
 
         // Bring the coverage journal up to date. Interval-gated internally, so
@@ -349,12 +558,15 @@ mod tests {
     /// `find_latest_session`'s mtime ranking without touching the clock.
     struct MockIngester {
         latest: Mutex<Option<String>>,
+        /// Writes the next tailer yields on its first poll.
+        tailed_writes: Mutex<Vec<ambits::ingest::WriteEvent>>,
     }
 
     impl MockIngester {
         fn new(latest: &str) -> Arc<Self> {
             Arc::new(Self {
                 latest: Mutex::new(Some(latest.to_string())),
+                tailed_writes: Mutex::new(Vec::new()),
             })
         }
 
@@ -377,19 +589,26 @@ mod tests {
             Vec::new()
         }
         fn new_tailer(&self, _files: Vec<PathBuf>) -> Box<dyn EventTailer> {
-            Box::new(NoopTailer)
+            Box::new(MockTailer {
+                writes: std::mem::take(&mut *self.tailed_writes.lock().unwrap()),
+            })
         }
     }
 
-    struct NoopTailer;
+    struct MockTailer {
+        writes: Vec<ambits::ingest::WriteEvent>,
+    }
 
-    impl EventTailer for NoopTailer {
+    impl EventTailer for MockTailer {
         fn add_file(&mut self, _path: PathBuf) {}
         fn read_new_events(&mut self) -> TailerOutput {
             TailerOutput {
                 events: Vec::new(),
                 compactions: Vec::new(),
                 session_cleared: false,
+                writes: std::mem::take(&mut self.writes),
+                finished: Vec::new(),
+                prompts: Vec::new(),
             }
         }
     }
@@ -424,7 +643,10 @@ mod tests {
         let session = TuiSession::new(
             project,
             &Some(log_dir.to_path_buf()),
-            Some(current.to_string()),
+            StartingSession {
+                id: Some(current.to_string()),
+                handoff: Default::default(),
+            },
             HashSet::new(),
             ingester,
             false,
@@ -460,7 +682,12 @@ mod tests {
         // A session that did not exist at startup appears and becomes latest.
         touch_session(logs.path(), "new-session");
         ingester.set_latest("new-session");
-        session.handle_tick(&Some(logs.path().to_path_buf()), &mut app, false, project.path());
+        session.handle_tick(
+            &Some(logs.path().to_path_buf()),
+            &mut app,
+            false,
+            project.path(),
+        );
 
         assert_eq!(session.current_session_id.as_deref(), Some("new-session"));
         assert_eq!(
@@ -502,7 +729,12 @@ mod tests {
         // mtime past `started_at` under the old guard.
         touch_session(logs.path(), "dead-session");
         ingester.set_latest("dead-session");
-        session.handle_tick(&Some(logs.path().to_path_buf()), &mut app, false, project.path());
+        session.handle_tick(
+            &Some(logs.path().to_path_buf()),
+            &mut app,
+            false,
+            project.path(),
+        );
 
         assert_eq!(
             session.current_session_id.as_deref(),
@@ -531,7 +763,12 @@ mod tests {
         for id in ["s2", "s3"] {
             touch_session(logs.path(), id);
             ingester.set_latest(id);
-            session.handle_tick(&Some(logs.path().to_path_buf()), &mut app, false, project.path());
+            session.handle_tick(
+                &Some(logs.path().to_path_buf()),
+                &mut app,
+                false,
+                project.path(),
+            );
         }
 
         assert_eq!(session.current_session_id.as_deref(), Some("s3"));
@@ -558,11 +795,21 @@ mod tests {
 
         touch_session(logs.path(), "s2");
         ingester.set_latest("s2");
-        session.handle_tick(&Some(logs.path().to_path_buf()), &mut app, false, project.path());
+        session.handle_tick(
+            &Some(logs.path().to_path_buf()),
+            &mut app,
+            false,
+            project.path(),
+        );
 
         // Plant a sentinel that only a reset would clear.
         app.session_slug = Some("sentinel".to_string());
-        session.handle_tick(&Some(logs.path().to_path_buf()), &mut app, false, project.path());
+        session.handle_tick(
+            &Some(logs.path().to_path_buf()),
+            &mut app,
+            false,
+            project.path(),
+        );
 
         assert_eq!(session.current_session_id.as_deref(), Some("s2"));
         assert_eq!(
@@ -696,10 +943,18 @@ mod tests {
         let (dir, mut app) = scanned_project();
         app.set_expanded("alpha.rs", RowKind::File, true);
 
-        save(dir.path(), &mut app, "alpha.rs", "pub fn alpha() {}\npub fn alpha2() {}\n");
+        save(
+            dir.path(),
+            &mut app,
+            "alpha.rs",
+            "pub fn alpha() {}\npub fn alpha2() {}\n",
+        );
 
         assert!(row(&app, "alpha.rs").unwrap().is_expanded);
-        assert!(row(&app, "alpha.rs::alpha2").is_some(), "the new symbol is visible");
+        assert!(
+            row(&app, "alpha.rs::alpha2").is_some(),
+            "the new symbol is visible"
+        );
     }
 
     /// An editor's atomic save arrives as Remove + Create; the file must not
@@ -714,5 +969,106 @@ mod tests {
         save(dir.path(), &mut app, "beta.rs", "pub fn beta() {}\n");
 
         assert!(row(&app, "beta.rs").unwrap().is_expanded);
+    }
+
+    /// Writes queued from any source are attributed off the render thread
+    /// and come back as `AppEvent::WriteRecorded` (spec §1).
+    #[test]
+    fn a_queued_write_is_attributed_by_the_worker_and_returned() {
+        let project = tempfile::tempdir().unwrap();
+        let log_dir = tempfile::tempdir().unwrap();
+        let ingester = MockIngester::new("s1");
+        let (mut session, rx) =
+            session_with(project.path(), log_dir.path(), &["s1"], "s1", ingester);
+        let mut app = empty_app(project.path(), "s1");
+
+        app.queue_write(new_file_write(project.path()));
+        session.handle_tick(
+            &Some(log_dir.path().to_path_buf()),
+            &mut app,
+            false,
+            project.path(),
+        );
+        assert!(
+            app.take_pending_writes().is_empty(),
+            "drained to the worker"
+        );
+
+        let (session, record) = loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(AppEvent::WriteRecorded { session, record }) => break (session, record),
+                Ok(_) => continue,
+                Err(e) => panic!("no WriteRecorded: {e:?}"),
+            }
+        };
+        assert_eq!(&*session, "s1", "tagged with the session it happened in");
+        assert_eq!(record.op, "toolu_1");
+        assert_eq!(record.file, "src/new.rs");
+        assert_eq!(record.level, ambits::writes::Level::Symbol);
+        assert_eq!(record.syms[0].0, "src/new.rs::a");
+    }
+
+    /// An agent creating `src/new.rs` with one function, `a`.
+    fn new_file_write(project: &Path) -> ambits::ingest::WriteEvent {
+        ambits::ingest::WriteEvent {
+            op: Arc::from("toolu_1"),
+            agent_id: Arc::from("agent-1"),
+            tool_name: Arc::from("Write"),
+            path: project.join("src/new.rs"),
+            timestamp: "2026-09-26T10:00:01Z".into(),
+            source: ambits::ingest::WriteSource::Write {
+                original: None,
+                content: "fn a() {}\n".into(),
+                create: true,
+                hunks: None,
+                user_modified: false,
+            },
+        }
+    }
+
+    /// The old session's tailer is drained before a switch in the same tick,
+    /// so its last write is still attributed to it rather than lost with the
+    /// tailer.
+    #[test]
+    fn a_write_tailed_in_the_tick_a_session_ends_stays_with_that_session() {
+        let project = tempfile::tempdir().unwrap();
+        let log_dir = tempfile::tempdir().unwrap();
+        let ingester = MockIngester::new("s1");
+        ingester
+            .tailed_writes
+            .lock()
+            .unwrap()
+            .push(new_file_write(project.path()));
+        let (mut session, rx) = session_with(
+            project.path(),
+            log_dir.path(),
+            &["s1"],
+            "s1",
+            Arc::clone(&ingester),
+        );
+        let mut app = empty_app(project.path(), "s1");
+
+        ingester.set_latest("s2");
+        touch_session(log_dir.path(), "s2");
+        session.handle_tick(
+            &Some(log_dir.path().to_path_buf()),
+            &mut app,
+            false,
+            project.path(),
+        );
+        assert_eq!(
+            app.session_id.as_deref(),
+            Some("s2"),
+            "switched in this tick"
+        );
+
+        let session_of_write = loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(AppEvent::WriteRecorded { session, .. }) => break session,
+                Ok(_) => continue,
+                Err(e) => panic!("no WriteRecorded: {e:?}"),
+            }
+        };
+        assert_eq!(&*session_of_write, "s1");
     }
 }

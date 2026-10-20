@@ -1,0 +1,618 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="{{CSP}}">
+<meta name="referrer" content="no-referrer">
+<title>ambits report</title>
+<style>
+:root {
+  --bg: #fbfbfa; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e3e2de;
+  --accent: #2f5fd0; --d1: #eef1f8; --d2: #d9e1f4; --d3: #b5c6ec; --d4: #7d9be0;
+  --ok: #1f7a4d; --warn: #a15c00; --bad: #b3261e; --prompt: #6d4bc4; --read: #2f5fd0;
+  --write: #c2410c; --delegate: #0f766e; --other: #8a8a84; --phase: #a3367a;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #151514; --panel: #1d1d1b; --ink: #ecebe7; --muted: #a3a29c; --line: #34332f;
+    --accent: #7ea2ff; --d1: #22283a; --d2: #2a3552; --d3: #36497a; --d4: #4f6fc0;
+    --ok: #5cc493; --warn: #e3a54a; --bad: #f2867d; --prompt: #b29cf2; --read: #7ea2ff;
+    --write: #f59b6b; --delegate: #4fc7b8; --other: #8f8e88; --phase: #e58ac0;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #151514; --panel: #1d1d1b; --ink: #ecebe7; --muted: #a3a29c; --line: #34332f;
+  --accent: #7ea2ff; --d1: #22283a; --d2: #2a3552; --d3: #36497a; --d4: #4f6fc0;
+  --ok: #5cc493; --warn: #e3a54a; --bad: #f2867d; --prompt: #b29cf2; --read: #7ea2ff;
+  --write: #f59b6b; --delegate: #4fc7b8; --other: #8f8e88; --phase: #e58ac0;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+code, .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px; }
+header { padding: 20px 16px 8px; max-width: 1200px; margin: 0 auto; }
+header h1 { font-size: 20px; margin: 0 0 4px; }
+header .meta { color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 16px; }
+nav { position: sticky; top: 0; background: var(--bg); border-bottom: 1px solid var(--line); z-index: 2; }
+nav .inner { max-width: 1200px; margin: 0 auto; padding: 0 16px; display: flex; gap: 4px; overflow-x: auto; }
+nav button { background: none; border: 0; border-bottom: 2px solid transparent; color: var(--muted); padding: 10px 12px; font: inherit; cursor: pointer; white-space: nowrap; }
+nav button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
+main { max-width: 1200px; margin: 0 auto; padding: 16px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; margin-bottom: 18px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.tile .v { font-size: 22px; font-weight: 600; }
+.tile .k { color: var(--muted); font-size: 12px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-bottom: 14px; }
+.card h2 { font-size: 15px; margin: 0 0 8px; }
+.notice { border-left: 3px solid var(--warn); padding: 8px 12px; background: var(--panel); margin-bottom: 14px; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
+.controls input[type="search"] { flex: 1 1 220px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); font: inherit; }
+details.file { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; margin-bottom: 6px; }
+details.file > summary { cursor: pointer; padding: 7px 10px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+details.file > summary .path { flex: 1 1 260px; overflow-wrap: anywhere; }
+.counts { color: var(--muted); font-size: 12px; }
+.sym { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 3px 10px; border-top: 1px solid var(--line); }
+.sym .name { overflow-wrap: anywhere; }
+.sym .kind, .sym .lines { color: var(--muted); font-size: 12px; }
+.chip { display: inline-block; border-radius: 10px; padding: 0 8px; font-size: 11.5px; line-height: 18px; border: 1px solid var(--line); white-space: nowrap; }
+.chip.d1 { background: var(--d1); } .chip.d2 { background: var(--d2); } .chip.d3 { background: var(--d3); } .chip.d4 { background: var(--d4); color: #fff; }
+.chip.current { border-color: var(--ok); color: var(--ok); } .chip.changed { border-color: var(--warn); color: var(--warn); }
+.chip.removed { border-color: var(--bad); color: var(--bad); } .chip.unknown { color: var(--muted); }
+a.chip { text-decoration: none; color: inherit; }
+.bar { height: 6px; width: 90px; background: var(--line); border-radius: 3px; overflow: hidden; display: inline-block; vertical-align: middle; }
+.bar > span { display: block; height: 100%; background: var(--accent); }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 6px 8px; border-top: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
+.scroll { overflow-x: auto; }
+.lanes { position: relative; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 0; margin-bottom: 12px; }
+.lane { position: relative; height: 26px; margin: 2px 0; }
+.lane .label { position: absolute; left: 8px; top: 4px; width: 120px; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lane .track { position: absolute; left: 136px; right: 12px; top: 3px; height: 20px; }
+.span { position: absolute; top: 2px; height: 16px; min-width: 3px; border-radius: 3px; cursor: pointer; border: 0; padding: 0; opacity: .85; }
+.span:hover, .span:focus { opacity: 1; outline: 2px solid var(--ink); }
+.span.prompt { background: var(--prompt); top: 0; height: 20px; opacity: .25; }
+.span.read { background: var(--read); } .span.write { background: var(--write); }
+.span.delegate { background: var(--delegate); } .span.other { background: var(--other); }
+.span.error { outline: 2px solid var(--bad); }
+.span.phase { background: var(--phase); }
+.span.phase.l1 { background: color-mix(in srgb, var(--phase) 75%, var(--panel)); }
+.span.phase.l2 { background: color-mix(in srgb, var(--phase) 50%, var(--panel)); }
+.chip.tier { border-color: var(--phase); background: color-mix(in srgb, var(--phase) 35%, transparent); }
+.chip.tier.l1 { background: color-mix(in srgb, var(--phase) 22%, transparent); }
+.chip.tier.l2 { background: color-mix(in srgb, var(--phase) 10%, transparent); }
+.calls .row .sub { color: var(--muted); flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lane.host .label { color: var(--ink); }
+.lanes .sep { border-top: 1px solid var(--line); margin: 6px 0; }
+.instant { position: absolute; top: 0; bottom: 0; width: 0; border-left: 1px dashed var(--muted); }
+.instant.commit { border-left-color: var(--ok); }
+.instant.marker { border-left: 2px solid var(--bad); }
+.legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+.legend i.span { position: static; top: auto; height: 10px; min-width: 0; }
+.calls .row { scroll-margin-top: 56px; display: flex; gap: 8px; padding: 3px 8px; border-top: 1px solid var(--line); cursor: pointer; align-items: baseline; }
+.calls .row:hover, .calls .row.sel { background: var(--d1); }
+.calls .row .t { color: var(--muted); font-size: 12px; flex: 0 0 64px; }
+.calls .row .n { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.calls .row .counts, .calls .row .chip { flex: none; white-space: nowrap; }
+.calls .row.prompt .n { font-weight: 600; }
+.calls .row.host { background: var(--bg); }
+.calls .row.nest .n { font-weight: 600; }
+.calls .row.error .n { color: var(--bad); }
+.expand { padding: 8px 12px 12px; border-top: 1px dashed var(--line); background: var(--bg); }
+.expand dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 12px; margin: 0; }
+.expand dt { color: var(--muted); }
+.expand dd { margin: 0; overflow-wrap: anywhere; min-width: 0; }
+.expand pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; max-height: 220px; overflow: auto; }
+.span.sel { outline: 2px solid var(--ink); opacity: 1; }
+.code { border: 1px solid var(--line); border-radius: 6px; overflow: auto; max-height: 480px; margin-top: 4px; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; line-height: 1.5; }
+.code .ln { display: grid; grid-template-columns: 3.5em 3.5em 1.2em 1fr; white-space: pre; }
+.code.read .ln { grid-template-columns: 4em 1fr; }
+.code.output .ln { grid-template-columns: 1fr; padding: 0 8px; }
+.code .no { color: var(--muted); text-align: right; padding-right: 8px; user-select: none; }
+.code .op { color: var(--muted); user-select: none; }
+.code .ln.add { background: color-mix(in srgb, var(--ok) 16%, transparent); }
+.code .ln.del { background: color-mix(in srgb, var(--bad) 16%, transparent); }
+.code .hunk { color: var(--muted); padding: 2px 8px; border-top: 1px solid var(--line); background: var(--bg); }
+.code .hunk:first-child { border-top: 0; }
+.args { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; }
+.args .k { color: var(--muted); }
+.args .v { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; max-height: 160px; overflow: auto; }
+.args .v.bulk { color: var(--muted); font-style: italic; }
+@media (max-width: 760px) { .expand dl { grid-template-columns: 1fr; } .lane .label { width: 70px; } .lane .track { left: 84px; } }
+.empty { color: var(--muted); padding: 8px 0; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header id="top"></header>
+<nav><div class="inner" role="tablist" id="tabs"></div></nav>
+<main>
+<section id="panel-summary" role="tabpanel"></section>
+<section id="panel-files" role="tabpanel" hidden></section>
+<section id="panel-writes" role="tabpanel" hidden></section>
+<section id="panel-trace" role="tabpanel" hidden></section>
+</main>
+<script id="report-data" type="application/json">{{DATA}}</script>
+<script>
+"use strict";
+(function () {
+  const R = JSON.parse(document.getElementById("report-data").textContent);
+  const DEPTHS = ["unseen", "name_only", "overview", "signature", "full_body"];
+  const DEPTH_LABEL = { name_only: "name", overview: "overview", signature: "signature", full_body: "full" };
+
+  function el(tag, props) {
+    const e = document.createElement(tag);
+    if (props) {
+      for (const [k, v] of Object.entries(props)) {
+        if (v === undefined || v === null || v === false) continue;
+        if (k === "class") e.className = v;
+        else if (k === "text") e.textContent = String(v);
+        else if (k === "on") for (const [ev, fn] of Object.entries(v)) e.addEventListener(ev, fn);
+        else e.setAttribute(k, String(v));
+      }
+    }
+    for (let i = 2; i < arguments.length; i++) {
+      const kid = arguments[i];
+      if (kid === undefined || kid === null || kid === false) continue;
+      if (Array.isArray(kid)) kid.forEach(k => k && e.append(k));
+      else e.append(typeof kid === "object" ? kid : document.createTextNode(String(kid)));
+    }
+    return e;
+  }
+  const short = sha => (sha || "").slice(0, 7);
+  const clock = ms => new Date(ms).toISOString().slice(11, 19);
+  const depthClass = d => "d" + Math.max(0, DEPTHS.indexOf(d));
+  const pct = (a, b) => (b ? Math.round((100 * a) / b) : 0);
+
+  // A subagent goes by what its delegation was for, else its own label.
+  const delegatedAs = new Map(R.spans.filter(x => x.child_agent).map(x => [x.child_agent, x.name.replace(/^[^·]*·\s*/, "")]));
+  const agentName = new Map();
+  R.agents.forEach((a, i) => {
+    const named = delegatedAs.get(a.id) || (a.label && a.label !== a.id ? a.label : "");
+    agentName.set(a.id, a.id === R.session_id ? "main" : (named ? named.slice(0, 48) : "agent " + i));
+  });
+  const nameOf = id => agentName.get(id) || id;
+  const writeByOp = new Map(R.writes.map(w => [w.op, w]));
+  let openSpan = () => {};
+  const spanById = new Map(R.spans.map(s => [s.i, s]));
+
+  document.title = (R.project.name || "project") + " · ambits report";
+  document.getElementById("top").append(
+    el("h1", { text: R.project.name || "Session report" }),
+    el("div", { class: "meta" },
+      el("span", null, "session ", el("code", { text: R.session_id })),
+      R.project.head ? el("span", null, "HEAD ", el("code", { text: short(R.project.head) })) : null,
+      el("span", { text: "generated " + R.generated_at }),
+      el("span", { text: "ambits " + R.ambits_version })));
+
+  const panels = { summary: "Summary", files: "Files", writes: "Writes", trace: "Trace" };
+  const tabs = document.getElementById("tabs");
+  function show(id) {
+    for (const key of Object.keys(panels)) {
+      document.getElementById("panel-" + key).hidden = key !== id;
+      tabs.querySelector('[data-tab="' + key + '"]').setAttribute("aria-selected", String(key === id));
+    }
+  }
+  for (const [id, label] of Object.entries(panels)) {
+    tabs.append(el("button", { role: "tab", "data-tab": id, "aria-selected": String(id === "summary"), text: label, on: { click: () => { history.replaceState(null, "", "#" + id); show(id); } } }));
+  }
+  // `#files`, `#writes`, `#trace`, or `#trace:<span id>` for one call.
+  function route() {
+    const [id, arg] = location.hash.slice(1).split(":");
+    if (id === "trace" && arg !== undefined && /^\d+$/.test(arg)) openSpan(Number(arg));
+    else if (panels[id]) show(id);
+  }
+  window.addEventListener("hashchange", route);
+  function jumpToWrite(op) {
+    show("writes");
+    const row = document.getElementById("w-" + op);
+    if (row) { row.scrollIntoView({ block: "center" }); row.classList.add("sel"); }
+  }
+
+  // Summary
+  (function () {
+    const t = R.totals;
+    const s = document.getElementById("panel-summary");
+    if (R.truncated.length) {
+      s.append(el("div", { class: "notice", text: "This report was cut to fit a size limit: " + R.truncated.join(", ") + ". Writes and totals are complete." }));
+    }
+    const tile = (v, k) => el("div", { class: "tile" }, el("div", { class: "v", text: v }), el("div", { class: "k", text: k }));
+    s.append(el("div", { class: "tiles" },
+      tile(t.writes, "writes"),
+      tile(t.symbols_written, "symbols written"),
+      tile(pct(t.symbols_read, t.symbols) + "%", "symbols read (" + t.symbols_read + " of " + t.symbols + ")"),
+      tile(t.symbols_read_full, "read in full"),
+      tile(t.files, "files"),
+      tile(t.spans, "tool calls and prompts"),
+      tile(t.agents, "agents")));
+
+    const commits = new Map();
+    for (const w of R.writes) for (const c of (w.landed.commits || [])) commits.set(c, (commits.get(c) || 0) + 1);
+    const subjects = new Map(R.instants.filter(i => i.kind === "commit").map(i => [i.sha, i.subject]));
+    const commitCard = el("div", { class: "card" }, el("h2", { text: "Commits the writes landed in" }));
+    if (!commits.size) commitCard.append(el("div", { class: "empty", text: "No write landed in a commit." }));
+    for (const [sha, n] of commits) {
+      commitCard.append(el("div", null, el("code", { text: short(sha) }), " ", subjects.get(sha) || "", el("span", { class: "counts", text: " · " + n + " write" + (n === 1 ? "" : "s") })));
+    }
+    s.append(commitCard);
+
+    const agents = el("div", { class: "card" }, el("h2", { text: "Agents" }));
+    for (const a of R.agents) {
+      const calls = R.spans.filter(x => x.agent === a.id && x.kind !== "prompt").length;
+      agents.append(el("div", null, el("strong", { text: nameOf(a.id) }), " ", el("code", { class: "counts", text: a.id }),
+        a.parent ? el("span", { class: "counts", text: " · started by " + nameOf(a.parent) }) : null,
+        el("span", { class: "counts", text: " · " + calls + " calls" })));
+    }
+    s.append(agents);
+
+    const top = R.files.filter(f => f.symbols_written > 0).sort((a, b) => b.symbols_written - a.symbols_written).slice(0, 10);
+    const filesCard = el("div", { class: "card" }, el("h2", { text: "Most-written files" }));
+    if (!top.length) filesCard.append(el("div", { class: "empty", text: "No symbol-level writes." }));
+    top.forEach(f => filesCard.append(el("div", null, el("code", { text: f.path }), el("span", { class: "counts", text: " · " + f.symbols_written + " symbols written, " + f.symbols_read + " read" }))));
+    s.append(filesCard);
+  })();
+
+  // Files
+  (function () {
+    const s = document.getElementById("panel-files");
+    const query = el("input", { type: "search", placeholder: "Filter files and symbols", "aria-label": "Filter files and symbols" });
+    const activeOnly = el("input", { type: "checkbox", id: "active-only", checked: "checked" });
+    s.append(el("div", { class: "controls" }, query, el("label", null, activeOnly, " only files something read or wrote")),
+      el("div", { class: "legend" }, "read depth:", ...["name_only", "overview", "signature", "full_body"].map(d => el("span", { class: "chip " + depthClass(d), text: DEPTH_LABEL[d] }))));
+    const list = el("div");
+    s.append(list);
+
+    function symbolRow(sym) {
+      const reads = Object.entries(sym.reads).map(([agent, d]) => el("span", { class: "chip " + depthClass(d), title: nameOf(agent) + ": " + d, text: nameOf(agent) + " · " + DEPTH_LABEL[d] }));
+      const writes = sym.writes.map(op => {
+        const w = writeByOp.get(op);
+        const st = w ? ((w.symbols.find(x => x.id === sym.id) || {}).status || (w.removed.includes(sym.id) ? "removed" : "unknown")) : "unknown";
+        const created = w && w.created.includes(sym.id);
+        return el("a", { class: "chip " + st, href: "#w-" + op, title: (w ? w.tool + " at " + w.time : op) + " · now " + st,
+          text: (created ? "created" : "written") + " · " + st, on: { click: ev => { ev.preventDefault(); jumpToWrite(op); } } });
+      });
+      const row = el("div", { class: "sym" },
+        el("span", { style: null, class: "name mono", text: sym.name }),
+        el("span", { class: "kind", text: sym.kind }),
+        el("span", { class: "lines", text: "L" + sym.lines[0] + "–" + sym.lines[1] }), ...reads, ...writes);
+      row.style.paddingLeft = (10 + 16 * sym.level) + "px";
+      return row;
+    }
+
+    function render() {
+      const q = query.value.trim().toLowerCase();
+      list.replaceChildren();
+      let shown = 0;
+      for (const f of R.files) {
+        const active = f.symbols_read > 0 || f.symbols_written > 0 || R.writes.some(w => w.file === f.path);
+        if (activeOnly.checked && !active) continue;
+        const syms = q ? f.symbols.filter(x => x.id.toLowerCase().includes(q)) : f.symbols;
+        if (q && !f.path.toLowerCase().includes(q) && !syms.length) continue;
+        shown++;
+        const d = el("details", { class: "file" },
+          el("summary", null,
+            el("span", { class: "path mono", text: f.path }),
+            el("span", { class: "counts", text: f.symbols_read + "/" + f.total_symbols + " read · " + f.symbols_written + " written" }),
+            el("span", { class: "bar", title: pct(f.symbols_read, f.total_symbols) + "% read" }, (() => { const b = el("span"); b.style.width = pct(f.symbols_read, f.total_symbols) + "%"; return b; })())));
+        if (f.symbols_written > 0 || q) d.open = true;
+        if (!f.symbols.length) d.append(el("div", { class: "sym counts", text: f.total_symbols ? "Symbols not listed for this file." : "No symbols in this file." }));
+        syms.forEach(x => d.append(symbolRow(x)));
+        list.append(d);
+      }
+      if (!shown) list.append(el("div", { class: "empty", text: "No files match." }));
+    }
+    query.addEventListener("input", render);
+    activeOnly.addEventListener("change", render);
+    render();
+  })();
+
+  // Writes
+  (function () {
+    const s = document.getElementById("panel-writes");
+    if (!R.writes.length) { s.append(el("div", { class: "empty", text: "This session wrote nothing." })); return; }
+    const groups = new Map();
+    for (const w of R.writes) {
+      const key = (w.landed.commits && w.landed.commits.length) ? w.landed.commits.join(" ") : w.landed.state;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(w);
+    }
+    const subjects = new Map(R.instants.filter(i => i.kind === "commit").map(i => [i.sha, i.subject]));
+    const stateText = { verified: "verified", unverified: "not verified", partial: "partly verified", uncommitted: "not committed", no_repository: "no repository" };
+    for (const [key, ws] of groups) {
+      const state = ws[0].landed.state;
+      const title = ws[0].landed.commits && ws[0].landed.commits.length
+        ? ws[0].landed.commits.map(c => short(c) + (subjects.get(c) ? " " + subjects.get(c) : "")).join(", ")
+        : stateText[state] || state;
+      const table = el("table", null, el("thead", null, el("tr", null, ...["Time", "Agent", "Tool", "File", "Symbols", "File now"].map(h => el("th", { text: h })))));
+      const body = el("tbody");
+      for (const w of ws) {
+        const syms = w.symbols.map(x => el("span", { class: "chip " + x.status, title: x.id, text: x.id.split("::").pop() + (w.created.includes(x.id) ? " (new)" : "") + " · " + x.status }));
+        const removed = w.removed.map(id => el("span", { class: "chip removed", title: id, text: id.split("::").pop() + " · deleted" }));
+        body.append(el("tr", { id: "w-" + w.op },
+          el("td", { class: "mono", text: w.time.slice(11, 19) || w.time }),
+          el("td", { text: nameOf(w.agent) }),
+          el("td", { text: w.tool }),
+          el("td", { class: "mono", text: w.file }),
+          el("td", null, ...syms, ...removed, w.level === "file" ? el("span", { class: "chip unknown", text: "whole file" }) : null, w.outside_symbols ? el("span", { class: "chip unknown", text: "outside symbols" }) : null),
+          el("td", null, el("span", { class: "chip " + w.status, text: w.status }))));
+      }
+      table.append(body);
+      s.append(el("div", { class: "card" }, el("h2", null, key === state ? title : "Commit " + title, el("span", { class: "counts", text: " · " + (stateText[state] || state) + " · " + ws.length + " write" + (ws.length === 1 ? "" : "s") })), el("div", { class: "scroll" }, table)));
+    }
+  })();
+
+  // Trace
+  (function () {
+    const s = document.getElementById("panel-trace");
+    // The harness's own timeline, when it supplied one (`--phases`).
+    const P = R.phases || { lanes: [], markers: [], incomplete: false };
+    const phaseSpans = P.lanes.flatMap(l => l.spans);
+    if (!R.spans.length && !phaseSpans.length) { s.append(el("div", { class: "empty", text: "No tool calls." })); return; }
+    const ends = R.spans.map(x => x.end_ms || x.start_ms);
+    const t0 = Math.min(...R.spans.map(x => x.start_ms), ...phaseSpans.map(p => p.start_ms), ...P.markers.map(m => m.t_ms));
+    const t1 = Math.max(t0 + 1, ...ends, ...R.instants.map(i => i.t_ms), ...phaseSpans.map(p => p.end_ms), ...P.markers.map(m => m.t_ms));
+    const at = t => (100 * (t - t0)) / (t1 - t0);
+
+    if (P.incomplete) s.append(el("div", { class: "notice", text: "The harness could not record its whole timeline, so a phase missing here may still have run." }));
+    s.append(el("div", { class: "legend" }, ...[...(phaseSpans.length ? ["phase"] : []), "prompt", "read", "write", "delegate", "other"].map(k => {
+      return el("span", null, el("i", { class: "span " + k }), k);
+    }), el("span", { text: clock(t0) + " → " + clock(t1) })));
+
+    const lanes = el("div", { class: "lanes" });
+    const attrText = attrs => attrs.map(a => a.key + " " + a.value).join(" · ");
+    const markersOn = track => {
+      for (const m of P.markers) {
+        const mk = el("div", { class: "instant marker", title: m.name + (m.attrs.length ? " · " + attrText(m.attrs) : "") + " at " + clock(m.t_ms) });
+        mk.style.left = at(m.t_ms) + "%";
+        track.append(mk);
+      }
+    };
+
+    // Every row of the list below, by key: a call `c<i>`, a harness span
+    // `h<lane>-<span>`, a marker `m<n>`. Details are built when first opened.
+    const entries = new Map();
+    // A row that stands for another, as a turn row for the prompt merged into it.
+    const alias = new Map();
+    function toggle(key, open) {
+      const e = entries.get(alias.get(key) || key);
+      if (!e || !e.row) return;
+      const wanted = open === undefined ? !e.box : open;
+      if (wanted && !e.box) {
+        e.box = e.detail();
+        e.row.after(e.box);
+      } else if (!wanted && e.box) {
+        e.box.remove();
+        e.box = null;
+      }
+      e.row.setAttribute("aria-expanded", String(Boolean(e.box)));
+      e.row.classList.toggle("sel", Boolean(e.box));
+      for (const b of [e.bar, e.also]) if (b) b.classList.toggle("sel", Boolean(e.box));
+    }
+    const reveal = key => { toggle(key, true); const e = entries.get(alias.get(key) || key); if (e && e.row) e.row.scrollIntoView({ block: "start" }); };
+
+    // Each harness lane stacks what overlaps into rows, so a phase that runs
+    // inside another sits on the row below it.
+    const hostItems = [];
+    const shade = li => " l" + Math.min(li, 2);
+    P.lanes.forEach((lane, li) => {
+      const items = lane.spans.map((p, si) => ({ p, li, lane: lane.name, nest: Boolean(lane.nest), key: "h" + li + "-" + si }))
+        .sort((a, b) => a.p.start_ms - b.p.start_ms || b.p.end_ms - a.p.end_ms);
+      const rowEnds = [];
+      for (const item of items) {
+        let r = rowEnds.findIndex(end => end <= item.p.start_ms);
+        if (r < 0) { r = rowEnds.length; rowEnds.push(0); }
+        rowEnds[r] = item.p.end_ms;
+        item.row = r;
+      }
+      const tracks = rowEnds.length ? rowEnds.map(() => el("div", { class: "track" })) : [el("div", { class: "track" })];
+      for (const item of items) {
+        const label = lane.name + " · " + item.p.name;
+        const b = el("button", { class: "span phase" + shade(li), title: label + " · " + (item.p.end_ms - item.p.start_ms) + " ms", "aria-label": label, on: { click: () => reveal(item.key) } });
+        b.style.left = at(item.p.start_ms) + "%";
+        b.style.width = Math.max(0.25, at(item.p.end_ms) - at(item.p.start_ms)) + "%";
+        tracks[item.row].append(b);
+        entries.set(item.key, { bar: b, row: null, box: null });
+        hostItems.push(item);
+      }
+      tracks.forEach((track, r) => {
+        markersOn(track);
+        const label = el("div", { class: "label", title: lane.name, text: r ? "" : (li ? "└ " : "") + lane.name });
+        label.style.paddingLeft = 10 * Math.max(0, li - 1) + "px";
+        lanes.append(el("div", { class: "lane host" }, label, track));
+      });
+    });
+    if (P.lanes.length && R.spans.length) lanes.append(el("div", { class: "sep" }));
+    const order = R.agents.map(a => a.id);
+    R.spans.forEach(x => { if (!order.includes(x.agent)) order.push(x.agent); });
+
+    // One details layout for every row: a list of named values, then any
+    // key/value grid (a call's arguments, a phase's attributes), then content.
+    const pairs = list => {
+      const grid = el("div", { class: "args" });
+      for (const [k, v, bulk] of list) grid.append(el("span", { class: "k mono", text: k }), el("pre", { class: "v mono" + (bulk ? " bulk" : ""), text: v }));
+      return grid;
+    };
+    const detailList = rows => {
+      const dl = el("dl");
+      for (const [k, v] of rows) if (v) dl.append(el("dt", { text: k }), el("dd", { class: k === "File" || k === "Symbol" ? "mono" : null, text: v }));
+      return dl;
+    };
+    const took = (start, end) => clock(start) + (end === null || end === undefined ? " · no result" : " · " + (end - start) + " ms");
+
+    const markerRows = (dl, ms) => {
+      for (const m of ms) dl.append(el("dt", { text: "Marker" }), el("dd", null, el("span", { class: "chip removed", text: m.name }), " " + clock(m.t_ms), m.attrs.length ? pairs(m.attrs.map(a => [a.key, a.value])) : null));
+    };
+    function detailOf(x, ms) {
+      const dl = detailList([["Kind", x.kind + (x.depth ? " · " + x.depth : "")], ["Tool", x.tool], ["Agent", nameOf(x.agent)],
+        ["When", took(x.start_ms, x.end_ms)],
+        ["File", x.file], ["Symbol", x.symbol], ["Started", x.child_agent ? nameOf(x.child_agent) : null], ["Error", x.message]]);
+      if (x.detail) dl.append(el("dt", { text: "Detail" }), el("dd", null, el("pre", { class: "mono", text: x.detail })));
+      if (x.read_count) {
+        const reads = x.read.length ? x.read.map(([id, d]) => el("div", null, el("span", { class: "chip " + depthClass(d), text: DEPTH_LABEL[d] }), " ", el("code", { text: id }))) : [el("div", { class: "counts", text: x.read_count + " symbols (list cut for size)" })];
+        dl.append(el("dt", { text: "Read" }), el("dd", null, ...reads));
+      }
+      if (x.args.length) dl.append(el("dt", { text: "Arguments" }), el("dd", null, pairs(x.args.map(a => [a.key, a.value, a.bulk]))));
+      const titles = { change: "Change", read: "Read", output: x.error ? "Error output" : "Output" };
+      if (x.content) dl.append(el("dt", { text: titles[x.content.type] || x.content.type }), el("dd", null, contentView(x.content)));
+      const w = R.writes.find(w => w.span === x.i);
+      if (w) dl.append(el("dt", { text: "Write" }), el("dd", null, el("a", { href: "#w-" + w.op, class: "chip " + w.status, text: "see write · " + w.status, on: { click: ev => { ev.preventDefault(); jumpToWrite(w.op); } } })));
+      markerRows(dl, ms || []);
+      return el("div", { class: "expand" }, dl);
+    }
+    function hostDetail(item, calls, prompt) {
+      const dl = detailList([["Kind", "phase"], ["Lane", item.lane], ["When", took(item.p.start_ms, item.p.end_ms)],
+        ["Ended", clock(item.p.end_ms)], ["Calls", calls || item.nest || prompt ? String(calls) : null]]);
+      if (item.p.attrs.length) dl.append(el("dt", { text: "Attributes" }), el("dd", null, pairs(item.p.attrs.map(a => [a.key, a.value]))));
+      if (prompt) {
+        dl.append(el("dt", { text: "Prompt" }), el("dd", null, took(prompt.start_ms, prompt.end_ms) + " · " + nameOf(prompt.agent)));
+        if (prompt.detail) dl.append(el("dt", { text: "Prompt text" }), el("dd", null, el("pre", { class: "mono", text: prompt.detail })));
+      }
+      return el("div", { class: "expand" }, dl);
+    }
+    function markerDetail(m) {
+      const dl = detailList([["Kind", "marker"], ["When", clock(m.t_ms)]]);
+      if (m.attrs.length) dl.append(el("dt", { text: "Attributes" }), el("dd", null, pairs(m.attrs.map(a => [a.key, a.value]))));
+      return el("div", { class: "expand" }, dl);
+    }
+
+    function contentView(c) {
+      const box = el("div", { class: "code " + c.type });
+      const cell = (cls, text) => el("span", { class: cls, text: text });
+      if (c.type === "read") {
+        c.lines.forEach((line, n) => box.append(el("div", { class: "ln" }, cell("no", c.start + n), cell("t", line))));
+      } else if (c.type === "output") {
+        if (!c.lines.length) box.append(el("div", { class: "hunk", text: "no output" }));
+        c.lines.forEach(line => box.append(el("div", { class: "ln" }, cell("t", line))));
+      } else {
+        for (const h of c.hunks) {
+          if (c.exact && h.old_start !== null) box.append(el("div", { class: "hunk", text: "@@ -" + h.old_start + " +" + h.new_start + " @@" }));
+          let oldNo = h.old_start, newNo = h.new_start;
+          for (const [op, line] of h.lines) {
+            const o = op === "+" ? "" : (oldNo === null ? "" : oldNo++);
+            const n = op === "-" ? "" : (newNo === null ? "" : newNo++);
+            box.append(el("div", { class: "ln" + (op === "+" ? " add" : op === "-" ? " del" : "") }, cell("no", o), cell("no", n), cell("op", op), cell("t", line)));
+          }
+        }
+        if (!c.exact) box.prepend(el("div", { class: "hunk", text: "as the call asked; the tool recorded no patch" }));
+      }
+      if (c.cut) box.append(el("div", { class: "hunk", text: "… " + c.cut + " more lines left out" }));
+      return box;
+    }
+
+    for (const agent of order) {
+      const track = el("div", { class: "track" });
+      for (const x of R.spans.filter(x => x.agent === agent)) {
+        const b = el("button", { class: "span " + x.kind + (x.error ? " error" : ""), title: x.name, "aria-label": x.name, on: { click: () => reveal("c" + x.i) } });
+        b.style.left = at(x.start_ms) + "%";
+        b.style.width = Math.max(0.25, at(x.end_ms || x.start_ms) - at(x.start_ms)) + "%";
+        track.append(b);
+        entries.set("c" + x.i, { bar: b, row: null, box: null });
+      }
+      for (const i of R.instants.filter(i => i.agent === null || i.agent === agent)) {
+        const m = el("div", { class: "instant " + i.kind, title: i.kind + (i.sha ? " " + short(i.sha) : "") + (i.subject ? " " + i.subject : "") + " at " + clock(i.t_ms) });
+        m.style.left = at(i.t_ms) + "%";
+        track.append(m);
+      }
+      markersOn(track);
+      lanes.append(el("div", { class: "lane" }, el("div", { class: "label", title: agent, text: nameOf(agent) }), track));
+    }
+
+    // One list: harness spans, markers and calls as one tree. Lanes are listed
+    // outermost first, so a span goes under the shortest span of an earlier
+    // lane, or a longer one of its own, covering at least half of it. A prompt
+    // and the deepest-lane span it mostly shares are one row. A call goes under
+    // its parent call (its prompt, or a delegation) when the two have the same
+    // place, else under the shortest `nest` span open when it started. A marker
+    // naming a tool goes on that tool's call it fell in; any other marker under
+    // the shortest span open at its time.
+    const len = p => p.end_ms - p.start_ms;
+    const covers = (p, a, b) => b > a
+      ? 2 * Math.max(0, Math.min(p.end_ms, b) - Math.max(p.start_ms, a)) >= b - a
+      : p.start_ms <= a && a <= p.end_ms;
+    const shortest = items => items.reduce((best, c) => !best || len(c.p) < len(best.p) || (len(c.p) === len(best.p) && c.p.start_ms > best.p.start_ms) ? c : best, null);
+    const openAt = (items, t) => shortest(items.filter(c => c.p.start_ms <= t && t <= c.p.end_ms));
+
+    const merged = new Map();
+    for (const x of R.spans) {
+      if (x.kind !== "prompt" || !x.end_ms) continue;
+      const own = { start_ms: x.start_ms, end_ms: x.end_ms };
+      const pair = hostItems.filter(c => !merged.has(c.key) && covers(c.p, x.start_ms, x.end_ms) && covers(own, c.p.start_ms, c.p.end_ms))
+        .reduce((best, c) => !best || c.li > best.li || (c.li === best.li && len(c.p) < len(best.p)) ? c : best, null);
+      if (pair) { merged.set(pair.key, x); alias.set("c" + x.i, pair.key); entries.get(pair.key).also = entries.get("c" + x.i).bar; }
+    }
+    const markersOf = new Map();
+    const loose = [];
+    P.markers.forEach((m, n) => {
+      const tool = (m.attrs.find(a => a.key === "tool_name") || {}).value;
+      const call = tool && R.spans.filter(x => x.tool === tool && x.start_ms <= m.t_ms && m.t_ms <= (x.end_ms || x.start_ms))
+        .reduce((best, x) => !best || x.start_ms > best.start_ms ? x : best, null);
+      if (call) markersOf.set(call.i, [...(markersOf.get(call.i) || []), m]);
+      else loose.push({ key: "m" + n, t: m.t_ms, len: 0, marker: m });
+    });
+
+    const nodes = [
+      ...hostItems.map(item => ({ key: item.key, t: item.p.start_ms, len: len(item.p), item, prompt: merged.get(item.key) })),
+      ...loose,
+      ...R.spans.filter(x => !alias.has("c" + x.i)).map(x => ({ key: "c" + x.i, t: x.start_ms, len: (x.end_ms || x.start_ms) - x.start_ms, call: x })),
+    ];
+    const nodeByKey = new Map(nodes.map(n => [n.key, n]));
+    const nests = hostItems.filter(c => c.nest);
+    const hostOf = item => shortest(hostItems.filter(c => c !== item && (c.li < item.li || (c.li === item.li && len(c.p) > len(item.p))) && covers(c.p, item.p.start_ms, item.p.end_ms)));
+    const placeOf = n => {
+      if (n.item) return hostOf(n.item);
+      if (n.marker) return openAt(hostItems, n.t);
+      return openAt(nests, n.t);
+    };
+    const home = new Map(nodes.map(n => { const h = placeOf(n); return [n.key, h ? nodeByKey.get(h.key) : null]; }));
+    const parentOf = n => {
+      if (!n.call || n.call.parent === null) return home.get(n.key);
+      const up = nodeByKey.get(alias.get("c" + n.call.parent) || "c" + n.call.parent);
+      if (up && up.item) return up;
+      return up && home.get(up.key) === home.get(n.key) ? up : home.get(n.key);
+    };
+    const kids = new Map(nodes.map(n => [n.key, []]));
+    const roots = [];
+    for (const n of nodes) { const p = parentOf(n); (p ? kids.get(p.key) : roots).push(n); }
+    const byTime = (a, b) => a.t - b.t || b.len - a.len || (a.call && b.call ? a.call.i - b.call.i : 0);
+    const callsIn = n => kids.get(n.key).reduce((sum, k) => sum + (k.call && k.call.kind !== "prompt" ? 1 : 0) + callsIn(k), 0);
+    const list = el("div", { class: "card calls" }, el("h2", { text: hostItems.length || P.markers.length ? "Phases and calls" : "Calls" }));
+    const row = (key, cls, kids2, indent) => {
+      const r = el("div", { class: "row " + cls, tabindex: "0", role: "button", "aria-expanded": "false", on: { click: () => toggle(key), keydown: ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggle(key); } } } }, ...kids2);
+      r.style.paddingLeft = (8 + 16 * indent) + "px";
+      list.append(r);
+      const e = entries.get(key) || { bar: null, row: null, box: null };
+      e.row = r;
+      entries.set(key, e);
+      return e;
+    };
+    function render(n, depth) {
+      if (n.call) {
+        const x = n.call, ms = markersOf.get(x.i) || [];
+        row(n.key, x.kind + (x.error ? " error" : ""), [el("span", { class: "t mono", text: clock(x.start_ms) }), el("span", { class: "chip", text: x.kind }),
+          el("span", { class: "n", title: x.name, text: x.name }), el("span", { class: "counts", text: x.end_ms ? (x.end_ms - x.start_ms) + " ms" : "no result" }),
+          ...ms.map(m => el("span", { class: "chip removed", text: m.name }))], depth).detail = () => detailOf(x, ms);
+      } else if (n.marker) {
+        const m = n.marker;
+        row(n.key, "marker", [el("span", { class: "t mono", text: clock(m.t_ms) }), el("span", { class: "chip removed", text: "marker" }),
+          el("span", { class: "n", text: m.name })], depth).detail = () => markerDetail(m);
+      } else {
+        const it = n.item, calls = callsIn(n);
+        const count = calls || it.nest || n.prompt ? " · " + (calls ? calls + " call" + (calls === 1 ? "" : "s") : "no calls") : "";
+        row(n.key, "host" + (it.nest || n.prompt ? " nest" : ""), [el("span", { class: "t mono", text: clock(it.p.start_ms) }), el("span", { class: "chip tier" + shade(it.li), text: it.lane }),
+          el("span", { class: "n", text: it.p.name }), n.prompt ? el("span", { class: "sub", title: n.prompt.name, text: n.prompt.name }) : null,
+          el("span", { class: "counts", text: n.len + " ms" + count })], depth).detail = () => hostDetail(it, calls, n.prompt);
+      }
+      for (const k of kids.get(n.key).sort(byTime)) render(k, depth + 1);
+    }
+    for (const n of roots.sort(byTime)) render(n, 0);
+    if (!R.spans.length) list.append(el("div", { class: "empty", text: "No tool calls." }));
+    s.append(lanes, list);
+    openSpan = i => { if (spanById.has(i)) { show("trace"); reveal("c" + i); } };
+  })();
+
+  route();
+})();
+</script>
+</body>
+</html>

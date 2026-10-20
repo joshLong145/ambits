@@ -31,7 +31,11 @@ fn fixture() -> tempfile::TempDir {
         "pub fn unrelated() -> u32 {\n    7\n}\n",
     )
     .unwrap();
-    std::fs::write(root.join("docs/notes.md"), "the needle is documented here\n").unwrap();
+    std::fs::write(
+        root.join("docs/notes.md"),
+        "the needle is documented here\n",
+    )
+    .unwrap();
     std::fs::write(root.join("target/generated.rs"), "fn needle() {}\n").unwrap();
 
     dir
@@ -164,7 +168,10 @@ fn without_p_the_project_is_the_enclosing_repository() {
     let scoped = run_in(&src, &["rg", "needle", "-l", "lib.rs"]);
     assert_eq!(scoped.code, 0, "{:?}", scoped.stderr);
     assert!(scoped.stdout.contains("src/lib.rs"));
-    assert!(!scoped.stdout.contains("docs/notes.md"), "lib.rs resolved against src/");
+    assert!(
+        !scoped.stdout.contains("docs/notes.md"),
+        "lib.rs resolved against src/"
+    );
 }
 
 /// The project's `tools.toml` is looked up under the project root, not the
@@ -354,16 +361,27 @@ fn a_second_identical_search_still_reports_unknown_depth() {
 fn files_without_match_lists_the_complement_of_files_with_matches() {
     let dir = fixture();
 
-    let out = rg(dir.path(), &["needle", "-t", "rust", "--files-without-match"]);
+    let out = rg(
+        dir.path(),
+        &["needle", "-t", "rust", "--files-without-match"],
+    );
     assert!(out.stdout.contains("src/util.rs"), "{:?}", out.stdout);
-    assert!(!out.stdout.contains("src/lib.rs"), "lib.rs matched, so it is excluded: {:?}", out.stdout);
+    assert!(
+        !out.stdout.contains("src/lib.rs"),
+        "lib.rs matched, so it is excluded: {:?}",
+        out.stdout
+    );
 }
 
 #[test]
 fn files_without_match_conflicts_with_files_with_matches() {
     let dir = fixture();
     let out = rg(dir.path(), &["needle", "-l", "--files-without-match"]);
-    assert_eq!(out.code, 2, "clap rejects the combination: {:?}", out.stderr);
+    assert_eq!(
+        out.code, 2,
+        "clap rejects the combination: {:?}",
+        out.stderr
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -376,7 +394,13 @@ fn type_list_needs_no_pattern_and_lists_known_types() {
     let dir = fixture();
     let out = rg(dir.path(), &["--type-list"]);
     assert_eq!(out.code, 0, "{:?}", out.stderr);
-    assert!(out.stdout.lines().any(|l| l.starts_with("rust:") && l.contains(".rs")), "{:?}", out.stdout);
+    assert!(
+        out.stdout
+            .lines()
+            .any(|l| l.starts_with("rust:") && l.contains(".rs")),
+        "{:?}",
+        out.stdout
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -390,9 +414,20 @@ fn pattern_file_patterns_join_the_alternation() {
     let patterns = dir.path().join("patterns.txt");
     std::fs::write(&patterns, "needle\n\nunrelated\n").unwrap();
 
-    let out = rg(dir.path(), &["-t", "rust", "-l", "-f", patterns.to_str().unwrap()]);
-    assert!(out.stdout.contains("src/lib.rs"), "needle: {:?}", out.stdout);
-    assert!(out.stdout.contains("src/util.rs"), "unrelated: {:?}", out.stdout);
+    let out = rg(
+        dir.path(),
+        &["-t", "rust", "-l", "-f", patterns.to_str().unwrap()],
+    );
+    assert!(
+        out.stdout.contains("src/lib.rs"),
+        "needle: {:?}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("src/util.rs"),
+        "unrelated: {:?}",
+        out.stdout
+    );
 }
 
 /// A missing pattern file is an expected, actionable failure — exit 2 with
@@ -402,7 +437,11 @@ fn a_missing_pattern_file_is_an_error() {
     let dir = fixture();
     let out = rg(dir.path(), &["-f", "does-not-exist.txt"]);
     assert_eq!(out.code, 2);
-    assert!(out.stderr.contains("does-not-exist.txt"), "{:?}", out.stderr);
+    assert!(
+        out.stderr.contains("does-not-exist.txt"),
+        "{:?}",
+        out.stderr
+    );
 }
 
 /// An empty pattern file, with no -e/PATTERN either, is "no pattern given" —

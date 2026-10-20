@@ -15,12 +15,20 @@ fn record_n_symbols(bencher: divan::Bencher, n: &usize) {
     let symbols: Vec<String> = (0..n).map(|i| format!("src/bench.rs::sym_{i}")).collect();
     let hash = [42u8; 32];
 
-    bencher.with_inputs(ContextLedger::new).bench_local_values(|mut ledger| {
-        for id in &symbols {
-            ledger.record(id.clone(), ReadDepth::Overview, hash, "agent-0".to_string(), 30);
-        }
-        divan::black_box(ledger)
-    });
+    bencher
+        .with_inputs(ContextLedger::new)
+        .bench_local_values(|mut ledger| {
+            for id in &symbols {
+                ledger.record(
+                    id.clone(),
+                    ReadDepth::Overview,
+                    hash,
+                    "agent-0".to_string(),
+                    30,
+                );
+            }
+            divan::black_box(ledger)
+        });
 }
 
 /// Benchmark upgrading depth for the same N symbols across 3 agents.
@@ -31,16 +39,22 @@ fn record_upgrade_n_symbols(bencher: divan::Bencher, n: &usize) {
     let symbols: Vec<String> = (0..n).map(|i| format!("src/bench.rs::sym_{i}")).collect();
     let hash = [1u8; 32];
     let agents = ["agent-0", "agent-1", "agent-2"];
-    let depths = [ReadDepth::NameOnly, ReadDepth::Overview, ReadDepth::FullBody];
+    let depths = [
+        ReadDepth::NameOnly,
+        ReadDepth::Overview,
+        ReadDepth::FullBody,
+    ];
 
-    bencher.with_inputs(ContextLedger::new).bench_local_values(|mut ledger| {
-        for (agent, depth) in agents.iter().zip(depths.iter()) {
-            for id in &symbols {
-                ledger.record(id.clone(), *depth, hash, agent.to_string(), 30);
+    bencher
+        .with_inputs(ContextLedger::new)
+        .bench_local_values(|mut ledger| {
+            for (agent, depth) in agents.iter().zip(depths.iter()) {
+                for id in &symbols {
+                    ledger.record(id.clone(), *depth, hash, agent.to_string(), 30);
+                }
             }
-        }
-        divan::black_box(ledger)
-    });
+            divan::black_box(ledger)
+        });
 }
 
 /// Benchmark `depth_of` lookups over a pre-populated ledger of N symbols.
@@ -53,7 +67,13 @@ fn depth_of_n_symbols(bencher: divan::Bencher, n: &usize) {
 
     let mut ledger = ContextLedger::new();
     for id in &symbols {
-        ledger.record(id.clone(), ReadDepth::FullBody, hash, "agent-0".to_string(), 30);
+        ledger.record(
+            id.clone(),
+            ReadDepth::FullBody,
+            hash,
+            "agent-0".to_string(),
+            30,
+        );
     }
 
     bencher.bench(|| {
@@ -79,7 +99,13 @@ fn mark_stale_n_symbols(bencher: divan::Bencher, n: &usize) {
         .with_inputs(|| {
             let mut ledger = ContextLedger::new();
             for id in &symbols {
-                ledger.record(id.clone(), ReadDepth::FullBody, old_hash, "agent-0".to_string(), 30);
+                ledger.record(
+                    id.clone(),
+                    ReadDepth::FullBody,
+                    old_hash,
+                    "agent-0".to_string(),
+                    30,
+                );
             }
             ledger
         })

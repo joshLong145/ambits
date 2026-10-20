@@ -101,7 +101,7 @@ scan included, which is both worse and harder to notice.
 |---|---|
 | CLI entry point | `src/main.rs` |
 | TUI state and key handling | `src/app.rs`, `src/tui.rs`, `src/ui/` |
-| Language parsers | `src/parser/` (`rust.rs`, `python.rs`, `typescript.rs`, `markdown.rs`) |
+| Language parsers | `src/parser/` (`rust.rs`, `python.rs`, `typescript.rs`, `java.rs`, `markdown.rs`) |
 | Serena backend | `src/serena/` |
 | Session ingestion and tool mappings | `src/ingest/` (`claude.rs`, `tool_config.rs`, `default_tools.toml`) |
 | Ledger and multi-agent tracking | `src/tracking/` |

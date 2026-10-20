@@ -52,11 +52,16 @@ fn tool_read_missing_path_returns_none() {
 // 2. Edit
 // ---------------------------------------------------------------------------
 #[test]
-fn tool_edit_full_body() {
+fn tool_edit_is_a_write() {
     let cfg = builtin();
     let input = serde_json::json!({ "file_path": "/src/foo.rs" });
     let call = map_tool_call(&cfg, "Edit", &input, "a", "ts").unwrap();
-    assert_eq!(call.read_depth, ReadDepth::FullBody);
+    assert_eq!(
+        call.read_depth,
+        ReadDepth::Unseen,
+        "a write grants no read credit (D9)"
+    );
+    assert_eq!(call.effect, ambits::ingest::Effect::Write);
     assert!(call.description.contains("foo.rs"));
 }
 
@@ -64,11 +69,16 @@ fn tool_edit_full_body() {
 // 3. Write
 // ---------------------------------------------------------------------------
 #[test]
-fn tool_write_full_body() {
+fn tool_write_is_a_write() {
     let cfg = builtin();
     let input = serde_json::json!({ "file_path": "/new/file.rs" });
     let call = map_tool_call(&cfg, "Write", &input, "a", "ts").unwrap();
-    assert_eq!(call.read_depth, ReadDepth::FullBody);
+    assert_eq!(
+        call.read_depth,
+        ReadDepth::Unseen,
+        "a write grants no read credit (D9)"
+    );
+    assert_eq!(call.effect, ambits::ingest::Effect::Write);
 }
 
 // ---------------------------------------------------------------------------
@@ -81,7 +91,11 @@ fn tool_glob_no_path_needed() {
     let call = map_tool_call(&cfg, "Glob", &input, "a", "ts").unwrap();
     assert_eq!(call.read_depth, ReadDepth::NameOnly);
     assert!(call.file_path.is_none());
-    assert!(call.description.contains("**/*.rs"), "description was: {}", call.description);
+    assert!(
+        call.description.contains("**/*.rs"),
+        "description was: {}",
+        call.description
+    );
 }
 
 #[test]
@@ -90,7 +104,11 @@ fn tool_glob_file_mask_fallback() {
     // `file_mask` is the second pattern_key for Glob.
     let input = serde_json::json!({ "file_mask": "*.toml" });
     let call = map_tool_call(&cfg, "Glob", &input, "a", "ts").unwrap();
-    assert!(call.description.contains("*.toml"), "description was: {}", call.description);
+    assert!(
+        call.description.contains("*.toml"),
+        "description was: {}",
+        call.description
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +120,11 @@ fn tool_grep_pattern_key() {
     let input = serde_json::json!({ "pattern": "fn main" });
     let call = map_tool_call(&cfg, "Grep", &input, "a", "ts").unwrap();
     assert_eq!(call.read_depth, ReadDepth::Overview);
-    assert!(call.description.contains("fn main"), "description was: {}", call.description);
+    assert!(
+        call.description.contains("fn main"),
+        "description was: {}",
+        call.description
+    );
 }
 
 #[test]
@@ -110,7 +132,11 @@ fn tool_grep_substring_pattern_fallback() {
     let cfg = builtin();
     let input = serde_json::json!({ "substring_pattern": "struct Foo" });
     let call = map_tool_call(&cfg, "Grep", &input, "a", "ts").unwrap();
-    assert!(call.description.contains("struct Foo"), "description was: {}", call.description);
+    assert!(
+        call.description.contains("struct Foo"),
+        "description was: {}",
+        call.description
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -160,7 +186,14 @@ fn tool_find_symbol_absent_include_body() {
 fn tool_find_referencing_symbols() {
     let cfg = builtin();
     let input = serde_json::json!({ "relative_path": "src/foo.rs", "name_path": "Foo" });
-    let call = map_tool_call(&cfg, "mcp__serena__find_referencing_symbols", &input, "a", "ts").unwrap();
+    let call = map_tool_call(
+        &cfg,
+        "mcp__serena__find_referencing_symbols",
+        &input,
+        "a",
+        "ts",
+    )
+    .unwrap();
     assert_eq!(call.read_depth, ReadDepth::Overview);
     assert_eq!(call.target_symbol.as_deref(), Some("Foo"));
 }
@@ -173,7 +206,12 @@ fn tool_replace_symbol_body() {
     let cfg = builtin();
     let input = serde_json::json!({ "relative_path": "src/foo.rs", "name_path": "MyFn" });
     let call = map_tool_call(&cfg, "mcp__serena__replace_symbol_body", &input, "a", "ts").unwrap();
-    assert_eq!(call.read_depth, ReadDepth::FullBody);
+    assert_eq!(
+        call.read_depth,
+        ReadDepth::Unseen,
+        "a write grants no read credit (D9)"
+    );
+    assert_eq!(call.effect, ambits::ingest::Effect::Write);
     assert_eq!(call.target_symbol.as_deref(), Some("MyFn"));
 }
 
@@ -185,7 +223,12 @@ fn tool_insert_after_symbol() {
     let cfg = builtin();
     let input = serde_json::json!({ "relative_path": "src/foo.rs", "name_path": "last_fn" });
     let call = map_tool_call(&cfg, "mcp__serena__insert_after_symbol", &input, "a", "ts").unwrap();
-    assert_eq!(call.read_depth, ReadDepth::FullBody);
+    assert_eq!(
+        call.read_depth,
+        ReadDepth::Unseen,
+        "a write grants no read credit (D9)"
+    );
+    assert_eq!(call.effect, ambits::ingest::Effect::Write);
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +239,12 @@ fn tool_insert_before_symbol() {
     let cfg = builtin();
     let input = serde_json::json!({ "relative_path": "src/foo.rs", "name_path": "first_fn" });
     let call = map_tool_call(&cfg, "mcp__serena__insert_before_symbol", &input, "a", "ts").unwrap();
-    assert_eq!(call.read_depth, ReadDepth::FullBody);
+    assert_eq!(
+        call.read_depth,
+        ReadDepth::Unseen,
+        "a write grants no read credit (D9)"
+    );
+    assert_eq!(call.effect, ambits::ingest::Effect::Write);
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +255,12 @@ fn tool_rename_symbol() {
     let cfg = builtin();
     let input = serde_json::json!({ "relative_path": "src/foo.rs", "name_path": "old_name" });
     let call = map_tool_call(&cfg, "mcp__serena__rename_symbol", &input, "a", "ts").unwrap();
-    assert_eq!(call.read_depth, ReadDepth::FullBody);
+    assert_eq!(
+        call.read_depth,
+        ReadDepth::Unseen,
+        "a write grants no read credit (D9)"
+    );
+    assert_eq!(call.effect, ambits::ingest::Effect::Write);
     assert_eq!(call.target_symbol.as_deref(), Some("old_name"));
 }
 
@@ -219,7 +272,12 @@ fn tool_notebook_edit() {
     let cfg = builtin();
     let input = serde_json::json!({ "notebook_path": "/work/notebook.ipynb" });
     let call = map_tool_call(&cfg, "NotebookEdit", &input, "a", "ts").unwrap();
-    assert_eq!(call.read_depth, ReadDepth::FullBody);
+    assert_eq!(
+        call.read_depth,
+        ReadDepth::Unseen,
+        "a write grants no read credit (D9)"
+    );
+    assert_eq!(call.effect, ambits::ingest::Effect::Write);
     assert!(call.file_path.is_some());
 }
 
@@ -232,7 +290,11 @@ fn tool_agent_maps_with_description() {
     let input = serde_json::json!({ "description": "Explore parser", "subagent_type": "Explore", "prompt": "..." });
     let call = map_tool_call(&cfg, "Agent", &input, "a", "ts").unwrap();
     assert_eq!(call.read_depth, ReadDepth::Unseen);
-    assert!(call.description.contains("Explore parser"), "description was: {}", call.description);
+    assert!(
+        call.description.contains("Explore parser"),
+        "description was: {}",
+        call.description
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -244,7 +306,11 @@ fn tool_search_gets_unseen() {
     let input = serde_json::json!({ "query": "select:Read,Edit" });
     let call = map_tool_call(&cfg, "ToolSearch", &input, "a", "ts").unwrap();
     assert_eq!(call.read_depth, ReadDepth::Unseen);
-    assert!(call.description.contains("select:Read,Edit"), "description was: {}", call.description);
+    assert!(
+        call.description.contains("select:Read,Edit"),
+        "description was: {}",
+        call.description
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +322,11 @@ fn tool_skill_gets_name_only() {
     let input = serde_json::json!({ "skill": "rust-skills:m01-ownership" });
     let call = map_tool_call(&cfg, "Skill", &input, "a", "ts").unwrap();
     assert_eq!(call.read_depth, ReadDepth::NameOnly);
-    assert!(call.description.contains("rust-skills:m01-ownership"), "description was: {}", call.description);
+    assert!(
+        call.description.contains("rust-skills:m01-ownership"),
+        "description was: {}",
+        call.description
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -268,7 +338,11 @@ fn tool_send_message_gets_unseen() {
     let input = serde_json::json!({ "to": "agent-abc", "message": "hi" });
     let call = map_tool_call(&cfg, "SendMessage", &input, "a", "ts").unwrap();
     assert_eq!(call.read_depth, ReadDepth::Unseen);
-    assert!(call.description.contains("agent-abc"), "description was: {}", call.description);
+    assert!(
+        call.description.contains("agent-abc"),
+        "description was: {}",
+        call.description
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +376,11 @@ fn tool_web_fetch_gets_unseen() {
     let input = serde_json::json!({ "url": "https://example.com" });
     let call = map_tool_call(&cfg, "WebFetch", &input, "a", "ts").unwrap();
     assert_eq!(call.read_depth, ReadDepth::Unseen);
-    assert!(call.description.contains("https://example.com"), "description was: {}", call.description);
+    assert!(
+        call.description.contains("https://example.com"),
+        "description was: {}",
+        call.description
+    );
 }
 
 #[test]
@@ -311,7 +389,11 @@ fn tool_web_search_gets_unseen() {
     let input = serde_json::json!({ "query": "rust error handling" });
     let call = map_tool_call(&cfg, "WebSearch", &input, "a", "ts").unwrap();
     assert_eq!(call.read_depth, ReadDepth::Unseen);
-    assert!(call.description.contains("rust error handling"), "description was: {}", call.description);
+    assert!(
+        call.description.contains("rust error handling"),
+        "description was: {}",
+        call.description
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -340,7 +422,12 @@ fn mcp_acp_edit_alias() {
     let cfg = builtin();
     let input = serde_json::json!({ "file_path": "/alias.rs" });
     let call = map_tool_call(&cfg, "mcp__acp__Edit", &input, "a", "ts").unwrap();
-    assert_eq!(call.read_depth, ReadDepth::FullBody);
+    assert_eq!(
+        call.read_depth,
+        ReadDepth::Unseen,
+        "a write grants no read credit (D9)"
+    );
+    assert_eq!(call.effect, ambits::ingest::Effect::Write);
 }
 
 // ---------------------------------------------------------------------------
@@ -353,7 +440,11 @@ fn tool_bash_short_command() {
     let call = map_tool_call(&cfg, "Bash", &input, "a", "ts").unwrap();
     assert_eq!(call.read_depth, ReadDepth::NameOnly);
     assert!(call.file_path.is_none());
-    assert!(call.description.contains("cargo build"), "description was: {}", call.description);
+    assert!(
+        call.description.contains("cargo build"),
+        "description was: {}",
+        call.description
+    );
 }
 
 #[test]
@@ -363,12 +454,23 @@ fn tool_bash_long_command_truncated() {
     let long_cmd = "cargo test --all-features -- --nocapture 2>&1 | tee output.log && \
         echo 'done' && cargo clippy --all-targets --all-features -- -D warnings && \
         cargo fmt --check && echo 'all checks passed' && cargo build --release";
-    assert!(long_cmd.len() > 200, "test command must exceed 200 chars, got {}", long_cmd.len());
+    assert!(
+        long_cmd.len() > 200,
+        "test command must exceed 200 chars, got {}",
+        long_cmd.len()
+    );
     let input = serde_json::json!({ "command": long_cmd });
     let call = map_tool_call(&cfg, "Bash", &input, "a", "ts").unwrap();
-    assert!(call.description.contains('…'), "expected truncation ellipsis, got: {}", call.description);
+    assert!(
+        call.description.contains('…'),
+        "expected truncation ellipsis, got: {}",
+        call.description
+    );
     // The description body (excluding "Bash " prefix) should be at most 200 chars + "…"
-    let body = call.description.strip_prefix("Bash ").unwrap_or(&call.description);
+    let body = call
+        .description
+        .strip_prefix("Bash ")
+        .unwrap_or(&call.description);
     // 200 chars + "…" (3 bytes) = 203 bytes max
     assert!(body.len() <= 204, "truncated body too long: {}", body);
 }
@@ -401,7 +503,11 @@ fn tool_bash_description_key_fallback() {
     // When "command" is absent, fall back to "description" pattern_key.
     let input = serde_json::json!({ "description": "List files" });
     let call = map_tool_call(&cfg, "Bash", &input, "a", "ts").unwrap();
-    assert!(call.description.contains("List files"), "description was: {}", call.description);
+    assert!(
+        call.description.contains("List files"),
+        "description was: {}",
+        call.description
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -418,7 +524,11 @@ fn tool_bash_show_command_credits_its_selectors() {
 
     assert_eq!(
         call.target_selectors,
-        vec![("src/app.rs::App/render".to_string(), ReadDepth::FullBody)]
+        vec![ambits::ingest::SelectorRead {
+            selector: "src/app.rs::App/render".to_string(),
+            depth: ReadDepth::FullBody,
+            whole: true
+        }]
     );
     assert_eq!(
         call.read_depth,
@@ -468,13 +578,18 @@ fn tool_todo_write_shows_first_todo() {
     let call = map_tool_call(&cfg, "TodoWrite", &input, "a", "ts").unwrap();
     assert_eq!(call.read_depth, ReadDepth::NameOnly);
     assert!(call.file_path.is_none());
-    assert!(call.description.contains("Run tests"), "description was: {}", call.description);
+    assert!(
+        call.description.contains("Run tests"),
+        "description was: {}",
+        call.description
+    );
 }
 
 #[test]
 fn tool_todo_write_long_content_truncated() {
     let cfg = builtin();
-    let long_content = "Implement the full authentication system with OAuth2 support and refresh tokens, \
+    let long_content =
+        "Implement the full authentication system with OAuth2 support and refresh tokens, \
         including token storage, silent renewal, logout flow, PKCE challenge, and integration \
         with the existing user profile service and role-based access control middleware";
     let input = serde_json::json!({
@@ -483,7 +598,11 @@ fn tool_todo_write_long_content_truncated() {
         ]
     });
     let call = map_tool_call(&cfg, "TodoWrite", &input, "a", "ts").unwrap();
-    assert!(call.description.contains('…'), "expected truncation, got: {}", call.description);
+    assert!(
+        call.description.contains('…'),
+        "expected truncation, got: {}",
+        call.description
+    );
 }
 
 #[test]
@@ -493,7 +612,11 @@ fn tool_todo_write_empty_todos() {
     let input = serde_json::json!({ "todos": [] });
     let call = map_tool_call(&cfg, "TodoWrite", &input, "a", "ts").unwrap();
     // No panic, description contains "TodoWrite"
-    assert!(call.description.starts_with("TodoWrite"), "description was: {}", call.description);
+    assert!(
+        call.description.starts_with("TodoWrite"),
+        "description was: {}",
+        call.description
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -508,21 +631,45 @@ fn parse_log_file_all_tool_stanzas() {
     let mut tmp = NamedTempFile::new().unwrap();
 
     let lines = [
-        assistant_line("Read",            r#"{"file_path":"/a.rs"}"#),
-        assistant_line("Edit",            r#"{"file_path":"/b.rs"}"#),
-        assistant_line("Write",           r#"{"file_path":"/c.rs"}"#),
-        assistant_line("Glob",            r#"{"pattern":"**/*.rs"}"#),
-        assistant_line("Grep",            r#"{"pattern":"fn foo"}"#),
-        assistant_line("mcp__serena__get_symbols_overview",      r#"{"relative_path":"src/lib.rs"}"#),
-        assistant_line("mcp__serena__find_symbol",               r#"{"relative_path":"src/lib.rs","name_path_pattern":"Foo","include_body":true}"#),
-        assistant_line("mcp__serena__find_referencing_symbols",  r#"{"relative_path":"src/lib.rs","name_path":"Foo"}"#),
-        assistant_line("mcp__serena__replace_symbol_body",       r#"{"relative_path":"src/lib.rs","name_path":"Foo"}"#),
-        assistant_line("mcp__serena__insert_after_symbol",       r#"{"relative_path":"src/lib.rs","name_path":"Foo"}"#),
-        assistant_line("mcp__serena__insert_before_symbol",      r#"{"relative_path":"src/lib.rs","name_path":"Foo"}"#),
-        assistant_line("mcp__serena__rename_symbol",             r#"{"relative_path":"src/lib.rs","name_path":"Foo"}"#),
-        assistant_line("NotebookEdit",    r#"{"notebook_path":"/nb.ipynb"}"#),
-        assistant_line("Bash",            r#"{"command":"cargo build"}"#),
-        assistant_line("TodoWrite",       r#"{"todos":[{"content":"Run tests","status":"pending","activeForm":"Running tests"}]}"#),
+        assistant_line("Read", r#"{"file_path":"/a.rs"}"#),
+        assistant_line("Edit", r#"{"file_path":"/b.rs"}"#),
+        assistant_line("Write", r#"{"file_path":"/c.rs"}"#),
+        assistant_line("Glob", r#"{"pattern":"**/*.rs"}"#),
+        assistant_line("Grep", r#"{"pattern":"fn foo"}"#),
+        assistant_line(
+            "mcp__serena__get_symbols_overview",
+            r#"{"relative_path":"src/lib.rs"}"#,
+        ),
+        assistant_line(
+            "mcp__serena__find_symbol",
+            r#"{"relative_path":"src/lib.rs","name_path_pattern":"Foo","include_body":true}"#,
+        ),
+        assistant_line(
+            "mcp__serena__find_referencing_symbols",
+            r#"{"relative_path":"src/lib.rs","name_path":"Foo"}"#,
+        ),
+        assistant_line(
+            "mcp__serena__replace_symbol_body",
+            r#"{"relative_path":"src/lib.rs","name_path":"Foo"}"#,
+        ),
+        assistant_line(
+            "mcp__serena__insert_after_symbol",
+            r#"{"relative_path":"src/lib.rs","name_path":"Foo"}"#,
+        ),
+        assistant_line(
+            "mcp__serena__insert_before_symbol",
+            r#"{"relative_path":"src/lib.rs","name_path":"Foo"}"#,
+        ),
+        assistant_line(
+            "mcp__serena__rename_symbol",
+            r#"{"relative_path":"src/lib.rs","name_path":"Foo"}"#,
+        ),
+        assistant_line("NotebookEdit", r#"{"notebook_path":"/nb.ipynb"}"#),
+        assistant_line("Bash", r#"{"command":"cargo build"}"#),
+        assistant_line(
+            "TodoWrite",
+            r#"{"todos":[{"content":"Run tests","status":"pending","activeForm":"Running tests"}]}"#,
+        ),
     ];
 
     for line in &lines {
@@ -537,7 +684,13 @@ fn parse_log_file_all_tool_stanzas() {
             _ => None,
         })
         .collect();
-    assert_eq!(tool_names.len(), 15, "expected 15 events, got {}: {:?}", tool_names.len(), tool_names);
+    assert_eq!(
+        tool_names.len(),
+        15,
+        "expected 15 events, got {}: {:?}",
+        tool_names.len(),
+        tool_names
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -572,7 +725,10 @@ fn cache_stanza_parses() {
 #[test]
 fn cache_stanza_fields_are_individually_optional() {
     let cfg = load_cfg("version = 1\n[cache]\nflush_interval_ms = 900\n");
-    assert_eq!(cfg.cache.enabled, None, "unset stays unset rather than defaulting to false");
+    assert_eq!(
+        cfg.cache.enabled, None,
+        "unset stays unset rather than defaulting to false"
+    );
     assert_eq!(cfg.cache.flush_interval_ms, Some(900));
 }
 
@@ -601,7 +757,10 @@ fn editor_stanza_is_optional() {
 #[test]
 fn editor_stanza_parses() {
     let cfg = load_cfg("version = 1\n[editor]\ncommand = \"code -g {file}:{line}\"\n");
-    assert_eq!(cfg.editor.command, Some("code -g {file}:{line}".to_string()));
+    assert_eq!(
+        cfg.editor.command,
+        Some("code -g {file}:{line}".to_string())
+    );
 }
 
 #[test]

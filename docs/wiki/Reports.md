@@ -1,0 +1,179 @@
+# Reports
+
+`ambits report` writes one session as a single JSON document: its trace,
+what each agent read of every symbol, and every write with whether it is
+still on disk and which commit it landed in. It is made for a viewer that has
+neither the session logs nor the checkout, such as a page published after an
+agent harness's run.
+
+```bash
+ambits -p . report > report.json
+ambits -p <clone> --log-dir <logs> -s <session> --state-dir <dir> report --max-bytes 1000000
+```
+
+The report is rebuilt from the session's logs, as the [TUI](TUI) does at
+launch, and folds in the session's [journal](Configuration#the-read-journal)
+when there is one: its reads keep the content hash they were journaled with,
+and its writes are included even if the logs have since lost them. It writes
+nothing. To have the journal hold everything first, run `cache sync`.
+
+## As a page
+
+`--format html` writes the same document as one self-contained HTML page:
+a summary, the files with each symbol's read depth and the writes that
+touched it, the writes grouped by the commit they landed in, and the trace as
+a timeline with one lane per agent above every call, under any lanes the
+harness supplied (see [A harness's phases](#a-harnesss-phases)). A call expands in place
+when clicked, as in the TUI: its arguments, and the change it made, the
+text it read with line numbers, or what it printed. Open it in any browser; it needs no
+server.
+
+```bash
+ambits -p . report --format html > report.html
+ambits report --format html --from-json screened.json > report.html
+```
+
+`--from-json` renders a document `report` printed earlier, exactly as
+given, without reading any session, log or checkout: build the JSON, screen
+it, then render the screened copy. It takes no `--max-bytes` or `--phases`;
+both apply when the JSON is built.
+
+## A harness's phases
+
+A harness that ran the session (a CI job, an agent runner) can hand
+`report` its own timeline with `--phases <file>`, so the page shows the whole
+run and not only the agent's calls:
+
+```bash
+ambits -p <clone> --log-dir <logs> -s <session> report --phases phases.json
+```
+
+```json
+{
+  "lanes": [
+    {"name": "Phases", "nest": true, "spans": [
+      {"name": "clone", "start_ms": 1791626399100, "end_ms": 1791626399500,
+       "attrs": [{"key": "cost_usd", "value": "0"}]}
+    ]}
+  ],
+  "markers": [{"t_ms": 1791626402000, "name": "tool_failure", "attrs": []}],
+  "incomplete": false
+}
+```
+
+List the lanes outermost first: each is drawn above the agents' lanes, in
+the order given, indented and shaded by its place in that order. A span that
+overlaps an earlier one in its lane goes on a row below it, so a phase run
+inside another sits under it. Markers are drawn across every lane.
+
+Under the lanes, one list holds the harness's spans and markers and the
+session's calls as a single tree, built from the lane order and the times:
+
+- A span goes under the shortest span of an earlier lane, or a longer one of
+  its own lane, that covers at least half of it: a run holds its phases, and
+  a phase the turns run in it.
+- A prompt and the span of the latest lane that it and the prompt each cover
+  at least half of are one row, the span's with the prompt's first line, so a
+  harness's turn and the prompt that began it are not listed twice.
+- A call goes under its prompt, or its delegation; a call or prompt with
+  neither goes under the shortest span of a `nest: true` lane open when it
+  started. Each `nest` span, and each row holding calls, says how many it
+  holds ("no calls" when none).
+- A marker with a `tool_name` attribute goes on the call of that tool it fell
+  within, as a badge and in the call's details; any other marker goes under
+  the shortest span open at its time.
+
+Whatever nothing holds stays at the top, in time order. Every row opens the
+same way: a phase or marker shows its kind, lane, times and `attrs` in the
+grid a call uses for its arguments. Times are epoch milliseconds, the clock span times use;
+`nest`, `markers`, `attrs` and `incomplete` may be left out. `incomplete: true` says the harness
+could not record its whole timeline, and the page says so. ambits does not
+interpret the names. It refuses a document with an unknown field, a lane
+with no name, or a span that ends before it starts. The document is carried
+as given under `phases`, so screen it with the rest.
+
+The page loads nothing. Its Content-Security-Policy is `default-src 'none'`
+with only its own script and stylesheet allowed, by hash, and it shows every
+value from the document as text, never as markup. The tab is in the URL
+(`report.html#writes`), and `#trace:<span id>` opens one call.
+
+## What it carries
+
+Everything the session's logs said about each call, as the
+[TUI's call view](TUI) shows it: its arguments, the diff of every write, the
+text every read returned, and every other call's output (a command's, a
+search's, a subagent's answer). A report is therefore as sensitive
+as the transcript itself. It holds file contents, and a command or a call's
+description says whatever it said, secrets included, so screen it before
+publishing it. Unlike a [snapshot](Snapshots), which never holds contents.
+
+Files are named by project-relative path, path arguments included, and the
+project by its directory's name, never its path.
+
+## Fields
+
+`schema_version` (1) is bumped on any breaking change.
+
+| Field | What it holds |
+|---|---|
+| `session_id`, `ambits_version`, `generated_at` | Which session, made by which ambits, when (RFC 3339) |
+| `project` | `name`, the project directory's name; `head`, the commit checked out, or `null` |
+| `totals` | `files`, `symbols`, `symbols_read`, `symbols_read_full`, `symbols_written`, `writes`, `spans`, `agents` |
+| `truncated` | What `--max-bytes` cut, in order; empty when nothing was |
+| `agents` | `id`, `label`, `parent` (`null` for the session's own agent) |
+| `spans` | One per tool call or prompt, as in [Traces](Traces) |
+| `instants` | `compaction`, `commit` (`sha`, `subject`) and `snapshot` events, by `t_ms` |
+| `files` | Every file, with `symbols` listed for those something read or wrote |
+| `writes` | Every attributed write, oldest first |
+| `phases` | The `--phases` document as given; absent without `--phases` |
+
+A span: `i` (its id, which `parent` and a write's `span` refer to), `parent`,
+`agent`, `kind` (`prompt`, `read`, `write`, `delegate`, `other`), `tool`,
+`name`, `detail`, `file`, `symbol`, `start_ms`, `end_ms` (`null` while it had
+no result; a prompt or delegation ends with the last span under it, as in
+its trace), `error`, `message`, `depth` (for a read), `read` (the symbols it
+was credited with, each with its depth), `read_count`, `child_agent` (for a
+delegation), `args` and `content`.
+
+`args` lists the call's arguments as `key`, `value` and `bulk`; a `bulk`
+argument held file contents the call wrote and is summed up (`8 lines · in
+the change below`), since `content` shows them. `content` is `null`, or:
+
+- `{"type": "change", "exact", "cut", "hunks"}` for a write: each hunk's
+  `old_start`, `new_start` and `lines` as `[op, text]` with `op` one of ` `,
+  `+`, `-`. `exact` when the hunks are the tool's own patch; otherwise they
+  are what the call asked for and carry no line numbers.
+- `{"type": "read", "start", "lines", "cut"}` for a read: the text it
+  returned, its first line numbered `start`.
+- `{"type": "output", "lines", "cut"}` for any other call: what it
+  returned, failed calls included.
+
+`cut` counts lines left out past the TUI's limit of 5000 per call.
+
+A symbol, under its file: `id`, `name`, `kind` (the language's word: `fn`,
+`class`, `def`), `level` (0 for top level), `lines` (1-based, inclusive),
+`reads` (each agent's depth), `writes` (the `op`s that touched, created or
+removed it).
+
+A write: `op`, `agent`, `time`, `tool`, `file`, `level` (`symbol` or `file`,
+see [Agent Writes](Agent-Writes)), `outside_symbols`, `symbols` (each `id`
+with its `status`), `created`, `removed`, `status` for the whole file
+(`current`, `changed`, `removed`, `unknown`), `landed` (as
+[`touched`](Agent-Writes) reports it), and `span`.
+
+## Size
+
+`--max-bytes N` cuts the document until it fits, in this order, naming each
+cut in `truncated`:
+
+1. `unwritten_file_symbols`: the symbol lists of files nothing wrote.
+2. `read_text`: the text reads returned.
+3. `output`: every other call's output.
+4. `span_reads`: every span's `read` list; `read_count` stays.
+5. `arguments`: every call's `args`.
+6. `phase_attrs`: the `attrs` of every phase span and marker.
+7. `diffs`: every write's `content`.
+8. `other_spans`: spans that neither read, wrote nor delegated.
+
+Writes, totals, phase times and the remaining spans are never cut, so a
+report can still exceed the limit.

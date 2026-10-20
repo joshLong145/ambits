@@ -8,11 +8,16 @@
 - [Finding Callers](Finding-Callers)
 - [Reading by Symbol](Reading-by-Symbol)
 - [Restoring Context](Restoring-Context)
+- [Agent Writes](Agent-Writes)
 - [Portability](Portability)
 
 **For you**
 - [TUI](TUI)
 - [Coverage and Multi-Agent](Coverage-and-Multi-Agent)
+- [Snapshots](Snapshots)
+- [Sharing](Sharing)
+- [Traces](Traces)
+- [Reports](Reports)
 - [Configuration](Configuration)
 
 **Reference**

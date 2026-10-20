@@ -187,10 +187,7 @@ pub struct RestoreReport {
 }
 
 /// Read the journal for `session_id`, if one exists and is non-empty.
-pub fn load_from_journal(
-    project_root: &Path,
-    session_id: &str,
-) -> Option<(ReadSet, Vec<String>)> {
+pub fn load_from_journal(project_root: &Path, session_id: &str) -> Option<(ReadSet, Vec<String>)> {
     let dir = crate::journal::journal_dir(project_root);
     let contents = crate::journal::read_journal_session(&dir, session_id);
     if contents.reads.is_empty() {
@@ -216,18 +213,103 @@ pub fn load_from_journal(
 pub struct CoverageIndex {
     reads: ReadSet,
     session_id: String,
+    /// Whose reads these are: one agent's, or — `None` — the whole
+    /// session's, for [`Self::reason`].
+    agent: Option<String>,
+    /// The agent that started `agent`, when known.
+    parent: Option<String>,
+    /// Why the reads are the whole session's rather than one agent's.
+    reason: Option<String>,
+}
+
+/// Whose reads a [`CoverageIndex`] should hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoverageScope {
+    /// The agent running this command, and the agent that started it.
+    Agent { id: String, parent: Option<String> },
+    /// An agent asked for by id, or a unique prefix of one (`--agent`).
+    Named(String),
+    /// Every agent's, and why.
+    Session { reason: String },
 }
 
 impl CoverageIndex {
-    /// Load the journal for `session_id`. `None` when there is no session, no
-    /// journal, or an empty one — all of which mean "no coverage context",
-    /// which callers must distinguish from "read nothing".
-    pub fn load(project_root: &Path, session_id: Option<&str>) -> Option<Self> {
+    /// Load the journal for `session_id`, keeping the reads `scope` asks for.
+    /// `None` when there is no session, no journal, or an empty one — all of
+    /// which mean "no coverage context", which callers must distinguish from
+    /// "read nothing". An agent that has read nothing yet has an index, and
+    /// an empty one.
+    ///
+    /// One agent's reads come from the journal's per-agent records. When
+    /// there are none (a journal from before them), or no agent matches a
+    /// `Named` one, the index holds the whole session's and says why.
+    pub fn load_scoped(
+        project_root: &Path,
+        session_id: Option<&str>,
+        scope: CoverageScope,
+    ) -> Option<Self> {
         let session_id = session_id?;
-        let (reads, _warnings) = load_from_journal(project_root, session_id)?;
+        let contents = crate::journal::read_journal_session(
+            &crate::journal::journal_dir(project_root),
+            session_id,
+        );
+        if contents.reads.is_empty() {
+            return None;
+        }
+        let session = |reason: String| CoverageIndex {
+            reads: contents.reads.clone(),
+            session_id: session_id.to_string(),
+            agent: None,
+            parent: None,
+            reason: Some(reason),
+        };
+        if contents.agent_reads.is_empty() && !matches!(scope, CoverageScope::Session { .. }) {
+            return Some(session(
+                "the journal records no agents: it predates per-agent reads".into(),
+            ));
+        }
+        let (id, parent) = match scope {
+            CoverageScope::Session { reason } => return Some(session(reason)),
+            CoverageScope::Agent { id, parent } => (id, parent),
+            CoverageScope::Named(prefix) => {
+                let mut agents: Vec<&str> = contents
+                    .agent_reads
+                    .keys()
+                    .map(|(_, a)| a.as_str())
+                    .collect();
+                agents.sort_unstable();
+                agents.dedup();
+                match agents
+                    .iter()
+                    .copied()
+                    .filter(|a| a.starts_with(&prefix))
+                    .collect::<Vec<_>>()
+                    .as_slice()
+                {
+                    _ if agents.contains(&prefix.as_str()) => (prefix, None),
+                    [one] => (one.to_string(), None),
+                    [] => return Some(session(format!("no agent's id starts with `{prefix}`"))),
+                    many => {
+                        return Some(session(format!(
+                            "{} agents' ids start with `{prefix}`",
+                            many.len()
+                        )))
+                    }
+                }
+            }
+        };
+        let reads = contents
+            .agent_reads
+            .iter()
+            .filter(|((_, agent), _)| *agent == id)
+            .map(|((symbol, _), read)| (symbol.clone(), *read))
+            .collect();
         Some(CoverageIndex {
             reads,
             session_id: session_id.to_string(),
+            agent: Some(id),
+            parent,
+            reason: None,
         })
     }
 
@@ -240,6 +322,9 @@ impl CoverageIndex {
         CoverageIndex {
             reads,
             session_id: session_id.into(),
+            agent: None,
+            parent: None,
+            reason: None,
         }
     }
 
@@ -259,6 +344,21 @@ impl CoverageIndex {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// The agent whose reads these are; `None` for the whole session's.
+    pub fn agent(&self) -> Option<&str> {
+        self.agent.as_deref()
+    }
+
+    /// The agent that started [`Self::agent`], when known.
+    pub fn parent(&self) -> Option<&str> {
+        self.parent.as_deref()
+    }
+
+    /// Why the reads are the whole session's, when they are.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
     }
 
     /// Distinct symbols with a recorded read.
@@ -294,13 +394,15 @@ pub fn replay_session_logs(
     for log_file in ingester.session_log_files(log_dir, session_id) {
         for event in ingester.parse_log_file_with_root(&log_file, project_root) {
             match event {
-                SessionEvent::ToolCall(tc) => crate::app::apply_tool_call(
-                    project_tree,
-                    project_root,
-                    &tc,
-                    &mut ledger,
-                    &mut depth_cache,
-                ),
+                SessionEvent::ToolCall(tc) => {
+                    crate::app::apply_tool_call(
+                        project_tree,
+                        project_root,
+                        &tc,
+                        &mut ledger,
+                        &mut depth_cache,
+                    );
+                }
                 // A `/clear` is a voluntary discard — resurrecting that
                 // context would mislead, so it is the one boundary we honor.
                 SessionEvent::SessionCleared => {
@@ -308,6 +410,12 @@ pub fn replay_session_logs(
                     depth_cache = crate::tracking::alignment::DepthOrdinalCache::new();
                 }
                 SessionEvent::Compacted { .. } => {}
+                // What a search printed (`ambits rg`) was seen.
+                SessionEvent::ToolFinished(f) => {
+                    crate::app::apply_shown(project_tree, &f, &mut ledger, &mut depth_cache);
+                }
+                // Writes grant no read credit (spec D9).
+                SessionEvent::Write(_) | SessionEvent::Prompt(_) => {}
             }
         }
     }
@@ -319,29 +427,13 @@ pub fn replay_session_logs(
 /// Every hash here is taken from the *current* tree, because that is all the
 /// session log can tell us — see [`RestoreSource::SessionLogs`]. The result
 /// therefore classifies as fully restored by construction.
-pub fn reads_from_ledger(
-    ledger: &crate::tracking::ContextLedger,
-) -> ReadSet {
+pub fn reads_from_ledger(ledger: &crate::tracking::ContextLedger) -> ReadSet {
     ledger
         .entries
         .values()
         .filter(|e| e.depth.is_seen() && !e.stale)
-        .map(|e| {
-            (
-                e.symbol_id.clone(),
-                (e.content_hash_at_read, e.depth),
-            )
-        })
+        .map(|e| (e.symbol_id.clone(), (e.content_hash_at_read, e.depth)))
         .collect()
-}
-
-/// Split `"<relative-path>::<Name/Path>"` into its two halves.
-///
-/// Symbol ids are built as `{path_prefix}::{name_path}` by every parser, with
-/// `/` separating nesting levels inside the name path — so the first `::` is
-/// unambiguously the boundary.
-pub fn split_symbol_id(id: &str) -> Option<(&str, &str)> {
-    id.split_once("::")
 }
 
 /// Recursively index every symbol in the tree by id, including nested children.
@@ -403,10 +495,7 @@ pub fn index_tree_by_hash(tree: &ProjectTree) -> HashMap<[u8; 32], Vec<&SymbolNo
 /// conservatism for its own sake — `index` is a `HashMap` with randomized
 /// iteration order, so a "first claimant wins" rule would rescue different
 /// symbols on different runs over identical data.
-pub fn classify(
-    reads: &ReadSet,
-    tree: &ProjectTree,
-) -> RestoreOutcome {
+pub fn classify(reads: &ReadSet, tree: &ProjectTree) -> RestoreOutcome {
     let index = index_tree(tree);
     let mut outcome = RestoreOutcome::default();
     // Orphans, held back for the hash pass below rather than being written
@@ -424,8 +513,8 @@ pub fn classify(
         // what was recorded — see `index_tree` on why one id can name several
         // symbols.
         let candidates = index.get(id.as_str());
-        let matched = candidates
-            .and_then(|syms| syms.iter().find(|s| s.content_hash == *hash_at_read));
+        let matched =
+            candidates.and_then(|syms| syms.iter().find(|s| s.content_hash == *hash_at_read));
 
         match (candidates, matched) {
             (_, Some(sym)) => {
@@ -454,14 +543,12 @@ pub fn classify(
 
     // Deterministic ordering: reads come from a HashMap, whose iteration order
     // is deliberately randomized between runs.
-    outcome
-        .restored
-        .sort_by(|a, b| {
-            a.file_path
-                .cmp(&b.file_path)
-                .then_with(|| a.line_range.start.cmp(&b.line_range.start))
-                .then_with(|| a.name_path.cmp(&b.name_path))
-        });
+    outcome.restored.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then_with(|| a.line_range.start.cmp(&b.line_range.start))
+            .then_with(|| a.name_path.cmp(&b.name_path))
+    });
     for bucket in [&mut outcome.drifted, &mut outcome.removed] {
         bucket.sort_by(|a, b| {
             a.file_path
@@ -553,10 +640,8 @@ fn follow_moves(
 /// Owned `(file_path, name_path)` for a symbol id. A malformed id degrades to
 /// an empty path and the whole id as the name, rather than losing the record.
 fn split_id(id: &str) -> (PathBuf, String) {
-    match split_symbol_id(id) {
-        Some((path, name)) => (PathBuf::from(path), name.to_string()),
-        None => (PathBuf::new(), id.to_string()),
-    }
+    let (path, name) = crate::symbols::split_id(id);
+    (PathBuf::from(path), name.to_string())
 }
 
 /// What a cold-start rehydrate changed about the ledger.
@@ -625,9 +710,7 @@ pub fn rehydrate_ledger(
         .collect();
     stats.moved = remap.len();
 
-    let resolve = |id: &str| -> String {
-        remap.get(id).cloned().unwrap_or_else(|| id.to_string())
-    };
+    let resolve = |id: &str| -> String { remap.get(id).cloned().unwrap_or_else(|| id.to_string()) };
 
     // The hash needs no adjustment when an id is re-keyed: a move is *defined*
     // by the body being byte-identical, which is how it was found. So the
@@ -653,7 +736,12 @@ pub fn rehydrate_ledger(
         if attributed.contains(symbol_id.as_str()) {
             continue;
         }
-        if ledger.rehydrate(resolve(symbol_id), *depth, *hash, fallback_agent.to_string()) {
+        if ledger.rehydrate(
+            resolve(symbol_id),
+            *depth,
+            *hash,
+            fallback_agent.to_string(),
+        ) {
             stats.inserted += 1;
         } else {
             stats.corrected += 1;
@@ -681,9 +769,10 @@ pub fn refresh_staleness(ledger: &mut crate::tracking::ContextLedger, tree: &Pro
         .iter()
         .filter(|(_, entry)| entry.depth.is_seen())
         .filter(|(id, entry)| {
-            !index
-                .get(id.as_str())
-                .is_some_and(|syms| syms.iter().any(|s| s.content_hash == entry.content_hash_at_read))
+            !index.get(id.as_str()).is_some_and(|syms| {
+                syms.iter()
+                    .any(|s| s.content_hash == entry.content_hash_at_read)
+            })
         })
         .map(|(id, _)| id.clone())
         .collect();
@@ -696,13 +785,104 @@ pub fn refresh_staleness(ledger: &mut crate::tracking::ContextLedger, tree: &Pro
 
 #[cfg(test)]
 mod tests {
-    use crate::helpers::*;
     use super::*;
+    use crate::helpers::*;
+
+    /// A journal of `(symbol, agent)` reads — `None` for a v1 record, which
+    /// names no agent — under `root`.
+    fn journal(root: &Path, session: &str, reads: &[(&str, Option<&str>)]) {
+        use crate::journal::{encode_hash, DepthDto, Record, JOURNAL_SUBDIR};
+        let dir = root.join(JOURNAL_SUBDIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lines: Vec<String> = reads
+            .iter()
+            .map(|(symbol, agent)| {
+                let read = Record::Read {
+                    symbol_id: (*symbol).into(),
+                    hash: encode_hash(&[1; 32]),
+                    depth: DepthDto::FullBody,
+                    agent: agent.map(String::from),
+                };
+                serde_json::to_string(&read).unwrap()
+            })
+            .collect();
+        std::fs::write(
+            dir.join(format!("{session}.ndjson")),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+    }
+
+    /// An agent's coverage is its own reads; `--agent` names another by a
+    /// prefix; a journal without agents, or a name matching none, gives the
+    /// whole session's and says why.
+    #[test]
+    fn coverage_is_the_calling_agents_own() {
+        let dir = tempfile::tempdir().unwrap();
+        journal(
+            dir.path(),
+            "s",
+            &[
+                ("a.rs::main", Some("s")),
+                ("a.rs::sub", Some("ab12")),
+                ("a.rs::both", Some("s")),
+                ("a.rs::both", Some("ab12")),
+            ],
+        );
+        let load = |scope| CoverageIndex::load_scoped(dir.path(), Some("s"), scope).unwrap();
+
+        let own = load(CoverageScope::Agent {
+            id: "ab12".into(),
+            parent: Some("s".into()),
+        });
+        assert_eq!(
+            (own.agent(), own.parent(), own.reason(), own.len()),
+            (Some("ab12"), Some("s"), None, 2)
+        );
+        assert!(
+            own.depth_of("a.rs::main").is_none(),
+            "its parent's read is not its own"
+        );
+        let main = load(CoverageScope::Agent {
+            id: "s".into(),
+            parent: None,
+        });
+        assert!(
+            main.depth_of("a.rs::sub").is_none(),
+            "nor is a subagent's its parent's"
+        );
+        let named = load(CoverageScope::Named("ab".into()));
+        assert_eq!((named.agent(), named.len()), (Some("ab12"), 2));
+        let unmatched = load(CoverageScope::Named("zz".into()));
+        assert_eq!((unmatched.agent(), unmatched.len()), (None, 3));
+        assert!(unmatched.reason().unwrap().contains("zz"));
+        let fresh = load(CoverageScope::Agent {
+            id: "new".into(),
+            parent: None,
+        });
+        assert_eq!(
+            (fresh.agent(), fresh.len()),
+            (Some("new"), 0),
+            "an agent that has read nothing has an empty index"
+        );
+
+        journal(dir.path(), "v1", &[("a.rs::main", None)]);
+        let old = CoverageIndex::load_scoped(
+            dir.path(),
+            Some("v1"),
+            CoverageScope::Agent {
+                id: "s".into(),
+                parent: None,
+            },
+        )
+        .unwrap();
+        assert_eq!((old.agent(), old.len()), (None, 1));
+        assert!(old.reason().unwrap().contains("predates"));
+    }
+
     use crate::symbols::merkle::content_hash;
 
-    fn reads(
-        entries: &[(&str, [u8; 32], ReadDepth)],
-    ) -> ReadSet {
+    fn reads(entries: &[(&str, [u8; 32], ReadDepth)]) -> ReadSet {
         entries
             .iter()
             .map(|(id, h, d)| (id.to_string(), (*h, *d)))
@@ -731,12 +911,18 @@ mod tests {
 
     #[test]
     fn changed_hash_is_withheld_as_drifted() {
-        let tree = project(vec![file("a.rs", vec![sym_hashed("a.rs::x", "x", "new body")])]);
+        let tree = project(vec![file(
+            "a.rs",
+            vec![sym_hashed("a.rs::x", "x", "new body")],
+        )]);
         let out = classify(
             &reads(&[("a.rs::x", content_hash("old body"), ReadDepth::FullBody)]),
             &tree,
         );
-        assert!(out.restored.is_empty(), "a drifted read must not be restored");
+        assert!(
+            out.restored.is_empty(),
+            "a drifted read must not be restored"
+        );
         assert_eq!(out.drifted.len(), 1);
         assert_eq!(out.drifted[0].reason, OmissionReason::Drifted);
         assert_eq!(out.drifted[0].file_path, PathBuf::from("a.rs"));
@@ -748,7 +934,11 @@ mod tests {
         // A body that survives nowhere in the tree — otherwise this is a move,
         // not a deletion, and `follow_moves` would rightly rescue it.
         let out = classify(
-            &reads(&[("a.rs::gone", content_hash("deleted body"), ReadDepth::FullBody)]),
+            &reads(&[(
+                "a.rs::gone",
+                content_hash("deleted body"),
+                ReadDepth::FullBody,
+            )]),
             &tree,
         );
         assert_eq!(out.removed.len(), 1);
@@ -812,7 +1002,11 @@ mod tests {
 
         // A hash matching neither is still genuine drift.
         let out = classify(
-            &reads(&[("a.rs::Foo", content_hash("something else"), ReadDepth::FullBody)]),
+            &reads(&[(
+                "a.rs::Foo",
+                content_hash("something else"),
+                ReadDepth::FullBody,
+            )]),
             &tree,
         );
         assert!(out.restored.is_empty());
@@ -851,7 +1045,11 @@ mod tests {
             ]),
             &tree,
         );
-        assert_eq!(out.restored.len(), 2, "shallow reads are still worth restoring");
+        assert_eq!(
+            out.restored.len(),
+            2,
+            "shallow reads are still worth restoring"
+        );
     }
 
     #[test]
@@ -870,7 +1068,11 @@ mod tests {
         let second = classify(&r, &tree);
         assert_eq!(first.restored, second.restored);
         assert_eq!(
-            first.restored.iter().map(|s| s.file_path.as_path()).collect::<Vec<_>>(),
+            first
+                .restored
+                .iter()
+                .map(|s| s.file_path.as_path())
+                .collect::<Vec<_>>(),
             vec![Path::new("a.rs"), Path::new("z.rs")]
         );
     }
@@ -880,7 +1082,10 @@ mod tests {
         let tree = project(vec![
             file(
                 "a.rs",
-                vec![sym_hashed("a.rs::x", "x", "1"), sym_hashed("a.rs::y", "y", "2")],
+                vec![
+                    sym_hashed("a.rs::x", "x", "1"),
+                    sym_hashed("a.rs::y", "y", "2"),
+                ],
             ),
             file("b.rs", vec![sym_hashed("b.rs::z", "z", "3")]),
         ]);
@@ -911,7 +1116,11 @@ mod tests {
         );
         assert_eq!(out.drifted.len(), 1);
         assert_eq!(out.removed.len(), 1);
-        assert_eq!(out.omitted_files(), vec![Path::new("a.rs")], "one file, not two");
+        assert_eq!(
+            out.omitted_files(),
+            vec![Path::new("a.rs")],
+            "one file, not two"
+        );
         assert_eq!(out.total(), 2);
     }
 
@@ -921,18 +1130,6 @@ mod tests {
         let out = classify(&HashMap::new(), &tree);
         assert_eq!(out.total(), 0);
         assert!(out.omitted_files().is_empty());
-    }
-
-    #[test]
-    fn split_symbol_id_handles_both_shapes() {
-        assert_eq!(split_symbol_id("src/a.rs::App/run"), Some(("src/a.rs", "App/run")));
-        assert_eq!(split_symbol_id("no-separator"), None);
-        // A malformed id degrades to using the whole thing as the name rather
-        // than losing the record.
-        assert_eq!(
-            split_id("no-separator"),
-            (PathBuf::new(), "no-separator".to_string())
-        );
     }
 
     /// Nested symbols must report the file they live in. Paths are derived
@@ -986,8 +1183,17 @@ mod tests {
         // What startup replay produces: the read is known, but its hash was
         // taken from the tree as it is today.
         let mut ledger = ContextLedger::new();
-        ledger.record("a.rs::x".into(), ReadDepth::FullBody, current, "ag".into(), 10);
-        assert!(!ledger.is_stale("a.rs::x"), "replay alone sees nothing wrong");
+        ledger.record(
+            "a.rs::x".into(),
+            ReadDepth::FullBody,
+            current,
+            "ag".into(),
+            10,
+        );
+        assert!(
+            !ledger.is_stale("a.rs::x"),
+            "replay alone sees nothing wrong"
+        );
 
         let contents = journal_of(&[("a.rs::x", "ag", at_read, ReadDepth::FullBody)]);
         let stats = rehydrate_ledger(&mut ledger, &contents, "sess", &tree);
@@ -1005,6 +1211,7 @@ mod tests {
     fn rehydrate_re_keys_a_moved_symbol_to_its_current_id() {
         let mut moved = sym_hashed("src/util.rs::helper", "helper", "fn body");
         moved.line_range = 12..18;
+        moved.head_line = 12;
         let tree = project(vec![file("src/util.rs", vec![moved])]);
         let hash = content_hash("fn body");
 
@@ -1100,8 +1307,20 @@ mod tests {
         let y_now = tree.files[0].symbols[1].content_hash;
 
         let mut ledger = ContextLedger::new();
-        ledger.record("a.rs::x".into(), ReadDepth::FullBody, x_now, "ag".into(), 10);
-        ledger.record("a.rs::y".into(), ReadDepth::FullBody, y_now, "ag".into(), 10);
+        ledger.record(
+            "a.rs::x".into(),
+            ReadDepth::FullBody,
+            x_now,
+            "ag".into(),
+            10,
+        );
+        ledger.record(
+            "a.rs::y".into(),
+            ReadDepth::FullBody,
+            y_now,
+            "ag".into(),
+            10,
+        );
 
         let contents = journal_of(&[
             ("a.rs::x", "ag", content_hash("stale"), ReadDepth::FullBody),
@@ -1151,7 +1370,13 @@ mod tests {
         let contents = journal_of(&[("a.rs::x", "old-agent", current, ReadDepth::FullBody)]);
         rehydrate_ledger(&mut ledger, &contents, "sess", &tree);
 
-        ledger.record("a.rs::x".into(), ReadDepth::NameOnly, current, "new-agent".into(), 1);
+        ledger.record(
+            "a.rs::x".into(),
+            ReadDepth::NameOnly,
+            current,
+            "new-agent".into(),
+            1,
+        );
 
         assert_eq!(ledger.depth_of("a.rs::x"), ReadDepth::FullBody);
         assert_eq!(ledger.provenance_of("a.rs::x"), Some(Provenance::Live));
@@ -1230,9 +1455,13 @@ mod tests {
     fn a_moved_symbol_is_restored_at_its_new_home() {
         let mut moved = sym_hashed("src/util.rs::format_tokens", "format_tokens", "fn body");
         moved.line_range = 12..18;
+        moved.head_line = 12;
         let tree = project(vec![
             file("src/util.rs", vec![moved]),
-            file("src/stats.rs", vec![sym_hashed("src/stats.rs::other", "other", "unrelated")]),
+            file(
+                "src/stats.rs",
+                vec![sym_hashed("src/stats.rs::other", "other", "unrelated")],
+            ),
         ]);
 
         let out = classify(
@@ -1247,9 +1476,16 @@ mod tests {
         assert!(out.removed.is_empty(), "it was found, not lost");
         assert_eq!(out.restored.len(), 1);
         let r = &out.restored[0];
-        assert_eq!(r.symbol_id, "src/util.rs::format_tokens", "the current address");
+        assert_eq!(
+            r.symbol_id, "src/util.rs::format_tokens",
+            "the current address"
+        );
         assert_eq!(r.file_path, PathBuf::from("src/util.rs"));
-        assert_eq!(r.line_range, 12..18, "line numbers describe where it is now");
+        assert_eq!(
+            r.line_range,
+            12..18,
+            "line numbers describe where it is now"
+        );
         assert_eq!(
             r.moved_from.as_deref(),
             Some("src/stats.rs::format_tokens"),
@@ -1280,7 +1516,10 @@ mod tests {
     /// We cannot tell which the agent read, so neither is rescued.
     #[test]
     fn two_orphans_claiming_one_node_are_both_withheld() {
-        let tree = project(vec![file("c.rs", vec![sym_hashed("c.rs::dup", "dup", "same")])]);
+        let tree = project(vec![file(
+            "c.rs",
+            vec![sym_hashed("c.rs::dup", "dup", "same")],
+        )]);
 
         let out = classify(
             &reads(&[
@@ -1319,7 +1558,11 @@ mod tests {
     fn only_full_body_reads_follow_a_move() {
         let tree = project(vec![file("b.rs", vec![sym_hashed("b.rs::x", "x", "body")])]);
 
-        for depth in [ReadDepth::NameOnly, ReadDepth::Overview, ReadDepth::Signature] {
+        for depth in [
+            ReadDepth::NameOnly,
+            ReadDepth::Overview,
+            ReadDepth::Signature,
+        ] {
             let out = classify(&reads(&[("a.rs::x", content_hash("body"), depth)]), &tree);
             assert!(out.restored.is_empty(), "{depth:?} must not follow a move");
             assert_eq!(out.removed.len(), 1);

@@ -6,20 +6,22 @@ path_keys    = ["file_path", "relative_path"]
 pattern_keys = []
 depth        = { type = "fixed", value = "FullBody" }
 description  = "Read {file_path|short}"
-target_lines = { offset_key = "offset", limit_key = "limit" }
+# Claude Code's Read starts at line 1 and returns 2000 lines unless told
+# otherwise, so a call naming only one of these still names a range.
+target_lines = { offset_key = "offset", limit_key = "limit", default_limit = 2000 }
 
 [[tool]]
 names        = ["Edit", "mcp__acp__Edit", "mcp__plugin_serena_serena__replace_content"]
 path_keys    = ["file_path", "relative_path"]
 pattern_keys = []
-depth        = { type = "fixed", value = "FullBody" }
+effect       = "write"
 description  = "Edit {file_path|short}"
 
 [[tool]]
 names        = ["Write", "mcp__acp__Write", "mcp__plugin_serena_serena__create_text_file"]
 path_keys    = ["file_path", "relative_path"]
 pattern_keys = []
-depth        = { type = "fixed", value = "FullBody" }
+effect       = "write"
 description  = "Write {file_path|short}"
 
 [[tool]]
@@ -71,7 +73,7 @@ names        = ["mcp__serena__replace_symbol_body",
                 "mcp__plugin_serena_serena__replace_symbol_body"]
 path_keys    = ["relative_path"]
 pattern_keys = []
-depth        = { type = "fixed", value = "FullBody" }
+effect       = "write"
 description  = "ReplaceSymbol {name_path}"
 target_symbol = { key = "name_path" }
 
@@ -80,7 +82,7 @@ names        = ["mcp__serena__insert_after_symbol",
                 "mcp__plugin_serena_serena__insert_after_symbol"]
 path_keys    = ["relative_path"]
 pattern_keys = []
-depth        = { type = "fixed", value = "FullBody" }
+effect       = "write"
 description  = "InsertAfter {name_path}"
 target_symbol = { key = "name_path" }
 
@@ -89,7 +91,7 @@ names        = ["mcp__serena__insert_before_symbol",
                 "mcp__plugin_serena_serena__insert_before_symbol"]
 path_keys    = ["relative_path"]
 pattern_keys = []
-depth        = { type = "fixed", value = "FullBody" }
+effect       = "write"
 description  = "InsertBefore {name_path}"
 target_symbol = { key = "name_path" }
 
@@ -97,15 +99,22 @@ target_symbol = { key = "name_path" }
 names        = ["mcp__serena__rename_symbol", "mcp__plugin_serena_serena__rename_symbol"]
 path_keys    = ["relative_path"]
 pattern_keys = []
-depth        = { type = "fixed", value = "FullBody" }
+effect       = "write"
 description  = "Rename {name_path}"
 target_symbol = { key = "name_path" }
+
+[[tool]]
+names        = ["MultiEdit"]
+path_keys    = ["file_path"]
+pattern_keys = []
+effect       = "write"
+description  = "MultiEdit {file_path|short}"
 
 [[tool]]
 names        = ["NotebookEdit"]
 path_keys    = ["notebook_path"]
 pattern_keys = []
-depth        = { type = "fixed", value = "FullBody" }
+effect       = "write"
 description  = "NotebookEdit {notebook_path|short}"
 
 [[tool]]
@@ -149,7 +158,19 @@ description   = "Bash {pattern|cmd}"
 # search commands take a regex over file content, so `ambits rg
 # 'src/app.rs::App'` asks for that *text* — crediting it as a read of that
 # symbol would claim knowledge of a definition the search may never have shown.
-target_selectors = { key = "command", requires = "ambits", subcommand = "show", depth = "FullBody", shallow_flag = "--no-body", shallow_depth = "NameOnly" }
+#
+# A full `show` prints the whole definition — an impl's every method, a
+# Markdown section's subsections — so what is inside the symbol is credited
+# with it, unless `--max-bytes` may have cut it short.
+target_selectors = { key = "command", requires = "ambits", subcommand = "show", depth = "FullBody", shallow_flag = "--no-body", shallow_depth = "NameOnly", cut_flag = "--max-bytes" }
+# A search's own output names the symbol each printed match sits in; those
+# are credited when the result arrives, at name depth — a matching line, not
+# the definition (`show` earns that). Modes that print no symbols (`-l`, `-c`,
+# `-q`) name none, so earn nothing.
+result_selectors = { key = "command", requires = "ambits", subcommands = ["rg", "grep"], depth = "NameOnly" }
+# A command that prints a file's lines (`sed -n 10,40p a.rs`, `head`, `tail`,
+# `cat`, `nl`) is credited as a Read of those lines.
+command_reads = "command"
 
 [[tool]]
 names         = ["TodoWrite"]

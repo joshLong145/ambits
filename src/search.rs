@@ -552,10 +552,31 @@ fn context_lines(buf: &[u8], hits: &[Hit], opts: &Options) -> Vec<(u32, Vec<u8>)
     out
 }
 
+/// Where a hit is attributed: its match's start — or, for a match that
+/// starts in its line's indentation (`^\s+fn run`), the line's first
+/// non-blank byte, where an item with no doc comment begins. Otherwise the
+/// match would land in the enclosing `impl`, not the method it names.
+fn attribution_byte(hit: &Hit) -> u32 {
+    let indent = hit
+        .text
+        .iter()
+        .take_while(|b| **b == b' ' || **b == b'\t')
+        .count();
+    let blank = hit
+        .text
+        .get(indent)
+        .is_none_or(|b| *b == b'\n' || *b == b'\r');
+    if hit.span.0 < indent && !blank {
+        hit.byte + (indent - hit.span.0) as u32
+    } else {
+        hit.byte
+    }
+}
+
 /// Fill in each hit's enclosing symbol and read depth.
 fn attribute(hits: &mut [Hit], symbols: &FileSymbols, coverage: Option<&CoverageIndex>) {
     for hit in hits {
-        let Some(node) = symbols.enclosing(hit.byte) else {
+        let Some(node) = symbols.enclosing(attribution_byte(hit)) else {
             continue;
         };
         hit.symbol = Some(SymbolHit {
@@ -674,6 +695,55 @@ fn render_symbol(symbol: Option<&SymbolHit>, have_journal: bool) -> String {
         Some(d) => format!("[{d} {}]", sym.name_path),
         None => format!("[{UNREAD} {}]", sym.name_path),
     }
+}
+
+/// The symbols a search's printed output names, as ids `show` takes: what
+/// [`render_symbol`] wrote on each match line (`src/a.rs:3:5:[— App/run]`,
+/// `src/a.rs:3:[full App/run]`, `src/a.rs:[App/run]`), or `symbol.id` on
+/// each `--json` match event. Context lines, `[-]` and anything else name
+/// nothing. For crediting a search from its logged output: this reads what
+/// was shown, so nothing is searched again.
+pub fn shown_selectors(output: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let id = if line.starts_with('{') {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .filter(|v| v["type"] == "match")
+                .and_then(|v| v["data"]["symbol"]["id"].as_str().map(String::from))
+        } else {
+            line_symbol(line)
+        };
+        if let Some(id) = id.filter(|id| !out.contains(id)) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// The symbol id a match line names: `path` and the name path in its
+/// bracket, which follows the path and its numbers (`:12`, `:12:5`).
+fn line_symbol(line: &str) -> Option<String> {
+    let open = line.find(":[")?;
+    let (path, numbers) = line[..open].split_once(':').unwrap_or((&line[..open], ""));
+    if path.is_empty()
+        || !numbers
+            .split(':')
+            .all(|n| n.is_empty() || n.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let inner = &line[open + 2..open + 2 + line[open + 2..].find(']')?];
+    if inner == NO_SYMBOL {
+        return None;
+    }
+    // `[depth name]` with a journal, `[name]` without one.
+    let depths = ["unseen", "name", "overview", "signature", "full", UNREAD];
+    let name = match inner.split_once(' ') {
+        Some((first, rest)) if depths.contains(&first) && !rest.is_empty() => rest,
+        _ => inner,
+    };
+    Some(format!("{path}::{name}"))
 }
 
 /// Clip to `max` bytes on a character boundary, reporting whether it cut.
@@ -889,7 +959,11 @@ fn print_json(
     let mut matched_lines = 0usize;
     for file in files {
         let path = file.path.display().to_string();
-        writeln!(w, "{}", json!({"type": "begin", "data": {"path": {"text": path}}}))?;
+        writeln!(
+            w,
+            "{}",
+            json!({"type": "begin", "data": {"path": {"text": path}}})
+        )?;
 
         if opts.mode.shows_source() {
             // One event per line, not per match — real rg folds same-line
@@ -959,7 +1033,8 @@ fn print_json(
         )?;
     }
 
-    let coverage = coverage.map(|c| json!({"session_id": c.session_id(), "symbols_read": c.len()}));
+    let coverage = coverage
+        .map(|c| serde_json::to_value(crate::lookup::CoverageDto::of(Some(c))).unwrap_or_default());
     writeln!(
         w,
         "{}",
@@ -1045,7 +1120,8 @@ pub fn run(
     }
 
     let mut w = std::io::BufWriter::new(std::io::stdout().lock());
-    match print_results(&mut w, &files, targets, opts, coverage, withheld).and_then(|()| w.flush()) {
+    match print_results(&mut w, &files, targets, opts, coverage, withheld).and_then(|()| w.flush())
+    {
         // The reader went away (`… | head`). Stop writing, but report the
         // outcome as if it had read everything: the exit code answers "was
         // there a match", which does not depend on who stopped listening.
@@ -1114,6 +1190,55 @@ fn print_results(
         OutputMode::Quiet => unreachable!("run returns before printing"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod shown_selector_tests {
+    use super::*;
+
+    #[test]
+    fn every_printed_form_of_a_match_names_its_symbol() {
+        let output = "src/a.rs:3:5:[— App/run]     fn run() {}
+src/a.rs:9:[full App/stop] fn stop() {}
+docs/a.md:[Guide/What leaves the machine] text
+docs/a.md-10-context line [not a match]
+src/b.rs:1:1:[-] use std::fmt;
+src/a.rs:4:2:[— App/run] again
+{\"type\":\"match\",\"data\":{\"symbol\":{\"id\":\"src/c.rs::C/new\"}}}
+{\"type\":\"summary\",\"data\":{}}
+… 20 more matches withheld (--head-limit 0 for all)";
+        assert_eq!(
+            shown_selectors(output),
+            vec![
+                "src/a.rs::App/run",
+                "src/a.rs::App/stop",
+                "docs/a.md::Guide/What leaves the machine",
+                "src/c.rs::C/new"
+            ]
+        );
+    }
+
+    #[test]
+    fn what_render_symbol_writes_reads_back() {
+        let hit = SymbolHit {
+            id: "src/a.rs::App/run".into(),
+            name_path: "App/run".into(),
+            label: "fn",
+            lines: [1, 2],
+            depth: Some(ReadDepth::Signature),
+            content_hash: [0; 32],
+            estimated_tokens: 1,
+        };
+        for (sym, journal) in [(Some(&hit), true), (Some(&hit), false)] {
+            let line = format!("src/a.rs:1:1:{} fn run", render_symbol(sym, journal));
+            assert_eq!(shown_selectors(&line), vec!["src/a.rs::App/run"], "{line}");
+        }
+        assert!(shown_selectors(&format!(
+            "src/a.rs:1:1:{} use x;",
+            render_symbol(None, true)
+        ))
+        .is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -1294,6 +1419,36 @@ mod tests {
         assert_eq!(found[0].symbol.as_ref().unwrap().id, "a.rs::Thing/method");
     }
 
+    /// A match starting in the indentation before `fn method` names the
+    /// method, not the item around it.
+    #[test]
+    fn a_match_starting_in_indentation_names_the_item_on_its_line() {
+        let mut found = vec![Hit {
+            line: 3,
+            column: 1,
+            byte: 36,
+            text: b"    fn method() {}\n".to_vec(),
+            span: (0, 13),
+            symbol: None,
+        }];
+        attribute(&mut found, &thing(), None);
+        assert_eq!(found[0].symbol.as_ref().unwrap().id, "a.rs::Thing/method");
+        let mut blank = vec![Hit {
+            line: 3,
+            column: 1,
+            byte: 36,
+            text: b"    \n".to_vec(),
+            span: (0, 2),
+            symbol: None,
+        }];
+        attribute(&mut blank, &thing(), None);
+        assert_ne!(
+            blank[0].symbol.as_ref().map(|s| s.id.as_str()),
+            Some("a.rs::Thing/method"),
+            "a blank line stays where it is"
+        );
+    }
+
     /// A match in a `use` line or a file-level comment belongs to no symbol,
     /// and must say so rather than be attributed to whatever is nearest.
     #[test]
@@ -1355,7 +1510,11 @@ mod tests {
     fn no_journal_omits_the_depth_entirely() {
         let sym = symbol_hit(None);
         assert_eq!(render_symbol(Some(&sym), false), "[render]");
-        assert_eq!(render_symbol(None, true), "[-]", "no symbol is its own case");
+        assert_eq!(
+            render_symbol(None, true),
+            "[-]",
+            "no symbol is its own case"
+        );
     }
 
     // ─── output ──────────────────────────────────────────────────────────────
@@ -1408,7 +1567,11 @@ mod tests {
         let mut opts = Options::new(vec!["fn".into()]);
         opts.heading = Some(false);
         let found = hits(two_on_one_line, &opts);
-        assert_eq!(lines_of(&found), vec![1, 1, 2], "fixture: two matches on line 1");
+        assert_eq!(
+            lines_of(&found),
+            vec![1, 1, 2],
+            "fixture: two matches on line 1"
+        );
 
         let files = vec![FileHits {
             path: PathBuf::from("a.rs"),
@@ -1418,11 +1581,7 @@ mod tests {
         }];
         let out = rendered(&files, &opts, false);
         let rows: Vec<&str> = out.lines().collect();
-        assert_eq!(
-            rows.len(),
-            2,
-            "one row per line, not per match: {rows:?}"
-        );
+        assert_eq!(rows.len(), 2, "one row per line, not per match: {rows:?}");
         assert!(
             rows[0].starts_with("a.rs:1:1:"),
             "reports the leftmost match's column: {:?}",
@@ -1476,7 +1635,11 @@ mod tests {
         opts.vimgrep = true;
         let found = hits(two_on_one_line, &opts);
         let groups = match_groups(&found, &opts);
-        assert_eq!(groups.len(), 3, "one line per match, even sharing a source line");
+        assert_eq!(
+            groups.len(),
+            3,
+            "one line per match, even sharing a source line"
+        );
         assert!(groups.iter().all(|g| g.len() == 1));
     }
 
@@ -1504,7 +1667,11 @@ mod tests {
             .collect();
         let matches: Vec<&serde_json::Value> =
             events.iter().filter(|e| e["type"] == "match").collect();
-        assert_eq!(matches.len(), 3, "one event per match, not per line: {matches:?}");
+        assert_eq!(
+            matches.len(),
+            3,
+            "one event per match, not per line: {matches:?}"
+        );
     }
 
     #[test]
@@ -1522,7 +1689,10 @@ mod tests {
         assert_eq!(events[0]["type"], "begin");
         assert_eq!(events[1]["type"], "match");
         assert_eq!(events[1]["data"]["line_number"], 1);
-        assert_eq!(events[1]["data"]["submatches"][0]["match"]["text"], "fn alpha");
+        assert_eq!(
+            events[1]["data"]["submatches"][0]["match"]["text"],
+            "fn alpha"
+        );
         assert!(
             events[1]["data"]["symbol"].is_null() || events[1]["data"]["symbol"]["id"].is_string(),
             "symbol is an object or null, never absent"
@@ -1554,7 +1724,11 @@ mod tests {
         let matches: Vec<&serde_json::Value> =
             events.iter().filter(|e| e["type"] == "match").collect();
 
-        assert_eq!(matches.len(), 2, "one event per line, not per match: {matches:?}");
+        assert_eq!(
+            matches.len(),
+            2,
+            "one event per line, not per match: {matches:?}"
+        );
         assert_eq!(matches[0]["data"]["line_number"], 1);
         assert_eq!(
             matches[0]["data"]["submatches"].as_array().unwrap().len(),
@@ -1562,7 +1736,10 @@ mod tests {
             "both of line 1's matches ride in one event"
         );
         assert_eq!(matches[1]["data"]["line_number"], 2);
-        assert_eq!(matches[1]["data"]["submatches"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            matches[1]["data"]["submatches"].as_array().unwrap().len(),
+            1
+        );
     }
 
     /// The envelope's `coverage` is what distinguishes "no journal" from
@@ -1576,20 +1753,24 @@ mod tests {
         let index = crate::restore::CoverageIndex::from_read_set(reads, "sess-1");
 
         let mut buf = Vec::new();
-        print_json(&mut buf, &one_file("src/a.rs", &opts), &opts, Some(&index), 7).unwrap();
-        let summary: serde_json::Value = serde_json::from_str(
-            String::from_utf8(buf).unwrap().lines().last().unwrap(),
+        print_json(
+            &mut buf,
+            &one_file("src/a.rs", &opts),
+            &opts,
+            Some(&index),
+            7,
         )
         .unwrap();
+        let summary: serde_json::Value =
+            serde_json::from_str(String::from_utf8(buf).unwrap().lines().last().unwrap()).unwrap();
         assert_eq!(summary["data"]["coverage"]["session_id"], "sess-1");
         assert_eq!(summary["data"]["withheld"], 7);
 
         let mut without = Vec::new();
         print_json(&mut without, &one_file("src/a.rs", &opts), &opts, None, 0).unwrap();
-        let summary: serde_json::Value = serde_json::from_str(
-            String::from_utf8(without).unwrap().lines().last().unwrap(),
-        )
-        .unwrap();
+        let summary: serde_json::Value =
+            serde_json::from_str(String::from_utf8(without).unwrap().lines().last().unwrap())
+                .unwrap();
         assert!(
             summary["data"]["coverage"].is_null(),
             "no journal must be null, not an empty object"
@@ -1629,8 +1810,7 @@ mod tests {
         let opts = Options::new(vec!["ambits".into()]);
         let matcher = Matcher::new(&opts).unwrap();
 
-        let found =
-            search_file(&matcher, &ParserRegistry::new(), &abs, &rel, &opts, None).unwrap();
+        let found = search_file(&matcher, &ParserRegistry::new(), &abs, &rel, &opts, None).unwrap();
         assert_eq!(found.hits.len(), 1);
         assert!(found.hits[0].symbol.is_none());
     }
@@ -1653,14 +1833,17 @@ mod tests {
     #[test]
     fn context_lines_carry_no_attribution() {
         let dir = tempfile::tempdir().unwrap();
-        let (abs, rel) = write(&dir, "a.rs", b"fn alpha() {}\nfn beta() {}\nfn gamma() {}\n");
+        let (abs, rel) = write(
+            &dir,
+            "a.rs",
+            b"fn alpha() {}\nfn beta() {}\nfn gamma() {}\n",
+        );
         let mut opts = Options::new(vec!["beta".into()]);
         opts.before_context = 1;
         opts.after_context = 1;
         let matcher = Matcher::new(&opts).unwrap();
 
-        let found =
-            search_file(&matcher, &ParserRegistry::new(), &abs, &rel, &opts, None).unwrap();
+        let found = search_file(&matcher, &ParserRegistry::new(), &abs, &rel, &opts, None).unwrap();
         assert_eq!(found.context.len(), 2, "one line either side");
         assert_eq!(found.context[0].0, 1);
         assert_eq!(found.context[1].0, 3);

@@ -42,13 +42,19 @@ independently:
 
 ```
 Agents: 5
-  ▶ [All]              Seen: 95%
-  ├─ 7842313b          35%
-  │  ├─ a38e68c        20%
-  │  ├─ a9fe23c        41%
-  │  └─ a845182        15%
-  └─ compact-0aff      10%
+  ▶ [All]                          Seen: 95%
+  ├─ main                          35%
+  │  ├─ Explore parser module      20%
+  │  ├─ Expert review of phase 6   41%
+  │  └─ a845182                    15%
+  └─ compact-0aff                  10%
 ```
+
+An agent has one name in every view — this pane, the inspector, the
+alignment view, the trace view: `main` for the session's own; a subagent by
+the task it was started for (its delegation's description), else by the
+first line of its task prompt; else by its id. `--agent` takes the id, or a
+prefix of it.
 
 In the [TUI](TUI): `Tab` to the Stats panel, `j`/`k` to move, `Enter` to
 filter — tree, activity feed and depth breakdown all follow. `a` cycles agents

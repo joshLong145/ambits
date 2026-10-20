@@ -1,8 +1,8 @@
-use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::Frame;
 
 use ambits::app::App;
 use ambits::ingest::CompactionEvent;
@@ -15,10 +15,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let popup_area = super::centered_rect(area, 80, 70);
     f.render_widget(Clear, popup_area);
 
-    let Some(ev) = app
-        .compaction_history
-        .get(app.compaction_overlay_index)
-    else {
+    let Some(ev) = app.compaction_history.get(app.compaction_overlay_index) else {
         return;
     };
 
@@ -80,10 +77,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         }
         if ev.ledger_before.files_accessed.len() > 20 {
             lines.push(Line::from(Span::styled(
-                format!(
-                    "  … ({} more)",
-                    ev.ledger_before.files_accessed.len() - 20,
-                ),
+                format!("  … ({} more)", ev.ledger_before.files_accessed.len() - 20,),
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -129,7 +123,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(paragraph, popup_area);
 }
 
@@ -205,26 +201,6 @@ fn depth_color(d: ReadDepth) -> Color {
 }
 
 fn wrap_summary(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(20);
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        if current.is_empty() {
-            current.push_str(word);
-        } else if current.len() + 1 + word.len() > width {
-            lines.push(std::mem::take(&mut current));
-            current.push_str(word);
-        } else {
-            current.push(' ');
-            current.push_str(word);
-        }
-    }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
+    let text: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    ambits::text::wrap(&text, width.max(20), usize::MAX).0
 }
-
