@@ -35,6 +35,22 @@ alters a command, flag, output format or config key, update the matching
 To publish, copy `docs/wiki/*.md` into a clone of
 `git@github.com:joshLong145/ambits.wiki.git` and push it.
 
+## Releasing
+
+`.github/workflows/release.yml` runs when a version tag is pushed. It builds
+static Linux (x86_64, aarch64) and macOS (arm64, x86_64) binaries and publishes
+them, with `SHA256SUMS`, as a GitHub Release. The tag has no `v` and must equal
+the `version` in `Cargo.toml`, or the run fails before building.
+
+1. Bump `version` in `Cargo.toml` (and `Cargo.lock` via `cargo build`) on a
+   branch, and merge it to `main`.
+2. Tag the merge commit on `main` and push the tag:
+   ```bash
+   git tag -a 0.21.0 -m 0.21.0
+   git push origin 0.21.0
+   ```
+3. Watch the run with `gh run watch`. Re-running it replaces the assets.
+
 ## Landing the Plane (Session Completion)
 
 **When ending a work session**, complete ALL steps below. Work is NOT complete until `git push` succeeds.

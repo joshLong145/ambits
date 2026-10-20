@@ -6,6 +6,18 @@
 cargo install ambits
 ```
 
+Or download a prebuilt binary from
+[Releases](https://github.com/joshLong145/ambits/releases): static Linux builds
+for x86_64 and aarch64, and macOS builds for Apple Silicon and Intel. Each is a
+`.tar.gz` named `ambits-<version>-<target>`, with `SHA256SUMS` to check it
+against.
+
+```bash
+tar -xzf ambits-0.21.0-aarch64-apple-darwin.tar.gz
+mv ambits-0.21.0-aarch64-apple-darwin/ambits ~/.local/bin/
+ambits --version
+```
+
 Or build from source — Rust 1.88+ (`rust-version` in `Cargo.toml`):
 
 ```bash

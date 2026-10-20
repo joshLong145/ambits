@@ -17,7 +17,7 @@ Both surfaces are plain text and JSON with no vendor coupling. Ingestion is curr
 ## Quick start
 
 ```bash
-cargo install ambits
+cargo install ambits   # or a prebuilt binary from Releases
 
 # Hand read history back automatically after every compaction
 ambits hook install --project .

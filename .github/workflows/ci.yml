@@ -59,12 +59,4 @@ jobs:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
       - name: Check the binary is static and runs
-        run: |
-          bin=target/${{ matrix.target }}/release/ambits
-          file "$bin"
-          # From the ELF, not file's wording, which says "static-pie linked" for a static PIE.
-          if readelf -lW "$bin" | grep -q 'Requesting program interpreter'; then echo "$bin needs a program interpreter" >&2; exit 1; fi
-          if readelf -dW "$bin" | grep -q '(NEEDED)'; then echo "$bin links shared libraries" >&2; exit 1; fi
-          "$bin" --version
-          dir=$(mktemp -d) && git -C "$dir" init -q && printf 'fn a() {}\n' > "$dir/a.rs"
-          "$bin" -p "$dir" --dump | grep -q 'fn a'
+        run: .github/scripts/check-static.sh target/${{ matrix.target }}/release/ambits
