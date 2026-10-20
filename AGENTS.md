@@ -46,8 +46,8 @@ the `version` in `Cargo.toml`, or the run fails before building.
    branch, and merge it to `main`.
 2. Tag the merge commit on `main` and push the tag:
    ```bash
-   git tag -a 0.21.0 -m 0.21.0
-   git push origin 0.21.0
+   git tag -a 0.25.0 -m 0.25.0
+   git push origin 0.25.0
    ```
 3. Watch the run with `gh run watch`. Re-running it replaces the assets.
 
