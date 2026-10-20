@@ -145,13 +145,20 @@ pub fn find<'t>(tree: &'t ProjectTree, selectors: &[&str]) -> Vec<Vec<(&'t Path,
     let mut by_file: HashMap<&str, Vec<(usize, &str)>> = HashMap::new();
     for (i, selector) in parsed.iter().enumerate() {
         if let Selector::Id(id) = selector {
-            by_file.entry(crate::symbols::split_id(id).0).or_default().push((i, id.as_str()));
+            by_file
+                .entry(crate::symbols::split_id(id).0)
+                .or_default()
+                .push((i, id.as_str()));
         }
     }
     // One pass over the files: finding a file by path normalises each path.
     if !by_file.is_empty() {
         for file in &tree.files {
-            let Some(ids) = by_file.get(crate::objects::normalize_path(&file.file_path.to_string_lossy()).as_str()) else { continue };
+            let Some(ids) = by_file
+                .get(crate::objects::normalize_path(&file.file_path.to_string_lossy()).as_str())
+            else {
+                continue;
+            };
             for sym in file.walk() {
                 for &(i, _) in ids.iter().filter(|(_, id)| sym.id == *id) {
                     out[i].push((file.file_path.as_path(), sym));
@@ -180,7 +187,10 @@ const SUGGESTIONS: usize = 5;
 /// A name-path segment as a guess would spell it: without generics
 /// (`ContentRow<'a>` is `ContentRow`), without an `impl ` prefix, in any case.
 fn loosely(segment: &str) -> String {
-    let segment = segment.trim().strip_prefix("impl ").unwrap_or(segment.trim());
+    let segment = segment
+        .trim()
+        .strip_prefix("impl ")
+        .unwrap_or(segment.trim());
     let mut depth = 0usize;
     let bare: String = segment
         .chars()
@@ -203,8 +213,14 @@ fn loosely(segment: &str) -> String {
 /// its section however deep it sits (`Guide/Setup/Install` for `Install`).
 fn suggest<'a>(all: &[(&Path, &'a SymbolNode)], id: &str) -> Vec<&'a str> {
     let (path, name) = crate::symbols::split_id(id);
-    let want: Vec<String> = name.split('/').map(loosely).filter(|s| !s.is_empty()).collect();
-    let Some(last) = want.last() else { return Vec::new() };
+    let want: Vec<String> = name
+        .split('/')
+        .map(loosely)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let Some(last) = want.last() else {
+        return Vec::new();
+    };
     let in_file = |file: &str| file == path || file.ends_with(&format!("/{path}"));
     let (mut ends, mut shares) = (Vec::new(), Vec::new());
     for (_, sym) in all {
@@ -349,7 +365,14 @@ pub fn run(
     max_bytes: Option<usize>,
     coverage: Option<&crate::restore::CoverageIndex>,
 ) -> Result<()> {
-    let out = resolve(project_root, tree, queries, include_body, max_bytes, coverage);
+    let out = resolve(
+        project_root,
+        tree,
+        queries,
+        include_body,
+        max_bytes,
+        coverage,
+    );
     // Single line, like the other JSON surfaces, so it survives being piped
     // through line-oriented tooling.
     writeln!(
@@ -431,8 +454,8 @@ fn resolve<'a>(
 
 #[cfg(test)]
 mod tests {
-    use crate::helpers::*;
     use super::*;
+    use crate::helpers::*;
 
     #[test]
     fn ids_are_recognized_by_their_separator() {
@@ -459,7 +482,10 @@ mod tests {
 
     #[test]
     fn short_prefixes_are_accepted_but_stubs_are_not() {
-        assert_eq!(parse_selector("deadbeef"), Selector::Hash("deadbeef".into()));
+        assert_eq!(
+            parse_selector("deadbeef"),
+            Selector::Hash("deadbeef".into())
+        );
         assert_eq!(
             parse_selector("deadbee"),
             Selector::Unrecognized("deadbee".into()),
@@ -516,10 +542,36 @@ mod tests {
             ("a.rs", "struct Row<'a>(&'a str);\nimpl<'a> Row<'a> {\n    fn new(s: &'a str) -> Self { Row(s) }\n}\nfn new() {}\n"),
             ("g.md", "# Guide\n\n## Setup\n\n### Install\n\ntext\n"),
         ]);
-        let got = show(dir.path(), &tree, &["a.rs::Row/new", "g.md::Install", "a.rs::Row<'a>/new", "a.rs::Nothing/here"], false);
-        let suggestions = |i: usize| got["results"][i]["suggestions"].as_array().map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect::<Vec<_>>());
-        assert_eq!(suggestions(0), Some(vec!["a.rs::Row<'a>/new".to_string(), "a.rs::new".to_string()]), "the method first, then the same name");
-        assert_eq!(suggestions(1), Some(vec!["g.md::Guide/Setup/Install".to_string()]));
+        let got = show(
+            dir.path(),
+            &tree,
+            &[
+                "a.rs::Row/new",
+                "g.md::Install",
+                "a.rs::Row<'a>/new",
+                "a.rs::Nothing/here",
+            ],
+            false,
+        );
+        let suggestions = |i: usize| {
+            got["results"][i]["suggestions"].as_array().map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            suggestions(0),
+            Some(vec![
+                "a.rs::Row<'a>/new".to_string(),
+                "a.rs::new".to_string()
+            ]),
+            "the method first, then the same name"
+        );
+        assert_eq!(
+            suggestions(1),
+            Some(vec!["g.md::Guide/Setup/Install".to_string()])
+        );
         assert_eq!(suggestions(2), None, "a match needs none");
         assert_eq!(suggestions(3), None, "nothing close");
     }
@@ -528,7 +580,10 @@ mod tests {
     /// reconstructed from line numbers.
     #[test]
     fn the_definition_is_the_exact_source_span() {
-        let (dir, tree) = tmp_project(&[("a.rs", "fn before() {}\n\nfn target(x: u8) -> u8 {\n    x + 1\n}\n")]);
+        let (dir, tree) = tmp_project(&[(
+            "a.rs",
+            "fn before() {}\n\nfn target(x: u8) -> u8 {\n    x + 1\n}\n",
+        )]);
         let v = show(dir.path(), &tree, &["a.rs::target"], true);
         let m = &v["results"][0]["matches"][0];
         assert_eq!(
@@ -596,7 +651,12 @@ mod tests {
     #[test]
     fn a_miss_and_a_bad_selector_are_distinguishable() {
         let (dir, tree) = tmp_project(&[("a.rs", "fn only() {}\n")]);
-        let v = show(dir.path(), &tree, &["a.rs::nope", "wat", &"0".repeat(64)], false);
+        let v = show(
+            dir.path(),
+            &tree,
+            &["a.rs::nope", "wat", &"0".repeat(64)],
+            false,
+        );
         assert_eq!(v["results"][0]["selector"], "id");
         assert_eq!(v["results"][0]["matches"].as_array().unwrap().len(), 0);
         assert_eq!(v["results"][1]["selector"], "unrecognized");

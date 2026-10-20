@@ -28,7 +28,11 @@ pub struct SymbolMeta {
 /// field's, else the node's own first line, which lies below any comments
 /// or attributes glued above it.
 pub fn head_line(node: tree_sitter::Node<'_>) -> u32 {
-    node.child_by_field_name("name").unwrap_or(node).start_position().row as u32 + 1
+    node.child_by_field_name("name")
+        .unwrap_or(node)
+        .start_position()
+        .row as u32
+        + 1
 }
 
 /// The earliest node in an unbroken run of comments immediately above
@@ -280,11 +284,7 @@ impl ParserRegistry {
     /// If `filter` is `Some`, files whose project-relative path does not
     /// satisfy the filter are skipped *before* I/O — excluded files are not
     /// read from disk or parsed.
-    pub fn scan_project(
-        &self,
-        root: &Path,
-        filter: Option<&PathFilter>,
-    ) -> Result<ProjectTree> {
+    pub fn scan_project(&self, root: &Path, filter: Option<&PathFilter>) -> Result<ProjectTree> {
         // Walk first, parse second. Measured on this repo, walking the tree is
         // effectively free — restricting the parse to a single file costs the
         // same as parsing none — while parsing every file is ~95ms of the

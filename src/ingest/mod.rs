@@ -84,7 +84,11 @@ pub struct SelectorRead {
 impl SelectorRead {
     /// `selector` at `depth`, nothing inside it read with it.
     pub fn new(selector: impl Into<String>, depth: ReadDepth) -> Self {
-        SelectorRead { selector: selector.into(), depth, whole: false }
+        SelectorRead {
+            selector: selector.into(),
+            depth,
+            whole: false,
+        }
     }
 }
 
@@ -328,7 +332,11 @@ pub trait SessionIngester: Send + Sync {
     fn replay_log_file(&self, path: &Path, project_root: &Path) -> FileReplay {
         let events = self.parse_log_file_with_root(path, project_root);
         let offset = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        FileReplay { events, offset, awaiting: Vec::new() }
+        FileReplay {
+            events,
+            offset,
+            awaiting: Vec::new(),
+        }
     }
 
     /// A tailer that continues exactly where a replay stopped. Default: a
@@ -349,7 +357,12 @@ pub trait SessionIngester: Send + Sync {
     /// log `files`: for display, or a report, never the journal or a
     /// snapshot (spec §9.6).
     /// Default: not available.
-    fn call_detail(&self, files: &[PathBuf], id: &str, kind: content::ContentKind) -> Option<content::CallDetail> {
+    fn call_detail(
+        &self,
+        files: &[PathBuf],
+        id: &str,
+        kind: content::ContentKind,
+    ) -> Option<content::CallDetail> {
         let _ = (files, id, kind);
         None
     }
@@ -361,7 +374,10 @@ pub trait SessionIngester: Send + Sync {
         files: &[PathBuf],
         wanted: &std::collections::HashMap<String, content::ContentKind>,
     ) -> std::collections::HashMap<String, content::CallDetail> {
-        wanted.iter().filter_map(|(id, kind)| Some((id.clone(), self.call_detail(files, id, *kind)?))).collect()
+        wanted
+            .iter()
+            .filter_map(|(id, kind)| Some((id.clone(), self.call_detail(files, id, *kind)?)))
+            .collect()
     }
 }
 

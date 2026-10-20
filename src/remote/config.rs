@@ -39,14 +39,19 @@ impl Config {
     pub fn load(project_root: &Path) -> Result<Self> {
         let path = config_path(project_root);
         match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).wrap_err_with(|| format!("reading {}", path.display())),
+            Ok(text) => {
+                toml::from_str(&text).wrap_err_with(|| format!("reading {}", path.display()))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).wrap_err_with(|| format!("reading {}", path.display())),
         }
     }
 
     pub fn save(&self, project_root: &Path) -> Result<()> {
-        write_atomic(&config_path(project_root), toml::to_string(self)?.as_bytes())
+        write_atomic(
+            &config_path(project_root),
+            toml::to_string(self)?.as_bytes(),
+        )
     }
 
     /// This store's id, minted and saved the first time it is asked for.
@@ -66,13 +71,19 @@ impl Config {
 /// lets anyone rewrite the history everyone pulls.
 pub fn add(project_root: &Path, name: &str, path: &Path) -> Result<Vec<String>> {
     if !valid_remote_name(name) {
-        bail!("not a remote name: {name:?} (letters, digits, `.`, `_`, `-`; not starting with `.`)");
+        bail!(
+            "not a remote name: {name:?} (letters, digits, `.`, `_`, `-`; not starting with `.`)"
+        );
     }
     let mut config = Config::load(project_root)?;
     if config.remotes.contains_key(name) {
         bail!("remote {name} already exists; remove it first");
     }
-    let path = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
     let path = path.canonicalize().unwrap_or(path);
     if path.starts_with(crate::state_dir::state_root(project_root)) {
         bail!("a remote cannot live inside this project's own store");
@@ -82,10 +93,15 @@ pub fn add(project_root: &Path, name: &str, path: &Path) -> Result<Vec<String>> 
     if let Ok(meta) = std::fs::metadata(&path) {
         use std::os::unix::fs::PermissionsExt;
         if meta.permissions().mode() & 0o002 != 0 {
-            warnings.push(format!("{} is world-writable: anyone on this machine can rewrite what you pull", path.display()));
+            warnings.push(format!(
+                "{} is world-writable: anyone on this machine can rewrite what you pull",
+                path.display()
+            ));
         }
     }
-    config.remotes.insert(name.to_string(), RemoteConfig { path });
+    config
+        .remotes
+        .insert(name.to_string(), RemoteConfig { path });
     config.save(project_root)?;
     Ok(warnings)
 }
@@ -103,12 +119,21 @@ pub fn resolve(project_root: &Path, name: Option<&str>) -> Result<(String, Store
     let config = Config::load(project_root)?;
     let name = match name {
         Some(n) => n.to_string(),
-        None if config.remotes.len() == 1 => config.remotes.keys().next().cloned().unwrap_or_default(),
+        None if config.remotes.len() == 1 => {
+            config.remotes.keys().next().cloned().unwrap_or_default()
+        }
         None if config.remotes.contains_key("origin") => "origin".into(),
-        None if config.remotes.is_empty() => return Err(eyre!("no remotes; add one with `ambits remote add <name> <path>`")),
+        None if config.remotes.is_empty() => {
+            return Err(eyre!(
+                "no remotes; add one with `ambits remote add <name> <path>`"
+            ))
+        }
         None => return Err(eyre!("several remotes and none is `origin`; name one")),
     };
-    let remote = config.remotes.get(&name).ok_or_else(|| eyre!("no remote named {name}"))?;
+    let remote = config
+        .remotes
+        .get(&name)
+        .ok_or_else(|| eyre!("no remote named {name}"))?;
     Ok((name, Store::at_root(&remote.path)))
 }
 
@@ -125,7 +150,10 @@ mod tests {
         assert!(resolve(&root, None).is_err(), "none yet");
         add(&root, "team", &far).unwrap();
         let (name, store) = resolve(&root, None).unwrap();
-        assert_eq!((name.as_str(), store.root()), ("team", far.canonicalize().unwrap().as_path()));
+        assert_eq!(
+            (name.as_str(), store.root()),
+            ("team", far.canonicalize().unwrap().as_path())
+        );
         assert!(add(&root, "team", &far).is_err(), "no duplicates");
         for bad in ["", ".hidden", "a/b", "../x", "a b"] {
             assert!(add(&root, bad, &far).is_err(), "{bad:?}");

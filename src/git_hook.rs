@@ -33,11 +33,17 @@ fn hooks_dir(repo_dir: &Path) -> Result<(PathBuf, bool)> {
             bail!("core.hooksPath is set in {} config ({path}); not installing a hook every repository would run", &scope[2..]);
         }
     }
-    let path = repo.git_path("hooks").ok_or_else(|| eyre!("git could not locate the hooks directory"))?;
-    let git_dir = git(repo_dir, &["rev-parse", "--absolute-git-dir"]).map(|o| PathBuf::from(String::from_utf8_lossy(&o).trim()));
+    let path = repo
+        .git_path("hooks")
+        .ok_or_else(|| eyre!("git could not locate the hooks directory"))?;
+    let git_dir = git(repo_dir, &["rev-parse", "--absolute-git-dir"])
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o).trim()));
     let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let (hooks, top) = (canonical(&path), canonical(&repo.top));
-    let in_work_tree = hooks.starts_with(&top) && !git_dir.as_deref().is_some_and(|g| hooks.starts_with(canonical(g)));
+    let in_work_tree = hooks.starts_with(&top)
+        && !git_dir
+            .as_deref()
+            .is_some_and(|g| hooks.starts_with(canonical(g)));
     Ok((path, in_work_tree))
 }
 
@@ -81,7 +87,10 @@ pub struct Installed {
 /// `ambits` (an absolute path to this binary).
 pub fn install(repo_dir: &Path, ambits: &Path) -> Result<Installed> {
     let Some(ambits) = ambits.to_str() else {
-        bail!("the ambits path {} is not UTF-8, so a hook cannot name it reliably", ambits.display());
+        bail!(
+            "the ambits path {} is not UTF-8, so a hook cannot name it reliably",
+            ambits.display()
+        );
     };
     let (dir, in_work_tree) = hooks_dir(repo_dir)?;
     std::fs::create_dir_all(&dir)?;
@@ -91,7 +100,10 @@ pub fn install(repo_dir: &Path, ambits: &Path) -> Result<Installed> {
     if let Ok(existing) = std::fs::read_to_string(&hook) {
         if !existing.contains(MARKER) {
             if chained.exists() {
-                bail!("{} already exists; resolve it by hand before installing", chained.display());
+                bail!(
+                    "{} already exists; resolve it by hand before installing",
+                    chained.display()
+                );
             }
             std::fs::rename(&hook, &chained).wrap_err("keeping the existing post-commit hook")?;
             moved = true;
@@ -112,7 +124,10 @@ pub fn install(repo_dir: &Path, ambits: &Path) -> Result<Installed> {
         }
         return Err(e).wrap_err("writing the post-commit hook");
     }
-    Ok(Installed { path: hook, in_work_tree })
+    Ok(Installed {
+        path: hook,
+        in_work_tree,
+    })
 }
 
 /// Remove the hook, putting back any hook it chained to. Returns whether

@@ -4,7 +4,17 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Tabs as four spaces, other control characters as one.
 pub fn clean(s: &str) -> String {
-    s.chars().flat_map(|c| if c == '\t' { vec![' '; 4] } else if c.is_control() { vec![' '] } else { vec![c] }).collect()
+    s.chars()
+        .flat_map(|c| {
+            if c == '\t' {
+                vec![' '; 4]
+            } else if c.is_control() {
+                vec![' ']
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
 }
 
 /// Lines being wrapped: the first `keep` made, the rest only counted.
@@ -48,7 +58,14 @@ impl Lines {
 /// spaces dropped. Only the first `keep` lines are made; the second value
 /// is how many there are in all.
 pub fn wrap(s: &str, room: usize, keep: usize) -> (Vec<String>, usize) {
-    let mut lines = Lines { room: room.max(1), keep, out: Vec::new(), line: String::new(), used: 0, total: 1 };
+    let mut lines = Lines {
+        room: room.max(1),
+        keep,
+        out: Vec::new(),
+        line: String::new(),
+        used: 0,
+        total: 1,
+    };
     for word in s.split_inclusive(' ') {
         // A word that fits on a line of its own starts one, not breaks.
         let w = word.trim_end().width();
@@ -70,8 +87,17 @@ mod tests {
 
     #[test]
     fn wraps_between_words_and_breaks_a_long_one() {
-        assert_eq!(wrap("you are an expert reviewer", 12, usize::MAX), (vec!["you are an".into(), "expert".into(), "reviewer".into()], 3));
-        assert_eq!(wrap("abcdefghij k", 8, usize::MAX).0, vec!["abcdefgh", "ij k"]);
+        assert_eq!(
+            wrap("you are an expert reviewer", 12, usize::MAX),
+            (
+                vec!["you are an".into(), "expert".into(), "reviewer".into()],
+                3
+            )
+        );
+        assert_eq!(
+            wrap("abcdefghij k", 8, usize::MAX).0,
+            vec!["abcdefgh", "ij k"]
+        );
         assert_eq!(wrap("", 8, usize::MAX), (vec![String::new()], 1));
     }
 

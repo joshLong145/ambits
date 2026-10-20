@@ -7,12 +7,12 @@ use std::time::{Duration, SystemTime};
 mod common;
 
 use ambits::ingest::tool_config::SyncConfig;
-use common::{git, run_ambits};
 use ambits::objects::gc;
 use ambits::objects::snapshot::{snapshot, Outcome, Request, Snapshot};
 use ambits::objects::store::Store;
 use ambits::objects::{Kind, ObjectId};
 use ambits::parser::ParserRegistry;
+use common::{git, run_ambits};
 
 const SESSION: &str = "0b7e9d3a-1c2f-4e5a-9b8c-7d6e5f4a3b2c";
 const READ: &str = r#"{"kind":"read","sym":"src/a.rs::alpha","h":"b3:0000000000000000000000000000000000000000000000000000000000000000","d":"full_body","a":"agent-1"}"#;
@@ -35,7 +35,11 @@ impl Project {
         git(&root, &["init", "-q"]);
         git(&root, &["add", "."]);
         git(&root, &["commit", "-qm", "init"]);
-        let project = Self { _dir: dir, root, registry: ParserRegistry::new() };
+        let project = Self {
+            _dir: dir,
+            root,
+            registry: ParserRegistry::new(),
+        };
         project.append_journal(&format!("{READ}\n"));
         project
     }
@@ -44,7 +48,11 @@ impl Project {
         use std::io::Write as _;
         let dir = self.root.join(".ambits/coverage");
         std::fs::create_dir_all(&dir).unwrap();
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{SESSION}.ndjson"))).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(format!("{SESSION}.ndjson")))
+            .unwrap();
         f.write_all(text.as_bytes()).unwrap();
     }
 
@@ -73,7 +81,9 @@ impl Project {
 fn created(outcome: Outcome) -> ObjectId {
     match outcome {
         Outcome::Created { id, .. } => id,
-        Outcome::NothingChanged(tip) => panic!("expected a new snapshot, got nothing changed at {tip:?}"),
+        Outcome::NothingChanged(tip) => {
+            panic!("expected a new snapshot, got nothing changed at {tip:?}")
+        }
     }
 }
 
@@ -89,7 +99,14 @@ fn snapshotting_twice_is_a_no_op() {
     let p = Project::new();
     let first = created(p.snap());
     assert_eq!(unchanged(p.snap()), first);
-    assert_eq!(p.store().list().iter().filter(|(id, _)| p.store().get(id, Kind::Snapshot).is_ok()).count(), 1);
+    assert_eq!(
+        p.store()
+            .list()
+            .iter()
+            .filter(|(id, _)| p.store().get(id, Kind::Snapshot).is_ok())
+            .count(),
+        1
+    );
 }
 
 /// Only content counts: a touched file is the same state.
@@ -98,8 +115,12 @@ fn touching_a_dirty_file_changes_nothing() {
     let p = Project::new();
     std::fs::write(p.root.join("src/a.rs"), "fn alpha() { 1; }\n").unwrap();
     let first = created(p.snap());
-    let file = std::fs::File::options().write(true).open(p.root.join("src/a.rs")).unwrap();
-    file.set_modified(SystemTime::now() + Duration::from_secs(60)).unwrap();
+    let file = std::fs::File::options()
+        .write(true)
+        .open(p.root.join("src/a.rs"))
+        .unwrap();
+    file.set_modified(SystemTime::now() + Duration::from_secs(60))
+        .unwrap();
     assert_eq!(unchanged(p.snap()), first);
 }
 
@@ -130,7 +151,11 @@ fn reverting_makes_a_new_snapshot_on_top_of_the_tip() {
     assert_ne!(reverted, clean);
     let s = Snapshot::load(&p.store(), reverted).unwrap();
     assert_eq!(s.parents, vec![dirty]);
-    assert_eq!(s.coverage, Snapshot::load(&p.store(), clean).unwrap().coverage, "same coverage as before");
+    assert_eq!(
+        s.coverage,
+        Snapshot::load(&p.store(), clean).unwrap().coverage,
+        "same coverage as before"
+    );
 }
 
 /// The journal is an input: a new record is a new snapshot; a torn,
@@ -156,19 +181,36 @@ fn a_journal_schema_upgrade_changes_the_id_once() {
     let v2 = format!(
         r#"{{"kind":"header","schema_version":2,"created_at":"0","session_id":"{SESSION}","project_root":"/p","tree_fingerprint":"b3:00","ambit_version":"0","backend":"tree-sitter","os":"x","arch":"y"}}"#
     );
-    std::fs::write(p.root.join(format!(".ambits/coverage/{SESSION}.ndjson")), format!("{v2}\n{READ}\n")).unwrap();
+    std::fs::write(
+        p.root.join(format!(".ambits/coverage/{SESSION}.ndjson")),
+        format!("{v2}\n{READ}\n"),
+    )
+    .unwrap();
     let before = created(p.snap());
 
     let open = || {
-        drop(ambits::journal::Journal::open(&p.root, SESSION, Duration::ZERO, || {
-            ambits::journal::EnvironmentManifest::capture(&p.registry.scan_project(&p.root, None).unwrap(), "tree-sitter", None)
-        }))
+        drop(ambits::journal::Journal::open(
+            &p.root,
+            SESSION,
+            Duration::ZERO,
+            || {
+                ambits::journal::EnvironmentManifest::capture(
+                    &p.registry.scan_project(&p.root, None).unwrap(),
+                    "tree-sitter",
+                    None,
+                )
+            },
+        ))
     };
     open();
     let upgraded = created(p.snap());
     assert_ne!(upgraded, before);
     open();
-    assert_eq!(unchanged(p.snap()), upgraded, "a second open appends nothing");
+    assert_eq!(
+        unchanged(p.snap()),
+        upgraded,
+        "a second open appends nothing"
+    );
 }
 
 /// `[sync] ignore` covers every record type: tree, reads, writes and the
@@ -183,15 +225,25 @@ fn ignored_paths_appear_in_no_object() {
         READ.replace("src/a.rs::alpha", "secret/key.rs::topsecret"),
         r#"{"kind":"write","op":"toolu_1","av":2,"a":"agent-1","t":"2026-09-26T10:00:00Z","tool":"Edit","file":"secret/key.rs","level":"file"}"#
     ));
-    let sync = SyncConfig { ignore: Some(vec!["secret/".into()]), global_ignore: vec![] };
+    let sync = SyncConfig {
+        ignore: Some(vec!["secret/".into()]),
+        global_ignore: vec![],
+    };
     let id = created(p.snapshot_with(&sync));
 
     for (_, path) in p.store().list() {
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("secret") && !text.contains("topsecret"), "{} leaks: {text}", path.display());
+        assert!(
+            !text.contains("secret") && !text.contains("topsecret"),
+            "{} leaks: {text}",
+            path.display()
+        );
     }
     let s = Snapshot::load(&p.store(), id).unwrap();
-    assert!(s.inputs.dirty.is_empty(), "the untracked ignored file is not dirty");
+    assert!(
+        s.inputs.dirty.is_empty(),
+        "the untracked ignored file is not dirty"
+    );
 }
 
 #[test]
@@ -216,8 +268,14 @@ fn assert_closed(store: &Store) {
     for (id, path) in store.list() {
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         let text = v["payload"].to_string();
-        for hex in text.split('"').filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())) {
-            assert!(store.contains(&ObjectId::parse(hex).unwrap()), "{id:?} references missing {hex}");
+        for hex in text
+            .split('"')
+            .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            assert!(
+                store.contains(&ObjectId::parse(hex).unwrap()),
+                "{id:?} references missing {hex}"
+            );
         }
     }
 }
@@ -234,21 +292,39 @@ fn crash_then_gc_then_snapshot_never_loses_an_object() {
     let orphan = created(p.snap());
     // The reflog as it was before the crashed snapshot moved the ref.
     let reflog = p.root.join(".ambits/reflog.ndjson");
-    let first = std::fs::read_to_string(&reflog).unwrap().lines().next().unwrap().to_string();
+    let first = std::fs::read_to_string(&reflog)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
     std::fs::write(&reflog, format!("{first}\n")).unwrap();
 
     // Within the grace period nothing unreachable goes.
-    let young = gc::gc(&p.store(), gc::DEFAULT_GRACE, ambits::objects::refs::REFLOG_EXPIRY).unwrap();
+    let young = gc::gc(
+        &p.store(),
+        gc::DEFAULT_GRACE,
+        ambits::objects::refs::REFLOG_EXPIRY,
+    )
+    .unwrap();
     assert!(young.deleted.is_empty());
     assert!(p.store().contains(&orphan));
 
-    let collected = gc::gc(&p.store(), Duration::ZERO, ambits::objects::refs::REFLOG_EXPIRY).unwrap();
+    let collected = gc::gc(
+        &p.store(),
+        Duration::ZERO,
+        ambits::objects::refs::REFLOG_EXPIRY,
+    )
+    .unwrap();
     assert!(collected.deleted.contains(&orphan));
     assert_closed(&p.store());
     assert!(Snapshot::load(&p.store(), kept).is_ok());
 
     let again = created(p.snap());
-    assert_eq!(again, orphan, "same inputs and parent: the same id, rebuilt");
+    assert_eq!(
+        again, orphan,
+        "same inputs and parent: the same id, rebuilt"
+    );
     assert_closed(&p.store());
 }
 
@@ -273,12 +349,20 @@ fn gc_deletes_parents_before_children() {
             .collect();
         references.push((id, refs));
     }
-    let stats = gc::gc(&p.store(), Duration::ZERO, ambits::objects::refs::REFLOG_EXPIRY).unwrap();
+    let stats = gc::gc(
+        &p.store(),
+        Duration::ZERO,
+        ambits::objects::refs::REFLOG_EXPIRY,
+    )
+    .unwrap();
     assert!(p.store().list().is_empty(), "everything was unreachable");
     let position = |id: &ObjectId| stats.deleted.iter().position(|d| d == id).unwrap();
     for (parent, children) in &references {
         for child in children {
-            assert!(position(parent) < position(child), "{parent:?} deleted after its child {child:?}");
+            assert!(
+                position(parent) < position(child),
+                "{parent:?} deleted after its child {child:?}"
+            );
         }
     }
 }
@@ -294,11 +378,21 @@ fn reusing_an_object_refreshes_its_age() {
     let writes = Snapshot::load(&p.store(), first).unwrap().writes;
     let path = p.store().path_of(&writes);
     let old = SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
-    std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
 
-    p.append_journal(&format!("{}\n", READ.replace("src/a.rs::alpha", "src/b.rs::beta")));
+    p.append_journal(&format!(
+        "{}\n",
+        READ.replace("src/a.rs::alpha", "src/b.rs::beta")
+    ));
     created(p.snap());
-    let age = SystemTime::now().duration_since(std::fs::metadata(&path).unwrap().modified().unwrap()).unwrap();
+    let age = SystemTime::now()
+        .duration_since(std::fs::metadata(&path).unwrap().modified().unwrap())
+        .unwrap();
     assert!(age < Duration::from_secs(60), "age not refreshed: {age:?}");
 }
 
@@ -323,9 +417,17 @@ fn the_cli_snapshots_and_logs() {
 fn file_contents_never_reach_objects_or_notes() {
     const CANARY: &str = "CANARY_5e1d_never_persist";
     let p = Project::new();
-    std::fs::write(p.root.join("src/a.rs"), format!("fn alpha() {{ let _ = \"{CANARY}\"; }}\n")).unwrap();
+    std::fs::write(
+        p.root.join("src/a.rs"),
+        format!("fn alpha() {{ let _ = \"{CANARY}\"; }}\n"),
+    )
+    .unwrap();
     git(&p.root, &["commit", "-qam", "canary"]);
-    std::fs::write(p.root.join("src/b.rs"), format!("fn beta() {{ /* {CANARY} */ }}\n")).unwrap();
+    std::fs::write(
+        p.root.join("src/b.rs"),
+        format!("fn beta() {{ /* {CANARY} */ }}\n"),
+    )
+    .unwrap();
     created(p.snap());
 
     let mut files = vec![];
@@ -333,14 +435,22 @@ fn file_contents_never_reach_objects_or_notes() {
         let mut stack = vec![p.root.join(".ambits").join(dir)];
         while let Some(d) = stack.pop() {
             for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-                if e.path().is_dir() { stack.push(e.path()) } else { files.push(e.path()) }
+                if e.path().is_dir() {
+                    stack.push(e.path())
+                } else {
+                    files.push(e.path())
+                }
             }
         }
     }
     assert!(!files.is_empty());
     for f in files {
         let text = std::fs::read_to_string(&f).unwrap_or_default();
-        assert!(!text.contains(CANARY), "{} leaks file contents", f.display());
+        assert!(
+            !text.contains(CANARY),
+            "{} leaks file contents",
+            f.display()
+        );
     }
 }
 
@@ -363,9 +473,14 @@ fn an_extra_field_in_a_snapshot_is_refused() {
     let p = Project::new();
     let id = created(p.snap());
     let path = p.store().path_of(&id);
-    let mut envelope: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     envelope["payload"]["host"] = serde_json::json!("laptop");
-    std::fs::write(&path, ambits::objects::canonical::to_bytes(&envelope).unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        ambits::objects::canonical::to_bytes(&envelope).unwrap(),
+    )
+    .unwrap();
     assert!(Snapshot::load(&p.store(), id).is_err());
 }
 
@@ -376,7 +491,12 @@ fn gc_collects_leftover_temp_files() {
     created(p.snap());
     let stray = p.root.join(".ambits/.tmp-deadbeef");
     std::fs::write(&stray, "{}\n").unwrap();
-    let stats = gc::gc(&p.store(), Duration::ZERO, ambits::objects::refs::REFLOG_EXPIRY).unwrap();
+    let stats = gc::gc(
+        &p.store(),
+        Duration::ZERO,
+        ambits::objects::refs::REFLOG_EXPIRY,
+    )
+    .unwrap();
     assert_eq!(stats.temp_files_removed, 1);
     assert!(!stray.exists());
 }
@@ -388,9 +508,20 @@ fn an_older_format_snapshot_is_refused_with_advice() {
     let p = Project::new();
     let id = created(p.snap());
     let path = p.store().path_of(&id);
-    let mut envelope: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    envelope["payload"].as_object_mut().unwrap().remove("format");
-    std::fs::write(&path, ambits::objects::canonical::to_bytes(&envelope).unwrap()).unwrap();
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    envelope["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("format");
+    std::fs::write(
+        &path,
+        ambits::objects::canonical::to_bytes(&envelope).unwrap(),
+    )
+    .unwrap();
     let err = Snapshot::load(&p.store(), id).unwrap_err().to_string();
-    assert!(err.contains("older ambits") && err.contains("delete .ambits/objects"), "{err}");
+    assert!(
+        err.contains("older ambits") && err.contains("delete .ambits/objects"),
+        "{err}"
+    );
 }

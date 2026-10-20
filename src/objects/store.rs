@@ -44,7 +44,10 @@ impl Store {
     /// A store whose root is `dir` itself: a remote, laid out as `.ambits/`
     /// is (§12.2).
     pub fn at_root(dir: &Path) -> Self {
-        Self { root: dir.to_path_buf(), written_dirs: Default::default() }
+        Self {
+            root: dir.to_path_buf(),
+            written_dirs: Default::default(),
+        }
     }
 
     /// Make every object written so far durable: fsync each directory that
@@ -71,7 +74,9 @@ impl Store {
     /// Where the object `id` lives: `objects/ab/cdef….json`.
     pub fn path_of(&self, id: &ObjectId) -> PathBuf {
         let hex = id.hex();
-        self.objects().join(&hex[..2]).join(format!("{}.json", &hex[2..]))
+        self.objects()
+            .join(&hex[..2])
+            .join(format!("{}.json", &hex[2..]))
     }
 
     pub fn contains(&self, id: &ObjectId) -> bool {
@@ -84,7 +89,10 @@ impl Store {
     /// bytes — but its age is refreshed, so a gc running alongside cannot
     /// collect what this snapshot is about to reference (§8).
     pub fn put(&self, kind: Kind, payload: &Value) -> Result<ObjectId> {
-        debug_assert!(kind != Kind::Snapshot, "snapshots are stored with their derived id");
+        debug_assert!(
+            kind != Kind::Snapshot,
+            "snapshots are stored with their derived id"
+        );
         let bytes = canonical::to_bytes(payload)?;
         let id = content_id(kind, &bytes);
         self.put_at(&id, kind, payload)?;
@@ -103,7 +111,10 @@ impl Store {
         let envelope = canonical::to_bytes(&json!({"payload": payload, "type": kind.name()}))?;
         write_atomic(&path, &envelope)?;
         if let Some(dir) = path.parent() {
-            self.written_dirs.lock().expect("not poisoned").insert(dir.to_path_buf());
+            self.written_dirs
+                .lock()
+                .expect("not poisoned")
+                .insert(dir.to_path_buf());
         }
         Ok(())
     }
@@ -115,7 +126,10 @@ impl Store {
         let envelope = canonical::to_bytes(&json!({"payload": payload, "type": kind.name()}))?;
         write_atomic(&path, &envelope)?;
         if let Some(dir) = path.parent() {
-            self.written_dirs.lock().expect("not poisoned").insert(dir.to_path_buf());
+            self.written_dirs
+                .lock()
+                .expect("not poisoned")
+                .insert(dir.to_path_buf());
         }
         Ok(())
     }
@@ -125,15 +139,29 @@ impl Store {
         let path = self.path_of(id);
         // One open, then everything checked on what was opened: no window
         // for a swap to a symlink or a FIFO.
-        let bytes = read_capped(&path, MAX_OBJECT_BYTES).wrap_err_with(|| format!("object {}", id.short()))?;
-        let envelope = canonical::from_bytes(&bytes).wrap_err_with(|| format!("object {}", id.short()))?;
-        let found = envelope.get("type").and_then(Value::as_str).and_then(Kind::from_name);
+        let bytes = read_capped(&path, MAX_OBJECT_BYTES)
+            .wrap_err_with(|| format!("object {}", id.short()))?;
+        let envelope =
+            canonical::from_bytes(&bytes).wrap_err_with(|| format!("object {}", id.short()))?;
+        let found = envelope
+            .get("type")
+            .and_then(Value::as_str)
+            .and_then(Kind::from_name);
         if found != Some(kind) {
             bail!("object {} is not a {} object", id.short(), kind.name());
         }
-        let payload = envelope.get("payload").cloned().ok_or_else(|| eyre!("object {} has no payload", id.short()))?;
-        if payload.as_object().is_some_and(|o| o.values().any(|v| v.as_array().is_some_and(|a| a.len() > MAX_ENTRIES))) {
-            bail!("object {} has a list of over {MAX_ENTRIES} entries", id.short());
+        let payload = envelope
+            .get("payload")
+            .cloned()
+            .ok_or_else(|| eyre!("object {} has no payload", id.short()))?;
+        if payload.as_object().is_some_and(|o| {
+            o.values()
+                .any(|v| v.as_array().is_some_and(|a| a.len() > MAX_ENTRIES))
+        }) {
+            bail!(
+                "object {} has a list of over {MAX_ENTRIES} entries",
+                id.short()
+            );
         }
         if kind != Kind::Snapshot && content_id(kind, &canonical::to_bytes(&payload)?) != *id {
             bail!("object {} does not match its id", id.short());
@@ -149,7 +177,9 @@ impl Store {
             let prefix = fan.file_name().to_string_lossy().into_owned();
             for entry in fs::read_dir(fan.path()).into_iter().flatten().flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                let Some(rest) = name.strip_suffix(".json") else { continue };
+                let Some(rest) = name.strip_suffix(".json") else {
+                    continue;
+                };
                 if let Ok(id) = ObjectId::parse(&format!("{prefix}{rest}")) {
                     out.push((id, entry.path()));
                 }
@@ -171,7 +201,9 @@ pub fn create_private_dir(dir: &Path) -> Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    builder.create(dir).wrap_err_with(|| format!("creating {}", dir.display()))
+    builder
+        .create(dir)
+        .wrap_err_with(|| format!("creating {}", dir.display()))
 }
 
 /// How far [`write_atomic_with`] goes to make a write survive a crash.
@@ -205,7 +237,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 /// optionally fsynced, then renamed over `path`. A reader sees the old file
 /// or the new one, never a torn one, and a failed write leaves no temp file.
 pub fn write_atomic_with(path: &Path, bytes: &[u8], durability: Durability) -> Result<()> {
-    let dir = path.parent().ok_or_else(|| eyre!("{} has no parent", path.display()))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| eyre!("{} has no parent", path.display()))?;
     create_private_dir(dir)?;
     let tmp = dir.join(format!(".tmp-{}", random_token()));
     let result = (|| -> Result<()> {
@@ -242,7 +276,8 @@ pub fn walk_files(dir: &Path) -> Vec<PathBuf> {
 
 /// A file ambits' own writes leave behind only when interrupted.
 pub fn is_temp(path: &Path) -> bool {
-    path.file_name().is_some_and(|n| n.to_string_lossy().starts_with(".tmp-"))
+    path.file_name()
+        .is_some_and(|n| n.to_string_lossy().starts_with(".tmp-"))
 }
 
 /// Flush a directory's entries to disk, so renames into it survive a power
@@ -270,11 +305,17 @@ pub fn open_regular(path: &Path, options: &mut fs::OpenOptions) -> std::io::Resu
     }
     #[cfg(not(unix))]
     if fs::symlink_metadata(path).is_ok_and(|m| !m.is_file()) {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
     }
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{} is not a regular file", path.display())));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
     }
     Ok(file)
 }
@@ -286,7 +327,10 @@ pub fn read_capped(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     file.take(max + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{} is over the {max}-byte limit", path.display())));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is over the {max}-byte limit", path.display()),
+        ));
     }
     Ok(bytes)
 }
@@ -305,7 +349,12 @@ pub fn refresh_age(path: &Path) {
 pub fn random_token() -> String {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
     h.write_u32(std::process::id());
     format!("{:016x}", h.finish())
 }
@@ -332,8 +381,15 @@ mod tests {
         let id = store.put(Kind::Coverage, &json!({"n": 1})).unwrap();
         assert!(store.get(&id, Kind::Writes).is_err(), "wrong type");
 
-        fs::write(store.path_of(&id), br#"{"payload":{"n":2},"type":"coverage"}"#).unwrap();
-        assert!(store.get(&id, Kind::Coverage).is_err(), "content no longer matches the id");
+        fs::write(
+            store.path_of(&id),
+            br#"{"payload":{"n":2},"type":"coverage"}"#,
+        )
+        .unwrap();
+        assert!(
+            store.get(&id, Kind::Coverage).is_err(),
+            "content no longer matches the id"
+        );
     }
 
     #[cfg(unix)]

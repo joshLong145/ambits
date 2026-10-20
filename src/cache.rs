@@ -53,7 +53,6 @@ pub struct JournalStat {
     pub schema_version: Option<u32>,
 }
 
-
 /// Every session with a journal under `dir` (the `.ambits/coverage`
 /// directory), sorted.
 ///
@@ -98,7 +97,9 @@ pub fn collect(project_root: &Path) -> Vec<JournalStat> {
         let mut bytes = 0u64;
         let mut newest: Option<std::time::SystemTime> = None;
         for path in &shards {
-            let Ok(meta) = std::fs::metadata(path) else { continue };
+            let Ok(meta) = std::fs::metadata(path) else {
+                continue;
+            };
             bytes += meta.len();
             if let Ok(m) = meta.modified() {
                 newest = Some(newest.map_or(m, |n| n.max(m)));
@@ -122,7 +123,11 @@ pub fn collect(project_root: &Path) -> Vec<JournalStat> {
 
     // Newest first: the current session is what anyone running this is most
     // likely looking for.
-    out.sort_by(|a, b| a.age_days.cmp(&b.age_days).then_with(|| a.session_id.cmp(&b.session_id)));
+    out.sort_by(|a, b| {
+        a.age_days
+            .cmp(&b.age_days)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
     out
 }
 
@@ -136,7 +141,10 @@ pub fn status(project_root: &Path) -> Result<()> {
         writeln!(out, "No coverage journals in {}", dir.display())?;
         writeln!(out)?;
         writeln!(out, "Journals are written by the TUI. Without one,")?;
-        writeln!(out, "`restore-context` rebuilds the history from session logs instead.")?;
+        writeln!(
+            out,
+            "`restore-context` rebuilds the history from session logs instead."
+        )?;
         return Ok(());
     }
 
@@ -159,7 +167,11 @@ pub fn status(project_root: &Path) -> Result<()> {
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "?".into()),
             s.age_days
-                .map(|d| if d == 0 { "today".to_string() } else { format!("{d}d") })
+                .map(|d| if d == 0 {
+                    "today".to_string()
+                } else {
+                    format!("{d}d")
+                })
                 .unwrap_or_else(|| "-".into()),
         )?;
     }
@@ -217,8 +229,7 @@ pub fn clear(project_root: &Path, session: Option<&str>, all: bool) -> Result<()
 
     let mut removed = 0;
     for path in &targets {
-        std::fs::remove_file(path)
-            .wrap_err_with(|| format!("removing {}", path.display()))?;
+        std::fs::remove_file(path).wrap_err_with(|| format!("removing {}", path.display()))?;
         removed += 1;
     }
 
@@ -227,7 +238,10 @@ pub fn clear(project_root: &Path, session: Option<&str>, all: bool) -> Result<()
         "Removed {removed} journal{}.",
         if removed == 1 { "" } else { "s" }
     )?;
-    writeln!(out, "Restores for those sessions now reconstruct from session logs instead.")?;
+    writeln!(
+        out,
+        "Restores for those sessions now reconstruct from session logs instead."
+    )?;
     Ok(())
 }
 
@@ -361,9 +375,7 @@ mod tests {
             vec!["sess-b".to_string()],
             "clearing a session removes every one of its shards"
         );
-        assert!(
-            crate::journal::session_shard_paths(&journal_dir(dir.path()), "sess-a").is_empty()
-        );
+        assert!(crate::journal::session_shard_paths(&journal_dir(dir.path()), "sess-a").is_empty());
     }
 
     #[test]

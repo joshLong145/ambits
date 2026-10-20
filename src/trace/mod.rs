@@ -74,7 +74,11 @@ impl Span {
         if self.kind == SpanKind::Prompt {
             let line = self.description.lines().next().unwrap_or_default();
             let cut: String = line.chars().take(80).collect();
-            return if cut.len() < line.len() || self.description.lines().nth(1).is_some() { format!("{cut}…") } else { cut };
+            return if cut.len() < line.len() || self.description.lines().nth(1).is_some() {
+                format!("{cut}…")
+            } else {
+                cut
+            };
         }
         if let Some(summary) = &self.summary {
             return format!("{} · {summary}", self.tool);
@@ -90,7 +94,12 @@ impl Span {
     /// What a delegation was started for: its own description, else the
     /// one its tool's stanza made (`Agent: …`) without the tool's name.
     pub fn task(&self) -> String {
-        self.summary.clone().unwrap_or_else(|| self.description.trim_start_matches("Agent: ").trim().to_string())
+        self.summary.clone().unwrap_or_else(|| {
+            self.description
+                .trim_start_matches("Agent: ")
+                .trim()
+                .to_string()
+        })
     }
 
     /// The files whose symbols the call read — for an `ambits show` or a
@@ -107,13 +116,15 @@ impl Span {
     }
 
     /// The symbols the call read in `file`, by name path.
-    pub fn reads_in<'s>(&'s self, file: &'s str) -> impl Iterator<Item = (&'s str, crate::tracking::ReadDepth)> + 's {
+    pub fn reads_in<'s>(
+        &'s self,
+        file: &'s str,
+    ) -> impl Iterator<Item = (&'s str, crate::tracking::ReadDepth)> + 's {
         self.read.iter().filter_map(move |(id, depth)| {
             let (f, name) = crate::symbols::split_id(id);
             (f == file).then_some((name, *depth))
         })
     }
-
 }
 
 /// Something that happened at a moment rather than over time.
@@ -122,7 +133,10 @@ pub enum InstantKind {
     Compaction,
     Snapshot(String),
     /// A commit made during the session, by its committer time.
-    Commit { sha: String, subject: String },
+    Commit {
+        sha: String,
+        subject: String,
+    },
 }
 
 impl InstantKind {
@@ -131,7 +145,9 @@ impl InstantKind {
         match self {
             InstantKind::Compaction => "compaction".into(),
             InstantKind::Snapshot(id) => format!("snapshot {}", id.get(..12).unwrap_or(id)),
-            InstantKind::Commit { sha, subject } => format!("commit {} {subject}", sha.get(..7).unwrap_or(sha)),
+            InstantKind::Commit { sha, subject } => {
+                format!("commit {} {subject}", sha.get(..7).unwrap_or(sha))
+            }
         }
     }
 }
@@ -175,7 +191,9 @@ impl Trace {
     /// A call started. Calls without a parseable timestamp are skipped: a
     /// span needs a place on the time axis.
     pub fn start(&mut self, call: &AgentToolCall, project_root: &Path) {
-        let Some(start) = crate::time::parse_rfc3339_millis(&call.timestamp_str) else { return };
+        let Some(start) = crate::time::parse_rfc3339_millis(&call.timestamp_str) else {
+            return;
+        };
         let kind = if matches!(&*call.tool_name, "Agent" | "Task") {
             SpanKind::Delegate
         } else if call.effect == Effect::Write {
@@ -185,7 +203,10 @@ impl Trace {
         } else {
             SpanKind::Other
         };
-        let file = call.file_path.as_deref().and_then(|p| crate::objects::project_file(p, project_root));
+        let file = call
+            .file_path
+            .as_deref()
+            .and_then(|p| crate::objects::project_file(p, project_root));
         if let Some(id) = &call.tool_use_id {
             self.by_id.insert(id.clone(), self.spans.len());
         }
@@ -211,7 +232,9 @@ impl Trace {
     /// its launch, then its agent stopping — so the later end wins and an
     /// error from either sticks.
     pub fn finish(&mut self, f: &ToolFinished) {
-        let Some(&ix) = self.by_id.get(&f.id) else { return };
+        let Some(&ix) = self.by_id.get(&f.id) else {
+            return;
+        };
         let span = &mut self.spans[ix];
         if let Some(t) = crate::time::parse_rfc3339_millis(&f.timestamp) {
             span.end = Some(span.end.unwrap_or(0).max(t).max(span.start));
@@ -245,7 +268,9 @@ impl Trace {
     /// A turn began. Its span's own end is its start; it lasts, in the
     /// tree, as long as the calls under it.
     pub fn prompt(&mut self, prompt: &Prompt) {
-        let Some(t) = crate::time::parse_rfc3339_millis(&prompt.timestamp) else { return };
+        let Some(t) = crate::time::parse_rfc3339_millis(&prompt.timestamp) else {
+            return;
+        };
         self.spans.push(Span {
             id: None,
             agent: prompt.agent_id.clone(),
@@ -267,9 +292,17 @@ impl Trace {
     /// The commits made during the session, replacing any found before:
     /// each scan sees them all.
     pub fn set_commits(&mut self, commits: &[crate::git::Commit]) {
-        self.instants.retain(|i| !matches!(i.kind, InstantKind::Commit { .. }));
+        self.instants
+            .retain(|i| !matches!(i.kind, InstantKind::Commit { .. }));
         for c in commits {
-            self.instant(c.t, None, InstantKind::Commit { sha: c.sha.clone(), subject: c.subject.clone() });
+            self.instant(
+                c.t,
+                None,
+                InstantKind::Commit {
+                    sha: c.sha.clone(),
+                    subject: c.subject.clone(),
+                },
+            );
         }
     }
 
@@ -278,7 +311,10 @@ impl Trace {
     }
 
     /// Build a trace from a session's events, as the CLI does without a TUI.
-    pub fn from_events(events: impl IntoIterator<Item = SessionEvent>, project_root: &Path) -> Self {
+    pub fn from_events(
+        events: impl IntoIterator<Item = SessionEvent>,
+        project_root: &Path,
+    ) -> Self {
         let mut trace = Self::default();
         for event in events {
             trace.apply(&event, project_root);
@@ -291,7 +327,11 @@ impl Trace {
         match event {
             SessionEvent::ToolCall(call) => self.start(call, project_root),
             SessionEvent::ToolFinished(f) => self.finish(f),
-            SessionEvent::Compacted { timestamp, agent_id, .. } => {
+            SessionEvent::Compacted {
+                timestamp,
+                agent_id,
+                ..
+            } => {
                 if let Some(t) = crate::time::parse_rfc3339_millis(timestamp) {
                     self.instant(t, Some(agent_id.clone()), InstantKind::Compaction);
                 }
@@ -304,8 +344,16 @@ impl Trace {
 
     /// First and last moment anything happened, in milliseconds.
     pub fn range(&self) -> Option<(u64, u64)> {
-        let starts = self.spans.iter().map(|s| s.start).chain(self.instants.iter().map(|i| i.t));
-        let ends = self.spans.iter().map(|s| s.end.unwrap_or(s.start)).chain(self.instants.iter().map(|i| i.t));
+        let starts = self
+            .spans
+            .iter()
+            .map(|s| s.start)
+            .chain(self.instants.iter().map(|i| i.t));
+        let ends = self
+            .spans
+            .iter()
+            .map(|s| s.end.unwrap_or(s.start))
+            .chain(self.instants.iter().map(|i| i.t));
         Some((starts.min()?, ends.max()?))
     }
 
@@ -325,7 +373,12 @@ impl Trace {
             .filter_map(|(i, s)| Some((s.child_agent.as_deref()?, i)))
             .collect();
         let mut prompts: HashMap<&str, Vec<(u64, usize)>> = HashMap::new();
-        for (i, s) in self.spans.iter().enumerate().filter(|(_, s)| s.kind == SpanKind::Prompt) {
+        for (i, s) in self
+            .spans
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.kind == SpanKind::Prompt)
+        {
             prompts.entry(&s.agent).or_default().push((s.start, i));
         }
         for list in prompts.values_mut() {
@@ -341,7 +394,11 @@ impl Trace {
         for (i, span) in self.spans.iter().enumerate() {
             let parent = match span.kind {
                 SpanKind::Prompt => None,
-                _ => delegated.get(&*span.agent).copied().filter(|&p| p != i).or_else(|| prompt_of(span)),
+                _ => delegated
+                    .get(&*span.agent)
+                    .copied()
+                    .filter(|&p| p != i)
+                    .or_else(|| prompt_of(span)),
             };
             match parent {
                 Some(parent) => children.entry(parent).or_default().push(i),
@@ -355,20 +412,34 @@ impl Trace {
             kids.sort_by_key(start);
         }
         fn build(ix: usize, trace: &Trace, children: &HashMap<usize, Vec<usize>>) -> Node {
-            let kids: Vec<Node> = children.get(&ix).into_iter().flatten().map(|&c| build(c, trace, children)).collect();
+            let kids: Vec<Node> = children
+                .get(&ix)
+                .into_iter()
+                .flatten()
+                .map(|&c| build(c, trace, children))
+                .collect();
             let span = &trace.spans[ix];
             let own_end = span.end.unwrap_or(span.start);
             let end = kids.iter().map(|k| k.end).fold(own_end, u64::max);
-            Node { span: ix, end, children: kids }
+            Node {
+                span: ix,
+                end,
+                children: kids,
+            }
         }
-        roots.into_iter().map(|r| build(r, self, &children)).collect()
+        roots
+            .into_iter()
+            .map(|r| build(r, self, &children))
+            .collect()
     }
 
     /// The roots under an agent filter: every root, or the subtrees whose
     /// span belongs to that agent (prefix match, as `--agent` is
     /// elsewhere), in start order.
     pub fn roots<'a>(&self, tree: &'a [Node], filter: Option<&str>) -> Vec<&'a Node> {
-        let Some(agent) = filter else { return tree.iter().collect() };
+        let Some(agent) = filter else {
+            return tree.iter().collect();
+        };
         let mut out = Vec::new();
         let mut stack: Vec<&Node> = tree.iter().collect();
         while let Some(node) = stack.pop() {
@@ -407,7 +478,9 @@ impl Node {
 
 /// Span index → the root of its tree: which trace each span belongs to.
 pub fn roots_by_span(tree: &[Node]) -> HashMap<usize, usize> {
-    tree.iter().flat_map(|root| root.spans().into_iter().map(move |s| (s, root.span))).collect()
+    tree.iter()
+        .flat_map(|root| root.spans().into_iter().map(move |s| (s, root.span)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -428,7 +501,8 @@ mod tests {
             agent_id: Arc::from(agent),
             timestamp: at.to_string(),
             error: false,
-            message: None, child_agent: child.map(Arc::from),
+            message: None,
+            child_agent: child.map(Arc::from),
             shown: Vec::new(),
             printed: Vec::new(),
         }
@@ -465,9 +539,19 @@ mod tests {
         let delegation = &tree[0];
         assert_eq!(t.spans()[delegation.span].kind, SpanKind::Delegate);
         assert_eq!(delegation.children.len(), 1);
-        assert_eq!(delegation.end, crate::time::parse_rfc3339_millis(T9).unwrap());
-        let child = t.spans()[delegation.span].child_agent.clone().expect("its subagent");
-        assert_eq!(t.delegation_of(&child), Some(delegation.span), "a subagent leads back to its delegation");
+        assert_eq!(
+            delegation.end,
+            crate::time::parse_rfc3339_millis(T9).unwrap()
+        );
+        let child = t.spans()[delegation.span]
+            .child_agent
+            .clone()
+            .expect("its subagent");
+        assert_eq!(
+            t.delegation_of(&child),
+            Some(delegation.span),
+            "a subagent leads back to its delegation"
+        );
     }
 
     /// A background delegation finishes at launch and again when its agent
@@ -477,7 +561,10 @@ mod tests {
         let mut t = Trace::default();
         t.start(&call("main", "d", "Agent", T0), Path::new("/p"));
         t.finish(&done("main", "d", T1, Some("x")));
-        t.finish(&ToolFinished { error: true, ..done("main", "d", T9, Some("x")) });
+        t.finish(&ToolFinished {
+            error: true,
+            ..done("main", "d", T9, Some("x"))
+        });
         t.finish(&done("main", "d", T5, None));
         let span = &t.spans()[0];
         assert_eq!(span.end, crate::time::parse_rfc3339_millis(T9));
@@ -495,7 +582,10 @@ mod tests {
     #[test]
     fn a_clear_empties_the_trace() {
         let mut t = Trace::default();
-        t.apply(&SessionEvent::ToolCall(call("main", "t1", "Read", T0)), Path::new("/p"));
+        t.apply(
+            &SessionEvent::ToolCall(call("main", "t1", "Read", T0)),
+            Path::new("/p"),
+        );
         t.apply(&SessionEvent::SessionCleared, Path::new("/p"));
         assert!(t.is_empty());
     }

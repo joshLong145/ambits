@@ -115,12 +115,20 @@ impl NameInterner {
 
 impl SymbolNode {
     pub fn total_symbols(&self) -> usize {
-        1 + self.children.iter().map(|c| c.total_symbols()).sum::<usize>()
+        1 + self
+            .children
+            .iter()
+            .map(|c| c.total_symbols())
+            .sum::<usize>()
     }
 
     pub fn total_tokens(&self) -> usize {
         self.estimated_tokens as usize
-            + self.children.iter().map(|c| c.total_tokens()).sum::<usize>()
+            + self
+                .children
+                .iter()
+                .map(|c| c.total_tokens())
+                .sum::<usize>()
     }
 
     /// The nesting path within the file, e.g. `App/process_compaction`.
@@ -162,14 +170,19 @@ impl FileSymbols {
 
 /// Recursive half of [`FileSymbols::enclosing`].
 fn enclosing(symbols: &[SymbolNode], byte: u32) -> Option<&SymbolNode> {
-    innermost(symbols, &|sym| sym.byte_range.start <= byte && byte < sym.byte_range.end)
+    innermost(symbols, &|sym| {
+        sym.byte_range.start <= byte && byte < sym.byte_range.end
+    })
 }
 
 /// The deepest symbol `contains` accepts, descending only into symbols it
 /// accepts: the one containment search, whatever the position is measured
 /// in (a byte for `enclosing`, a line for write attribution). A symbol whose
 /// children do not contain the position is itself the answer.
-pub fn innermost<'a>(symbols: &'a [SymbolNode], contains: &dyn Fn(&SymbolNode) -> bool) -> Option<&'a SymbolNode> {
+pub fn innermost<'a>(
+    symbols: &'a [SymbolNode],
+    contains: &dyn Fn(&SymbolNode) -> bool,
+) -> Option<&'a SymbolNode> {
     let hit = symbols.iter().find(|s| contains(s))?;
     innermost(&hit.children, contains).or(Some(hit))
 }
@@ -209,7 +222,9 @@ pub fn split_id(id: &str) -> (&str, &str) {
 /// `name_path` is `ancestor` or nested inside it, by name path: `App`
 /// covers `App/handle_key` but not `Application`. Works on whole ids too.
 pub fn nested_in(name_path: &str, ancestor: &str) -> bool {
-    name_path.strip_prefix(ancestor).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    name_path
+        .strip_prefix(ancestor)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// The full project symbol tree, organized by directory structure.
@@ -223,7 +238,9 @@ impl ProjectTree {
     /// The file whose project-relative path is `rel`, as records name files
     /// (normalized, `/`-separated).
     pub fn file(&self, rel: &str) -> Option<&FileSymbols> {
-        self.files.iter().find(|f| crate::objects::normalize_path(&f.file_path.to_string_lossy()) == rel)
+        self.files
+            .iter()
+            .find(|f| crate::objects::normalize_path(&f.file_path.to_string_lossy()) == rel)
     }
 
     /// Every symbol in the tree, depth-first, paired with its owning file.
@@ -239,7 +256,11 @@ impl ProjectTree {
     pub fn walk(&self) -> Vec<(&Path, &SymbolNode)> {
         self.files
             .iter()
-            .flat_map(|file| file.walk().into_iter().map(move |sym| (file.file_path.as_path(), sym)))
+            .flat_map(|file| {
+                file.walk()
+                    .into_iter()
+                    .map(move |sym| (file.file_path.as_path(), sym))
+            })
             .collect()
     }
 
@@ -260,9 +281,16 @@ mod tests {
     #[test]
     fn ids_split_at_the_first_separator() {
         assert_eq!(split_id("src/a.rs::App/run"), ("src/a.rs", "App/run"));
-        assert_eq!(split_id("src/a.rs::impl fmt::Display for X"), ("src/a.rs", "impl fmt::Display for X"));
+        assert_eq!(
+            split_id("src/a.rs::impl fmt::Display for X"),
+            ("src/a.rs", "impl fmt::Display for X")
+        );
         assert_eq!(split_id("no-separator"), ("", "no-separator"));
-        assert!(nested_in("App/run", "App") && nested_in("App", "App") && !nested_in("Application", "App"));
+        assert!(
+            nested_in("App/run", "App")
+                && nested_in("App", "App")
+                && !nested_in("Application", "App")
+        );
     }
 
     /// `sym_with_children` leaves the parent spanning 0..100, so the child's

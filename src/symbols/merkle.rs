@@ -167,7 +167,8 @@ mod tests {
             label: "fn",
             file_path: Arc::new(PathBuf::new()),
             byte_range: 0..0,
-            line_range: 0..0, head_line: 0,
+            line_range: 0..0,
+            head_line: 0,
             content_hash: content_hash("fn x() {}"),
             merkle_hash: [0u8; 32],
             children: Vec::new(),
@@ -190,7 +191,8 @@ mod tests {
             label: "fn",
             file_path: Arc::new(PathBuf::new()),
             byte_range: 0..0,
-            line_range: 0..0, head_line: 0,
+            line_range: 0..0,
+            head_line: 0,
             content_hash: content_hash(name),
             merkle_hash: [0u8; 32],
             children: Vec::new(),
@@ -200,8 +202,14 @@ mod tests {
         parent.children = vec![make("a"), make("b")];
         compute_merkle_hash(&mut parent);
         assert_ne!(parent.merkle_hash, parent.content_hash);
-        assert_eq!(parent.children[0].merkle_hash, parent.children[0].content_hash);
-        assert_eq!(parent.children[1].merkle_hash, parent.children[1].content_hash);
+        assert_eq!(
+            parent.children[0].merkle_hash,
+            parent.children[0].content_hash
+        );
+        assert_eq!(
+            parent.children[1].merkle_hash,
+            parent.children[1].content_hash
+        );
     }
 
     #[test]

@@ -965,7 +965,8 @@ pub fn make_sym(id: &str, name: &str) -> SymbolNode {
         label: "fn",
         file_path: Arc::new(PathBuf::from("src/bench.rs")),
         byte_range: 0..100,
-        line_range: 1..10, head_line: 1,
+        line_range: 1..10,
+        head_line: 1,
         content_hash: hash,
         merkle_hash: hash,
         children: Vec::new(),
@@ -991,7 +992,9 @@ pub fn make_symbol_tree(depth: usize, breadth: usize) -> SymbolNode {
 
 /// Build a flat list of N symbols, all in one file.
 pub fn make_flat_symbols(n: usize) -> Vec<SymbolNode> {
-    (0..n).map(|i| make_sym(&format!("src/bench.rs::sym_{i}"), &format!("sym_{i}"))).collect()
+    (0..n)
+        .map(|i| make_sym(&format!("src/bench.rs::sym_{i}"), &format!("sym_{i}")))
+        .collect()
 }
 
 /// Build a FileSymbols containing `n_symbols` flat symbols.
@@ -1000,9 +1003,16 @@ pub fn make_file(path: &str, n_symbols: usize) -> FileSymbols {
     let file_path_arc = Arc::new(file_path.clone());
     let symbols = make_flat_symbols(n_symbols)
         .into_iter()
-        .map(|mut s| { s.file_path = Arc::clone(&file_path_arc); s })
+        .map(|mut s| {
+            s.file_path = Arc::clone(&file_path_arc);
+            s
+        })
         .collect();
-    FileSymbols { file_path, symbols, total_lines: n_symbols * 5 }
+    FileSymbols {
+        file_path,
+        symbols,
+        total_lines: n_symbols * 5,
+    }
 }
 
 /// Build a ProjectTree with `n_files` files, each containing `symbols_per_file` symbols.
@@ -1010,7 +1020,10 @@ pub fn make_project(n_files: usize, symbols_per_file: usize) -> ProjectTree {
     let files = (0..n_files)
         .map(|i| make_file(&format!("src/module_{i}.rs"), symbols_per_file))
         .collect();
-    ProjectTree { root: PathBuf::from("/bench/project"), files }
+    ProjectTree {
+        root: PathBuf::from("/bench/project"),
+        files,
+    }
 }
 
 /// Build a synthetic monorepo `ProjectTree` for project-scale benchmarks.
@@ -1089,7 +1102,13 @@ pub fn make_populated_ledger(project: &ProjectTree) -> ContextLedger {
     let hash = [0u8; 32];
     for file in &project.files {
         for sym in &file.symbols {
-            ledger.record(sym.id.clone(), ReadDepth::FullBody, hash, "agent-0".to_string(), sym.estimated_tokens as usize);
+            ledger.record(
+                sym.id.clone(),
+                ReadDepth::FullBody,
+                hash,
+                "agent-0".to_string(),
+                sym.estimated_tokens as usize,
+            );
         }
     }
     ledger
@@ -1101,8 +1120,14 @@ pub fn make_jsonl_lines(n: usize) -> String {
         (r#"{"type":"read","file_path":"src/main.rs"}"#, "Read"),
         (r#"{"pattern":"**/*.rs"}"#, "Glob"),
         (r#"{"pattern":"fn parse","path":"src"}"#, "Grep"),
-        (r#"{"name_path_pattern":"parse_file","relative_path":"src/parser/rust.rs"}"#, "mcp__serena__find_symbol"),
-        (r#"{"relative_path":"src/coverage.rs","depth":1}"#, "mcp__serena__get_symbols_overview"),
+        (
+            r#"{"name_path_pattern":"parse_file","relative_path":"src/parser/rust.rs"}"#,
+            "mcp__serena__find_symbol",
+        ),
+        (
+            r#"{"relative_path":"src/coverage.rs","depth":1}"#,
+            "mcp__serena__get_symbols_overview",
+        ),
     ];
     let mut out = String::with_capacity(n * 200);
     for i in 0..n {

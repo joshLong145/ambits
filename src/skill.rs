@@ -19,8 +19,7 @@ const SKILL_FILES: &[(&str, &str)] = &[
 pub fn install(global: bool, project: Option<PathBuf>) -> Result<()> {
     let mut out = std::io::stdout().lock();
     let target_dir = if global {
-        let home = std::env::var("HOME")
-            .wrap_err("HOME environment variable not set")?;
+        let home = std::env::var("HOME").wrap_err("HOME environment variable not set")?;
         PathBuf::from(home).join(".claude/skills/ambit")
     } else if let Some(p) = project {
         p.join(".claude/skills/ambit")

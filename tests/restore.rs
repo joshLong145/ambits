@@ -35,7 +35,11 @@ impl Project {
         git(&root, &["init", "-q"]);
         git(&root, &["add", "."]);
         git(&root, &["commit", "-qm", "init"]);
-        let p = Self { _dir: dir, root, registry: ParserRegistry::new() };
+        let p = Self {
+            _dir: dir,
+            root,
+            registry: ParserRegistry::new(),
+        };
 
         let tree = p.registry.scan_project(&p.root, None).unwrap();
         let mut records: Vec<ambits::journal::Record> = tree
@@ -48,7 +52,9 @@ impl Project {
                 agent: Some("agent-1".into()),
             })
             .collect();
-        records.push(ambits::journal::Record::Write(Box::new(common::write_record("toolu_1", "src/a.rs"))));
+        records.push(ambits::journal::Record::Write(Box::new(
+            common::write_record("toolu_1", "src/a.rs"),
+        )));
         common::append_journal(&p.root, SOURCE, &records);
         p
     }
@@ -68,15 +74,28 @@ impl Project {
 
     fn restore(&self, reference: &str, into: Option<&str>) -> Report {
         let tree = self.registry.scan_project(&self.root, None).unwrap();
-        restore(&Request { project_root: &self.root, reference, into, tree: &tree, backend: "tree-sitter", filter: None }).unwrap()
+        restore(&Request {
+            project_root: &self.root,
+            reference,
+            into,
+            tree: &tree,
+            backend: "tree-sitter",
+            filter: None,
+        })
+        .unwrap()
     }
 
     fn shard(&self, session: &str) -> String {
-        std::fs::read_to_string(self.root.join(format!(".ambits/coverage/{session}.restore.ndjson"))).unwrap_or_default()
+        std::fs::read_to_string(
+            self.root
+                .join(format!(".ambits/coverage/{session}.restore.ndjson")),
+        )
+        .unwrap_or_default()
     }
 
     fn target_reads(&self, session: &str) -> Vec<String> {
-        let contents = ambits::journal::read_journal_session(&self.root.join(".ambits/coverage"), session);
+        let contents =
+            ambits::journal::read_journal_session(&self.root.join(".ambits/coverage"), session);
         let mut ids: Vec<String> = contents.reads.into_keys().collect();
         ids.sort();
         ids
@@ -97,12 +116,25 @@ fn restoring_into_a_new_session_mints_it_and_fills_it() {
     let p = Project::new();
     let id = created(p.snapshot(SOURCE));
     let report = p.restore(SOURCE, None);
-    assert!(ambits::ingest::claude::is_uuid(&report.session), "{}", report.session);
+    assert!(
+        ambits::ingest::claude::is_uuid(&report.session),
+        "{}",
+        report.session
+    );
     assert_eq!((report.reads_appended, report.writes_appended), (3, 1));
-    assert_eq!(p.target_reads(&report.session), vec!["src/a.rs::alpha", "src/a.rs::beta", "src/b.rs::gamma"]);
-    assert!(p.shard(&report.session).contains(r#""kind":"history","of":"write""#));
+    assert_eq!(
+        p.target_reads(&report.session),
+        vec!["src/a.rs::alpha", "src/a.rs::beta", "src/b.rs::gamma"]
+    );
+    assert!(p
+        .shard(&report.session)
+        .contains(r#""kind":"history","of":"write""#));
     let store = Store::at(&p.root);
-    let tip = ambits::objects::refs::read(&store, &ambits::objects::refs::RefName::session(&report.session).unwrap()).unwrap();
+    let tip = ambits::objects::refs::read(
+        &store,
+        &ambits::objects::refs::RefName::session(&report.session).unwrap(),
+    )
+    .unwrap();
     assert_eq!(tip, Some(id));
     assert!(report.pinned_elsewhere.is_none(), "same commit: no warning");
 }
@@ -116,7 +148,10 @@ fn restoring_twice_changes_nothing() {
     let reflog = || std::fs::read_to_string(p.root.join(".ambits/reflog.ndjson")).unwrap();
     let (shard, before) = (p.shard(TARGET), reflog());
     let again = p.restore(SOURCE, Some(TARGET));
-    assert_eq!((again.reads_appended, again.writes_appended, again.ref_moved), (0, 0, false));
+    assert_eq!(
+        (again.reads_appended, again.writes_appended, again.ref_moved),
+        (0, 0, false)
+    );
     assert_eq!(p.shard(TARGET), shard);
     assert_eq!(reflog(), before);
 }
@@ -128,7 +163,10 @@ fn the_targets_next_snapshot_descends_from_the_restored_one() {
     let restored = created(p.snapshot(SOURCE));
     p.restore(SOURCE, Some(TARGET));
     let next = created(p.snapshot(TARGET));
-    assert_eq!(Snapshot::load(&Store::at(&p.root), next).unwrap().parents, vec![restored]);
+    assert_eq!(
+        Snapshot::load(&Store::at(&p.root), next).unwrap().parents,
+        vec![restored]
+    );
 }
 
 /// A symbol moved to another file since is restored at its new address.
@@ -140,8 +178,12 @@ fn a_moved_symbol_is_restored_where_it_lives_now() {
     std::fs::write(p.root.join("src/b.rs"), "fn gamma() {}\nfn beta() {}\n").unwrap();
     let report = p.restore(SOURCE, Some(TARGET));
     assert_eq!(report.files["src/a.rs"].moved, 1);
-    assert!(p.target_reads(TARGET).contains(&"src/b.rs::beta".to_string()));
-    assert!(!p.target_reads(TARGET).contains(&"src/a.rs::beta".to_string()));
+    assert!(p
+        .target_reads(TARGET)
+        .contains(&"src/b.rs::beta".to_string()));
+    assert!(!p
+        .target_reads(TARGET)
+        .contains(&"src/a.rs::beta".to_string()));
 }
 
 /// A symbol changed since is reported drifted and not restored.
@@ -153,7 +195,9 @@ fn a_drifted_symbol_is_reported_and_left_out() {
     git(&p.root, &["commit", "-qam", "edit"]);
     let report = p.restore(SOURCE, Some(TARGET));
     assert_eq!(report.files["src/a.rs"].drifted, 1);
-    assert!(!p.target_reads(TARGET).contains(&"src/a.rs::alpha".to_string()));
+    assert!(!p
+        .target_reads(TARGET)
+        .contains(&"src/a.rs::alpha".to_string()));
 }
 
 /// A snapshot on another commit is restored with a warning, never a checkout.
@@ -169,7 +213,11 @@ fn a_snapshot_on_another_commit_warns() {
     let (pinned, head) = report.pinned_elsewhere.clone().expect("warned");
     assert_eq!(pinned.as_deref(), Some(before.as_str()));
     assert_ne!(head, pinned);
-    assert_ne!(git(&p.root, &["rev-parse", "HEAD"]), before, "nothing was checked out");
+    assert_ne!(
+        git(&p.root, &["rev-parse", "HEAD"]),
+        before,
+        "nothing was checked out"
+    );
 }
 
 /// What was read in a file that was dirty when snapshotted, and has since
@@ -180,7 +228,13 @@ fn reads_of_a_since_changed_dirty_file_are_unverifiable() {
     std::fs::write(p.root.join("src/b.rs"), "fn gamma() { 1; }\n").unwrap();
     // The session read the dirty version.
     let tree = p.registry.scan_project(&p.root, None).unwrap();
-    let gamma = tree.walk().into_iter().find(|(_, s)| &*s.name == "gamma").unwrap().1.clone();
+    let gamma = tree
+        .walk()
+        .into_iter()
+        .find(|(_, s)| &*s.name == "gamma")
+        .unwrap()
+        .1
+        .clone();
     let read = ambits::journal::Record::Read {
         symbol_id: gamma.id.clone(),
         hash: ambits::journal::encode_hash(&gamma.content_hash),
@@ -208,5 +262,10 @@ fn the_cli_restores_and_reports() {
     assert!(out.contains(&format!("into session {TARGET}")), "{out}");
     assert!(out.contains("src/a.rs: 2 verified"), "{out}");
     let again = run_ambits(&p.root, &["restore", SOURCE, "--into", TARGET]);
-    assert!(again.contains("0 read(s) and 0 write(s) appended; the session already pointed at this snapshot"), "{again}");
+    assert!(
+        again.contains(
+            "0 read(s) and 0 write(s) appended; the session already pointed at this snapshot"
+        ),
+        "{again}"
+    );
 }

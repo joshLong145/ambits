@@ -13,7 +13,11 @@ const SESSION: &str = "1b0cc9c2-14c1-46fa-a36e-8a948e95a1c1";
 
 fn write_log(path: &Path, lines: &[Value]) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+    std::fs::write(
+        path,
+        lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+    )
+    .unwrap();
 }
 
 struct Layout {
@@ -37,49 +41,95 @@ fn layout() -> Layout {
     let cwd = workspace.to_string_lossy().into_owned();
     let base = |at: &str| json!({"sessionId": SESSION, "cwd": cwd, "entrypoint": "sdk-py", "timestamp": at});
     let merge = |mut a: Value, b: Value| {
-        a.as_object_mut().unwrap().extend(b.as_object().unwrap().clone());
+        a.as_object_mut()
+            .unwrap()
+            .extend(b.as_object().unwrap().clone());
         a
     };
     let logs = dir.path().join("logs");
     write_log(
         &logs.join(format!("{SESSION}.jsonl")),
         &[
-            merge(base("2026-10-10T10:00:00.000Z"), json!({"type": "user", "message": {"role": "user", "content": "## Runtime Context\n\n- Issue: X-1"}})),
-            merge(base("2026-10-10T10:00:01.000Z"), json!({"type": "assistant", "message": {"role": "assistant", "content": [
-                {"type": "tool_use", "id": "toolu_r", "name": "Read", "input": {"file_path": file}}]}})),
-            merge(base("2026-10-10T10:00:01.200Z"), json!({"type": "user",
+            merge(
+                base("2026-10-10T10:00:00.000Z"),
+                json!({"type": "user", "message": {"role": "user", "content": "## Runtime Context\n\n- Issue: X-1"}}),
+            ),
+            merge(
+                base("2026-10-10T10:00:01.000Z"),
+                json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_r", "name": "Read", "input": {"file_path": file}}]}}),
+            ),
+            merge(
+                base("2026-10-10T10:00:01.200Z"),
+                json!({"type": "user",
                 "toolUseResult": {"type": "text", "file": {"filePath": file, "content": before, "startLine": 1}},
-                "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_r", "content": "ok"}]}})),
-            merge(base("2026-10-10T10:00:02.000Z"), json!({"type": "assistant", "message": {"role": "assistant", "content": [
-                {"type": "tool_use", "id": "toolu_e", "name": "Edit", "input": {"file_path": file, "old_string": "fn alpha() {}", "new_string": "fn alpha() { let _x = 1; }"}}]}})),
-            merge(base("2026-10-10T10:00:02.300Z"), json!({"type": "user",
+                "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_r", "content": "ok"}]}}),
+            ),
+            merge(
+                base("2026-10-10T10:00:02.000Z"),
+                json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_e", "name": "Edit", "input": {"file_path": file, "old_string": "fn alpha() {}", "new_string": "fn alpha() { let _x = 1; }"}}]}}),
+            ),
+            merge(
+                base("2026-10-10T10:00:02.300Z"),
+                json!({"type": "user",
                 "toolUseResult": {"filePath": file, "oldString": "fn alpha() {}", "newString": "fn alpha() { let _x = 1; }",
                     "originalFile": before, "replaceAll": false, "userModified": false,
                     "structuredPatch": [{"oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1,
                         "lines": ["-fn alpha() {}", "+fn alpha() { let _x = 1; }"]}]},
-                "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_e", "content": "ok"}]}})),
+                "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_e", "content": "ok"}]}}),
+            ),
         ],
     );
-    Layout { _dir: dir, clone, logs }
+    Layout {
+        _dir: dir,
+        clone,
+        logs,
+    }
 }
 
 fn run(l: &Layout, args: &[&str]) -> Value {
     let logs = l.logs.to_string_lossy().into_owned();
     let clone = l.clone.to_string_lossy().into_owned();
     let out = ambits(&l.clone)
-        .args([&["-p", clone.as_str(), "--log-dir", logs.as_str(), "--session", SESSION], args].concat())
+        .args(
+            [
+                &[
+                    "-p",
+                    clone.as_str(),
+                    "--log-dir",
+                    logs.as_str(),
+                    "--session",
+                    SESSION,
+                ],
+                args,
+            ]
+            .concat(),
+        )
         .output()
         .unwrap();
-    assert!(out.status.success(), "ambits {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "ambits {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     serde_json::from_slice(&out.stdout).expect("JSON output")
 }
 
 fn spans(trace: &Value) -> Vec<&Value> {
-    trace["resourceSpans"][0]["scopeSpans"][0]["spans"].as_array().unwrap().iter().collect()
+    trace["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .collect()
 }
 
 fn attr<'a>(span: &'a Value, key: &str) -> Option<&'a Value> {
-    span["attributes"].as_array()?.iter().find(|a| a["key"] == key).map(|a| &a["value"])
+    span["attributes"]
+        .as_array()?
+        .iter()
+        .find(|a| a["key"] == key)
+        .map(|a| &a["value"])
 }
 
 #[test]
@@ -97,8 +147,14 @@ fn tool_paths_are_relative_to_the_clone_not_the_sessions_cwd() {
 fn a_prompt_with_no_origin_still_roots_its_calls() {
     let l = layout();
     let trace = run(&l, &["trace"]);
-    let prompt = spans(&trace).into_iter().find(|s| attr(s, "ambits.prompt").is_some()).expect("a prompt span");
-    assert!(prompt["name"].as_str().unwrap().starts_with("## Runtime Context"));
+    let prompt = spans(&trace)
+        .into_iter()
+        .find(|s| attr(s, "ambits.prompt").is_some())
+        .expect("a prompt span");
+    assert!(prompt["name"]
+        .as_str()
+        .unwrap()
+        .starts_with("## Runtime Context"));
 }
 
 #[test]
@@ -113,7 +169,23 @@ fn sync(l: &Layout, state: &Path, extra: &[&str]) -> std::process::Output {
     let clone = l.clone.to_string_lossy().into_owned();
     let state = state.to_string_lossy().into_owned();
     ambits(&l.clone)
-        .args([&["-p", clone.as_str(), "--log-dir", logs.as_str(), "--session", SESSION, "--state-dir", state.as_str()], extra, &["cache", "sync", "--format", "json"]].concat())
+        .args(
+            [
+                &[
+                    "-p",
+                    clone.as_str(),
+                    "--log-dir",
+                    logs.as_str(),
+                    "--session",
+                    SESSION,
+                    "--state-dir",
+                    state.as_str(),
+                ],
+                extra,
+                &["cache", "sync", "--format", "json"],
+            ]
+            .concat(),
+        )
         .output()
         .unwrap()
 }
@@ -123,12 +195,25 @@ fn cache_sync_journals_reads_and_symbol_level_writes_without_a_terminal() {
     let l = layout();
     let state = l.logs.with_file_name("state");
     let out = sync(&l, &state, &[]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let summary: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!((summary["symbols_read"].as_u64(), summary["writes"].as_u64()), (Some(2), Some(1)), "{summary}");
+    assert_eq!(
+        (summary["symbols_read"].as_u64(), summary["writes"].as_u64()),
+        (Some(2), Some(1)),
+        "{summary}"
+    );
 
-    let journal = std::fs::read_to_string(state.join(format!("coverage/{SESSION}.ndjson"))).unwrap();
-    let write: Value = journal.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|r| r["kind"] == "write").expect("a write record");
+    let journal =
+        std::fs::read_to_string(state.join(format!("coverage/{SESSION}.ndjson"))).unwrap();
+    let write: Value = journal
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|r| r["kind"] == "write")
+        .expect("a write record");
     assert_eq!(write["level"], "symbol");
     assert_eq!(write["syms"][0][0], "src/a.rs::alpha", "{write}");
     assert!(!l.clone.join(".ambits").exists());
@@ -178,29 +263,54 @@ fn cache_sync_credits_a_subagent_nested_under_a_workflow() {
     let file = l.clone.join("src/a.rs").to_string_lossy().into_owned();
     let line = |at: &str, body: Value| {
         let mut v = json!({"sessionId": SESSION, "agentId": "wf1", "timestamp": at});
-        v.as_object_mut().unwrap().extend(body.as_object().unwrap().clone());
+        v.as_object_mut()
+            .unwrap()
+            .extend(body.as_object().unwrap().clone());
         v
     };
     write_log(
-        &l.logs.join(SESSION).join("subagents/workflows/run-1/agent-wf1.jsonl"),
+        &l.logs
+            .join(SESSION)
+            .join("subagents/workflows/run-1/agent-wf1.jsonl"),
         &[
-            line("2026-10-10T10:00:03.000Z", json!({"type": "assistant", "message": {"role": "assistant", "content": [
-                {"type": "tool_use", "id": "toolu_w", "name": "Read", "input": {"file_path": file}}]}})),
-            line("2026-10-10T10:00:03.100Z", json!({"type": "user", "toolUseResult": {},
-                "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_w", "content": "ok"}]}})),
+            line(
+                "2026-10-10T10:00:03.000Z",
+                json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_w", "name": "Read", "input": {"file_path": file}}]}}),
+            ),
+            line(
+                "2026-10-10T10:00:03.100Z",
+                json!({"type": "user", "toolUseResult": {},
+                "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_w", "content": "ok"}]}}),
+            ),
         ],
     );
     let state = l.logs.with_file_name("state");
     assert!(sync(&l, &state, &[]).status.success());
-    let journal = std::fs::read_to_string(state.join(format!("coverage/{SESSION}.ndjson"))).unwrap();
+    let journal =
+        std::fs::read_to_string(state.join(format!("coverage/{SESSION}.ndjson"))).unwrap();
     assert!(
-        journal.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).any(|r| r["kind"] == "read" && r["a"] == "wf1"),
+        journal
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .any(|r| r["kind"] == "read" && r["a"] == "wf1"),
         "no read credited to the nested agent:\n{journal}"
     );
 }
 
 fn report(l: &Layout, extra: &[&str]) -> Value {
-    run(l, &[&["--state-dir", l.logs.with_file_name("state").to_str().unwrap()], &["report"][..], extra].concat())
+    run(
+        l,
+        &[
+            &[
+                "--state-dir",
+                l.logs.with_file_name("state").to_str().unwrap(),
+            ],
+            &["report"][..],
+            extra,
+        ]
+        .concat(),
+    )
 }
 
 #[test]
@@ -210,22 +320,52 @@ fn the_report_attributes_the_edit_to_its_symbol_and_its_span() {
     assert_eq!(r["schema_version"], 1);
     assert_eq!(r["project"]["name"], "repo");
     let write = &r["writes"][0];
-    assert_eq!(write["symbols"], json!([{"id": "src/a.rs::alpha", "status": "current"}]), "{write}");
+    assert_eq!(
+        write["symbols"],
+        json!([{"id": "src/a.rs::alpha", "status": "current"}]),
+        "{write}"
+    );
     let span = &r["spans"][write["span"].as_u64().unwrap() as usize];
-    assert_eq!((span["kind"].as_str(), span["tool"].as_str()), (Some("write"), Some("Edit")));
-    let prompt = r["spans"].as_array().unwrap().iter().find(|s| s["kind"] == "prompt").unwrap();
-    assert_eq!(span["parent"], prompt["i"], "the edit nests under the prompt that started its turn");
+    assert_eq!(
+        (span["kind"].as_str(), span["tool"].as_str()),
+        (Some("write"), Some("Edit"))
+    );
+    let prompt = r["spans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["kind"] == "prompt")
+        .unwrap();
+    assert_eq!(
+        span["parent"], prompt["i"],
+        "the edit nests under the prompt that started its turn"
+    );
 }
 
 #[test]
 fn the_report_lists_each_symbol_with_who_read_it_and_which_writes_touched_it() {
     let l = layout();
     let r = report(&l, &[]);
-    let file = r["files"].as_array().unwrap().iter().find(|f| f["path"] == "src/a.rs").unwrap();
-    let alpha = file["symbols"].as_array().unwrap().iter().find(|s| s["id"] == "src/a.rs::alpha").unwrap();
+    let file = r["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "src/a.rs")
+        .unwrap();
+    let alpha = file["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "src/a.rs::alpha")
+        .unwrap();
     assert_eq!(alpha["reads"][SESSION], "full_body");
     assert_eq!(alpha["writes"], json!([r["writes"][0]["op"]]));
-    let read = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Read").unwrap();
+    let read = r["spans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["tool"] == "Read")
+        .unwrap();
     assert_eq!(read["read_count"], 2, "{read}");
     assert_eq!(r["totals"]["symbols_written"], 1);
 }
@@ -252,7 +392,10 @@ fn the_report_carries_no_absolute_path() {
         }
         r
     };
-    assert!(!without_details.to_string().contains(&root), "{without_details}");
+    assert!(
+        !without_details.to_string().contains(&root),
+        "{without_details}"
+    );
 }
 
 #[test]
@@ -260,11 +403,34 @@ fn max_bytes_cuts_in_order_and_says_so() {
     let l = layout();
     let full = report(&l, &[]);
     let r = report(&l, &["--max-bytes", "10"]);
-    assert_eq!(r["truncated"], json!(["unwritten_file_symbols", "read_text", "output", "span_reads", "arguments", "phase_attrs", "diffs", "other_spans"]));
+    assert_eq!(
+        r["truncated"],
+        json!([
+            "unwritten_file_symbols",
+            "read_text",
+            "output",
+            "span_reads",
+            "arguments",
+            "phase_attrs",
+            "diffs",
+            "other_spans"
+        ])
+    );
     assert_eq!(r["writes"], full["writes"], "writes are never cut");
-    let read = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Read").unwrap();
-    assert_eq!((read["read"].clone(), read["read_count"].clone()), (json!([]), json!(2)));
-    assert!(report(&l, &["--max-bytes", "100000000"])["truncated"].as_array().unwrap().is_empty());
+    let read = r["spans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["tool"] == "Read")
+        .unwrap();
+    assert_eq!(
+        (read["read"].clone(), read["read_count"].clone()),
+        (json!([]), json!(2))
+    );
+    assert!(report(&l, &["--max-bytes", "100000000"])["truncated"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 fn phases_doc() -> Value {
@@ -292,8 +458,14 @@ fn the_report_carries_the_harness_phases_as_given() {
     let l = layout();
     let doc = phases_doc();
     let r = report(&l, &["--phases", &phases_file(&l, &doc)]);
-    assert_eq!(r["phases"], doc, "a lane given no `nest` is carried without one");
-    assert!(report(&l, &[]).get("phases").is_none(), "no --phases, no key: older readers see the same document");
+    assert_eq!(
+        r["phases"], doc,
+        "a lane given no `nest` is carried without one"
+    );
+    assert!(
+        report(&l, &[]).get("phases").is_none(),
+        "no --phases, no key: older readers see the same document"
+    );
 }
 
 #[test]
@@ -302,9 +474,18 @@ fn a_lane_nests_calls_only_when_it_says_so_with_a_bool() {
     let mut quoted = phases_doc();
     quoted["lanes"][1]["nest"] = json!("yes");
     let out = report_page(&l, &["--phases", &phases_file(&l, &quoted)]);
-    assert!(!out.status.success(), "a `nest` that is not a bool is refused");
+    assert!(
+        !out.status.success(),
+        "a `nest` that is not a bool is refused"
+    );
     let r = report(&l, &["--phases", &phases_file(&l, &phases_doc())]);
-    assert_eq!((r["phases"]["lanes"][0].get("nest"), &r["phases"]["lanes"][1]["nest"]), (None, &json!(true)));
+    assert_eq!(
+        (
+            r["phases"]["lanes"][0].get("nest"),
+            &r["phases"]["lanes"][1]["nest"]
+        ),
+        (None, &json!(true))
+    );
 }
 
 #[test]
@@ -316,10 +497,18 @@ fn a_phases_document_with_impossible_times_or_unknown_fields_is_refused() {
     unknown["lanes"][0]["colour"] = json!("red");
     let mut unnamed = phases_doc();
     unnamed["lanes"][0]["name"] = json!(" ");
-    for (doc, says) in [(backwards, "ends before it starts"), (unknown, "colour"), (unnamed, "no name")] {
+    for (doc, says) in [
+        (backwards, "ends before it starts"),
+        (unknown, "colour"),
+        (unnamed, "no name"),
+    ] {
         let out = report_page(&l, &["--phases", &phases_file(&l, &doc)]);
         assert!(!out.status.success(), "accepted {doc}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains(says), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(says),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
 
@@ -330,16 +519,34 @@ fn max_bytes_cuts_phase_attributes_but_keeps_their_times() {
     let r = report(&l, &["--phases", &file, "--max-bytes", "10"]);
     let phases = &r["phases"]["lanes"][1]["spans"];
     assert_eq!(phases[1]["attrs"], json!([]));
-    assert_eq!((phases[1]["start_ms"].clone(), phases[1]["end_ms"].clone()), (json!(1_791_626_400_000u64), json!(1_791_626_402_900u64)));
+    assert_eq!(
+        (phases[1]["start_ms"].clone(), phases[1]["end_ms"].clone()),
+        (json!(1_791_626_400_000u64), json!(1_791_626_402_900u64))
+    );
     assert_eq!(r["phases"]["markers"][0]["attrs"], json!([]));
 }
 
 #[test]
 fn the_html_report_embeds_the_phases() {
     let l = layout();
-    let out = report_page(&l, &["--format", "html", "--phases", &phases_file(&l, &phases_doc())]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(embedded_report(&String::from_utf8(out.stdout).unwrap())["phases"], phases_doc());
+    let out = report_page(
+        &l,
+        &[
+            "--format",
+            "html",
+            "--phases",
+            &phases_file(&l, &phases_doc()),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        embedded_report(&String::from_utf8(out.stdout).unwrap())["phases"],
+        phases_doc()
+    );
 }
 
 #[test]
@@ -348,8 +555,22 @@ fn phases_cannot_be_added_to_a_report_built_elsewhere() {
     let file = l.logs.with_file_name("r.json");
     std::fs::write(&file, report(&l, &[]).to_string()).unwrap();
     let phases = phases_file(&l, &phases_doc());
-    let out = ambits(&l.clone).args(["report", "--format", "html", "--from-json", file.to_str().unwrap(), "--phases", &phases]).output().unwrap();
-    assert!(!out.status.success(), "a screened report carries its phases already");
+    let out = ambits(&l.clone)
+        .args([
+            "report",
+            "--format",
+            "html",
+            "--from-json",
+            file.to_str().unwrap(),
+            "--phases",
+            &phases,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a screened report carries its phases already"
+    );
 }
 
 #[test]
@@ -358,9 +579,16 @@ fn the_report_folds_in_writes_already_journaled() {
     let state = l.logs.with_file_name("state");
     assert!(sync(&l, &state, &[]).status.success());
     std::fs::remove_file(l.logs.join(format!("{SESSION}.jsonl"))).unwrap();
-    std::fs::write(l.logs.join(format!("{SESSION}.jsonl")), "{\"type\":\"user\",\"sessionId\":\"x\"}\n").unwrap();
+    std::fs::write(
+        l.logs.join(format!("{SESSION}.jsonl")),
+        "{\"type\":\"user\",\"sessionId\":\"x\"}\n",
+    )
+    .unwrap();
     let r = report(&l, &[]);
-    assert_eq!(r["writes"][0]["symbols"][0]["id"], "src/a.rs::alpha", "the journal's write survives a log that lost it");
+    assert_eq!(
+        r["writes"][0]["symbols"][0]["id"], "src/a.rs::alpha",
+        "the journal's write survives a log that lost it"
+    );
 }
 
 fn embedded_report(page: &str) -> Value {
@@ -373,17 +601,41 @@ fn embedded_report(page: &str) -> Value {
 fn report_page(l: &Layout, args: &[&str]) -> std::process::Output {
     let logs = l.logs.to_string_lossy().into_owned();
     let clone = l.clone.to_string_lossy().into_owned();
-    ambits(&l.clone).args([&["-p", clone.as_str(), "--log-dir", logs.as_str(), "--session", SESSION, "report"], args].concat()).output().unwrap()
+    ambits(&l.clone)
+        .args(
+            [
+                &[
+                    "-p",
+                    clone.as_str(),
+                    "--log-dir",
+                    logs.as_str(),
+                    "--session",
+                    SESSION,
+                    "report",
+                ],
+                args,
+            ]
+            .concat(),
+        )
+        .output()
+        .unwrap()
 }
 
 #[test]
 fn the_html_report_embeds_the_json_report_under_a_closed_policy() {
     let l = layout();
     let out = report_page(&l, &["--format", "html"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let page = String::from_utf8(out.stdout).unwrap();
     assert!(page.starts_with("<!doctype html>"));
-    assert!(page.contains("default-src 'none'"), "the page must load nothing");
+    assert!(
+        page.contains("default-src 'none'"),
+        "the page must load nothing"
+    );
     assert!(!page.contains("{{"), "a placeholder was left unfilled");
     let mut embedded = embedded_report(&page);
     let mut json = report(&l, &[]);
@@ -401,9 +653,26 @@ fn from_json_renders_a_screened_report_without_the_session() {
     let file = l.logs.with_file_name("screened.json");
     std::fs::write(&file, r.to_string()).unwrap();
     std::fs::remove_dir_all(&l.logs).unwrap();
-    let out = ambits(&l.clone).args(["report", "--format", "html", "--from-json", file.to_str().unwrap()]).output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(embedded_report(&String::from_utf8(out.stdout).unwrap()), r, "rendered exactly as given");
+    let out = ambits(&l.clone)
+        .args([
+            "report",
+            "--format",
+            "html",
+            "--from-json",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        embedded_report(&String::from_utf8(out.stdout).unwrap()),
+        r,
+        "rendered exactly as given"
+    );
 }
 
 #[test]
@@ -412,22 +681,60 @@ fn from_json_needs_the_html_format_and_takes_no_size_limit() {
     let file = l.logs.with_file_name("r.json");
     std::fs::write(&file, report(&l, &[]).to_string()).unwrap();
     let path = file.to_str().unwrap();
-    let json_out = ambits(&l.clone).args(["report", "--from-json", path]).output().unwrap();
+    let json_out = ambits(&l.clone)
+        .args(["report", "--from-json", path])
+        .output()
+        .unwrap();
     assert!(!json_out.status.success());
     assert!(String::from_utf8_lossy(&json_out.stderr).contains("--format html"));
-    let capped = ambits(&l.clone).args(["report", "--format", "html", "--from-json", path, "--max-bytes", "10"]).output().unwrap();
-    assert!(!capped.status.success(), "--max-bytes cannot apply to a report built elsewhere");
+    let capped = ambits(&l.clone)
+        .args([
+            "report",
+            "--format",
+            "html",
+            "--from-json",
+            path,
+            "--max-bytes",
+            "10",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !capped.status.success(),
+        "--max-bytes cannot apply to a report built elsewhere"
+    );
 }
 
 #[test]
 fn an_edit_span_carries_its_arguments_and_the_tools_own_patch() {
     let l = layout();
     let r = report(&l, &[]);
-    let edit = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Edit").unwrap();
-    let file_path = edit["args"].as_array().unwrap().iter().find(|a| a["key"] == "file_path").unwrap();
-    assert_eq!(file_path["value"], "src/a.rs", "a path argument inside the project is relative");
-    let new_string = edit["args"].as_array().unwrap().iter().find(|a| a["key"] == "new_string").unwrap();
-    assert_eq!(new_string["bulk"], true, "file contents an argument wrote are summed up, not repeated");
+    let edit = r["spans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["tool"] == "Edit")
+        .unwrap();
+    let file_path = edit["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["key"] == "file_path")
+        .unwrap();
+    assert_eq!(
+        file_path["value"], "src/a.rs",
+        "a path argument inside the project is relative"
+    );
+    let new_string = edit["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["key"] == "new_string")
+        .unwrap();
+    assert_eq!(
+        new_string["bulk"], true,
+        "file contents an argument wrote are summed up, not repeated"
+    );
     assert_eq!(
         edit["content"],
         json!({"type": "change", "exact": true, "cut": 0, "hunks": [{"old_start": 1, "new_start": 1,
@@ -439,16 +746,32 @@ fn an_edit_span_carries_its_arguments_and_the_tools_own_patch() {
 fn a_read_span_carries_the_text_it_returned() {
     let l = layout();
     let r = report(&l, &[]);
-    let read = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Read").unwrap();
-    assert_eq!(read["content"], json!({"type": "read", "start": 1, "lines": ["fn alpha() {}", "", "fn beta() {}"], "cut": 0}));
+    let read = r["spans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["tool"] == "Read")
+        .unwrap();
+    assert_eq!(
+        read["content"],
+        json!({"type": "read", "start": 1, "lines": ["fn alpha() {}", "", "fn beta() {}"], "cut": 0})
+    );
 }
 
 #[test]
 fn a_prompt_span_carries_no_call_content() {
     let l = layout();
     let r = report(&l, &[]);
-    let prompt = r["spans"].as_array().unwrap().iter().find(|s| s["kind"] == "prompt").unwrap();
-    assert_eq!((prompt["args"].clone(), prompt["content"].clone()), (json!([]), Value::Null));
+    let prompt = r["spans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["kind"] == "prompt")
+        .unwrap();
+    assert_eq!(
+        (prompt["args"].clone(), prompt["content"].clone()),
+        (json!([]), Value::Null)
+    );
 }
 
 #[test]
@@ -457,9 +780,18 @@ fn a_prompt_span_ends_when_its_last_call_does() {
     let r = report(&l, &[]);
     let spans = r["spans"].as_array().unwrap();
     let prompt = spans.iter().find(|s| s["kind"] == "prompt").unwrap();
-    let last = spans.iter().filter(|s| s["parent"] == prompt["i"]).filter_map(|s| s["end_ms"].as_u64()).max().unwrap();
+    let last = spans
+        .iter()
+        .filter(|s| s["parent"] == prompt["i"])
+        .filter_map(|s| s["end_ms"].as_u64())
+        .max()
+        .unwrap();
     assert_eq!(prompt["end_ms"].as_u64(), Some(last));
-    assert_eq!(last - prompt["start_ms"].as_u64().unwrap(), 2_300, "from the prompt to the Edit's result");
+    assert_eq!(
+        last - prompt["start_ms"].as_u64().unwrap(),
+        2_300,
+        "from the prompt to the Edit's result"
+    );
 }
 
 /// The session's log with every Edit result's `originalFile` taken out, as
@@ -483,8 +815,13 @@ fn without_original_file(l: &Layout) {
 }
 
 fn journaled_write(state: &Path) -> Value {
-    let journal = std::fs::read_to_string(state.join(format!("coverage/{SESSION}.ndjson"))).unwrap();
-    journal.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|r| r["kind"] == "write").expect("a write record")
+    let journal =
+        std::fs::read_to_string(state.join(format!("coverage/{SESSION}.ndjson"))).unwrap();
+    journal
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|r| r["kind"] == "write")
+        .expect("a write record")
 }
 
 #[test]
@@ -494,7 +831,11 @@ fn an_edit_without_original_file_is_still_attributed_to_its_symbol() {
     let state = l.logs.with_file_name("state");
     assert!(sync(&l, &state, &[]).status.success());
     let write = journaled_write(&state);
-    assert_eq!((write["level"].as_str(), write["syms"][0][0].as_str()), (Some("symbol"), Some("src/a.rs::alpha")), "{write}");
+    assert_eq!(
+        (write["level"].as_str(), write["syms"][0][0].as_str()),
+        (Some("symbol"), Some("src/a.rs::alpha")),
+        "{write}"
+    );
 }
 
 #[test]
@@ -506,9 +847,12 @@ fn a_later_sessions_edit_to_the_same_file_is_undone_first() {
     // first edit's added line is no longer on disk until this one is undone.
     let file = l.clone.join("src/a.rs");
     std::fs::write(&file, "fn alpha() { let _x = 2; }\n\nfn beta() {}\n").unwrap();
-    let base = |at: &str| json!({"sessionId": LATER, "cwd": l.clone.parent().unwrap(), "timestamp": at});
+    let base =
+        |at: &str| json!({"sessionId": LATER, "cwd": l.clone.parent().unwrap(), "timestamp": at});
     let merge = |mut a: Value, b: Value| {
-        a.as_object_mut().unwrap().extend(b.as_object().unwrap().clone());
+        a.as_object_mut()
+            .unwrap()
+            .extend(b.as_object().unwrap().clone());
         a
     };
     let later_log = l.logs.join(format!("{LATER}.jsonl"));
@@ -516,24 +860,42 @@ fn a_later_sessions_edit_to_the_same_file_is_undone_first() {
     write_log(
         &later_log,
         &[
-            merge(base("2026-10-10T11:00:00.000Z"), json!({"type": "assistant", "message": {"role": "assistant", "content": [
-                {"type": "tool_use", "id": "toolu_later", "name": "Edit", "input": {"file_path": path, "old_string": "let _x = 1;", "new_string": "let _x = 2;"}}]}})),
-            merge(base("2026-10-10T11:00:00.200Z"), json!({"type": "user",
+            merge(
+                base("2026-10-10T11:00:00.000Z"),
+                json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_later", "name": "Edit", "input": {"file_path": path, "old_string": "let _x = 1;", "new_string": "let _x = 2;"}}]}}),
+            ),
+            merge(
+                base("2026-10-10T11:00:00.200Z"),
+                json!({"type": "user",
                 "toolUseResult": {"filePath": path, "oldString": "let _x = 1;", "newString": "let _x = 2;", "originalFile": null,
                     "replaceAll": false, "userModified": false,
                     "structuredPatch": [{"oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1, "lines": ["-fn alpha() { let _x = 1; }", "+fn alpha() { let _x = 2; }"]}]},
-                "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_later", "content": "ok"}]}})),
+                "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_later", "content": "ok"}]}}),
+            ),
         ],
     );
     let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-    std::fs::File::options().write(true).open(&later_log).unwrap().set_modified(later).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&later_log)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
 
     let state = l.logs.with_file_name("state");
     assert!(sync(&l, &state, &[]).status.success());
     let write = journaled_write(&state);
-    assert_eq!((write["level"].as_str(), write["syms"][0][0].as_str()), (Some("symbol"), Some("src/a.rs::alpha")), "{write}");
+    assert_eq!(
+        (write["level"].as_str(), write["syms"][0][0].as_str()),
+        (Some("symbol"), Some("src/a.rs::alpha")),
+        "{write}"
+    );
     let r = report(&l, &[]);
-    assert_eq!(r["writes"][0]["symbols"][0]["status"], "changed", "the later session changed alpha again");
+    assert_eq!(
+        r["writes"][0]["symbols"][0]["status"], "changed",
+        "the later session changed alpha again"
+    );
 }
 
 /// A Bash call, and its result, appended to the session's log.
@@ -544,7 +906,10 @@ fn append_command(l: &Layout, id: &str, command: &str, output: &str, failed: boo
     let result = json!({"type": "user", "sessionId": SESSION, "timestamp": "2026-10-10T10:00:05.400Z",
         "toolUseResult": {"stdout": output, "stderr": "", "interrupted": false},
         "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": output, "is_error": failed}]}});
-    let mut log = std::fs::OpenOptions::new().append(true).open(l.logs.join(format!("{SESSION}.jsonl"))).unwrap();
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(l.logs.join(format!("{SESSION}.jsonl")))
+        .unwrap();
     writeln!(log, "{call}\n{result}").unwrap();
 }
 
@@ -553,19 +918,44 @@ fn a_command_span_carries_its_output() {
     let l = layout();
     append_command(&l, "toolu_ls", "ls src", "a.rs\nb.rs", false);
     let r = report(&l, &[]);
-    let ls = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Bash").unwrap();
-    assert_eq!(ls["content"], json!({"type": "output", "lines": ["a.rs", "b.rs"], "cut": 0}));
-    assert_eq!(ls["args"][0], json!({"key": "description", "value": "List the sources", "bulk": false}));
+    let ls = r["spans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["tool"] == "Bash")
+        .unwrap();
+    assert_eq!(
+        ls["content"],
+        json!({"type": "output", "lines": ["a.rs", "b.rs"], "cut": 0})
+    );
+    assert_eq!(
+        ls["args"][0],
+        json!({"key": "description", "value": "List the sources", "bulk": false})
+    );
 }
 
 #[test]
 fn a_failed_command_still_carries_what_it_printed() {
     let l = layout();
-    append_command(&l, "toolu_bad", "cargo test", "error[E0425]: cannot find value `x`", true);
+    append_command(
+        &l,
+        "toolu_bad",
+        "cargo test",
+        "error[E0425]: cannot find value `x`",
+        true,
+    );
     let r = report(&l, &[]);
-    let bad = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Bash").unwrap();
+    let bad = r["spans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["tool"] == "Bash")
+        .unwrap();
     assert_eq!(bad["error"], true);
-    assert_eq!(bad["content"]["lines"], json!(["error[E0425]: cannot find value `x`"]));
+    assert_eq!(
+        bad["content"]["lines"],
+        json!(["error[E0425]: cannot find value `x`"])
+    );
 }
 
 #[test]
@@ -574,10 +964,23 @@ fn max_bytes_cuts_output_before_symbol_reads() {
     append_command(&l, "toolu_ls", "ls src", &"x\n".repeat(2000), false);
     let full = serde_json::to_vec(&report(&l, &[])).unwrap().len();
     let r = report(&l, &["--max-bytes", &(full - 1000).to_string()]);
-    assert_eq!(r["truncated"], json!(["unwritten_file_symbols", "read_text", "output"]), "{}", r["truncated"]);
-    let read = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Read").unwrap();
+    assert_eq!(
+        r["truncated"],
+        json!(["unwritten_file_symbols", "read_text", "output"]),
+        "{}",
+        r["truncated"]
+    );
+    let read = r["spans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["tool"] == "Read")
+        .unwrap();
     assert_eq!(read["read_count"], 2);
-    assert!(!read["read"].as_array().unwrap().is_empty(), "symbol reads survive a cut that output alone satisfies");
+    assert!(
+        !read["read"].as_array().unwrap().is_empty(),
+        "symbol reads survive a cut that output alone satisfies"
+    );
 }
 
 /// A Bash call run from the workspace, as an agent harness runs it.
@@ -589,7 +992,10 @@ fn append_shell_printing(l: &Layout, id: &str, command: &str, output: &str) {
     let result = json!({"type": "user", "sessionId": SESSION, "cwd": cwd, "timestamp": "2026-10-10T10:00:06.100Z",
         "toolUseResult": {"stdout": "", "stderr": "", "interrupted": false},
         "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": output}]}});
-    let mut log = std::fs::OpenOptions::new().append(true).open(l.logs.join(format!("{SESSION}.jsonl"))).unwrap();
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(l.logs.join(format!("{SESSION}.jsonl")))
+        .unwrap();
     writeln!(log, "{call}\n{result}").unwrap();
 }
 
@@ -601,7 +1007,12 @@ fn shell_only(command: &str) -> Layout {
 fn shell_only_printing(command: &str, output: &str) -> Layout {
     let l = layout();
     let log = l.logs.join(format!("{SESSION}.jsonl"));
-    let kept: Vec<String> = std::fs::read_to_string(&log).unwrap().lines().filter(|line| !line.contains("toolu_r")).map(String::from).collect();
+    let kept: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.contains("toolu_r"))
+        .map(String::from)
+        .collect();
     std::fs::write(&log, kept.join("\n") + "\n").unwrap();
     append_shell_printing(&l, "toolu_sh", command, output);
     l
@@ -609,12 +1020,22 @@ fn shell_only_printing(command: &str, output: &str) -> Layout {
 
 /// Each symbol of `src/a.rs` some agent read, with the depth.
 fn reads_of_a(r: &Value) -> Vec<(String, String)> {
-    let file = r["files"].as_array().unwrap().iter().find(|f| f["path"] == "src/a.rs").unwrap();
+    let file = r["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "src/a.rs")
+        .unwrap();
     file["symbols"]
         .as_array()
         .unwrap()
         .iter()
-        .filter_map(|s| Some((s["name"].as_str()?.to_string(), s["reads"][SESSION].as_str()?.to_string())))
+        .filter_map(|s| {
+            Some((
+                s["name"].as_str()?.to_string(),
+                s["reads"][SESSION].as_str()?.to_string(),
+            ))
+        })
         .collect()
 }
 
@@ -622,11 +1043,29 @@ fn reads_of_a(r: &Value) -> Vec<(String, String)> {
 fn a_shell_command_that_prints_lines_reads_the_symbols_on_them() {
     let l = shell_only("cd repo && sed -n 1,1p src/a.rs");
     let r = report(&l, &[]);
-    let file = r["files"].as_array().unwrap().iter().find(|f| f["path"] == "src/a.rs").unwrap();
-    let depth = |name: &str| file["symbols"].as_array().unwrap().iter().find(|s| s["name"] == name).unwrap()["reads"][SESSION].clone();
+    let file = r["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "src/a.rs")
+        .unwrap();
+    let depth = |name: &str| {
+        file["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == name)
+            .unwrap()["reads"][SESSION]
+            .clone()
+    };
     assert_eq!(depth("alpha"), "full_body", "line 1 is all of alpha");
     assert_eq!(depth("beta"), Value::Null, "beta was not printed");
-    let sh = r["spans"].as_array().unwrap().iter().find(|s| s["tool"] == "Bash").unwrap();
+    let sh = r["spans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["tool"] == "Bash")
+        .unwrap();
     assert_eq!(sh["read_count"], 1);
 }
 
@@ -634,21 +1073,45 @@ fn a_shell_command_that_prints_lines_reads_the_symbols_on_them() {
 fn tail_reads_the_last_lines_of_the_file() {
     let l = shell_only("tail -n 1 repo/src/a.rs");
     let r = report(&l, &[]);
-    let file = r["files"].as_array().unwrap().iter().find(|f| f["path"] == "src/a.rs").unwrap();
-    let read: Vec<&str> = file["symbols"].as_array().unwrap().iter().filter(|s| !s["reads"].as_object().unwrap().is_empty()).map(|s| s["name"].as_str().unwrap()).collect();
+    let file = r["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "src/a.rs")
+        .unwrap();
+    let read: Vec<&str> = file["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| !s["reads"].as_object().unwrap().is_empty())
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
     assert_eq!(read, ["beta"]);
 }
 
 #[test]
 fn a_lone_grep_of_one_file_credits_the_symbols_on_its_lines() {
-    let l = shell_only_printing("cd repo && grep -n alpha src/a.rs", "1:fn alpha() { let _x = 1; }");
-    assert_eq!(reads_of_a(&report(&l, &[])), [("alpha".into(), "name_only".into())]);
+    let l = shell_only_printing(
+        "cd repo && grep -n alpha src/a.rs",
+        "1:fn alpha() { let _x = 1; }",
+    );
+    assert_eq!(
+        reads_of_a(&report(&l, &[])),
+        [("alpha".into(), "name_only".into())]
+    );
 }
 
 #[test]
 fn a_recursive_grep_credits_matches_and_context_by_file() {
-    let l = shell_only_printing("grep -rn -A1 beta repo/src", "repo/src/a.rs-2-\nrepo/src/a.rs:3:fn beta() {}\nrepo/src/missing-1-x.rs:9:not a file");
-    assert_eq!(reads_of_a(&report(&l, &[])), [("beta".into(), "name_only".into())], "line 2 is blank, in no symbol");
+    let l = shell_only_printing(
+        "grep -rn -A1 beta repo/src",
+        "repo/src/a.rs-2-\nrepo/src/a.rs:3:fn beta() {}\nrepo/src/missing-1-x.rs:9:not a file",
+    );
+    assert_eq!(
+        reads_of_a(&report(&l, &[])),
+        [("beta".into(), "name_only".into())],
+        "line 2 is blank, in no symbol"
+    );
 }
 
 #[test]

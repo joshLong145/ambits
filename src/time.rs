@@ -13,7 +13,9 @@ pub fn days(n: u64) -> Option<Duration> {
 
 /// Seconds since the Unix epoch, or 0 if the clock reads before it.
 pub fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Now, as RFC 3339 UTC to the second.
@@ -26,11 +28,25 @@ pub fn now_rfc3339() -> String {
 /// anything else, including a non-`Z` offset.
 pub fn parse_rfc3339(s: &str) -> Option<u64> {
     let b = s.as_bytes();
-    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || !s.ends_with('Z') {
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || !s.ends_with('Z')
+    {
         return None;
     }
     let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
-    let (y, mo, d, h, mi, se) = (num(0..4)?, num(5..7)?, num(8..10)?, num(11..13)?, num(14..16)?, num(17..19)?);
+    let (y, mo, d, h, mi, se) = (
+        num(0..4)?,
+        num(5..7)?,
+        num(8..10)?,
+        num(11..13)?,
+        num(14..16)?,
+        num(17..19)?,
+    );
     if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
         return None;
     }
@@ -70,7 +86,12 @@ pub fn rfc3339(secs: u64) -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
 }
 
 /// `MM-DD HH:MM`, UTC, for milliseconds since the epoch: a compact
@@ -103,7 +124,10 @@ mod tests {
         let ms = super::parse_rfc3339_millis("2026-09-27T10:05:33.450Z").unwrap();
         assert_eq!(super::day_minute(ms), "09-27 10:05");
         assert_eq!(super::clock(ms), "10:05:33.4");
-        assert_eq!(super::short("2026-09-27T10:05:33.103Z"), "2026-09-27 10:05Z");
+        assert_eq!(
+            super::short("2026-09-27T10:05:33.103Z"),
+            "2026-09-27 10:05Z"
+        );
         assert_eq!(super::short("yesterday"), "yesterday");
     }
 
@@ -120,7 +144,10 @@ mod tests {
         for secs in [0, 951_782_400, 1_790_000_000] {
             assert_eq!(parse_rfc3339(&rfc3339(secs)), Some(secs));
         }
-        assert_eq!(parse_rfc3339("2026-09-27T13:39:43.103Z"), parse_rfc3339("2026-09-27T13:39:43Z"));
+        assert_eq!(
+            parse_rfc3339("2026-09-27T13:39:43.103Z"),
+            parse_rfc3339("2026-09-27T13:39:43Z")
+        );
         assert_eq!(parse_rfc3339("2026-09-27T13:39:43+02:00"), None);
         assert_eq!(parse_rfc3339("yesterday"), None);
     }
@@ -128,8 +155,14 @@ mod tests {
     #[test]
     fn millisecond_precision_is_kept() {
         let base = parse_rfc3339("2026-09-27T13:39:43Z").unwrap() * 1000;
-        assert_eq!(parse_rfc3339_millis("2026-09-27T13:39:43.103Z"), Some(base + 103));
-        assert_eq!(parse_rfc3339_millis("2026-09-27T13:39:43.1Z"), Some(base + 100));
+        assert_eq!(
+            parse_rfc3339_millis("2026-09-27T13:39:43.103Z"),
+            Some(base + 103)
+        );
+        assert_eq!(
+            parse_rfc3339_millis("2026-09-27T13:39:43.1Z"),
+            Some(base + 100)
+        );
         assert_eq!(parse_rfc3339_millis("2026-09-27T13:39:43Z"), Some(base));
         assert_eq!(parse_rfc3339_millis("nonsense"), None);
     }

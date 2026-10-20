@@ -23,7 +23,8 @@ use crate::time::{now_rfc3339, now_secs};
 /// (§8); `ambits gc --reflog-expiry-days` overrides it.
 pub const REFLOG_EXPIRY_DAYS: u64 = 90;
 /// [`REFLOG_EXPIRY_DAYS`] as a duration.
-pub const REFLOG_EXPIRY: Duration = Duration::from_secs(REFLOG_EXPIRY_DAYS * crate::time::SECS_PER_DAY);
+pub const REFLOG_EXPIRY: Duration =
+    Duration::from_secs(REFLOG_EXPIRY_DAYS * crate::time::SECS_PER_DAY);
 
 /// A validated ref name, e.g. `refs/sessions/<id>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +47,10 @@ impl RefName {
             bail!("not a remote name: {remote:?}");
         }
         let session = Self::session(session)?;
-        Ok(Self(format!("refs/remotes/{remote}/sessions/{}", session.session_id())))
+        Ok(Self(format!(
+            "refs/remotes/{remote}/sessions/{}",
+            session.session_id()
+        )))
     }
 
     pub fn as_str(&self) -> &str {
@@ -64,7 +68,9 @@ impl RefName {
 pub fn valid_remote_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
         && !name.starts_with('.')
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Directories an older ambits kept refs, reflogs and notes in.
@@ -73,7 +79,10 @@ const OLD_LAYOUT: [&str; 3] = ["refs", "logs", "notes"];
 /// Refuse a store laid out by an older ambits: pre-1.0, it is not
 /// converted.
 fn check_layout(store: &Store) -> Result<()> {
-    let old: Vec<&str> = OLD_LAYOUT.into_iter().filter(|d| store.root().join(d).is_dir()).collect();
+    let old: Vec<&str> = OLD_LAYOUT
+        .into_iter()
+        .filter(|d| store.root().join(d).is_dir())
+        .collect();
     if !old.is_empty() {
         let dirs: Vec<String> = old.iter().map(|d| format!(".ambits/{d}")).collect();
         bail!(
@@ -108,21 +117,29 @@ pub struct ReflogEntry {
 
 /// Every ref's tip: the `new` of its last entry.
 fn tips(entries: &[ReflogEntry]) -> HashMap<&str, &str> {
-    entries.iter().map(|e| (e.name.as_str(), e.new.as_str())).collect()
+    entries
+        .iter()
+        .map(|e| (e.name.as_str(), e.new.as_str()))
+        .collect()
 }
 
 /// The snapshot `name` points at, if any.
 pub fn read(store: &Store, name: &RefName) -> Result<Option<ObjectId>> {
     check_layout(store)?;
     let entries = reflog(store)?;
-    tips(&entries).get(name.as_str()).map(|t| ObjectId::parse(t)).transpose()
+    tips(&entries)
+        .get(name.as_str())
+        .map(|t| ObjectId::parse(t))
+        .transpose()
 }
 
 /// Every ref, local and remote-tracking, with its tip.
 pub fn all(store: &Store) -> Result<Vec<(String, ObjectId)>> {
     let entries = reflog(store)?;
-    let mut out: Vec<(String, ObjectId)> =
-        tips(&entries).into_iter().filter_map(|(name, tip)| Some((name.to_string(), ObjectId::parse(tip).ok()?))).collect();
+    let mut out: Vec<(String, ObjectId)> = tips(&entries)
+        .into_iter()
+        .filter_map(|(name, tip)| Some((name.to_string(), ObjectId::parse(tip).ok()?)))
+        .collect();
     out.sort();
     Ok(out)
 }
@@ -130,14 +147,25 @@ pub fn all(store: &Store) -> Result<Vec<(String, ObjectId)>> {
 /// Move `name` from `expected` to `new`: one reflog entry, appended under
 /// the reflog's lock once the ref is seen to hold `expected` still — if it
 /// does not, another process moved it and nothing is written.
-pub fn update(store: &Store, name: &RefName, expected: Option<ObjectId>, new: ObjectId, action: &str) -> Result<()> {
+pub fn update(
+    store: &Store,
+    name: &RefName,
+    expected: Option<ObjectId>,
+    new: ObjectId,
+    action: &str,
+) -> Result<()> {
     check_layout(store)?;
     let file = reflog_file(store);
     let lock = file.lock()?;
     let entries = reflog(store)?;
-    let current = tips(&entries).get(name.as_str()).and_then(|t| ObjectId::parse(t).ok());
+    let current = tips(&entries)
+        .get(name.as_str())
+        .and_then(|t| ObjectId::parse(t).ok());
     if current != expected {
-        bail!("{} moved meanwhile (another snapshot, restore or push); run it again", name.as_str());
+        bail!(
+            "{} moved meanwhile (another snapshot, restore or push); run it again",
+            name.as_str()
+        );
     }
     let entry = ReflogEntry {
         name: name.as_str().to_string(),
@@ -165,8 +193,17 @@ pub fn expire_reflogs(store: &Store, expiry: Duration) -> Result<usize> {
     let file = reflog_file(store);
     let lock = file.lock()?;
     let entries = reflog(store)?;
-    let last: HashMap<&str, usize> = entries.iter().enumerate().map(|(i, e)| (e.name.as_str(), i)).collect();
-    let kept: Vec<&ReflogEntry> = entries.iter().enumerate().filter(|(i, e)| e.secs >= cutoff || last[e.name.as_str()] == *i).map(|(_, e)| e).collect();
+    let last: HashMap<&str, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.name.as_str(), i))
+        .collect();
+    let kept: Vec<&ReflogEntry> = entries
+        .iter()
+        .enumerate()
+        .filter(|(i, e)| e.secs >= cutoff || last[e.name.as_str()] == *i)
+        .map(|(_, e)| e)
+        .collect();
     let dropped = entries.len() - kept.len();
     if dropped > 0 {
         file.rewrite(&lock, &kept, Durability::Fsync)?;
@@ -194,7 +231,11 @@ struct NoteLine {
 
 pub fn write_note(store: &Store, id: &ObjectId, message: Option<&str>) -> Result<()> {
     check_layout(store)?;
-    let note = Note { time: now_rfc3339(), message: message.map(String::from), version: env!("CARGO_PKG_VERSION").to_string() };
+    let note = Note {
+        time: now_rfc3339(),
+        message: message.map(String::from),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
     let file = notes_file(store);
     let lock = file.lock()?;
     file.append(&lock, &[NoteLine { id: id.hex(), note }], Durability::Fsync)
@@ -202,7 +243,11 @@ pub fn write_note(store: &Store, id: &ObjectId, message: Option<&str>) -> Result
 
 /// Every snapshot's note; the last written wins.
 pub fn notes(store: &Store) -> Result<HashMap<ObjectId, Note>> {
-    Ok(notes_file(store).read::<NoteLine>()?.into_iter().filter_map(|l| Some((ObjectId::parse(&l.id).ok()?, l.note))).collect())
+    Ok(notes_file(store)
+        .read::<NoteLine>()?
+        .into_iter()
+        .filter_map(|l| Some((ObjectId::parse(&l.id).ok()?, l.note)))
+        .collect())
 }
 
 pub fn read_note(store: &Store, id: &ObjectId) -> Option<Note> {
@@ -210,7 +255,11 @@ pub fn read_note(store: &Store, id: &ObjectId) -> Option<Note> {
 }
 
 /// Copy `from`'s notes for `ids` that `to` lacks; how many.
-pub fn copy_notes(from: &Store, to: &Store, ids: &std::collections::HashSet<ObjectId>) -> Result<usize> {
+pub fn copy_notes(
+    from: &Store,
+    to: &Store,
+    ids: &std::collections::HashSet<ObjectId>,
+) -> Result<usize> {
     let have = notes(to)?;
     let missing: Vec<NoteLine> = notes(from)?
         .into_iter()
@@ -233,7 +282,10 @@ pub fn prune_notes(store: &Store, keep: impl Fn(&ObjectId) -> bool) -> Result<us
     }
     let lock = file.lock()?;
     let lines: Vec<NoteLine> = file.read()?;
-    let kept: Vec<&NoteLine> = lines.iter().filter(|l| ObjectId::parse(&l.id).is_ok_and(|id| keep(&id))).collect();
+    let kept: Vec<&NoteLine> = lines
+        .iter()
+        .filter(|l| ObjectId::parse(&l.id).is_ok_and(|id| keep(&id)))
+        .collect();
     let dropped = lines.len() - kept.len();
     if dropped > 0 {
         file.rewrite(&lock, &kept, Durability::Fsync)?;
@@ -250,7 +302,12 @@ mod tests {
     #[test]
     fn session_refs_need_a_uuid() {
         assert!(RefName::session(SESSION).is_ok());
-        for bad in ["", "../../etc", "s", "0b7e9d3a-1c2f-4e5a-9b8c-7d6e5f4a3b2c/../x"] {
+        for bad in [
+            "",
+            "../../etc",
+            "s",
+            "0b7e9d3a-1c2f-4e5a-9b8c-7d6e5f4a3b2c/../x",
+        ] {
             assert!(RefName::session(bad).is_err(), "{bad}");
         }
     }
@@ -263,14 +320,23 @@ mod tests {
         let (a, b) = (ObjectId([1; 32]), ObjectId([2; 32]));
 
         update(&store, &name, None, a, "snapshot").unwrap();
-        assert!(update(&store, &name, None, b, "snapshot").is_err(), "stale expectation");
+        assert!(
+            update(&store, &name, None, b, "snapshot").is_err(),
+            "stale expectation"
+        );
         update(&store, &name, Some(a), b, "snapshot").unwrap();
         assert_eq!(read(&store, &name).unwrap(), Some(b));
         assert_eq!(all(&store).unwrap(), vec![(name.as_str().to_string(), b)]);
 
         let news: Vec<String> = reflog(&store).unwrap().into_iter().map(|e| e.new).collect();
         assert_eq!(news, vec![a.hex(), b.hex()]);
-        assert_eq!(std::fs::read_dir(dir.path().join(".ambits")).unwrap().count(), 2, "one reflog and its lock");
+        assert_eq!(
+            std::fs::read_dir(dir.path().join(".ambits"))
+                .unwrap()
+                .count(),
+            2,
+            "one reflog and its lock"
+        );
     }
 
     /// Two writers racing from the same tip: exactly one moves the ref.
@@ -283,7 +349,14 @@ mod tests {
                 let root = root.clone();
                 std::thread::spawn(move || {
                     let store = Store::at(&root);
-                    update(&store, &RefName::session(SESSION).unwrap(), None, ObjectId([n; 32]), "snapshot").is_ok()
+                    update(
+                        &store,
+                        &RefName::session(SESSION).unwrap(),
+                        None,
+                        ObjectId([n; 32]),
+                        "snapshot",
+                    )
+                    .is_ok()
                 })
             })
             .collect::<Vec<_>>()
@@ -310,9 +383,18 @@ mod tests {
         };
         let file = reflog_file(&store);
         let lock = file.lock().unwrap();
-        file.append(&lock, &[entry(None, 1), entry(Some(1), 2)], Durability::NoSync).unwrap();
+        file.append(
+            &lock,
+            &[entry(None, 1), entry(Some(1), 2)],
+            Durability::NoSync,
+        )
+        .unwrap();
         drop(lock);
-        assert_eq!(expire_reflogs(&store, REFLOG_EXPIRY).unwrap(), 1, "both are old; the tip's stays");
+        assert_eq!(
+            expire_reflogs(&store, REFLOG_EXPIRY).unwrap(),
+            1,
+            "both are old; the tip's stays"
+        );
         assert_eq!(read(&store, &name).unwrap(), Some(ObjectId([2; 32])));
     }
 
@@ -323,7 +405,10 @@ mod tests {
         let (a, b) = (ObjectId([1; 32]), ObjectId([2; 32]));
         write_note(&store, &a, Some("first")).unwrap();
         write_note(&store, &b, None).unwrap();
-        assert_eq!(read_note(&store, &a).unwrap().message.as_deref(), Some("first"));
+        assert_eq!(
+            read_note(&store, &a).unwrap().message.as_deref(),
+            Some("first")
+        );
         assert_eq!(prune_notes(&store, |id| *id == b).unwrap(), 1);
         assert!(read_note(&store, &a).is_none());
         assert!(read_note(&store, &b).is_some());
@@ -335,12 +420,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".ambits/refs/sessions")).unwrap();
         let store = Store::at(dir.path());
-        let err = read(&store, &RefName::session(SESSION).unwrap()).unwrap_err().to_string();
-        assert!(err.contains("older ambits") && err.contains(".ambits/refs"), "{err}");
+        let err = read(&store, &RefName::session(SESSION).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("older ambits") && err.contains(".ambits/refs"),
+            "{err}"
+        );
         let objects = dir.path().join(".ambits/objects/ab");
         std::fs::create_dir_all(&objects).unwrap();
         std::fs::write(objects.join("cd.json"), "{}").unwrap();
-        assert!(crate::objects::gc::gc(&store, Duration::ZERO, REFLOG_EXPIRY).is_err(), "gc must not see no refs and collect everything");
+        assert!(
+            crate::objects::gc::gc(&store, Duration::ZERO, REFLOG_EXPIRY).is_err(),
+            "gc must not see no refs and collect everything"
+        );
         assert!(objects.join("cd.json").exists());
     }
 }

@@ -7,11 +7,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKi
 use crate::coverage::count_symbols;
 use crate::expansion::{Expansion, RowKind};
 use crate::filter::PathFilter;
-use crate::symbols::{ProjectTree, SymbolNode};
-use crate::tracking::ReadDepth;
-use crate::tracking::ContextLedger;
-use crate::tracking::agents::{AgentTree, AgentNode};
 use crate::ingest::AgentToolCall;
+use crate::symbols::{ProjectTree, SymbolNode};
+use crate::tracking::agents::{AgentNode, AgentTree};
+use crate::tracking::ContextLedger;
+use crate::tracking::ReadDepth;
 
 /// How files are sorted in the tree view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,8 +35,8 @@ pub enum FileCoverageStatus {
 pub struct TreeRow {
     pub symbol_id: String,
     pub display_name: String,
-    pub label: &'static str,  // Language-specific label (e.g., "class", "def", "fn")
-    pub depth: usize,         // nesting depth for indentation
+    pub label: &'static str, // Language-specific label (e.g., "class", "def", "fn")
+    pub depth: usize,        // nesting depth for indentation
     pub kind: RowKind,
     pub is_expanded: bool,
     pub has_children: bool,
@@ -273,7 +273,8 @@ pub struct App {
     pub content_view: Option<ContentView>,
     /// Each written file's symbols as write statuses compare them, kept
     /// between frames: see [`App::file_contents`].
-    file_contents: std::cell::RefCell<HashMap<String, (blake3::Hash, Arc<crate::writes::FileContents>)>>,
+    file_contents:
+        std::cell::RefCell<HashMap<String, (blake3::Hash, Arc<crate::writes::FileContents>)>>,
 
     /// Path filter restricting which files are tracked, if any. Shared with
     /// the TUI re-parse paths (file watcher, Serena cache rescan) so that
@@ -365,24 +366,23 @@ impl App {
     /// surface; a journal that cannot be written must never be fatal.
     pub fn enable_journal(&mut self, backend: &str, interval: std::time::Duration) -> Vec<String> {
         let Some(session_id) = self.session_id.clone() else {
-            return vec![
-                "no session id resolved; coverage journaling disabled".to_string()
-            ];
+            return vec!["no session id resolved; coverage journaling disabled".to_string()];
         };
         // A switch to the current session retired its own writer, which holds
         // the journal's lock: take it back rather than reopen, since a lock
         // dropped here can outlive the drop in a child mid-spawn.
-        if self.retired_journal.as_ref().is_some_and(|j| j.session_id() == session_id) {
+        if self
+            .retired_journal
+            .as_ref()
+            .is_some_and(|j| j.session_id() == session_id)
+        {
             let journal = self.retired_journal.take().expect("checked above");
             let warnings = journal.warnings().to_vec();
             self.journal = Some(journal);
             return warnings;
         }
-        let journal = crate::journal::Journal::open(
-            &self.project_root,
-            &session_id,
-            interval,
-            || {
+        let journal =
+            crate::journal::Journal::open(&self.project_root, &session_id, interval, || {
                 crate::journal::EnvironmentManifest::capture(
                     &self.project_tree,
                     backend,
@@ -391,8 +391,7 @@ impl App {
                     // "this run was filtered" means.
                     self.filter.as_ref().map(|f| f.display()),
                 )
-            },
-        );
+            });
         let mut warnings = journal.warnings().to_vec();
         if let Some(error) = journal.error() {
             warnings.push(format!("coverage journaling disabled: {error}"));
@@ -421,15 +420,23 @@ impl App {
         let warnings = self.enable_journal(settings.backend, settings.interval);
         self.sync_journal();
         self.load_writes();
-        JournalAttach { rehydrated, warnings }
+        JournalAttach {
+            rehydrated,
+            warnings,
+        }
     }
 
     /// Fold the session's journaled writes into the index: what earlier runs
     /// attributed, which this run's replay only re-attributes later, if at
     /// all.
     fn load_writes(&mut self) {
-        let Some(session) = self.session_id.as_deref() else { return };
-        let journaled = crate::write_index::WriteIndex::load(&crate::journal::journal_dir(&self.project_root), session);
+        let Some(session) = self.session_id.as_deref() else {
+            return;
+        };
+        let journaled = crate::write_index::WriteIndex::load(
+            &crate::journal::journal_dir(&self.project_root),
+            session,
+        );
         let had = !self.writes.is_empty() || !journaled.is_empty();
         for record in journaled.into_records() {
             self.writes.insert(record);
@@ -609,14 +616,22 @@ impl App {
         metadata: Option<crate::ingest::CompactionMetadata>,
     ) {
         if let Some(t) = crate::time::parse_rfc3339_millis(&timestamp) {
-            self.trace.instant(t, Some(agent_id.clone()), crate::trace::InstantKind::Compaction);
+            self.trace.instant(
+                t,
+                Some(agent_id.clone()),
+                crate::trace::InstantKind::Compaction,
+            );
         }
         use std::collections::BTreeSet;
         let files_before: BTreeSet<std::path::PathBuf> = self
             .project_tree
             .files
             .iter()
-            .filter(|f| f.symbols.iter().any(|sym| self.ledger.depth_of(&sym.id).is_seen()))
+            .filter(|f| {
+                f.symbols
+                    .iter()
+                    .any(|sym| self.ledger.depth_of(&sym.id).is_seen())
+            })
             .map(|f| f.file_path.clone())
             .collect();
 
@@ -635,14 +650,15 @@ impl App {
         };
 
         let sequence = self.compaction_history.len() as u32 + 1;
-        self.compaction_history.push(crate::ingest::CompactionEvent {
-            sequence,
-            timestamp,
-            agent_id,
-            summary,
-            ledger_before: snapshot,
-            metadata,
-        });
+        self.compaction_history
+            .push(crate::ingest::CompactionEvent {
+                sequence,
+                timestamp,
+                agent_id,
+                summary,
+                ledger_before: snapshot,
+                metadata,
+            });
         self.compaction_overlay_index = self.compaction_history.len().saturating_sub(1);
 
         // Demote rather than wipe: the reads are still facts, they just no
@@ -689,7 +705,10 @@ impl App {
             let file_writes = (!writes.is_empty())
                 .then(|| {
                     let rel = crate::objects::normalize_path(&file_path);
-                    Some(crate::write_index::FileWrites::new(writes.remove(rel.as_str())?, self.file_contents(&rel)?))
+                    Some(crate::write_index::FileWrites::new(
+                        writes.remove(rel.as_str())?,
+                        self.file_contents(&rel)?,
+                    ))
                 })
                 .flatten();
             let file_id = file_path.clone();
@@ -726,7 +745,12 @@ impl App {
             });
 
             if is_expanded {
-                let context = RowContext { expansion: &self.expansion, ledger: &self.ledger, agent_filter, writes: file_writes.as_ref() };
+                let context = RowContext {
+                    expansion: &self.expansion,
+                    ledger: &self.ledger,
+                    agent_filter,
+                    writes: file_writes.as_ref(),
+                };
                 for sym in &file.symbols {
                     flatten_symbol(sym, 1, &context, &mut rows);
                 }
@@ -755,7 +779,9 @@ impl App {
         let overlay = self.show_compaction_overlay || self.show_alignment_overlay;
         match key.code {
             KeyCode::Char('q') => return self.should_quit = true,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return self.should_quit = true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return self.should_quit = true
+            }
             KeyCode::Tab => return self.cycle_focus(true),
             KeyCode::BackTab => return self.cycle_focus(false),
             KeyCode::Char('[') if !overlay => return self.cycle_agent_filter_backward(),
@@ -767,7 +793,9 @@ impl App {
                 };
                 return;
             }
-            KeyCode::Char('o') if self.trace_view.open && !overlay => return self.open_content_view(),
+            KeyCode::Char('o') if self.trace_view.open && !overlay => {
+                return self.open_content_view()
+            }
             KeyCode::Char('f') => {
                 self.show_activity = !self.show_activity;
                 if !self.show_activity && self.focus == FocusPanel::Feed {
@@ -775,16 +803,27 @@ impl App {
                 }
                 return;
             }
-            KeyCode::Esc if self.focus != FocusPanel::Left && !overlay => return self.focus = FocusPanel::Left,
+            KeyCode::Esc if self.focus != FocusPanel::Left && !overlay => {
+                return self.focus = FocusPanel::Left
+            }
             _ => {}
         }
         match self.focus {
             FocusPanel::Right => self.handle_right_key(key),
             FocusPanel::Feed => self.handle_feed_key(key),
             FocusPanel::Left if self.trace_view.open => {
-                let before = (self.trace_view.selected, self.trace_view.list, self.trace_view.focus);
+                let before = (
+                    self.trace_view.selected,
+                    self.trace_view.list,
+                    self.trace_view.focus,
+                );
                 self.handle_trace_key(key);
-                if (self.trace_view.selected, self.trace_view.list, self.trace_view.focus) != before {
+                if (
+                    self.trace_view.selected,
+                    self.trace_view.list,
+                    self.trace_view.focus,
+                ) != before
+                {
                     self.panel_index = 0;
                 }
             }
@@ -796,8 +835,14 @@ impl App {
     fn handle_right_key(&mut self, key: KeyEvent) {
         match (self.right_pane, self.trace_view.open) {
             (RightPane::Session, _) => self.handle_session_key(key),
-            (RightPane::Inspector, true) => self.handle_panel_rows_key(key, self.trace_panel_targets().len(), Self::open_panel_target),
-            (RightPane::Inspector, false) => self.handle_panel_rows_key(key, usize::MAX, Self::open_inspected_trace),
+            (RightPane::Inspector, true) => self.handle_panel_rows_key(
+                key,
+                self.trace_panel_targets().len(),
+                Self::open_panel_target,
+            ),
+            (RightPane::Inspector, false) => {
+                self.handle_panel_rows_key(key, usize::MAX, Self::open_inspected_trace)
+            }
         }
     }
 
@@ -805,8 +850,12 @@ impl App {
     /// moved through with `j`/`k` and opened with `Enter`.
     fn handle_panel_rows_key(&mut self, key: KeyEvent, rows: usize, open: fn(&mut Self)) {
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.panel_index = (self.panel_index + 1).min(rows.saturating_sub(1)),
-            KeyCode::Char('k') | KeyCode::Up => self.panel_index = self.panel_index.saturating_sub(1),
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.panel_index = (self.panel_index + 1).min(rows.saturating_sub(1))
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.panel_index = self.panel_index.saturating_sub(1)
+            }
             KeyCode::Enter => open(self),
             _ => {}
         }
@@ -825,8 +874,12 @@ impl App {
     /// The activity feed's keys: scroll it.
     fn handle_feed_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('k') | KeyCode::Up => self.activity_scroll_offset = self.activity_scroll_offset.saturating_add(1),
-            KeyCode::Char('j') | KeyCode::Down => self.activity_scroll_offset = self.activity_scroll_offset.saturating_sub(1),
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.activity_scroll_offset = self.activity_scroll_offset.saturating_add(1)
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.activity_scroll_offset = self.activity_scroll_offset.saturating_sub(1)
+            }
             KeyCode::Char('G') => self.activity_scroll_offset = 0,
             _ => {}
         }
@@ -839,7 +892,12 @@ impl App {
         use crate::trace::summary::Target;
         use crate::trace::view::Item;
         let targets = self.trace_panel_targets();
-        let Some(target) = targets.get(self.panel_index.min(targets.len().saturating_sub(1))).cloned() else { return };
+        let Some(target) = targets
+            .get(self.panel_index.min(targets.len().saturating_sub(1)))
+            .cloned()
+        else {
+            return;
+        };
         let item = match target {
             Target::File(file) => {
                 if self.reveal_id(&file, None) {
@@ -866,7 +924,13 @@ impl App {
                 Item::Span(i) => index.root_of(i),
                 Item::Instant(_) => self.trace_view.list,
             };
-            let Some(root) = root.or_else(|| self.trace_view.list_index(&self.trace_list()).map(|i| self.trace_list()[i].root)) else { return };
+            let Some(root) = root.or_else(|| {
+                self.trace_view
+                    .list_index(&self.trace_list())
+                    .map(|i| self.trace_list()[i].root)
+            }) else {
+                return;
+            };
             self.trace_view.open_trace(root);
         }
         if let Item::Span(i) = item {
@@ -969,7 +1033,9 @@ impl App {
         let tv = &self.trace_view;
         let Some(root) = tv.focus else {
             let traces = self.trace_list();
-            return tv.list_index(&traces).map_or(PanelSubject::Nothing, |i| PanelSubject::Trace(traces[i].root));
+            return tv.list_index(&traces).map_or(PanelSubject::Nothing, |i| {
+                PanelSubject::Trace(traces[i].root)
+            });
         };
         match tv.selected {
             Some(Item::Span(i)) if i == root => PanelSubject::Trace(root),
@@ -1011,7 +1077,10 @@ impl App {
 
     fn content_key(&self, span: usize) -> Option<ContentKey> {
         let s = self.trace.spans().get(span)?;
-        Some(ContentKey { id: s.id.clone()?, ended: s.end.is_some() })
+        Some(ContentKey {
+            id: s.id.clone()?,
+            ended: s.end.is_some(),
+        })
     }
 
     /// The load to ask the content worker for, if the wanted call's content
@@ -1020,7 +1089,11 @@ impl App {
         let span = self.content_span()?;
         let kind = self.content_kind(span)?;
         let key = self.content_key(span)?;
-        let have = self.contents.loaded.as_ref().is_some_and(|(k, _)| *k == key);
+        let have = self
+            .contents
+            .loaded
+            .as_ref()
+            .is_some_and(|(k, _)| *k == key);
         if have || self.contents.asked.as_ref() == Some(&key) {
             return None;
         }
@@ -1029,18 +1102,27 @@ impl App {
     }
 
     /// The content worker's answer.
-    pub fn set_call_content(&mut self, key: ContentKey, content: Option<crate::ingest::content::CallDetail>) {
+    pub fn set_call_content(
+        &mut self,
+        key: ContentKey,
+        content: Option<crate::ingest::content::CallDetail>,
+    ) {
         self.contents.loaded = Some((key, content.map(Arc::new)));
     }
 
     /// Where `span`'s content stands. A call still running shows what was
     /// loaded while it ran until the load after it ended arrives.
     pub fn content_state(&self, span: usize) -> ContentState<'_> {
-        let Some(key) = self.content_key(span).filter(|_| self.content_kind(span).is_some()) else { return ContentState::Missing };
+        let Some(key) = self
+            .content_key(span)
+            .filter(|_| self.content_kind(span).is_some())
+        else {
+            return ContentState::Missing;
+        };
         match &self.contents.loaded {
-            Some((k, content)) if k.id == key.id && (*k == key || content.is_some()) => {
-                content.as_deref().map_or(ContentState::Missing, ContentState::Loaded)
-            }
+            Some((k, content)) if k.id == key.id && (*k == key || content.is_some()) => content
+                .as_deref()
+                .map_or(ContentState::Missing, ContentState::Loaded),
             _ => ContentState::Loading,
         }
     }
@@ -1049,14 +1131,21 @@ impl App {
     fn open_content_view(&mut self) {
         if let PanelSubject::Call(span) = self.trace_panel_subject() {
             if self.content_kind(span).is_some() {
-                self.content_view = Some(ContentView { span, scroll: 0, height: std::cell::Cell::new(0), width: std::cell::Cell::new(80) });
+                self.content_view = Some(ContentView {
+                    span,
+                    scroll: 0,
+                    height: std::cell::Cell::new(0),
+                    width: std::cell::Cell::new(80),
+                });
             }
         }
     }
 
     /// The content view's keys: scroll, step between hunks, close.
     fn handle_content_key(&mut self, key: KeyEvent) {
-        let Some(view) = &self.content_view else { return };
+        let Some(view) = &self.content_view else {
+            return;
+        };
         let (rows, hunks) = match self.content_state(view.span) {
             ContentState::Loaded(c) => {
                 let rows = c.rows(view.width.get());
@@ -1069,7 +1158,9 @@ impl App {
         let at = view.scroll.min(last);
         let to = match key.code {
             KeyCode::Char('q') => return self.should_quit = true,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return self.should_quit = true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return self.should_quit = true
+            }
             KeyCode::Esc | KeyCode::Char('o') => return self.content_view = None,
             KeyCode::Char('j') | KeyCode::Down => at + 1,
             KeyCode::Char('k') | KeyCode::Up => at.saturating_sub(1),
@@ -1092,11 +1183,19 @@ impl App {
     }
 
     /// [`Self::trace_panel_targets`] over an index already worked out.
-    pub fn trace_panel_targets_in(&self, index: &crate::trace::summary::TraceIndex) -> Vec<crate::trace::summary::Target> {
+    pub fn trace_panel_targets_in(
+        &self,
+        index: &crate::trace::summary::TraceIndex,
+    ) -> Vec<crate::trace::summary::Target> {
         use crate::trace::summary;
         match self.trace_panel_subject() {
-            PanelSubject::Trace(root) => summary::detail(&self.trace, index, root).map(|d| d.rows().iter().map(summary::Row::target).collect()).unwrap_or_default(),
-            PanelSubject::Call(i) => summary::call_rows(&self.trace, index, i, self.write_of(i)).iter().map(summary::Row::target).collect(),
+            PanelSubject::Trace(root) => summary::detail(&self.trace, index, root)
+                .map(|d| d.rows().iter().map(summary::Row::target).collect())
+                .unwrap_or_default(),
+            PanelSubject::Call(i) => summary::call_rows(&self.trace, index, i, self.write_of(i))
+                .iter()
+                .map(summary::Row::target)
+                .collect(),
             PanelSubject::Instant(_) | PanelSubject::Nothing => Vec::new(),
         }
     }
@@ -1109,12 +1208,28 @@ impl App {
     /// The trace view's rows under the current agent filter.
     pub fn trace_rows(&self) -> Vec<crate::trace::view::Row> {
         let tv = &self.trace_view;
-        crate::trace::view::waterfall(&self.trace, self.agent_filter.as_deref(), tv.focus, &tv.collapsed_spans, &tv.query)
+        crate::trace::view::waterfall(
+            &self.trace,
+            self.agent_filter.as_deref(),
+            tv.focus,
+            &tv.collapsed_spans,
+            &tv.query,
+        )
     }
 
     /// The tracks and their screen rows under the current agent filter.
-    pub fn trace_tracks(&self) -> (Vec<crate::trace::view::Track>, Vec<crate::trace::view::TrackRow>) {
-        let tracks = crate::trace::view::tracks(&self.trace, self.agent_filter.as_deref(), self.trace_view.focus, self.trace_open_end());
+    pub fn trace_tracks(
+        &self,
+    ) -> (
+        Vec<crate::trace::view::Track>,
+        Vec<crate::trace::view::TrackRow>,
+    ) {
+        let tracks = crate::trace::view::tracks(
+            &self.trace,
+            self.agent_filter.as_deref(),
+            self.trace_view.focus,
+            self.trace_open_end(),
+        );
         let rows = crate::trace::view::track_rows(&tracks, &self.trace_view.collapsed_agents);
         (tracks, rows)
     }
@@ -1153,7 +1268,11 @@ impl App {
             KeyCode::Char('t') => self.trace_view.open = false,
             KeyCode::Esc | KeyCode::Backspace => self.trace_view.close_trace(),
             KeyCode::Char('v') => {
-                self.trace_view.layout = if waterfall { Layout::Tracks } else { Layout::Waterfall };
+                self.trace_view.layout = if waterfall {
+                    Layout::Tracks
+                } else {
+                    Layout::Waterfall
+                };
             }
             KeyCode::Char('w') => self.trace_view.zoom(&self.trace, 0.5, None),
             KeyCode::Char('s') => self.trace_view.zoom(&self.trace, 2.0, None),
@@ -1166,8 +1285,12 @@ impl App {
             KeyCode::PageUp => self.move_trace_row(-20),
             KeyCode::Char('g') => self.move_trace_row(isize::MIN / 2),
             KeyCode::Char('G') => self.move_trace_row(isize::MAX / 2),
-            KeyCode::Char('h') | KeyCode::Left if waterfall => self.trace_view.toggle_span(Some(false)),
-            KeyCode::Char('l') | KeyCode::Right if waterfall => self.trace_view.toggle_span(Some(true)),
+            KeyCode::Char('h') | KeyCode::Left if waterfall => {
+                self.trace_view.toggle_span(Some(false))
+            }
+            KeyCode::Char('l') | KeyCode::Right if waterfall => {
+                self.trace_view.toggle_span(Some(true))
+            }
             KeyCode::Char('h') | KeyCode::Left => {
                 let (tracks, rows) = self.trace_tracks();
                 self.trace_view.step_span(&tracks, &rows, -1);
@@ -1218,7 +1341,13 @@ impl App {
                     tv.open_trace(traces[ix].root);
                 }
             }
-            KeyCode::Char('v') => tv.layout = if tv.layout == Layout::Waterfall { Layout::Tracks } else { Layout::Waterfall },
+            KeyCode::Char('v') => {
+                tv.layout = if tv.layout == Layout::Waterfall {
+                    Layout::Tracks
+                } else {
+                    Layout::Waterfall
+                }
+            }
             _ => {}
         }
     }
@@ -1229,13 +1358,16 @@ impl App {
             self.trace_view.move_row(&rows, delta);
         } else {
             let (tracks, rows) = self.trace_tracks();
-            self.trace_view.move_track_row(&self.trace, &tracks, &rows, delta);
+            self.trace_view
+                .move_track_row(&self.trace, &tracks, &rows, delta);
         }
     }
 
     /// In the tracks layout, put the lane cursor on the selected span's row.
     fn follow_selection_to_track(&mut self) {
-        let Some(crate::trace::view::Item::Span(i)) = self.trace_view.selected else { return };
+        let Some(crate::trace::view::Item::Span(i)) = self.trace_view.selected else {
+            return;
+        };
         let (tracks, rows) = self.trace_tracks();
         if let Some(r) = rows.iter().position(|r| r.spans(&tracks).contains(&i)) {
             self.trace_view.track_row = r;
@@ -1246,7 +1378,9 @@ impl App {
     /// symbol or file it was about, in the tree.
     fn follow_trace_selection(&mut self) {
         use crate::trace::view::{Item, Layout};
-        let Some(Item::Span(i)) = self.trace_view.selected else { return };
+        let Some(Item::Span(i)) = self.trace_view.selected else {
+            return;
+        };
         let span = self.trace.spans()[i].clone();
         if let Some(child) = &span.child_agent {
             if self.trace_view.layout == Layout::Waterfall {
@@ -1267,7 +1401,10 @@ impl App {
         // To the first symbol it was credited with reading; else its file.
         let revealed = match span.read.first() {
             Some((id, _)) => self.reveal_id(crate::symbols::split_id(id).0, Some(id.clone())),
-            None => span.file.as_deref().is_some_and(|file| self.reveal_id(file, None)),
+            None => span
+                .file
+                .as_deref()
+                .is_some_and(|file| self.reveal_id(file, None)),
         };
         if revealed {
             self.trace_view.open = false;
@@ -1279,14 +1416,20 @@ impl App {
     /// it sits in; or, `None`, the file. `false` when the file is not in the
     /// tree. A symbol no longer there leaves the file selected.
     pub fn reveal_id(&mut self, file: &str, target: Option<String>) -> bool {
-        let Some(tree_file) = self.project_tree.file(file) else { return false };
+        let Some(tree_file) = self.project_tree.file(file) else {
+            return false;
+        };
         let file_id = tree_file.file_path.to_string_lossy().into_owned();
         self.set_expanded(&file_id, RowKind::File, true);
         if let Some(id) = &target {
             let (path, name) = crate::symbols::split_id(id);
             let segments: Vec<&str> = name.split('/').collect();
             for n in 1..segments.len() {
-                self.set_expanded(&format!("{path}::{}", segments[..n].join("/")), RowKind::Symbol, true);
+                self.set_expanded(
+                    &format!("{path}::{}", segments[..n].join("/")),
+                    RowKind::Symbol,
+                    true,
+                );
             }
         }
         let want = target.unwrap_or_else(|| file_id.clone());
@@ -1325,7 +1468,9 @@ impl App {
 
     /// Every write of the session by op, and whether its version is still
     /// in the tree: read once per written file, for a frame to colour by.
-    pub fn write_statuses(&self) -> std::collections::HashMap<&str, (&crate::writes::WriteRecord, crate::writes::Status)> {
+    pub fn write_statuses(
+        &self,
+    ) -> std::collections::HashMap<&str, (&crate::writes::WriteRecord, crate::writes::Status)> {
         let mut out = std::collections::HashMap::new();
         for (file, writes) in self.writes.by_file(None) {
             let now = self.file_contents(file);
@@ -1345,7 +1490,9 @@ impl App {
     /// Wheel zooms at the pointer, a click selects, a drag pans.
     fn handle_trace_mouse(&mut self, mouse: MouseEvent) {
         use crate::trace::view::{Item, Layout};
-        let Some(g) = self.trace_geometry.get() else { return };
+        let Some(g) = self.trace_geometry.get() else {
+            return;
+        };
         if self.trace_view.focus.is_none() {
             let traces = self.trace_list();
             match mouse.kind {
@@ -1382,7 +1529,14 @@ impl App {
                     if let Some(r) = rows.get(row) {
                         self.trace_view.track_row = row;
                         let open_end = self.trace_open_end();
-                        let hit = crate::trace::view::span_at(&self.trace, &r.spans(&tracks), &vp, g.bars_width as usize, col, open_end);
+                        let hit = crate::trace::view::span_at(
+                            &self.trace,
+                            &r.spans(&tracks),
+                            &vp,
+                            g.bars_width as usize,
+                            col,
+                            open_end,
+                        );
                         if let Some(i) = hit {
                             self.trace_view.selected = Some(Item::Span(i));
                         }
@@ -1392,7 +1546,8 @@ impl App {
             MouseEventKind::Drag(_) => {
                 if let Some(from) = self.trace_drag {
                     let moved = f64::from(from) - f64::from(mouse.column);
-                    self.trace_view.pan(&self.trace, moved / f64::from(g.bars_width.max(1)));
+                    self.trace_view
+                        .pan(&self.trace, moved / f64::from(g.bars_width.max(1)));
                     self.trace_drag = Some(mouse.column);
                 }
             }
@@ -1429,8 +1584,6 @@ impl App {
         self.selected_index = new_idx.clamp(0, self.tree_rows.len() as i32 - 1) as usize;
         self.panel_index = 0;
     }
-
-
 
     fn select_first(&mut self) {
         self.selected_index = 0;
@@ -1496,8 +1649,7 @@ impl App {
             else {
                 return;
             };
-            self.pending_editor_request =
-                Some((self.project_root.join(&file.file_path), 1));
+            self.pending_editor_request = Some((self.project_root.join(&file.file_path), 1));
             return;
         }
 
@@ -1511,13 +1663,19 @@ impl App {
     fn open_in_editor(&mut self, id: &str) {
         let found = crate::lookup::find(&self.project_tree, &[id]);
         if let Some(&(path, sym)) = found.first().and_then(|hits| hits.first()) {
-            self.pending_editor_request = Some((self.project_root.join(path), sym.line_range.start));
+            self.pending_editor_request =
+                Some((self.project_root.join(path), sym.line_range.start));
         }
     }
 
     /// Call `span`'s write record, when it is a write the journal has.
     pub fn write_of(&self, span: usize) -> Option<&crate::writes::WriteRecord> {
-        self.trace.spans().get(span)?.id.as_deref().and_then(|op| self.writes.get(op))
+        self.trace
+            .spans()
+            .get(span)?
+            .id
+            .as_deref()
+            .and_then(|op| self.writes.get(op))
     }
 
     /// The agent ids the stats panel lists, in the order it lists them.
@@ -1530,7 +1688,10 @@ impl App {
     /// `agents_seen`. Every cursor, bound, and count that has to line up with
     /// what is on screen must come from here.
     fn agent_list(&self) -> Vec<String> {
-        self.flattened_agents().into_iter().map(|(id, _)| id).collect()
+        self.flattened_agents()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
     }
 
     fn cycle_agent_filter(&mut self) {
@@ -1706,27 +1867,46 @@ impl App {
     /// Move focus forward (`Tab`) or back (`Shift+Tab`) through the left
     /// panel, the right panel and — when shown — the feed.
     fn cycle_focus(&mut self, forward: bool) {
-        let order: &[FocusPanel] =
-            if self.show_activity { &[FocusPanel::Left, FocusPanel::Right, FocusPanel::Feed] } else { &[FocusPanel::Left, FocusPanel::Right] };
+        let order: &[FocusPanel] = if self.show_activity {
+            &[FocusPanel::Left, FocusPanel::Right, FocusPanel::Feed]
+        } else {
+            &[FocusPanel::Left, FocusPanel::Right]
+        };
         let at = order.iter().position(|f| *f == self.focus).unwrap_or(0);
-        let next = if forward { (at + 1) % order.len() } else { (at + order.len() - 1) % order.len() };
+        let next = if forward {
+            (at + 1) % order.len()
+        } else {
+            (at + order.len() - 1) % order.len()
+        };
         self.focus = order[next];
     }
 
     /// The traces that touched the selected row, for the inspector.
     pub fn inspector_touches(&self) -> Vec<crate::trace::touch::Touch> {
-        let Some(row) = self.tree_rows.get(self.selected_index) else { return Vec::new() };
+        let Some(row) = self.tree_rows.get(self.selected_index) else {
+            return Vec::new();
+        };
         let (file, symbol) = match row.kind {
             RowKind::File => (row.symbol_id.as_str(), None),
-            RowKind::Symbol => (crate::symbols::split_id(&row.symbol_id).0, Some(row.symbol_id.as_str())),
+            RowKind::Symbol => (
+                crate::symbols::split_id(&row.symbol_id).0,
+                Some(row.symbol_id.as_str()),
+            ),
         };
-        crate::trace::touch::touches(&self.trace, &crate::objects::normalize_path(file), symbol, &self.writes)
+        crate::trace::touch::touches(
+            &self.trace,
+            &crate::objects::normalize_path(file),
+            symbol,
+            &self.writes,
+        )
     }
 
     /// Open the trace the inspector has selected, at its first call on the row.
     fn open_inspected_trace(&mut self) {
         let touches = self.inspector_touches();
-        let Some(t) = touches.get(self.panel_index.min(touches.len().saturating_sub(1))) else { return };
+        let Some(t) = touches.get(self.panel_index.min(touches.len().saturating_sub(1))) else {
+            return;
+        };
         self.trace_view.open = true;
         self.trace_view.open_trace(t.root);
         self.trace_view.selected = Some(crate::trace::view::Item::Span(t.span));
@@ -1803,12 +1983,23 @@ impl App {
     pub fn process_tool_finished(&mut self, finished: &crate::ingest::ToolFinished) {
         self.trace.finish(finished);
         if !finished.shown.is_empty() {
-            let read = apply_shown(&self.project_tree, finished, &mut self.ledger, &mut self.depth_cache);
+            let read = apply_shown(
+                &self.project_tree,
+                finished,
+                &mut self.ledger,
+                &mut self.depth_cache,
+            );
             self.trace.note_read(&finished.id, read);
             self.rebuild_tree_rows();
         }
         if !finished.printed.is_empty() {
-            let read = apply_printed(&self.project_tree, &self.project_root, finished, &mut self.ledger, &mut self.depth_cache);
+            let read = apply_printed(
+                &self.project_tree,
+                &self.project_root,
+                finished,
+                &mut self.ledger,
+                &mut self.depth_cache,
+            );
             self.trace.note_read(&finished.id, read);
             self.rebuild_tree_rows();
         }
@@ -1823,7 +2014,8 @@ impl App {
     /// `pending_writes`). Without a session there is no journal to put it in.
     pub fn queue_write(&mut self, event: crate::ingest::WriteEvent) {
         if let Some(session) = &self.session_id {
-            self.pending_writes.push((Arc::from(session.as_str()), event));
+            self.pending_writes
+                .push((Arc::from(session.as_str()), event));
         }
     }
 
@@ -1869,8 +2061,18 @@ impl App {
         if self.session_id.as_deref() == Some(id) {
             return "main".to_string();
         }
-        let task = self.trace.delegation_of(id).map(|d| self.trace.spans()[d].task()).filter(|t| !t.is_empty());
-        let label = || self.agent_tree.agents.get(id).map(|n| n.label.clone()).filter(|l| !l.is_empty() && l != id);
+        let task = self
+            .trace
+            .delegation_of(id)
+            .map(|d| self.trace.spans()[d].task())
+            .filter(|t| !t.is_empty());
+        let label = || {
+            self.agent_tree
+                .agents
+                .get(id)
+                .map(|n| n.label.clone())
+                .filter(|l| !l.is_empty() && l != id)
+        };
         task.or_else(label).unwrap_or_else(|| id.to_string())
     }
 
@@ -1950,7 +2152,11 @@ fn resolve_selector_path(tree: &ProjectTree, event: &AgentToolCall) -> Option<St
         return None;
     }
 
-    let names: Vec<&str> = event.target_selectors.iter().map(|s| s.selector.as_str()).collect();
+    let names: Vec<&str> = event
+        .target_selectors
+        .iter()
+        .map(|s| s.selector.as_str())
+        .collect();
     let mut paths: Vec<&Path> = Vec::new();
     for hits in crate::lookup::find(tree, &names) {
         if let Some(&(p, _)) = hits.first() {
@@ -1980,14 +2186,29 @@ pub struct Credit<'a> {
 }
 
 impl<'a> Credit<'a> {
-    pub fn new(ledger: &'a mut ContextLedger, depth_cache: &'a mut crate::tracking::alignment::DepthOrdinalCache, agent: &'a str) -> Self {
-        Credit { ledger, depth_cache, agent, read: Vec::new() }
+    pub fn new(
+        ledger: &'a mut ContextLedger,
+        depth_cache: &'a mut crate::tracking::alignment::DepthOrdinalCache,
+        agent: &'a str,
+    ) -> Self {
+        Credit {
+            ledger,
+            depth_cache,
+            agent,
+            read: Vec::new(),
+        }
     }
 
     /// Credit `sym` at `depth`; `implied` when it comes with a parent read
     /// whole.
     fn record(&mut self, sym: &SymbolNode, depth: ReadDepth, implied: bool) {
-        self.ledger.record(sym.id.clone(), depth, sym.content_hash, self.agent.to_string(), sym.estimated_tokens as usize);
+        self.ledger.record(
+            sym.id.clone(),
+            depth,
+            sym.content_hash,
+            self.agent.to_string(),
+            sym.estimated_tokens as usize,
+        );
         self.depth_cache.record(&sym.id, self.agent, depth);
         self.read.push((sym.id.clone(), depth, implied));
     }
@@ -2047,12 +2268,22 @@ pub fn apply_tool_call(
     let mut credit = Credit::new(ledger, depth_cache, &event.agent_id);
 
     if !event.target_selectors.is_empty() {
-        mark_selectors(tree, event.target_selectors.iter().map(|s| (s.selector.as_str(), s.depth, s.whole)), &mut credit);
+        mark_selectors(
+            tree,
+            event
+                .target_selectors
+                .iter()
+                .map(|s| (s.selector.as_str(), s.depth, s.whole)),
+            &mut credit,
+        );
     }
 
     // The file as the trace and write records name it: `./src/a.rs`, or
     // one named with a decomposed accent, is the tree's `src/a.rs`.
-    let named = event.file_path.as_deref().and_then(|p| crate::objects::project_file(p, project_root));
+    let named = event
+        .file_path
+        .as_deref()
+        .and_then(|p| crate::objects::project_file(p, project_root));
     if let Some(file) = named.as_deref().and_then(|f| tree.file(f)) {
         if event.target_symbol.is_some() || event.target_lines.is_some() {
             mark_targeted_symbols(&file.symbols, event, &mut credit);
@@ -2061,7 +2292,11 @@ pub fn apply_tool_call(
         }
     }
     for read in &event.file_reads {
-        let Some(file) = crate::objects::project_file(&read.path, project_root).and_then(|f| tree.file(&f)) else { continue };
+        let Some(file) =
+            crate::objects::project_file(&read.path, project_root).and_then(|f| tree.file(&f))
+        else {
+            continue;
+        };
         use crate::ingest::command_reads::Lines;
         let lines = match &read.lines {
             Lines::Whole => {
@@ -2075,7 +2310,12 @@ pub fn apply_tool_call(
             }
         };
         // What the command printed is what a Read of those lines returns.
-        let as_read = AgentToolCall { target_symbol: None, target_lines: Some(lines), read_depth: ReadDepth::FullBody, ..event.clone() };
+        let as_read = AgentToolCall {
+            target_symbol: None,
+            target_lines: Some(lines),
+            read_depth: ReadDepth::FullBody,
+            ..event.clone()
+        };
         mark_targeted_symbols(&file.symbols, &as_read, &mut credit);
     }
     credit.listed()
@@ -2094,7 +2334,11 @@ pub fn apply_shown(
         return Vec::new();
     }
     let mut credit = Credit::new(ledger, depth_cache, &finished.agent_id);
-    mark_selectors(tree, finished.shown.iter().map(|(s, d)| (s.as_str(), *d, false)), &mut credit);
+    mark_selectors(
+        tree,
+        finished.shown.iter().map(|(s, d)| (s.as_str(), *d, false)),
+        &mut credit,
+    );
     credit.listed()
 }
 
@@ -2110,12 +2354,18 @@ pub fn apply_printed(
     depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
 ) -> Vec<(String, ReadDepth)> {
     fn innermost(symbols: &[SymbolNode], line: u32) -> Option<&SymbolNode> {
-        let sym = symbols.iter().find(|s| s.line_range.start <= line && line <= s.line_range.end)?;
+        let sym = symbols
+            .iter()
+            .find(|s| s.line_range.start <= line && line <= s.line_range.end)?;
         innermost(&sym.children, line).or(Some(sym))
     }
     let mut credit = Credit::new(ledger, depth_cache, &finished.agent_id);
     for (path, line) in &finished.printed {
-        let Some(file) = crate::objects::project_file(path, project_root).and_then(|f| tree.file(&f)) else { continue };
+        let Some(file) =
+            crate::objects::project_file(path, project_root).and_then(|f| tree.file(&f))
+        else {
+            continue;
+        };
         if let Some(sym) = innermost(&file.symbols, *line) {
             credit.record(sym, ReadDepth::NameOnly, false);
         }
@@ -2136,7 +2386,11 @@ pub fn apply_printed(
 /// A selector matching nothing is silently ignored. The command may have been
 /// a miss, or may name a symbol that has since changed; either way there is
 /// no read to record.
-fn mark_selectors<'s>(tree: &ProjectTree, selectors: impl IntoIterator<Item = (&'s str, ReadDepth, bool)>, credit: &mut Credit<'_>) {
+fn mark_selectors<'s>(
+    tree: &ProjectTree,
+    selectors: impl IntoIterator<Item = (&'s str, ReadDepth, bool)>,
+    credit: &mut Credit<'_>,
+) {
     // Resolved as `show` resolves them (`lookup::find`). A symbol named more
     // than once takes the deepest naming; `record` is upgrade-only. A
     // selector `whole` printed the whole definition, so what is inside the
@@ -2157,7 +2411,10 @@ fn mark_selectors<'s>(tree: &ProjectTree, selectors: impl IntoIterator<Item = (&
 fn count_stale(symbols: &[SymbolNode], ledger: &ContextLedger) -> usize {
     symbols
         .iter()
-        .map(|s| usize::from(ledger.is_stale(&s.id) && ledger.depth_of(&s.id).is_seen()) + count_stale(&s.children, ledger))
+        .map(|s| {
+            usize::from(ledger.is_stale(&s.id) && ledger.depth_of(&s.id).is_seen())
+                + count_stale(&s.children, ledger)
+        })
         .sum()
 }
 
@@ -2170,7 +2427,12 @@ struct RowContext<'a> {
 }
 
 fn flatten_symbol(sym: &SymbolNode, depth: usize, cx: &RowContext<'_>, rows: &mut Vec<TreeRow>) {
-    let RowContext { expansion, ledger, agent_filter, .. } = *cx;
+    let RowContext {
+        expansion,
+        ledger,
+        agent_filter,
+        ..
+    } = *cx;
     let is_expanded = expansion.is_expanded(&sym.id, RowKind::Symbol);
     let read_depth = match agent_filter {
         Some(agent_id) => ledger.depth_of_for_agent(&sym.id, agent_id),
@@ -2179,12 +2441,19 @@ fn flatten_symbol(sym: &SymbolNode, depth: usize, cx: &RowContext<'_>, rows: &mu
     // A collapsed symbol summarizes its descendants, as a file row does: reads
     // land on innermost symbols, so without this a method read inside
     // `impl App` leaves every visible row grey under an amber file.
-    let (coverage_status, coverage_seen, coverage_total, coverage_full, stale_count) = if !is_expanded && !sym.children.is_empty() {
-        let (total, seen, full) = count_symbols(&sym.children, ledger, agent_filter);
-        (Some(coverage_status_from_counts(total, seen, full)), seen, total, full, count_stale(&sym.children, ledger))
-    } else {
-        (None, 0, 0, 0, 0)
-    };
+    let (coverage_status, coverage_seen, coverage_total, coverage_full, stale_count) =
+        if !is_expanded && !sym.children.is_empty() {
+            let (total, seen, full) = count_symbols(&sym.children, ledger, agent_filter);
+            (
+                Some(coverage_status_from_counts(total, seen, full)),
+                seen,
+                total,
+                full,
+                count_stale(&sym.children, ledger),
+            )
+        } else {
+            (None, 0, 0, 0, 0)
+        };
 
     rows.push(TreeRow {
         symbol_id: sym.id.clone(),
@@ -2214,7 +2483,6 @@ fn flatten_symbol(sym: &SymbolNode, depth: usize, cx: &RowContext<'_>, rows: &mu
     }
 }
 
-
 /// Unconditionally record every symbol in `symbols` (and all their descendants)
 /// at the event's `read_depth`. Used when the entire file — or the entire body of
 /// a named symbol — was present in the tool response.
@@ -2223,7 +2491,12 @@ fn flatten_symbol(sym: &SymbolNode, depth: usize, cx: &RowContext<'_>, rows: &mu
 /// symbols that match the event's `target_symbol` or `target_lines`.
 /// `implied` for symbols that come with a parent read whole: listed by the
 /// parent, not themselves.
-pub fn mark_file_symbols(symbols: &[SymbolNode], depth: ReadDepth, credit: &mut Credit<'_>, implied: bool) {
+pub fn mark_file_symbols(
+    symbols: &[SymbolNode],
+    depth: ReadDepth,
+    credit: &mut Credit<'_>,
+    implied: bool,
+) {
     for sym in symbols {
         credit.record(sym, depth, implied);
         mark_file_symbols(&sym.children, depth, credit, true);
@@ -2236,7 +2509,11 @@ pub fn mark_file_symbols(symbols: &[SymbolNode], depth: ReadDepth, credit: &mut 
 /// the tool response included the entire named symbol's body. Line-range matches
 /// (via `target_lines`) recurse precisely so that only overlapping child symbols
 /// are promoted — preventing unread siblings from being over-credited.
-pub fn mark_targeted_symbols(symbols: &[SymbolNode], event: &AgentToolCall, credit: &mut Credit<'_>) {
+pub fn mark_targeted_symbols(
+    symbols: &[SymbolNode],
+    event: &AgentToolCall,
+    credit: &mut Credit<'_>,
+) {
     for sym in symbols {
         match classify_symbol_match(sym, event) {
             MatchKind::ByName => {
@@ -2299,7 +2576,9 @@ fn strip_leading_keywords(mut s: &str) -> &str {
 /// so that tool-qualified paths like `"impl App/method"` match ambit's tree path
 /// `"App/method"` without special-casing individual languages or keywords.
 pub fn symbol_name_matches(sym: &SymbolNode, event: &AgentToolCall) -> bool {
-    let Some(ref target_name) = event.target_symbol else { return false };
+    let Some(ref target_name) = event.target_symbol else {
+        return false;
+    };
 
     let norm_target = normalize_name_path(target_name);
 
@@ -2310,7 +2589,11 @@ pub fn symbol_name_matches(sym: &SymbolNode, event: &AgentToolCall) -> bool {
             (target_name.as_str(), name_part),
             (norm_target.as_str(), norm_name_part.as_str()),
         ] {
-            if np == t || (np.len() > t.len() && np.as_bytes()[np.len() - t.len() - 1] == b'/' && np.ends_with(t)) {
+            if np == t
+                || (np.len() > t.len()
+                    && np.as_bytes()[np.len() - t.len() - 1] == b'/'
+                    && np.ends_with(t))
+            {
                 return true;
             }
         }
@@ -2323,7 +2606,9 @@ pub fn symbol_name_matches(sym: &SymbolNode, event: &AgentToolCall) -> bool {
 /// Check if a symbol's line range overlaps with the tool call's `target_lines`.
 /// A symbol's range includes its last line; a call's range does not.
 pub fn symbol_lines_match(sym: &SymbolNode, event: &AgentToolCall) -> bool {
-    let Some(ref target_range) = event.target_lines else { return false };
+    let Some(ref target_range) = event.target_lines else {
+        return false;
+    };
     sym.line_range.start < target_range.end && target_range.start <= sym.line_range.end
 }
 
@@ -2333,11 +2618,15 @@ pub fn symbol_lines_match(sym: &SymbolNode, event: &AgentToolCall) -> bool {
 /// attributes or decorators), no more than `Signature` when it began at or
 /// before that line, and no more than `Overview` when it began below it.
 pub fn overlap_depth(sym: &SymbolNode, event: &AgentToolCall) -> ReadDepth {
-    let Some(ref range) = event.target_lines else { return event.read_depth };
+    let Some(ref range) = event.target_lines else {
+        return event.read_depth;
+    };
     if range.start <= sym.line_range.start && sym.line_range.end < range.end {
         return event.read_depth;
     }
-    let head = sym.head_line.clamp(sym.line_range.start, sym.line_range.end);
+    let head = sym
+        .head_line
+        .clamp(sym.line_range.start, sym.line_range.end);
     if range.end <= head {
         ReadDepth::Unseen
     } else if range.start <= head {
@@ -2412,18 +2701,30 @@ mod tests {
     #[test]
     fn a_calls_file_is_the_trees_however_it_is_spelled() {
         let file = |p: &str| crate::objects::project_file(Path::new(p), Path::new("/project"));
-        for spelled in ["/project/src/main.rs", "src/main.rs", "./src/main.rs", "/project/./src/main.rs"] {
+        for spelled in [
+            "/project/src/main.rs",
+            "src/main.rs",
+            "./src/main.rs",
+            "/project/./src/main.rs",
+        ] {
             assert_eq!(file(spelled).as_deref(), Some("src/main.rs"), "{spelled}");
         }
         assert_eq!(file("/elsewhere/main.rs"), None, "outside the project");
         assert_eq!(file("../main.rs"), None);
-        assert_eq!(file("cafe\u{301}.rs").as_deref(), Some("caf\u{e9}.rs"), "NFC, as the tree's paths are");
+        assert_eq!(
+            file("cafe\u{301}.rs").as_deref(),
+            Some("caf\u{e9}.rs"),
+            "NFC, as the tree's paths are"
+        );
     }
 
     /// A read named `./mock/f.rs` credits the tree's `mock/f.rs`.
     #[test]
     fn a_read_credits_the_file_however_it_is_spelled() {
-        let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::alpha", "alpha")])]);
+        let mut app = test_app(vec![file(
+            "mock/f.rs",
+            vec![sym("mock/f.rs::alpha", "alpha")],
+        )]);
         let mut call = tool_call("Read", "./mock/f.rs", ReadDepth::FullBody);
         call.tool_use_id = Some(Arc::from("r1"));
         app.process_agent_event(call);
@@ -2438,7 +2739,12 @@ mod tests {
         let mut ledger = ContextLedger::new();
         let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
 
-        mark_file_symbols(&[parent], event.read_depth, &mut Credit::new(&mut ledger, &mut cache, &event.agent_id), false);
+        mark_file_symbols(
+            &[parent],
+            event.read_depth,
+            &mut Credit::new(&mut ledger, &mut cache, &event.agent_id),
+            false,
+        );
 
         assert_eq!(ledger.depth_of("mock/f.rs::parent"), ReadDepth::FullBody);
         assert_eq!(ledger.depth_of("mock/f.rs::child"), ReadDepth::FullBody);
@@ -2452,7 +2758,11 @@ mod tests {
         let mut ledger = ContextLedger::new();
         let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
 
-        mark_targeted_symbols(&[s1, s2], &event, &mut Credit::new(&mut ledger, &mut cache, &event.agent_id));
+        mark_targeted_symbols(
+            &[s1, s2],
+            &event,
+            &mut Credit::new(&mut ledger, &mut cache, &event.agent_id),
+        );
 
         assert_eq!(ledger.depth_of("mock/f.rs::alpha"), ReadDepth::Unseen);
         assert_eq!(ledger.depth_of("mock/f.rs::beta"), ReadDepth::FullBody);
@@ -2466,10 +2776,18 @@ mod tests {
         let mut ledger = ContextLedger::new();
         let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
 
-        mark_targeted_symbols(&[s1, s2], &event, &mut Credit::new(&mut ledger, &mut cache, &event.agent_id));
+        mark_targeted_symbols(
+            &[s1, s2],
+            &event,
+            &mut Credit::new(&mut ledger, &mut cache, &event.agent_id),
+        );
 
         assert_eq!(ledger.depth_of("mock/f.rs::a"), ReadDepth::Unseen);
-        assert_eq!(ledger.depth_of("mock/f.rs::b"), ReadDepth::Overview, "lines 12-17 of 10-20: begun inside");
+        assert_eq!(
+            ledger.depth_of("mock/f.rs::b"),
+            ReadDepth::Overview,
+            "lines 12-17 of 10-20: begun inside"
+        );
     }
 
     #[test]
@@ -2479,45 +2797,78 @@ mod tests {
 
         // No coverage.
         let (total, seen, full) = count_symbols(&syms, &ledger, None);
-        assert_eq!(coverage_status_from_counts(total, seen, full), FileCoverageStatus::NotCovered);
+        assert_eq!(
+            coverage_status_from_counts(total, seen, full),
+            FileCoverageStatus::NotCovered
+        );
 
         // Partial: one seen, one unseen → PartiallyCovered.
         ledger.record("s1".into(), ReadDepth::NameOnly, [0; 32], "ag".into(), 10);
         let (total, seen, full) = count_symbols(&syms, &ledger, None);
-        assert_eq!(coverage_status_from_counts(total, seen, full), FileCoverageStatus::PartiallyCovered);
+        assert_eq!(
+            coverage_status_from_counts(total, seen, full),
+            FileCoverageStatus::PartiallyCovered
+        );
 
         // All seen (both NameOnly) but none FullBody → AllSeen.
         ledger.record("s2".into(), ReadDepth::NameOnly, [0; 32], "ag".into(), 10);
         let (total, seen, full) = count_symbols(&syms, &ledger, None);
-        assert_eq!(coverage_status_from_counts(total, seen, full), FileCoverageStatus::AllSeen);
+        assert_eq!(
+            coverage_status_from_counts(total, seen, full),
+            FileCoverageStatus::AllSeen
+        );
 
         // One FullBody, one NameOnly → AllSeen (all seen, not all full).
         ledger.record("s1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
         let (total, seen, full) = count_symbols(&syms, &ledger, None);
-        assert_eq!(coverage_status_from_counts(total, seen, full), FileCoverageStatus::AllSeen);
+        assert_eq!(
+            coverage_status_from_counts(total, seen, full),
+            FileCoverageStatus::AllSeen
+        );
 
         // Full: both FullBody.
         ledger.record("s2".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
         let (total, seen, full) = count_symbols(&syms, &ledger, None);
-        assert_eq!(coverage_status_from_counts(total, seen, full), FileCoverageStatus::FullyCovered);
+        assert_eq!(
+            coverage_status_from_counts(total, seen, full),
+            FileCoverageStatus::FullyCovered
+        );
 
         // Direct FullBody with unseen siblings → PartiallyCovered (full > 0, seen < total).
-        assert_eq!(coverage_status_from_counts(3, 1, 1), FileCoverageStatus::PartiallyCovered);
+        assert_eq!(
+            coverage_status_from_counts(3, 1, 1),
+            FileCoverageStatus::PartiallyCovered
+        );
     }
 
     #[test]
     fn symbol_matches_target_formats() {
         // Plain name match.
         let s = sym("mock/app.rs::App/handle_key", "handle_key");
-        let event = tool_call_targeted("find_symbol", "mock/app.rs", ReadDepth::FullBody, "handle_key");
+        let event = tool_call_targeted(
+            "find_symbol",
+            "mock/app.rs",
+            ReadDepth::FullBody,
+            "handle_key",
+        );
         assert!(symbol_matches_target(&s, &event));
 
         // Name path suffix match.
-        let event2 = tool_call_targeted("find_symbol", "mock/app.rs", ReadDepth::FullBody, "App/handle_key");
+        let event2 = tool_call_targeted(
+            "find_symbol",
+            "mock/app.rs",
+            ReadDepth::FullBody,
+            "App/handle_key",
+        );
         assert!(symbol_matches_target(&s, &event2));
 
         // Non-match.
-        let event3 = tool_call_targeted("find_symbol", "mock/app.rs", ReadDepth::FullBody, "other_fn");
+        let event3 = tool_call_targeted(
+            "find_symbol",
+            "mock/app.rs",
+            ReadDepth::FullBody,
+            "other_fn",
+        );
         assert!(!symbol_matches_target(&s, &event3));
     }
 
@@ -2545,13 +2896,19 @@ mod tests {
         // Starts with uppercase — not a keyword.
         assert_eq!(normalize_name_path("Display for App"), "Display for App");
         // Has colons — not a simple keyword token.
-        assert_eq!(normalize_name_path("std::fmt::Display for App"), "std::fmt::Display for App");
+        assert_eq!(
+            normalize_name_path("std::fmt::Display for App"),
+            "std::fmt::Display for App"
+        );
     }
 
     #[test]
     fn normalize_name_path_per_segment() {
         // Each `/`-separated segment is normalised independently.
-        assert_eq!(normalize_name_path("impl App/fn handle_key"), "App/handle_key");
+        assert_eq!(
+            normalize_name_path("impl App/fn handle_key"),
+            "App/handle_key"
+        );
     }
 
     // --- symbol_name_matches with keyword-qualified paths ---
@@ -2560,7 +2917,12 @@ mod tests {
     fn symbol_name_matches_impl_qualified_method() {
         // Serena emits "impl App/handle_key"; ambit's tree has id "mock/app.rs::App/handle_key".
         let s = sym("mock/app.rs::App/handle_key", "handle_key");
-        let event = tool_call_targeted("find_symbol", "mock/app.rs", ReadDepth::FullBody, "impl App/handle_key");
+        let event = tool_call_targeted(
+            "find_symbol",
+            "mock/app.rs",
+            ReadDepth::FullBody,
+            "impl App/handle_key",
+        );
         assert!(symbol_name_matches(&s, &event));
     }
 
@@ -2568,7 +2930,12 @@ mod tests {
     fn symbol_name_matches_impl_block_itself() {
         // Serena emits "impl App"; ambit's tree has id "mock/app.rs::App" (impl block).
         let s = sym("mock/app.rs::App", "App");
-        let event = tool_call_targeted("find_symbol", "mock/app.rs", ReadDepth::Signature, "impl App");
+        let event = tool_call_targeted(
+            "find_symbol",
+            "mock/app.rs",
+            ReadDepth::Signature,
+            "impl App",
+        );
         assert!(symbol_name_matches(&s, &event));
     }
 
@@ -2576,7 +2943,12 @@ mod tests {
     fn symbol_name_matches_trait_impl() {
         // "impl Display for App" → normalised "Display for App"
         let s = sym("mock/app.rs::Display for App", "Display for App");
-        let event = tool_call_targeted("find_symbol", "mock/app.rs", ReadDepth::FullBody, "impl Display for App");
+        let event = tool_call_targeted(
+            "find_symbol",
+            "mock/app.rs",
+            ReadDepth::FullBody,
+            "impl Display for App",
+        );
         assert!(symbol_name_matches(&s, &event));
     }
 
@@ -2587,16 +2959,19 @@ mod tests {
         // Parent impl block spans lines 1..100; two sibling methods inside.
         let method_a = sym_with_lines("f.rs::Foo/method_a", "method_a", 5, 20);
         let method_b = sym_with_lines("f.rs::Foo/method_b", "method_b", 50, 70);
-        let impl_block = sym_with_children_and_lines(
-            "f.rs::Foo", "Foo", vec![method_a, method_b], 1, 100,
-        );
+        let impl_block =
+            sym_with_children_and_lines("f.rs::Foo", "Foo", vec![method_a, method_b], 1, 100);
 
         // Read covers exactly method_b's lines, 50 through 70.
         let event = tool_call_lines("Read", "f.rs", ReadDepth::FullBody, 50, 71);
         let mut ledger = ContextLedger::new();
         let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
 
-        mark_targeted_symbols(&[impl_block], &event, &mut Credit::new(&mut ledger, &mut cache, &event.agent_id));
+        mark_targeted_symbols(
+            &[impl_block],
+            &event,
+            &mut Credit::new(&mut ledger, &mut cache, &event.agent_id),
+        );
 
         // The parent is marked (it overlaps) no deeper than a part of it shows,
         // and method_a is not marked at all.
@@ -2612,15 +2987,27 @@ mod tests {
             let event = tool_call_lines("Read", "f.rs", ReadDepth::FullBody, start, end);
             let mut ledger = ContextLedger::new();
             let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
-            mark_targeted_symbols(std::slice::from_ref(&f), &event, &mut Credit::new(&mut ledger, &mut cache, &event.agent_id));
+            mark_targeted_symbols(
+                std::slice::from_ref(&f),
+                &event,
+                &mut Credit::new(&mut ledger, &mut cache, &event.agent_id),
+            );
             ledger.depth_of("f.rs::f")
         };
         assert_eq!(depth_for(10, 21), ReadDepth::FullBody, "every line");
         assert_eq!(depth_for(1, 40), ReadDepth::FullBody, "and more");
-        assert_eq!(depth_for(10, 15), ReadDepth::Signature, "from its first line");
+        assert_eq!(
+            depth_for(10, 15),
+            ReadDepth::Signature,
+            "from its first line"
+        );
         assert_eq!(depth_for(5, 12), ReadDepth::Signature, "from before it");
         assert_eq!(depth_for(14, 30), ReadDepth::Overview, "from inside it");
-        assert_eq!(depth_for(20, 25), ReadDepth::Overview, "its last line only: a range ending on it still overlaps");
+        assert_eq!(
+            depth_for(20, 25),
+            ReadDepth::Overview,
+            "its last line only: a range ending on it still overlaps"
+        );
         assert_eq!(depth_for(21, 25), ReadDepth::Unseen, "after it");
     }
 
@@ -2638,10 +3025,26 @@ mod tests {
             let recorded = credit.read.len();
             (ledger.depth_of("f.rs::f"), recorded)
         };
-        assert_eq!(depth_for(5, 12), (ReadDepth::Unseen, 0), "its decorators only: not even recorded");
-        assert_eq!(depth_for(5, 13), (ReadDepth::Signature, 1), "down to the line naming it");
-        assert_eq!(depth_for(11, 14), (ReadDepth::Signature, 1), "from inside its decorators");
-        assert_eq!(depth_for(13, 15), (ReadDepth::Overview, 1), "from below its name");
+        assert_eq!(
+            depth_for(5, 12),
+            (ReadDepth::Unseen, 0),
+            "its decorators only: not even recorded"
+        );
+        assert_eq!(
+            depth_for(5, 13),
+            (ReadDepth::Signature, 1),
+            "down to the line naming it"
+        );
+        assert_eq!(
+            depth_for(11, 14),
+            (ReadDepth::Signature, 1),
+            "from inside its decorators"
+        );
+        assert_eq!(
+            depth_for(13, 15),
+            (ReadDepth::Overview, 1),
+            "from below its name"
+        );
     }
 
     #[test]
@@ -2649,16 +3052,19 @@ mod tests {
         // Name-based match on the impl block should still bulk-mark all children.
         let method_a = sym_with_lines("f.rs::Foo/method_a", "method_a", 5, 20);
         let method_b = sym_with_lines("f.rs::Foo/method_b", "method_b", 50, 70);
-        let impl_block = sym_with_children_and_lines(
-            "f.rs::Foo", "Foo", vec![method_a, method_b], 1, 100,
-        );
+        let impl_block =
+            sym_with_children_and_lines("f.rs::Foo", "Foo", vec![method_a, method_b], 1, 100);
 
         // find_symbol("impl Foo", include_body=true) — all children embedded in response.
         let event = tool_call_targeted("find_symbol", "f.rs", ReadDepth::FullBody, "impl Foo");
         let mut ledger = ContextLedger::new();
         let mut cache = crate::tracking::alignment::DepthOrdinalCache::new();
 
-        mark_targeted_symbols(&[impl_block], &event, &mut Credit::new(&mut ledger, &mut cache, &event.agent_id));
+        mark_targeted_symbols(
+            &[impl_block],
+            &event,
+            &mut Credit::new(&mut ledger, &mut cache, &event.agent_id),
+        );
 
         assert_eq!(ledger.depth_of("f.rs::Foo"), ReadDepth::FullBody);
         assert_eq!(ledger.depth_of("f.rs::Foo/method_a"), ReadDepth::FullBody);
@@ -2746,7 +3152,11 @@ mod tests {
 
         let mut app = App::new(tree, dir.path().to_path_buf());
         app.set_session_id(Some("sess-1".into()));
-        write_journal(dir.path(), "sess-1", &[("mock/f.rs::alpha", "agent-9", current)]);
+        write_journal(
+            dir.path(),
+            "sess-1",
+            &[("mock/f.rs::alpha", "agent-9", current)],
+        );
 
         let stats = app.rehydrate_from_journal().expect("journal was found");
 
@@ -2766,7 +3176,10 @@ mod tests {
     fn rehydrate_from_journal_is_a_no_op_without_a_journal() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::new(
-            project(vec![file("mock/f.rs", vec![sym("mock/f.rs::alpha", "alpha")])]),
+            project(vec![file(
+                "mock/f.rs",
+                vec![sym("mock/f.rs::alpha", "alpha")],
+            )]),
             dir.path().to_path_buf(),
         );
         app.set_session_id(Some("sess-none".into()));
@@ -2813,12 +3226,18 @@ mod tests {
     /// inverts the incentive the tool exists to create.
     #[test]
     fn a_show_command_credits_the_symbols_it_names() {
-        let syms = vec![sym("mock/f.rs::alpha", "alpha"), sym("mock/f.rs::beta", "beta")];
+        let syms = vec![
+            sym("mock/f.rs::alpha", "alpha"),
+            sym("mock/f.rs::beta", "beta"),
+        ];
         let mut app = test_app(vec![file("mock/f.rs", syms)]);
 
         let mut event = tool_call("Bash", "", ReadDepth::FullBody);
         event.file_path = None;
-        event.target_selectors = vec![crate::ingest::SelectorRead::new("mock/f.rs::alpha", ReadDepth::FullBody)];
+        event.target_selectors = vec![crate::ingest::SelectorRead::new(
+            "mock/f.rs::alpha",
+            ReadDepth::FullBody,
+        )];
         app.process_agent_event(event);
 
         assert_eq!(app.ledger.depth_of("mock/f.rs::alpha"), ReadDepth::FullBody);
@@ -2834,14 +3253,45 @@ mod tests {
     /// the whole file, its top-level symbols — their children came with them.
     #[test]
     fn a_call_lists_what_it_read_in_its_own_right() {
-        let tree = project(vec![file("mock/f.rs", vec![sym_with_children("mock/f.rs::App", "App", vec![sym("mock/f.rs::App/run", "run")]), sym("mock/f.rs::free", "free")])]);
-        let (mut ledger, mut cache) = (ContextLedger::new(), crate::tracking::alignment::DepthOrdinalCache::new());
-        let shown = vec![("mock/f.rs::App".to_string(), ReadDepth::NameOnly), ("mock/f.rs::App/run".to_string(), ReadDepth::NameOnly)];
-        let search = crate::ingest::ToolFinished { id: Arc::from("s"), agent_id: Arc::from("a"), timestamp: String::new(), error: false, child_agent: None, message: None, shown: shown.clone(), printed: Vec::new() };
+        let tree = project(vec![file(
+            "mock/f.rs",
+            vec![
+                sym_with_children(
+                    "mock/f.rs::App",
+                    "App",
+                    vec![sym("mock/f.rs::App/run", "run")],
+                ),
+                sym("mock/f.rs::free", "free"),
+            ],
+        )]);
+        let (mut ledger, mut cache) = (
+            ContextLedger::new(),
+            crate::tracking::alignment::DepthOrdinalCache::new(),
+        );
+        let shown = vec![
+            ("mock/f.rs::App".to_string(), ReadDepth::NameOnly),
+            ("mock/f.rs::App/run".to_string(), ReadDepth::NameOnly),
+        ];
+        let search = crate::ingest::ToolFinished {
+            id: Arc::from("s"),
+            agent_id: Arc::from("a"),
+            timestamp: String::new(),
+            error: false,
+            child_agent: None,
+            message: None,
+            shown: shown.clone(),
+            printed: Vec::new(),
+        };
         assert_eq!(apply_shown(&tree, &search, &mut ledger, &mut cache), shown);
         let whole = tool_call("Read", "mock/f.rs", ReadDepth::FullBody);
         let listed = apply_tool_call(&tree, Path::new(""), &whole, &mut ledger, &mut cache);
-        assert_eq!(listed, vec![("mock/f.rs::App".to_string(), ReadDepth::FullBody), ("mock/f.rs::free".to_string(), ReadDepth::FullBody)]);
+        assert_eq!(
+            listed,
+            vec![
+                ("mock/f.rs::App".to_string(), ReadDepth::FullBody),
+                ("mock/f.rs::free".to_string(), ReadDepth::FullBody)
+            ]
+        );
     }
 
     /// Every view names an agent one way: `main`; a subagent by its
@@ -2855,7 +3305,11 @@ mod tests {
         labelled.label = Arc::from("Review the parser");
         app.process_agent_event(labelled);
         assert_eq!(app.agent_title("sess"), "main");
-        assert_eq!(app.agent_title("ab1"), "Review the parser", "its log's label");
+        assert_eq!(
+            app.agent_title("ab1"),
+            "Review the parser",
+            "its log's label"
+        );
         assert_eq!(app.agent_title("zz9"), "zz9", "nothing known");
 
         let mut spawn = tool_call("Agent", "", ReadDepth::Unseen);
@@ -2865,21 +3319,40 @@ mod tests {
         spawn.timestamp_str = "2026-09-27T10:00:00Z".into();
         app.process_agent_event(spawn);
         app.process_tool_finished(&crate::ingest::ToolFinished {
-            id: Arc::from("d1"), agent_id: Arc::from("sess"), timestamp: "2026-09-27T10:00:01Z".into(),
-            error: false, child_agent: Some(Arc::from("ab1")), message: None, shown: Vec::new(), printed: Vec::new(),
+            id: Arc::from("d1"),
+            agent_id: Arc::from("sess"),
+            timestamp: "2026-09-27T10:00:01Z".into(),
+            error: false,
+            child_agent: Some(Arc::from("ab1")),
+            message: None,
+            shown: Vec::new(),
+            printed: Vec::new(),
         });
-        assert_eq!(app.agent_title("ab1"), "Expert review", "its delegation's task first");
+        assert_eq!(
+            app.agent_title("ab1"),
+            "Expert review",
+            "its delegation's task first"
+        );
     }
 
     /// A file's contents are made once, and made again when the file
     /// changes: its symbols' merkle hashes say so.
     #[test]
     fn file_contents_are_kept_until_the_file_changes() {
-        let mut app = test_app(vec![file("mock/f.rs", vec![sym("mock/f.rs::alpha", "alpha")])]);
+        let mut app = test_app(vec![file(
+            "mock/f.rs",
+            vec![sym("mock/f.rs::alpha", "alpha")],
+        )]);
         let first = app.file_contents("mock/f.rs").unwrap();
-        assert!(Arc::ptr_eq(&first, &app.file_contents("mock/f.rs").unwrap()), "kept");
+        assert!(
+            Arc::ptr_eq(&first, &app.file_contents("mock/f.rs").unwrap()),
+            "kept"
+        );
         app.project_tree.files[0].symbols[0].content_hash = [9; 32];
-        assert!(!Arc::ptr_eq(&first, &app.file_contents("mock/f.rs").unwrap()), "made again");
+        assert!(
+            !Arc::ptr_eq(&first, &app.file_contents("mock/f.rs").unwrap()),
+            "made again"
+        );
         assert!(app.file_contents("mock/absent.rs").is_none());
     }
 
@@ -2887,11 +3360,18 @@ mod tests {
     /// depth it carries, never lowering a deeper read.
     #[test]
     fn a_search_result_credits_what_it_showed() {
-        let syms = vec![sym("mock/f.rs::alpha", "alpha"), sym("mock/f.rs::beta", "beta"), sym("mock/f.rs::gamma", "gamma")];
+        let syms = vec![
+            sym("mock/f.rs::alpha", "alpha"),
+            sym("mock/f.rs::beta", "beta"),
+            sym("mock/f.rs::gamma", "gamma"),
+        ];
         let mut app = test_app(vec![file("mock/f.rs", syms)]);
         let mut read = tool_call("Bash", "", ReadDepth::FullBody);
         read.file_path = None;
-        read.target_selectors = vec![crate::ingest::SelectorRead::new("mock/f.rs::beta", ReadDepth::FullBody)];
+        read.target_selectors = vec![crate::ingest::SelectorRead::new(
+            "mock/f.rs::beta",
+            ReadDepth::FullBody,
+        )];
         app.process_agent_event(read);
 
         app.process_tool_finished(&crate::ingest::ToolFinished {
@@ -2901,12 +3381,27 @@ mod tests {
             error: false,
             child_agent: None,
             message: None,
-            shown: vec![("mock/f.rs::alpha".into(), ReadDepth::NameOnly), ("mock/f.rs::beta".into(), ReadDepth::NameOnly)],
+            shown: vec![
+                ("mock/f.rs::alpha".into(), ReadDepth::NameOnly),
+                ("mock/f.rs::beta".into(), ReadDepth::NameOnly),
+            ],
             printed: Vec::new(),
         });
-        assert_eq!(app.ledger.depth_of("mock/f.rs::alpha"), ReadDepth::NameOnly, "seen, not read");
-        assert_eq!(app.ledger.depth_of("mock/f.rs::beta"), ReadDepth::FullBody, "a full read stays full");
-        assert_eq!(app.ledger.depth_of("mock/f.rs::gamma"), ReadDepth::Unseen, "not shown");
+        assert_eq!(
+            app.ledger.depth_of("mock/f.rs::alpha"),
+            ReadDepth::NameOnly,
+            "seen, not read"
+        );
+        assert_eq!(
+            app.ledger.depth_of("mock/f.rs::beta"),
+            ReadDepth::FullBody,
+            "a full read stays full"
+        );
+        assert_eq!(
+            app.ledger.depth_of("mock/f.rs::gamma"),
+            ReadDepth::Unseen,
+            "not shown"
+        );
     }
 
     /// A `show` that printed a container whole — an impl and every method in
@@ -2914,21 +3409,58 @@ mod tests {
     /// short read only the container.
     #[test]
     fn a_whole_show_of_a_container_reads_its_children() {
-        let impl_app = || file("mock/f.rs", vec![sym_with_children("mock/f.rs::App", "App", vec![sym("mock/f.rs::App/run", "run")])]);
+        let impl_app = || {
+            file(
+                "mock/f.rs",
+                vec![sym_with_children(
+                    "mock/f.rs::App",
+                    "App",
+                    vec![sym("mock/f.rs::App/run", "run")],
+                )],
+            )
+        };
         let show = |whole: bool| {
             let mut event = tool_call("Bash", "", ReadDepth::FullBody);
             event.file_path = None;
-            event.target_selectors = vec![crate::ingest::SelectorRead { selector: "mock/f.rs::App".into(), depth: ReadDepth::FullBody, whole }];
+            event.target_selectors = vec![crate::ingest::SelectorRead {
+                selector: "mock/f.rs::App".into(),
+                depth: ReadDepth::FullBody,
+                whole,
+            }];
             event
         };
         let mut app = test_app(vec![impl_app()]);
-        let listed = apply_tool_call(&app.project_tree, &app.project_root, &show(true), &mut app.ledger, &mut app.depth_cache);
-        assert_eq!(app.ledger.depth_of("mock/f.rs::App/run"), ReadDepth::FullBody, "its method came with it");
-        assert_eq!(listed, vec![("mock/f.rs::App".to_string(), ReadDepth::FullBody)], "listed as the impl");
+        let listed = apply_tool_call(
+            &app.project_tree,
+            &app.project_root,
+            &show(true),
+            &mut app.ledger,
+            &mut app.depth_cache,
+        );
+        assert_eq!(
+            app.ledger.depth_of("mock/f.rs::App/run"),
+            ReadDepth::FullBody,
+            "its method came with it"
+        );
+        assert_eq!(
+            listed,
+            vec![("mock/f.rs::App".to_string(), ReadDepth::FullBody)],
+            "listed as the impl"
+        );
 
         let mut cut = test_app(vec![impl_app()]);
-        apply_tool_call(&cut.project_tree, &cut.project_root, &show(false), &mut cut.ledger, &mut cut.depth_cache);
-        assert_eq!(cut.ledger.depth_of("mock/f.rs::App/run"), ReadDepth::Unseen, "perhaps cut before it");
+        apply_tool_call(
+            &cut.project_tree,
+            &cut.project_root,
+            &show(false),
+            &mut cut.ledger,
+            &mut cut.depth_cache,
+        );
+        assert_eq!(
+            cut.ledger.depth_of("mock/f.rs::App/run"),
+            ReadDepth::Unseen,
+            "perhaps cut before it"
+        );
     }
 
     /// Selectors carry their own location, so one command can legitimately
@@ -2962,7 +3494,10 @@ mod tests {
 
         let mut event = tool_call("Bash", "", ReadDepth::FullBody);
         event.file_path = None;
-        event.target_selectors = vec![crate::ingest::SelectorRead::new(&hex[3..11], ReadDepth::FullBody)];
+        event.target_selectors = vec![crate::ingest::SelectorRead::new(
+            &hex[3..11],
+            ReadDepth::FullBody,
+        )];
         app.process_agent_event(event);
 
         assert_eq!(app.ledger.depth_of("a.rs::only"), ReadDepth::FullBody);
@@ -2979,7 +3514,10 @@ mod tests {
 
         let mut event = tool_call("Bash", "", ReadDepth::FullBody);
         event.file_path = None;
-        event.target_selectors = vec![crate::ingest::SelectorRead::new("a.rs::one", ReadDepth::FullBody)];
+        event.target_selectors = vec![crate::ingest::SelectorRead::new(
+            "a.rs::one",
+            ReadDepth::FullBody,
+        )];
 
         let (path, target) = event_log_path_and_target(&app.project_tree, &event);
         assert_eq!(path, "a.rs");
@@ -3013,7 +3551,10 @@ mod tests {
 
         let mut event = tool_call("Bash", "", ReadDepth::FullBody);
         event.file_path = None;
-        event.target_selectors = vec![crate::ingest::SelectorRead::new("a.rs::nope", ReadDepth::FullBody)];
+        event.target_selectors = vec![crate::ingest::SelectorRead::new(
+            "a.rs::nope",
+            ReadDepth::FullBody,
+        )];
 
         let (path, target) = event_log_path_and_target(&app.project_tree, &event);
         assert_eq!(path, "-");
@@ -3025,7 +3566,12 @@ mod tests {
     #[test]
     fn ordinary_file_and_symbol_targeted_events_are_unaffected() {
         let app = test_app(vec![file("a.rs", vec![sym("a.rs::one", "one")])]);
-        let event = tool_call_targeted("Read", "/test/project/a.rs", ReadDepth::FullBody, "a.rs::one");
+        let event = tool_call_targeted(
+            "Read",
+            "/test/project/a.rs",
+            ReadDepth::FullBody,
+            "a.rs::one",
+        );
 
         let (path, target) = event_log_path_and_target(&app.project_tree, &event);
         assert_eq!(path, "/test/project/a.rs");
@@ -3040,7 +3586,10 @@ mod tests {
 
         let mut event = tool_call("Bash", "", ReadDepth::FullBody);
         event.file_path = None;
-        event.target_selectors = vec![crate::ingest::SelectorRead::new("a.rs::nope", ReadDepth::FullBody)];
+        event.target_selectors = vec![crate::ingest::SelectorRead::new(
+            "a.rs::nope",
+            ReadDepth::FullBody,
+        )];
         app.process_agent_event(event);
 
         assert_eq!(app.ledger.total_seen(), 0);
@@ -3048,7 +3597,10 @@ mod tests {
 
     #[test]
     fn process_agent_event_updates_ledger() {
-        let syms = vec![sym("mock/f.rs::alpha", "alpha"), sym("mock/f.rs::beta", "beta")];
+        let syms = vec![
+            sym("mock/f.rs::alpha", "alpha"),
+            sym("mock/f.rs::beta", "beta"),
+        ];
         let mut app = test_app(vec![file("mock/f.rs", syms)]);
 
         let event = tool_call("Read", "/test/project/mock/f.rs", ReadDepth::FullBody);
@@ -3060,10 +3612,18 @@ mod tests {
 
     #[test]
     fn process_agent_event_targeted() {
-        let syms = vec![sym("mock/f.rs::alpha", "alpha"), sym("mock/f.rs::beta", "beta")];
+        let syms = vec![
+            sym("mock/f.rs::alpha", "alpha"),
+            sym("mock/f.rs::beta", "beta"),
+        ];
         let mut app = test_app(vec![file("mock/f.rs", syms)]);
 
-        let event = tool_call_targeted("find_symbol", "/test/project/mock/f.rs", ReadDepth::FullBody, "beta");
+        let event = tool_call_targeted(
+            "find_symbol",
+            "/test/project/mock/f.rs",
+            ReadDepth::FullBody,
+            "beta",
+        );
         app.process_agent_event(event);
 
         assert_eq!(app.ledger.depth_of("mock/f.rs::alpha"), ReadDepth::Unseen);
@@ -3240,7 +3800,11 @@ mod tests {
             .values()
             .filter(|e| {
                 listed.iter().any(|(id, _)| {
-                    e.agent_depths.get(id).copied().unwrap_or(ReadDepth::Unseen).is_seen()
+                    e.agent_depths
+                        .get(id)
+                        .copied()
+                        .unwrap_or(ReadDepth::Unseen)
+                        .is_seen()
                 })
             })
             .count();
@@ -3310,7 +3874,9 @@ mod tests {
             file("mock/z.rs", vec![sym("mock/z.rs::z", "z")]),
         ]);
         // Alphabetical mode preserves the file insertion order.
-        let file_rows: Vec<&str> = app.tree_rows.iter()
+        let file_rows: Vec<&str> = app
+            .tree_rows
+            .iter()
             .filter(|r| r.is_file())
             .map(|r| r.display_name.as_str())
             .collect();
@@ -3321,17 +3887,22 @@ mod tests {
     fn rebuild_tree_rows_by_coverage() {
         let syms_a = vec![sym("mock/a.rs::x", "x")];
         let syms_b = vec![sym("mock/b.rs::y", "y")];
-        let mut app = test_app(vec![
-            file("mock/a.rs", syms_a),
-            file("mock/b.rs", syms_b),
-        ]);
+        let mut app = test_app(vec![file("mock/a.rs", syms_a), file("mock/b.rs", syms_b)]);
 
         // Mark mock/a.rs as partially covered.
-        app.ledger.record("mock/a.rs::x".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+        app.ledger.record(
+            "mock/a.rs::x".into(),
+            ReadDepth::FullBody,
+            [0; 32],
+            "ag".into(),
+            10,
+        );
         app.sort_mode = SortMode::ByCoverage;
         app.rebuild_tree_rows();
 
-        let file_rows: Vec<&str> = app.tree_rows.iter()
+        let file_rows: Vec<&str> = app
+            .tree_rows
+            .iter()
             .filter(|r| r.is_file())
             .map(|r| r.display_name.as_str())
             .collect();
@@ -3614,9 +4185,7 @@ mod tests {
     fn process_compaction_clears_live_ledger() {
         // Two files; read one. After compaction, the live ledger should be
         // empty (symbol back to Unseen) but the snapshot captures the prior state.
-        let mut app = test_app(vec![
-            file("mock/a.rs", vec![sym("mock/a.rs::a1", "a1")]),
-        ]);
+        let mut app = test_app(vec![file("mock/a.rs", vec![sym("mock/a.rs::a1", "a1")])]);
         let event = tool_call("Read", "/test/project/mock/a.rs", ReadDepth::FullBody);
         app.process_agent_event(event);
 
@@ -3650,7 +4219,11 @@ mod tests {
             file("mock/a.rs", vec![sym("mock/a.rs::a1", "a1")]),
             file("mock/b.rs", vec![sym("mock/b.rs::b1", "b1")]),
         ]);
-        app.process_agent_event(tool_call("Read", "/test/project/mock/a.rs", ReadDepth::FullBody));
+        app.process_agent_event(tool_call(
+            "Read",
+            "/test/project/mock/a.rs",
+            ReadDepth::FullBody,
+        ));
         app.process_compaction(
             "first".into(),
             "2026-05-11T14:23:00Z".into(),
@@ -3659,17 +4232,41 @@ mod tests {
         );
 
         // Read a different file after compaction.
-        app.process_agent_event(tool_call("Read", "/test/project/mock/b.rs", ReadDepth::FullBody));
+        app.process_agent_event(tool_call(
+            "Read",
+            "/test/project/mock/b.rs",
+            ReadDepth::FullBody,
+        ));
 
-        assert_eq!(app.compaction_history.len(), 1, "compaction history retained");
-        assert_eq!(app.ledger.depth_of("mock/a.rs::a1"), ReadDepth::FullBody,
-            "pre-compaction read survives");
-        assert!(app.ledger.is_restored("mock/a.rs::a1"), "but is marked restored");
-        assert_eq!(app.ledger.depth_of("mock/b.rs::b1"), ReadDepth::FullBody,
-            "post-compaction read should be reflected");
+        assert_eq!(
+            app.compaction_history.len(),
+            1,
+            "compaction history retained"
+        );
+        assert_eq!(
+            app.ledger.depth_of("mock/a.rs::a1"),
+            ReadDepth::FullBody,
+            "pre-compaction read survives"
+        );
+        assert!(
+            app.ledger.is_restored("mock/a.rs::a1"),
+            "but is marked restored"
+        );
+        assert_eq!(
+            app.ledger.depth_of("mock/b.rs::b1"),
+            ReadDepth::FullBody,
+            "post-compaction read should be reflected"
+        );
         assert!(!app.ledger.is_restored("mock/b.rs::b1"), "and is live");
-        assert_eq!(app.ledger.total_restored(), 1, "only the pre-compaction read is restored");
-        assert_eq!(app.compaction_call_count, 1, "counter restarted from zero after compaction");
+        assert_eq!(
+            app.ledger.total_restored(),
+            1,
+            "only the pre-compaction read is restored"
+        );
+        assert_eq!(
+            app.compaction_call_count, 1,
+            "counter restarted from zero after compaction"
+        );
     }
 
     /// Re-reading a symbol after a compaction promotes it back to Live — the
@@ -3677,7 +4274,11 @@ mod tests {
     #[test]
     fn re_read_after_compaction_promotes_back_to_live() {
         let mut app = test_app(vec![file("mock/a.rs", vec![sym("mock/a.rs::a1", "a1")])]);
-        app.process_agent_event(tool_call("Read", "/test/project/mock/a.rs", ReadDepth::FullBody));
+        app.process_agent_event(tool_call(
+            "Read",
+            "/test/project/mock/a.rs",
+            ReadDepth::FullBody,
+        ));
         app.process_compaction(
             "s".into(),
             "2026-05-11T14:23:00Z".into(),
@@ -3686,7 +4287,11 @@ mod tests {
         );
         assert!(app.ledger.is_restored("mock/a.rs::a1"));
 
-        app.process_agent_event(tool_call("Read", "/test/project/mock/a.rs", ReadDepth::FullBody));
+        app.process_agent_event(tool_call(
+            "Read",
+            "/test/project/mock/a.rs",
+            ReadDepth::FullBody,
+        ));
 
         assert!(!app.ledger.is_restored("mock/a.rs::a1"));
         assert_eq!(app.ledger.total_restored(), 0);
@@ -3728,7 +4333,7 @@ mod tests {
             timestamp_str: "2026-01-01T00:00:00Z".to_string(),
             target_symbol: None,
             target_lines: None,
-        target_selectors: Vec::new(),
+            target_selectors: Vec::new(),
             label: "agent-abc".into(),
             tool_use_id: None,
             effect: crate::ingest::Effect::Read,
@@ -3778,7 +4383,14 @@ mod write_tests {
 
     /// `src/a.rs` with `S { a, b }`, expanded, in session `sess`.
     fn marked_app(root: &Path) -> App {
-        let tree = project(vec![file("src/a.rs", vec![sym_with_children("src/a.rs::S", "S", vec![sym("src/a.rs::S/a", "a"), sym("src/a.rs::S/b", "b")])])]);
+        let tree = project(vec![file(
+            "src/a.rs",
+            vec![sym_with_children(
+                "src/a.rs::S",
+                "S",
+                vec![sym("src/a.rs::S/a", "a"), sym("src/a.rs::S/b", "b")],
+            )],
+        )]);
         let mut app = App::new(tree, root.to_path_buf());
         app.set_session_id(Some("sess".into()));
         app.set_expanded("src/a.rs", RowKind::File, true);
@@ -3787,7 +4399,12 @@ mod write_tests {
     }
 
     fn mark(app: &App, id: &str) -> Option<crate::write_index::WriteMark> {
-        app.tree_rows.iter().find(|r| r.symbol_id == id).expect("row").write.clone()
+        app.tree_rows
+            .iter()
+            .find(|r| r.symbol_id == id)
+            .expect("row")
+            .write
+            .clone()
     }
 
     fn wrote_a(app: &App) -> WriteRecord {
@@ -3807,16 +4424,24 @@ mod write_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = marked_app(dir.path());
         app.record_write("sess", wrote_a(&app));
-        let current = Some(crate::write_index::WriteMark { status: Status::Current, latest: "toolu_1".into(), count: 1 });
+        let current = Some(crate::write_index::WriteMark {
+            status: Status::Current,
+            latest: "toolu_1".into(),
+            count: 1,
+        });
         assert_eq!(mark(&app, "src/a.rs::S/a"), current);
         assert_eq!(mark(&app, "src/a.rs::S"), current, "a parent rolls up");
         assert_eq!(mark(&app, "src/a.rs::S/b"), None);
         assert_eq!(mark(&app, "src/a.rs"), current);
 
         // What the file watcher does on a change.
-        app.project_tree.files[0].symbols[0].children[0].content_hash = crate::symbols::merkle::content_hash("a2");
+        app.project_tree.files[0].symbols[0].children[0].content_hash =
+            crate::symbols::merkle::content_hash("a2");
         app.rebuild_tree_rows();
-        assert_eq!(mark(&app, "src/a.rs::S/a").map(|m| m.status), Some(Status::Changed));
+        assert_eq!(
+            mark(&app, "src/a.rs::S/a").map(|m| m.status),
+            Some(Status::Changed)
+        );
     }
 
     /// A file-level write marks the file row only.
@@ -3846,7 +4471,11 @@ mod write_tests {
         app.switch_session(Some("next".into()));
         app.agent_filter = None;
         app.rebuild_tree_rows();
-        assert_eq!(mark(&app, "src/a.rs"), None, "a new session starts unmarked");
+        assert_eq!(
+            mark(&app, "src/a.rs"),
+            None,
+            "a new session starts unmarked"
+        );
     }
 
     /// Attaching the journal brings back writes an earlier run recorded.
@@ -3859,9 +4488,15 @@ mod write_tests {
         drop(earlier);
 
         let mut app = marked_app(dir.path());
-        app.set_journal_settings(Some(JournalSettings { backend: "tree-sitter", interval: std::time::Duration::ZERO }));
+        app.set_journal_settings(Some(JournalSettings {
+            backend: "tree-sitter",
+            interval: std::time::Duration::ZERO,
+        }));
         app.attach_journal();
-        assert_eq!(mark(&app, "src/a.rs::S/a").map(|m| m.status), Some(crate::writes::Status::Current));
+        assert_eq!(
+            mark(&app, "src/a.rs::S/a").map(|m| m.status),
+            Some(crate::writes::Status::Current)
+        );
     }
 
     #[test]
@@ -3874,7 +4509,8 @@ mod write_tests {
         app.record_write("sess", record("toolu_1"));
         app.record_write("sess", record("toolu_1"));
 
-        let contents = crate::journal::read_journal_session(&crate::journal::journal_dir(dir.path()), "sess");
+        let contents =
+            crate::journal::read_journal_session(&crate::journal::journal_dir(dir.path()), "sess");
         assert_eq!(contents.writes.len(), 1, "journaled once");
         assert!(contents.writes.contains_key("toolu_1"));
     }
@@ -3890,12 +4526,19 @@ mod write_tests {
     /// A write call has no read depth, which used to keep it out of the feed.
     #[test]
     fn a_write_call_is_shown_in_the_activity_feed_without_read_credit() {
-        let mut app = App::new(project(vec![file("src/a.rs", vec![sym("src/a.rs::f", "f")])]), "/p".into());
+        let mut app = App::new(
+            project(vec![file("src/a.rs", vec![sym("src/a.rs::f", "f")])]),
+            "/p".into(),
+        );
         let mut call = tool_call("Edit", "src/a.rs", ReadDepth::Unseen);
         call.effect = crate::ingest::Effect::Write;
         app.process_agent_event(call);
         assert_eq!(app.activity.len(), 1);
-        assert_eq!(app.ledger.depth_of("src/a.rs::f"), ReadDepth::Unseen, "no read credit");
+        assert_eq!(
+            app.ledger.depth_of("src/a.rs::f"),
+            ReadDepth::Unseen,
+            "no read credit"
+        );
     }
 
     fn journaled(dir: &Path, session: &str) -> crate::journal::JournalContents {
@@ -3909,7 +4552,10 @@ mod write_tests {
             dir.to_path_buf(),
         );
         app.set_session_id(Some("a".into()));
-        app.set_journal_settings(Some(JournalSettings { backend: "tree-sitter", interval }));
+        app.set_journal_settings(Some(JournalSettings {
+            backend: "tree-sitter",
+            interval,
+        }));
         app.attach_journal();
         app
     }
@@ -3931,7 +4577,10 @@ mod write_tests {
         app.record_write("b", record("toolu_b"));
 
         let (a, b) = (journaled(dir.path(), "a"), journaled(dir.path(), "b"));
-        assert!(a.reads.is_empty() && a.writes.is_empty(), "nothing leaked into a");
+        assert!(
+            a.reads.is_empty() && a.writes.is_empty(),
+            "nothing leaked into a"
+        );
         assert!(b.reads.contains_key("src/a.rs::f"));
         assert!(b.writes.contains_key("toolu_b"));
     }
@@ -3982,7 +4631,10 @@ mod write_tests {
         switch(&mut app, "c");
         app.record_write("a", record("toolu_a"));
         for session in ["a", "b", "c"] {
-            assert!(journaled(dir.path(), session).writes.is_empty(), "{session}");
+            assert!(
+                journaled(dir.path(), session).writes.is_empty(),
+                "{session}"
+            );
         }
     }
 
@@ -4010,7 +4662,10 @@ mod write_tests {
         };
         let mut app = App::new(project(vec![]), "/p".into());
         app.queue_write(event());
-        assert!(app.take_pending_writes().is_empty(), "no session, no journal");
+        assert!(
+            app.take_pending_writes().is_empty(),
+            "no session, no journal"
+        );
 
         app.set_session_id(Some("a".into()));
         app.queue_write(event());
@@ -4027,7 +4682,10 @@ mod write_tests {
     /// Read `f`, then let it drift on disk: the entry is stale at its
     /// original hash, which is what every case below must preserve.
     fn app_with_a_stale_read() -> (App, [u8; 32]) {
-        let mut app = App::new(project(vec![file("src/a.rs", vec![sym("src/a.rs::f", "f")])]), "/p".into());
+        let mut app = App::new(
+            project(vec![file("src/a.rs", vec![sym("src/a.rs::f", "f")])]),
+            "/p".into(),
+        );
         app.process_agent_event(tool_call("Read", "src/a.rs", ReadDepth::FullBody));
         let read_at = app.ledger.entries["src/a.rs::f"].content_hash_at_read;
         app.ledger.mark_stale_if_changed("src/a.rs::f", [7u8; 32]);
@@ -4039,7 +4697,11 @@ mod write_tests {
         let entry = &app.ledger.entries["src/a.rs::f"];
         assert!(entry.stale, "{case}: stale read refreshed");
         assert_eq!(entry.content_hash_at_read, read_at, "{case}: hash replaced");
-        assert_eq!(entry.provenance, crate::tracking::Provenance::Live, "{case}");
+        assert_eq!(
+            entry.provenance,
+            crate::tracking::Provenance::Live,
+            "{case}"
+        );
         assert_eq!(entry.depth, ReadDepth::FullBody, "{case}");
     }
 
@@ -4049,11 +4711,25 @@ mod write_tests {
     #[test]
     fn a_write_call_leaves_a_stale_read_stale() {
         let cases = [
-            ("whole file", write_call(tool_call("Edit", "src/a.rs", ReadDepth::Unseen))),
-            ("target symbol", write_call(tool_call_targeted("replace_symbol_body", "src/a.rs", ReadDepth::Unseen, "f"))),
+            (
+                "whole file",
+                write_call(tool_call("Edit", "src/a.rs", ReadDepth::Unseen)),
+            ),
+            (
+                "target symbol",
+                write_call(tool_call_targeted(
+                    "replace_symbol_body",
+                    "src/a.rs",
+                    ReadDepth::Unseen,
+                    "f",
+                )),
+            ),
             ("selectors", {
                 let mut c = write_call(tool_call("Bash", "src/a.rs", ReadDepth::Unseen));
-                c.target_selectors = vec![crate::ingest::SelectorRead::new("src/a.rs::f", ReadDepth::Unseen)];
+                c.target_selectors = vec![crate::ingest::SelectorRead::new(
+                    "src/a.rs::f",
+                    ReadDepth::Unseen,
+                )];
                 c
             }),
         ];
@@ -4074,7 +4750,10 @@ mod write_tests {
 
     #[test]
     fn a_write_call_on_an_unread_file_creates_no_entries() {
-        let mut app = App::new(project(vec![file("src/a.rs", vec![sym("src/a.rs::f", "f")])]), "/p".into());
+        let mut app = App::new(
+            project(vec![file("src/a.rs", vec![sym("src/a.rs::f", "f")])]),
+            "/p".into(),
+        );
         app.process_agent_event(write_call(tool_call("Edit", "src/a.rs", ReadDepth::Unseen)));
         assert!(app.ledger.entries.is_empty());
     }
@@ -4102,8 +4781,12 @@ mod write_tests {
         app.process_agent_event(write_call(tool_call("Edit", "src/a.rs", ReadDepth::Unseen)));
         app.sync_journal();
 
-        let contents = crate::journal::read_journal_session(&crate::journal::journal_dir(dir.path()), "sess");
-        assert_eq!(contents.reads["src/a.rs::f"], (read_at, ReadDepth::FullBody));
+        let contents =
+            crate::journal::read_journal_session(&crate::journal::journal_dir(dir.path()), "sess");
+        assert_eq!(
+            contents.reads["src/a.rs::f"],
+            (read_at, ReadDepth::FullBody)
+        );
     }
 }
 
@@ -4123,16 +4806,48 @@ mod trace_view_tests {
     /// `src/a.rs` with `S { a }`; main reads `S/a`, then delegates to `ax1`,
     /// whose edit fails.
     fn app() -> App {
-        let tree = project(vec![file("src/a.rs", vec![sym_with_children("src/a.rs::S", "S", vec![sym("src/a.rs::S/a", "a")])])]);
+        let tree = project(vec![file(
+            "src/a.rs",
+            vec![sym_with_children(
+                "src/a.rs::S",
+                "S",
+                vec![sym("src/a.rs::S/a", "a")],
+            )],
+        )]);
         let mut app = App::new(tree, PathBuf::from("/test/project"));
         app.set_session_id(Some("sess".into()));
         let mut calls = vec![
-            ("sess", "r1", "Read", "2026-09-27T10:00:00.000Z", "2026-09-27T10:00:01.000Z", None, false),
-            ("sess", "d1", "Agent", "2026-09-27T10:00:02.000Z", "2026-09-27T10:00:02.100Z", Some("ax1"), false),
-            ("ax1", "x1", "Edit", "2026-09-27T10:00:03.000Z", "2026-09-27T10:00:04.000Z", None, true),
+            (
+                "sess",
+                "r1",
+                "Read",
+                "2026-09-27T10:00:00.000Z",
+                "2026-09-27T10:00:01.000Z",
+                None,
+                false,
+            ),
+            (
+                "sess",
+                "d1",
+                "Agent",
+                "2026-09-27T10:00:02.000Z",
+                "2026-09-27T10:00:02.100Z",
+                Some("ax1"),
+                false,
+            ),
+            (
+                "ax1",
+                "x1",
+                "Edit",
+                "2026-09-27T10:00:03.000Z",
+                "2026-09-27T10:00:04.000Z",
+                None,
+                true,
+            ),
         ];
         for (agent, id, tool, start, end, child, error) in calls.drain(..) {
-            let mut c = tool_call_targeted(tool, "/test/project/src/a.rs", ReadDepth::FullBody, "S/a");
+            let mut c =
+                tool_call_targeted(tool, "/test/project/src/a.rs", ReadDepth::FullBody, "S/a");
             c.agent_id = Arc::from(agent);
             c.tool_use_id = Some(Arc::from(id));
             c.timestamp_str = start.into();
@@ -4143,7 +4858,8 @@ mod trace_view_tests {
                 agent_id: Arc::from(agent),
                 timestamp: end.into(),
                 error,
-                message: None, child_agent: child.map(Arc::from),
+                message: None,
+                child_agent: child.map(Arc::from),
                 shown: Vec::new(),
                 printed: Vec::new(),
             });
@@ -4166,10 +4882,21 @@ mod trace_view_tests {
     fn the_trace_view_opens_on_a_list_of_prompts() {
         let mut app = app();
         key(&mut app, KeyCode::Esc);
-        assert!(app.trace_view.open && app.trace_view.focus.is_none(), "back on the list");
+        assert!(
+            app.trace_view.open && app.trace_view.focus.is_none(),
+            "back on the list"
+        );
         let traces = app.trace_list();
         assert_eq!(traces.len(), 1);
-        assert_eq!((traces[0].root, traces[0].calls, traces[0].failed, traces[0].agents), (3, 3, 1, 1));
+        assert_eq!(
+            (
+                traces[0].root,
+                traces[0].calls,
+                traces[0].failed,
+                traces[0].agents
+            ),
+            (3, 3, 1, 1)
+        );
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.trace_view.focus, Some(3));
         assert_eq!(app.trace_rows().len(), 4, "the prompt and its three calls");
@@ -4186,7 +4913,10 @@ mod trace_view_tests {
         key(&mut app, KeyCode::Char('w'));
         assert!(app.trace_view.viewport.is_some(), "w zooms");
         key(&mut app, KeyCode::Char('a'));
-        assert_eq!(app.agent_filter, filter, "a pans here, not the agent filter");
+        assert_eq!(
+            app.agent_filter, filter,
+            "a pans here, not the agent filter"
+        );
         key(&mut app, KeyCode::Char('0'));
         assert!(app.trace_view.viewport.is_none(), "0 fits");
         key(&mut app, KeyCode::Char('v'));
@@ -4205,7 +4935,11 @@ mod trace_view_tests {
         key(&mut app, KeyCode::Char('h'));
         assert!(app.trace_view.collapsed_spans.contains(&1), "h folds");
         key(&mut app, KeyCode::Enter);
-        assert_eq!(app.trace_view.selected, Some(Item::Span(2)), "unfolded, into ax1's edit");
+        assert_eq!(
+            app.trace_view.selected,
+            Some(Item::Span(2)),
+            "unfolded, into ax1's edit"
+        );
 
         key(&mut app, KeyCode::Char('v'));
         app.trace_view.selected = Some(Item::Span(1));
@@ -4220,7 +4954,10 @@ mod trace_view_tests {
         app.trace_view.selected = Some(Item::Span(0));
         key(&mut app, KeyCode::Enter);
         assert!(!app.trace_view.open);
-        assert_eq!(app.tree_rows[app.selected_index].symbol_id, "src/a.rs::S/a", "expanded down to it");
+        assert_eq!(
+            app.tree_rows[app.selected_index].symbol_id, "src/a.rs::S/a",
+            "expanded down to it"
+        );
     }
 
     #[test]
@@ -4250,7 +4987,11 @@ mod trace_view_tests {
             key(&mut app, KeyCode::Tab);
             assert_eq!(app.focus, FocusPanel::Right, "{view}: tab");
             key(&mut app, KeyCode::Tab);
-            assert_eq!(app.focus, FocusPanel::Left, "{view}: no feed shown, so back left");
+            assert_eq!(
+                app.focus,
+                FocusPanel::Left,
+                "{view}: no feed shown, so back left"
+            );
             key(&mut app, KeyCode::BackTab);
             assert_eq!(app.focus, FocusPanel::Right, "{view}: shift+tab");
             key(&mut app, KeyCode::Esc);
@@ -4284,14 +5025,36 @@ mod trace_view_tests {
     #[test]
     fn a_click_selects_and_the_wheel_zooms_at_the_pointer() {
         let mut app = app();
-        app.trace_geometry.set(Some(TraceGeometry { bars_x: 10, bars_width: 40, rows_y: 5, rows: 10, first_row: 0 }));
-        let mouse = |kind, column, row| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
-        app.handle_mouse(mouse(MouseEventKind::Down(crossterm::event::MouseButton::Left), 12, 7));
-        assert_eq!(app.trace_view.selected, Some(Item::Span(1)), "the third row: the prompt, the read, the delegation");
+        app.trace_geometry.set(Some(TraceGeometry {
+            bars_x: 10,
+            bars_width: 40,
+            rows_y: 5,
+            rows: 10,
+            first_row: 0,
+        }));
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            12,
+            7,
+        ));
+        assert_eq!(
+            app.trace_view.selected,
+            Some(Item::Span(1)),
+            "the third row: the prompt, the read, the delegation"
+        );
         let before = app.trace_view.viewport(&app.trace);
         app.handle_mouse(mouse(MouseEventKind::ScrollUp, 10, 7));
         let after = app.trace_view.viewport.expect("zoomed");
-        assert_eq!(after.start, before.start, "zoomed about the left edge, where the pointer is");
+        assert_eq!(
+            after.start, before.start,
+            "zoomed about the left edge, where the pointer is"
+        );
         assert!(after.width() < before.width());
     }
 }

@@ -36,7 +36,10 @@ fn trace_id(session: &str) -> String {
 fn span_id(session: &str, span: &Span, index: usize) -> String {
     // A call without a tool_use_id falls back to its position, still stable
     // for a given log.
-    let key = span.id.as_deref().map_or_else(|| format!("#{index}"), String::from);
+    let key = span
+        .id
+        .as_deref()
+        .map_or_else(|| format!("#{index}"), String::from);
     derive(&["span", session, &key], 8)
 }
 
@@ -48,7 +51,9 @@ fn attr(key: &str, value: Value) -> Value {
     let value = match value {
         Value::Bool(b) => json!({"boolValue": b}),
         Value::Number(n) => json!({"intValue": n.to_string()}),
-        other => json!({"stringValue": other.as_str().map_or_else(|| other.to_string(), String::from)}),
+        other => {
+            json!({"stringValue": other.as_str().map_or_else(|| other.to_string(), String::from)})
+        }
     };
     json!({"key": key, "value": value})
 }
@@ -66,7 +71,11 @@ fn depth_name(depth: crate::tracking::ReadDepth) -> &'static str {
 
 fn span_attributes(span: &Span) -> Vec<Value> {
     // A prompt invokes the session's agent, as a delegation invokes a subagent.
-    let operation = if matches!(span.kind, SpanKind::Delegate | SpanKind::Prompt) { "invoke_agent" } else { "execute_tool" };
+    let operation = if matches!(span.kind, SpanKind::Delegate | SpanKind::Prompt) {
+        "invoke_agent"
+    } else {
+        "execute_tool"
+    };
     let mut attrs = vec![
         attr("gen_ai.operation.name", json!(operation)),
         attr("gen_ai.tool.name", json!(&*span.tool)),
@@ -109,7 +118,9 @@ pub fn otlp(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
     let (start, end) = roots
         .iter()
         .map(|n| (trace.spans()[n.span].start, n.end))
-        .fold(None, |acc: Option<(u64, u64)>, (s, e)| Some(acc.map_or((s, e), |(a, b)| (a.min(s), b.max(e)))))
+        .fold(None, |acc: Option<(u64, u64)>, (s, e)| {
+            Some(acc.map_or((s, e), |(a, b)| (a.min(s), b.max(e))))
+        })
         .or_else(|| trace.range())
         .unwrap_or((0, 0));
 
@@ -118,7 +129,11 @@ pub fn otlp(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
     // the session.
     let mut root_events: Vec<Value> = Vec::new();
     let mut events: std::collections::HashMap<usize, Vec<Value>> = std::collections::HashMap::new();
-    for i in trace.instants().iter().filter(|i| filter.is_none_or(|a| i.agent.as_deref().is_none_or(|ia| ia.starts_with(a)))) {
+    for i in trace
+        .instants()
+        .iter()
+        .filter(|i| filter.is_none_or(|a| i.agent.as_deref().is_none_or(|ia| ia.starts_with(a))))
+    {
         let mut attrs = Vec::new();
         let name = match &i.kind {
             InstantKind::Compaction => "compaction",
@@ -136,7 +151,10 @@ pub fn otlp(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
             attrs.push(attr("gen_ai.agent.id", json!(&**agent)));
         }
         let event = json!({"timeUnixNano": nanos(i.t), "name": name, "attributes": attrs});
-        let during = roots.iter().find(|n| trace.spans()[n.span].kind == SpanKind::Prompt && (trace.spans()[n.span].start..=n.end).contains(&i.t));
+        let during = roots.iter().find(|n| {
+            trace.spans()[n.span].kind == SpanKind::Prompt
+                && (trace.spans()[n.span].start..=n.end).contains(&i.t)
+        });
         match during {
             Some(n) => events.entry(n.span).or_default().push(event),
             None => root_events.push(event),
@@ -154,12 +172,17 @@ pub fn otlp(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
         "status": {"code": 0},
     }));
 
-    let mut stack: Vec<(&Node, String)> = roots.iter().rev().map(|n| (*n, root_id.clone())).collect();
+    let mut stack: Vec<(&Node, String)> =
+        roots.iter().rev().map(|n| (*n, root_id.clone())).collect();
     while let Some((node, parent)) = stack.pop() {
         let span = &trace.spans()[node.span];
         let id = span_id(session, span, node.span);
         let why = span.message.as_deref().unwrap_or("tool call failed");
-        let status = if span.error { json!({"code": 2, "message": why}) } else { json!({"code": 0}) };
+        let status = if span.error {
+            json!({"code": 2, "message": why})
+        } else {
+            json!({"code": 0})
+        };
         let mut out = json!({
             "traceId": tid,
             "spanId": id,
@@ -227,7 +250,9 @@ pub fn chrome(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
         })
         .collect();
 
-    let mut events: Vec<Value> = vec![json!({"name": "process_name", "ph": "M", "pid": 1, "args": {"name": format!("session {session}")}})];
+    let mut events: Vec<Value> = vec![
+        json!({"name": "process_name", "ph": "M", "pid": 1, "args": {"name": format!("session {session}")}}),
+    ];
     for a in &agents {
         let name = match (*a == session, label.get(a)) {
             (true, _) => "main".to_string(),
@@ -247,7 +272,11 @@ pub fn chrome(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
         };
         let mut args = serde_json::Map::new();
         for a in span_attributes(s) {
-            let value = a["value"].as_object().and_then(|v| v.values().next()).cloned().unwrap_or_default();
+            let value = a["value"]
+                .as_object()
+                .and_then(|v| v.values().next())
+                .cloned()
+                .unwrap_or_default();
             args.insert(a["key"].as_str().unwrap_or_default().to_string(), value);
         }
         if s.error {
@@ -259,7 +288,12 @@ pub fn chrome(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
             "ts": micros(s.start), "dur": micros(n.end - s.start), "args": args,
         }));
         // A delegation's flow arrow to the first span of its subagent.
-        let first = n.children.iter().map(|c| &trace.spans()[c.span]).filter(|c| s.child_agent.as_ref() == Some(&c.agent)).min_by_key(|c| c.start);
+        let first = n
+            .children
+            .iter()
+            .map(|c| &trace.spans()[c.span])
+            .filter(|c| s.child_agent.as_ref() == Some(&c.agent))
+            .min_by_key(|c| c.start);
         if let Some(first) = first {
             events.push(json!({"name": "delegate", "cat": "delegate", "ph": "s", "id": flow, "pid": 1, "tid": tid, "ts": micros(s.start)}));
             events.push(json!({"name": "delegate", "cat": "delegate", "ph": "f", "bp": "e", "id": flow, "pid": 1, "tid": tids[&*first.agent], "ts": micros(first.start)}));
@@ -274,7 +308,9 @@ pub fn chrome(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
             Some(tid) => ("t", *tid),
             None => ("g", 0),
         };
-        events.push(json!({"name": name, "ph": "i", "s": scope, "pid": 1, "tid": tid, "ts": micros(i.t)}));
+        events.push(
+            json!({"name": name, "ph": "i", "s": scope, "pid": 1, "tid": tid, "ts": micros(i.t)}),
+        );
     }
     json!({"traceEvents": events, "displayTimeUnit": "ms"})
 }
@@ -301,7 +337,16 @@ mod tests {
     }
 
     fn done(agent: &str, id: &str, at: &str, child: Option<&str>, error: bool) -> ToolFinished {
-        ToolFinished { id: Arc::from(id), agent_id: Arc::from(agent), timestamp: at.into(), error, message: None, child_agent: child.map(Arc::from), shown: Vec::new(), printed: Vec::new() }
+        ToolFinished {
+            id: Arc::from(id),
+            agent_id: Arc::from(agent),
+            timestamp: at.into(),
+            error,
+            message: None,
+            child_agent: child.map(Arc::from),
+            shown: Vec::new(),
+            printed: Vec::new(),
+        }
     }
 
     /// main reads, delegates to agent-x (which reads and fails an edit),
@@ -310,19 +355,56 @@ mod tests {
         let mut t = Trace::default();
         let p = Path::new("/p");
         t.start(&call(SESSION, "r1", "Read", "2026-09-27T10:00:00.000Z"), p);
-        t.finish(&done(SESSION, "r1", "2026-09-27T10:00:00.400Z", None, false));
+        t.finish(&done(
+            SESSION,
+            "r1",
+            "2026-09-27T10:00:00.400Z",
+            None,
+            false,
+        ));
         t.start(&call(SESSION, "d1", "Agent", "2026-09-27T10:00:01.000Z"), p);
-        t.finish(&done(SESSION, "d1", "2026-09-27T10:00:01.100Z", Some("agent-x"), false));
-        t.start(&call("agent-x", "x1", "Read", "2026-09-27T10:00:02.000Z"), p);
-        t.finish(&done("agent-x", "x1", "2026-09-27T10:00:02.500Z", None, false));
-        t.start(&call("agent-x", "x2", "Edit", "2026-09-27T10:00:03.000Z"), p);
-        t.finish(&done("agent-x", "x2", "2026-09-27T10:00:03.100Z", None, true));
-        t.instant(1_790_503_204_000, Some(Arc::from(SESSION)), InstantKind::Compaction);
+        t.finish(&done(
+            SESSION,
+            "d1",
+            "2026-09-27T10:00:01.100Z",
+            Some("agent-x"),
+            false,
+        ));
+        t.start(
+            &call("agent-x", "x1", "Read", "2026-09-27T10:00:02.000Z"),
+            p,
+        );
+        t.finish(&done(
+            "agent-x",
+            "x1",
+            "2026-09-27T10:00:02.500Z",
+            None,
+            false,
+        ));
+        t.start(
+            &call("agent-x", "x2", "Edit", "2026-09-27T10:00:03.000Z"),
+            p,
+        );
+        t.finish(&done(
+            "agent-x",
+            "x2",
+            "2026-09-27T10:00:03.100Z",
+            None,
+            true,
+        ));
+        t.instant(
+            1_790_503_204_000,
+            Some(Arc::from(SESSION)),
+            InstantKind::Compaction,
+        );
         t
     }
 
     fn otlp_spans(v: &Value) -> Vec<Value> {
-        v["resourceSpans"][0]["scopeSpans"][0]["spans"].as_array().unwrap().clone()
+        v["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .unwrap()
+            .clone()
     }
 
     #[test]
@@ -332,10 +414,22 @@ mod tests {
         assert_eq!(spans.len(), 5, "root + four calls");
         let root = &spans[0];
         assert!(root.get("parentSpanId").is_none());
-        let by_name = |n: &str| spans.iter().find(|s| s["name"].as_str().unwrap().starts_with(n)).unwrap().clone();
-        let delegation = spans.iter().find(|s| s["attributes"].to_string().contains("invoke_agent")).unwrap();
+        let by_name = |n: &str| {
+            spans
+                .iter()
+                .find(|s| s["name"].as_str().unwrap().starts_with(n))
+                .unwrap()
+                .clone()
+        };
+        let delegation = spans
+            .iter()
+            .find(|s| s["attributes"].to_string().contains("invoke_agent"))
+            .unwrap();
         let edit = by_name("Edit");
-        assert_eq!(edit["parentSpanId"], delegation["spanId"], "the subagent's calls nest under the delegation");
+        assert_eq!(
+            edit["parentSpanId"], delegation["spanId"],
+            "the subagent's calls nest under the delegation"
+        );
         assert_eq!(edit["status"]["code"], 2);
         assert_eq!(by_name("Read")["parentSpanId"], root["spanId"]);
         // The delegation lasts until its subagent's last call ends.
@@ -349,28 +443,46 @@ mod tests {
 
     #[test]
     fn otlp_ids_are_stable_across_exports() {
-        assert_eq!(otlp(&sample(), SESSION, None), otlp(&sample(), SESSION, None));
+        assert_eq!(
+            otlp(&sample(), SESSION, None),
+            otlp(&sample(), SESSION, None)
+        );
     }
 
     #[test]
     fn an_agent_filter_keeps_that_agents_subtrees() {
         let spans = otlp_spans(&otlp(&sample(), SESSION, Some("agent-x")));
-        let names: Vec<&str> = spans.iter().skip(1).map(|s| s["name"].as_str().unwrap()).collect();
+        let names: Vec<&str> = spans
+            .iter()
+            .skip(1)
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
         assert_eq!(names.len(), 2, "{names:?}");
-        assert!(names.iter().all(|n| n.starts_with("Read") || n.starts_with("Edit")));
+        assert!(names
+            .iter()
+            .all(|n| n.starts_with("Read") || n.starts_with("Edit")));
     }
 
     #[test]
     fn chrome_has_a_thread_per_agent_complete_events_and_a_flow() {
         let v = chrome(&sample(), SESSION, None);
         let events = v["traceEvents"].as_array().unwrap();
-        let threads: Vec<&str> = events.iter().filter(|e| e["name"] == "thread_name").map(|e| e["args"]["name"].as_str().unwrap()).collect();
+        let threads: Vec<&str> = events
+            .iter()
+            .filter(|e| e["name"] == "thread_name")
+            .map(|e| e["args"]["name"].as_str().unwrap())
+            .collect();
         assert_eq!(threads[0], "main");
         assert!(threads[1].starts_with("agent-x"));
         assert_eq!(events.iter().filter(|e| e["ph"] == "X").count(), 4);
         assert!(events.iter().any(|e| e["ph"] == "s") && events.iter().any(|e| e["ph"] == "f"));
-        assert!(events.iter().any(|e| e["ph"] == "i" && e["name"] == "compaction"));
-        let failed = events.iter().find(|e| e["ph"] == "X" && e["cat"] == "write").unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e["ph"] == "i" && e["name"] == "compaction"));
+        let failed = events
+            .iter()
+            .find(|e| e["ph"] == "X" && e["cat"] == "write")
+            .unwrap();
         assert_eq!(failed["args"]["error"], true);
     }
 }

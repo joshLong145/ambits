@@ -1,8 +1,8 @@
-use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::Frame;
 
 use ambits::app::{App, FocusPanel};
 use ambits::ingest::{AgentToolCall, CompactionEvent};
@@ -74,10 +74,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                         format!(" [{}] ", agent_short),
                         Style::default().fg(colors::ACCENT_MUTED),
                     ),
-                    Span::styled(
-                        &event.description,
-                        Style::default().fg(Color::White),
-                    ),
+                    Span::styled(&event.description, Style::default().fg(Color::White)),
                     Span::styled(
                         match event.effect {
                             ambits::ingest::Effect::Write => "  (write)".to_string(),
@@ -92,12 +89,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let paragraph = if lines.is_empty() {
-        Paragraph::new(Line::from(
-            Span::styled(
-                "  No agent activity yet",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ))
+        Paragraph::new(Line::from(Span::styled(
+            "  No agent activity yet",
+            Style::default().fg(Color::DarkGray),
+        )))
         .block(block)
     } else {
         Paragraph::new(lines).block(block)
@@ -128,19 +123,21 @@ fn compaction_marker_line<'a>(c: &'a CompactionEvent, width: usize) -> Line<'a> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use ambits::ingest::AgentToolCall;
+    use ambits::symbols::{FileSymbols, ProjectTree};
+    use ambits::tracking::ReadDepth;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
-    use ambits::ingest::AgentToolCall;
-    use ambits::symbols::{ProjectTree, FileSymbols};
-    use ambits::tracking::ReadDepth;
+    use std::path::PathBuf;
 
     fn test_app() -> App {
         let tree = ProjectTree {
             root: PathBuf::from("/test"),
-            files: vec![
-                FileSymbols { file_path: "mock/a.rs".into(), symbols: Vec::new(), total_lines: 10 },
-            ],
+            files: vec![FileSymbols {
+                file_path: "mock/a.rs".into(),
+                symbols: Vec::new(),
+                total_lines: 10,
+            }],
         };
         App::new(tree, PathBuf::from("/test"))
     }
@@ -167,7 +164,7 @@ mod tests {
             timestamp_str: "2025-01-01T00:00:00Z".into(),
             target_symbol: None,
             target_lines: None,
-        target_selectors: Vec::new(),
+            target_selectors: Vec::new(),
             label: "agent-abc123".into(),
             tool_use_id: None,
             effect: ambits::ingest::Effect::Read,

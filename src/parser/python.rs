@@ -87,7 +87,15 @@ impl LanguageParser for PythonParser {
         let file_path_arc = Arc::new(path.to_path_buf());
         let names = NameInterner::new();
 
-        extract_symbols(root, src, &file_path_arc, &names, &path_prefix, "", &mut symbols);
+        extract_symbols(
+            root,
+            src,
+            &file_path_arc,
+            &names,
+            &path_prefix,
+            "",
+            &mut symbols,
+        );
 
         for sym in symbols.iter_mut() {
             compute_merkle_hash(sym);
@@ -114,12 +122,24 @@ impl LanguageParser for PythonParser {
 
 /// Pairs a [`SymbolCategory`] with a display label for use in [`SymbolNode`].
 // -- Definitions ------------------------------------------------------------
-const CLASS: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "class" };
-const DEF: SymbolMeta = SymbolMeta { category: SymbolCategory::Function, label: "def" };
+const CLASS: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Type,
+    label: "class",
+};
+const DEF: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Function,
+    label: "def",
+};
 
 // -- Variables & type aliases -----------------------------------------------
-const VAR: SymbolMeta = SymbolMeta { category: SymbolCategory::Variable, label: "var" };
-const TYPE_ALIAS: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "type" };
+const VAR: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Variable,
+    label: "var",
+};
+const TYPE_ALIAS: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Type,
+    label: "type",
+};
 
 /// tree-sitter-python's one comment node kind (`#...`), covering both a
 /// standalone note and a docstring-style comment alike.
@@ -179,13 +199,19 @@ fn extract_symbols(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         let symbol_info = match child.kind() {
-            "function_definition" => {
-                child_name(&child, src).map(|n| (n, DEF))
-            }
+            "function_definition" => child_name(&child, src).map(|n| (n, DEF)),
             "class_definition" => child_name(&child, src).map(|n| (n, CLASS)),
             // Decorated definitions: unwrap the decorator to find the inner def/class.
             "decorated_definition" => {
-                extract_decorated(&child, src, file_path, names, path_prefix, parent_name_path, out);
+                extract_decorated(
+                    &child,
+                    src,
+                    file_path,
+                    names,
+                    path_prefix,
+                    parent_name_path,
+                    out,
+                );
                 None
             }
             // Module-level assignments: annotated or UPPER_SNAKE_CASE only.
@@ -193,10 +219,16 @@ fn extract_symbols(
             // Python 3.12+ type alias: `type Alias = int`
             "type_alias_statement" => extract_type_alias(&child, src),
             // Recurse into compound statement bodies for nested definitions.
-            "if_statement" | "for_statement" | "while_statement"
-            | "try_statement" | "with_statement" | "match_statement" => {
+            "if_statement" | "for_statement" | "while_statement" | "try_statement"
+            | "with_statement" | "match_statement" => {
                 extract_from_compound_bodies(
-                    &child, src, file_path, names, path_prefix, parent_name_path, out,
+                    &child,
+                    src,
+                    file_path,
+                    names,
+                    path_prefix,
+                    parent_name_path,
+                    out,
                 );
                 None
             }
@@ -234,8 +266,24 @@ fn extract_symbols(
             // A class's body holds its methods; a function's, its nested definitions.
             if let Some(body) = child.child_by_field_name("body") {
                 match meta.category {
-                    SymbolCategory::Type => extract_symbols(body, src, file_path, names, path_prefix, &name_path, &mut sym.children),
-                    SymbolCategory::Function => extract_nested_definitions(body, src, file_path, names, path_prefix, &name_path, &mut sym.children),
+                    SymbolCategory::Type => extract_symbols(
+                        body,
+                        src,
+                        file_path,
+                        names,
+                        path_prefix,
+                        &name_path,
+                        &mut sym.children,
+                    ),
+                    SymbolCategory::Function => extract_nested_definitions(
+                        body,
+                        src,
+                        file_path,
+                        names,
+                        path_prefix,
+                        &name_path,
+                        &mut sym.children,
+                    ),
                     _ => {}
                 }
             }
@@ -314,8 +362,24 @@ fn extract_decorated(
 
                 if let Some(body) = child.child_by_field_name("body") {
                     match meta.category {
-                        SymbolCategory::Type => extract_symbols(body, src, file_path, names, path_prefix, &name_path, &mut sym.children),
-                        SymbolCategory::Function => extract_nested_definitions(body, src, file_path, names, path_prefix, &name_path, &mut sym.children),
+                        SymbolCategory::Type => extract_symbols(
+                            body,
+                            src,
+                            file_path,
+                            names,
+                            path_prefix,
+                            &name_path,
+                            &mut sym.children,
+                        ),
+                        SymbolCategory::Function => extract_nested_definitions(
+                            body,
+                            src,
+                            file_path,
+                            names,
+                            path_prefix,
+                            &name_path,
+                            &mut sym.children,
+                        ),
                         _ => {}
                     }
                 }
@@ -356,7 +420,9 @@ fn child_name(node: &Node, src: &[u8]) -> Option<String> {
 fn is_upper_snake_case(name: &str) -> bool {
     !name.is_empty()
         && name.chars().any(|c| c.is_ascii_uppercase())
-        && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// Try to extract a variable symbol from an `expression_statement`.
@@ -450,8 +516,20 @@ fn extract_nested_definitions(
     out: &mut Vec<SymbolNode>,
 ) {
     let mut found = Vec::new();
-    extract_symbols(body, src, file_path, names, path_prefix, parent_name_path, &mut found);
-    out.extend(found.into_iter().filter(|s| s.category != SymbolCategory::Variable));
+    extract_symbols(
+        body,
+        src,
+        file_path,
+        names,
+        path_prefix,
+        parent_name_path,
+        &mut found,
+    );
+    out.extend(
+        found
+            .into_iter()
+            .filter(|s| s.category != SymbolCategory::Variable),
+    );
 }
 
 fn extract_from_compound_bodies(
@@ -466,12 +544,28 @@ fn extract_from_compound_bodies(
     match node.kind() {
         "for_statement" | "while_statement" | "with_statement" => {
             if let Some(body) = node.child_by_field_name("body") {
-                extract_symbols(body, src, file_path, names, path_prefix, parent_name_path, out);
+                extract_symbols(
+                    body,
+                    src,
+                    file_path,
+                    names,
+                    path_prefix,
+                    parent_name_path,
+                    out,
+                );
             }
         }
         "if_statement" => {
             if let Some(body) = node.child_by_field_name("consequence") {
-                extract_symbols(body, src, file_path, names, path_prefix, parent_name_path, out);
+                extract_symbols(
+                    body,
+                    src,
+                    file_path,
+                    names,
+                    path_prefix,
+                    parent_name_path,
+                    out,
+                );
             }
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
@@ -479,14 +573,26 @@ fn extract_from_compound_bodies(
                     "elif_clause" => {
                         if let Some(body) = child.child_by_field_name("consequence") {
                             extract_symbols(
-                                body, src, file_path, names, path_prefix, parent_name_path, out,
+                                body,
+                                src,
+                                file_path,
+                                names,
+                                path_prefix,
+                                parent_name_path,
+                                out,
                             );
                         }
                     }
                     "else_clause" => {
                         if let Some(body) = child.child_by_field_name("body") {
                             extract_symbols(
-                                body, src, file_path, names, path_prefix, parent_name_path, out,
+                                body,
+                                src,
+                                file_path,
+                                names,
+                                path_prefix,
+                                parent_name_path,
+                                out,
                             );
                         }
                     }
@@ -496,7 +602,15 @@ fn extract_from_compound_bodies(
         }
         "try_statement" => {
             if let Some(body) = node.child_by_field_name("body") {
-                extract_symbols(body, src, file_path, names, path_prefix, parent_name_path, out);
+                extract_symbols(
+                    body,
+                    src,
+                    file_path,
+                    names,
+                    path_prefix,
+                    parent_name_path,
+                    out,
+                );
             }
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
@@ -506,7 +620,13 @@ fn extract_from_compound_bodies(
                         for inner in child.children(&mut inner_cursor) {
                             if inner.kind() == "block" {
                                 extract_symbols(
-                                    inner, src, file_path, names, path_prefix, parent_name_path, out,
+                                    inner,
+                                    src,
+                                    file_path,
+                                    names,
+                                    path_prefix,
+                                    parent_name_path,
+                                    out,
                                 );
                             }
                         }
@@ -514,7 +634,13 @@ fn extract_from_compound_bodies(
                     "else_clause" => {
                         if let Some(body) = child.child_by_field_name("body") {
                             extract_symbols(
-                                body, src, file_path, names, path_prefix, parent_name_path, out,
+                                body,
+                                src,
+                                file_path,
+                                names,
+                                path_prefix,
+                                parent_name_path,
+                                out,
                             );
                         }
                     }
@@ -529,7 +655,13 @@ fn extract_from_compound_bodies(
                     if child.kind() == "case_clause" {
                         if let Some(consequence) = child.child_by_field_name("consequence") {
                             extract_symbols(
-                                consequence, src, file_path, names, path_prefix, parent_name_path, out,
+                                consequence,
+                                src,
+                                file_path,
+                                names,
+                                path_prefix,
+                                parent_name_path,
+                                out,
                             );
                         }
                     }
@@ -667,9 +799,8 @@ mod tests {
 
     #[test]
     fn parse_nested_class() {
-        let syms = parse(
-            "class Outer:\n    class Inner:\n        def method(self):\n            pass\n",
-        );
+        let syms =
+            parse("class Outer:\n    class Inner:\n        def method(self):\n            pass\n");
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name.as_ref(), "Outer");
         assert_eq!(syms[0].children.len(), 1);
@@ -679,7 +810,10 @@ mod tests {
         // Inner class should have its own children
         assert_eq!(syms[0].children[0].children.len(), 1);
         assert_eq!(syms[0].children[0].children[0].name.as_ref(), "method");
-        assert_eq!(syms[0].children[0].children[0].id, "test.py::Outer/Inner/method");
+        assert_eq!(
+            syms[0].children[0].children[0].id,
+            "test.py::Outer/Inner/method"
+        );
     }
 
     #[test]
@@ -712,7 +846,10 @@ mod tests {
     fn total_lines_counted() {
         let parser = PythonParser::new();
         let file = parser
-            .parse_file(Path::new("test.py"), "def foo():\n    pass\n\ndef bar():\n    pass\n")
+            .parse_file(
+                Path::new("test.py"),
+                "def foo():\n    pass\n\ndef bar():\n    pass\n",
+            )
             .unwrap();
         assert_eq!(file.total_lines, 5);
     }
@@ -724,7 +861,10 @@ mod tests {
             .parse_file(Path::new("src/main.py"), "def foo():\n    pass\n")
             .unwrap();
         assert_eq!(file.file_path, Path::new("src/main.py"));
-        assert_eq!(file.symbols[0].file_path.as_path(), Path::new("src/main.py"));
+        assert_eq!(
+            file.symbols[0].file_path.as_path(),
+            Path::new("src/main.py")
+        );
         assert_eq!(file.symbols[0].id, "src/main.py::foo");
     }
 
@@ -737,9 +877,7 @@ mod tests {
 
     #[test]
     fn parse_decorated_method_inside_class() {
-        let syms = parse(
-            "class Foo:\n    @staticmethod\n    def bar():\n        pass\n",
-        );
+        let syms = parse("class Foo:\n    @staticmethod\n    def bar():\n        pass\n");
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name.as_ref(), "Foo");
         assert_eq!(syms[0].children.len(), 1);
@@ -754,7 +892,11 @@ mod tests {
         let run = &syms[0].children[0];
         assert_eq!(run.id, "test.py::W/run");
         let kids: Vec<&str> = run.children.iter().map(|c| c.name.as_ref()).collect();
-        assert_eq!(kids, ["_handle_sigterm", "helper"], "nested defs, even under `if`; not the annotated local");
+        assert_eq!(
+            kids,
+            ["_handle_sigterm", "helper"],
+            "nested defs, even under `if`; not the annotated local"
+        );
         assert_eq!(run.children[0].id, "test.py::W/run/_handle_sigterm");
         assert_eq!(run.children[0].line_range, 4..5);
     }
@@ -765,7 +907,10 @@ mod tests {
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name.as_ref(), "foo");
         assert_eq!(syms[0].line_range.start, 1);
-        assert_eq!(syms[0].head_line, 3, "the `def` line names it, below its decorators");
+        assert_eq!(
+            syms[0].head_line, 3,
+            "the `def` line names it, below its decorators"
+        );
     }
 
     #[test]
@@ -907,9 +1052,7 @@ mod tests {
 
     #[test]
     fn parse_function_inside_elif() {
-        let syms = parse(
-            "if False:\n    pass\nelif True:\n    def handler():\n        pass\n",
-        );
+        let syms = parse("if False:\n    pass\nelif True:\n    def handler():\n        pass\n");
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name.as_ref(), "handler");
     }
@@ -976,9 +1119,7 @@ mod tests {
 
     #[test]
     fn parse_class_with_methods_inside_if() {
-        let syms = parse(
-            "if True:\n    class Foo:\n        def method(self):\n            pass\n",
-        );
+        let syms = parse("if True:\n    class Foo:\n        def method(self):\n            pass\n");
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name.as_ref(), "Foo");
         assert_eq!(syms[0].category, SymbolCategory::Type);
@@ -1045,10 +1186,16 @@ mod tests {
         // for why that distinction matters in Python specifically.
         let src = "class Point:\n    def first():\n        pass\n    # Make another.\n    def second():\n        pass\n";
         let syms = parse(src);
-        assert_eq!(syms[0].byte_range.start as usize, src.find("class").unwrap());
+        assert_eq!(
+            syms[0].byte_range.start as usize,
+            src.find("class").unwrap()
+        );
         assert_eq!(syms[0].children.len(), 2);
         let second = &syms[0].children[1];
-        assert_eq!(second.byte_range.start as usize, src.find("# Make another.").unwrap());
+        assert_eq!(
+            second.byte_range.start as usize,
+            src.find("# Make another.").unwrap()
+        );
     }
 
     /// A known, narrow gap rather than a silent one: in tree-sitter-python's

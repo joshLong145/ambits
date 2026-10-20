@@ -22,7 +22,11 @@ fn commit() -> String {
             .map(|s| s.trim().to_string())
     };
     // Rebuild when HEAD moves, by checkout or by commit.
-    for path in ["HEAD", "packed-refs"].into_iter().map(String::from).chain(git(&["symbolic-ref", "-q", "HEAD"])) {
+    for path in ["HEAD", "packed-refs"]
+        .into_iter()
+        .map(String::from)
+        .chain(git(&["symbolic-ref", "-q", "HEAD"]))
+    {
         if let Some(p) = git(&["rev-parse", "--git-path", &path]) {
             println!("cargo:rerun-if-changed={p}");
         }
@@ -45,9 +49,15 @@ fn main() {
     let mut grammars = Vec::new();
     let mut name: Option<&str> = None;
     for line in lock.lines() {
-        if let Some(n) = line.strip_prefix("name = \"").and_then(|s| s.strip_suffix('"')) {
+        if let Some(n) = line
+            .strip_prefix("name = \"")
+            .and_then(|s| s.strip_suffix('"'))
+        {
             name = Some(n);
-        } else if let Some(v) = line.strip_prefix("version = \"").and_then(|s| s.strip_suffix('"')) {
+        } else if let Some(v) = line
+            .strip_prefix("version = \"")
+            .and_then(|s| s.strip_suffix('"'))
+        {
             if let Some(n) = name.take().filter(|n| n.starts_with("tree-sitter")) {
                 grammars.push((n, v));
             }
@@ -63,7 +73,8 @@ fn main() {
         }
     }
 
-    let mut out = String::from("/// `(crate, version)` for every tree-sitter crate in `Cargo.lock`.\n");
+    let mut out =
+        String::from("/// `(crate, version)` for every tree-sitter crate in `Cargo.lock`.\n");
     out.push_str("pub const GRAMMARS: &[(&str, &str)] = &[\n");
     for (n, v) in grammars {
         let _ = writeln!(out, "    ({n:?}, {v:?}),");

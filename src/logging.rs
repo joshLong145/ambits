@@ -41,7 +41,11 @@ pub fn init(log_output_dir: Option<&Path>, session_id: Option<&str>) {
     }
 
     let file_name = format!("{}.log", session_id.unwrap_or("no-session"));
-    let Ok(file) = OpenOptions::new().create(true).append(true).open(dir.join(file_name)) else {
+    let Ok(file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(file_name))
+    else {
         return;
     };
 
@@ -64,12 +68,27 @@ pub fn init(log_output_dir: Option<&Path>, session_id: Option<&str>) {
 /// `message` themselves — call sites in this codebase use `symbol_target`
 /// for a read's symbol/selector, precisely to avoid colliding with the
 /// envelope's own `target`.
-fn format_json_line(buf: &mut env_logger::fmt::Formatter, record: &log::Record) -> std::io::Result<()> {
+fn format_json_line(
+    buf: &mut env_logger::fmt::Formatter,
+    record: &log::Record,
+) -> std::io::Result<()> {
     let mut map = serde_json::Map::new();
-    map.insert("ts".to_string(), serde_json::Value::String(crate::time::now_rfc3339()));
-    map.insert("level".to_string(), serde_json::Value::String(record.level().to_string()));
-    map.insert("target".to_string(), serde_json::Value::String(record.target().to_string()));
-    map.insert("message".to_string(), serde_json::Value::String(record.args().to_string()));
+    map.insert(
+        "ts".to_string(),
+        serde_json::Value::String(crate::time::now_rfc3339()),
+    );
+    map.insert(
+        "level".to_string(),
+        serde_json::Value::String(record.level().to_string()),
+    );
+    map.insert(
+        "target".to_string(),
+        serde_json::Value::String(record.target().to_string()),
+    );
+    map.insert(
+        "message".to_string(),
+        serde_json::Value::String(record.args().to_string()),
+    );
 
     let mut visitor = JsonMapVisitor { map: &mut map };
     let _ = record.key_values().visit(&mut visitor);
@@ -85,7 +104,10 @@ impl<'a, 'kvs> VisitSource<'kvs> for JsonMapVisitor<'a> {
     fn visit_pair(&mut self, key: Key<'kvs>, value: Value<'kvs>) -> Result<(), KvError> {
         let mut collector = JsonValueVisitor(None);
         value.visit(&mut collector)?;
-        self.map.insert(key.to_string(), collector.0.unwrap_or(serde_json::Value::Null));
+        self.map.insert(
+            key.to_string(),
+            collector.0.unwrap_or(serde_json::Value::Null),
+        );
         Ok(())
     }
 }

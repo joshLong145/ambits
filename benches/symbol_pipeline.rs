@@ -12,8 +12,8 @@
 mod fixtures;
 
 use ambits::coverage::CoverageReport;
-use ambits::symbols::ProjectTree;
 use ambits::symbols::merkle::compute_merkle_hash;
+use ambits::symbols::ProjectTree;
 use ambits::tracking::{ContextLedger, ReadDepth};
 use fixtures::make_monorepo_tree;
 

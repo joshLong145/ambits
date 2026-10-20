@@ -126,7 +126,11 @@ pub fn normalize_path(path: &str) -> String {
 /// a path outside the project. The one way the ledger, the trace and write
 /// attribution agree on which file a call was about.
 pub fn project_file(path: &std::path::Path, root: &std::path::Path) -> Option<String> {
-    let rel = if path.is_absolute() { path.strip_prefix(root).ok()? } else { path };
+    let rel = if path.is_absolute() {
+        path.strip_prefix(root).ok()?
+    } else {
+        path
+    };
     project_rel(rel)
 }
 
@@ -171,7 +175,9 @@ pub fn file_hash(bytes: &[u8]) -> String {
 /// A regular file's bytes; `None` when it is gone or is anything else — a
 /// symlink is never followed (§9.1).
 pub fn read_regular(path: &std::path::Path) -> Option<Vec<u8>> {
-    std::fs::symlink_metadata(path).ok().filter(|m| m.is_file())?;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|m| m.is_file())?;
     std::fs::read(path).ok()
 }
 
@@ -180,7 +186,9 @@ pub fn valid_entry_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
-        && !name.chars().any(|c| matches!(c, '/' | '\\' | '\0' | ':') || c.is_control())
+        && !name
+            .chars()
+            .any(|c| matches!(c, '/' | '\\' | '\0' | ':') || c.is_control())
 }
 
 /// A project-relative record path: relative, normalized, no `..` (§9.1).
@@ -194,18 +202,26 @@ pub fn valid_record_path(path: &str) -> bool {
 /// A tool-use id, as Claude Code mints them: `toolu_` then letters and
 /// digits (§9.1).
 pub fn valid_op(op: &str) -> bool {
-    op.strip_prefix("toolu_").is_some_and(|rest| !rest.is_empty() && rest.len() <= 128 && rest.bytes().all(|b| b.is_ascii_alphanumeric()))
+    op.strip_prefix("toolu_").is_some_and(|rest| {
+        !rest.is_empty() && rest.len() <= 128 && rest.bytes().all(|b| b.is_ascii_alphanumeric())
+    })
 }
 
 /// A symbol id: a record path, `::`, and a name path of printable text.
 pub fn valid_symbol_id(id: &str) -> bool {
     let (file, name) = crate::symbols::split_id(id);
-    id.contains("::") && valid_record_path(file) && !name.is_empty() && id.len() <= 4096 && !id.chars().any(char::is_control)
+    id.contains("::")
+        && valid_record_path(file)
+        && !name.is_empty()
+        && id.len() <= 4096
+        && !id.chars().any(char::is_control)
 }
 
 /// A content hash as records carry one: `b3:` and 64 lowercase hex digits.
 pub fn valid_hash(h: &str) -> bool {
-    h.strip_prefix("b3:").is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    h.strip_prefix("b3:").is_some_and(|hex| {
+        hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 /// Short free text from elsewhere (an agent id, a tool name): printable and
@@ -217,7 +233,9 @@ pub fn valid_label(s: &str) -> bool {
 /// `s` with control characters (terminal escapes among them) replaced, for
 /// printing text that came from another machine.
 pub fn printable(s: &str) -> String {
-    s.chars().map(|c| if c.is_control() { '\u{fffd}' } else { c }).collect()
+    s.chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect()
 }
 
 #[cfg(test)]
@@ -231,7 +249,11 @@ mod tests {
             assert!(!valid_op(bad), "{bad:?}");
         }
         assert!(valid_symbol_id("src/a.rs::App/run"));
-        assert!(!valid_symbol_id("../a.rs::x") && !valid_symbol_id("src/a.rs") && !valid_symbol_id("a.rs::\u{1b}[2J"));
+        assert!(
+            !valid_symbol_id("../a.rs::x")
+                && !valid_symbol_id("src/a.rs")
+                && !valid_symbol_id("a.rs::\u{1b}[2J")
+        );
         assert!(valid_hash(&format!("b3:{}", "0".repeat(64))));
         assert!(!valid_hash("b3:XYZ") && !valid_hash(&"0".repeat(64)));
         assert_eq!(printable("ok\u{1b}[31m"), "ok\u{fffd}[31m");
@@ -241,7 +263,13 @@ mod tests {
     fn ids_round_trip_and_reject_junk() {
         let id = content_id(Kind::Coverage, b"[]");
         assert_eq!(ObjectId::parse(&id.hex()).unwrap(), id);
-        for bad in ["", "abc", &"A".repeat(64), &"0".repeat(63), &format!("{}g", "0".repeat(63))] {
+        for bad in [
+            "",
+            "abc",
+            &"A".repeat(64),
+            &"0".repeat(63),
+            &format!("{}g", "0".repeat(63)),
+        ] {
             assert!(ObjectId::parse(bad).is_err(), "{bad:?}");
         }
     }
@@ -249,19 +277,28 @@ mod tests {
     /// The type is part of the id: equal payloads of two types are two objects.
     #[test]
     fn the_type_is_part_of_the_id() {
-        assert_ne!(content_id(Kind::Coverage, b"[]"), content_id(Kind::Writes, b"[]"));
+        assert_ne!(
+            content_id(Kind::Coverage, b"[]"),
+            content_id(Kind::Writes, b"[]")
+        );
     }
 
     #[test]
     fn paths_normalize_separators_and_unicode() {
         // "é" precomposed vs "e" + combining acute.
-        assert_eq!(normalize_path("src\\caf\u{e9}.rs"), normalize_path("src/cafe\u{301}.rs"));
+        assert_eq!(
+            normalize_path("src\\caf\u{e9}.rs"),
+            normalize_path("src/cafe\u{301}.rs")
+        );
     }
 
     #[test]
     fn project_rel_normalizes_and_refuses_escapes() {
         use std::path::Path;
-        assert_eq!(project_rel(Path::new("./src/cafe\u{301}.rs")).as_deref(), Some("src/caf\u{e9}.rs"));
+        assert_eq!(
+            project_rel(Path::new("./src/cafe\u{301}.rs")).as_deref(),
+            Some("src/caf\u{e9}.rs")
+        );
         for bad in ["", ".", "../x", "/etc/passwd", "src/../../x"] {
             assert_eq!(project_rel(Path::new(bad)), None, "{bad}");
         }

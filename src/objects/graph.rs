@@ -32,13 +32,23 @@ impl Line {
     fn verified(&self) -> Option<(ObjectId, Vec<ObjectId>)> {
         let id = ObjectId::parse(&self.id).ok()?;
         let inputs = crate::journal::decode_hash(&self.inputs)?;
-        let parents = self.parents.iter().map(|p| ObjectId::parse(p)).collect::<Result<Vec<_>>>().ok()?;
+        let parents = self
+            .parents
+            .iter()
+            .map(|p| ObjectId::parse(p))
+            .collect::<Result<Vec<_>>>()
+            .ok()?;
         (snapshot_id(&inputs, &parents) == id).then_some((id, parents))
     }
 }
 
 fn graph_file(store: &Store) -> FlatLog {
-    FlatLog::at(store.root().join(crate::state_dir::CACHE).join(crate::state_dir::GRAPH))
+    FlatLog::at(
+        store
+            .root()
+            .join(crate::state_dir::CACHE)
+            .join(crate::state_dir::GRAPH),
+    )
 }
 
 /// The ancestry this store knows, and what it learned since loading.
@@ -53,8 +63,17 @@ impl Graph {
     /// cache is an empty one).
     pub fn load(local: &Store) -> Self {
         let file = graph_file(local);
-        let parents = file.read::<Line>().unwrap_or_default().iter().filter_map(Line::verified).collect();
-        Self { file, parents, learned: Vec::new() }
+        let parents = file
+            .read::<Line>()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Line::verified)
+            .collect();
+        Self {
+            file,
+            parents,
+            learned: Vec::new(),
+        }
     }
 
     /// Record `snap`'s parents, as loaded (so verified) from some store.
@@ -92,13 +111,23 @@ impl Graph {
 
     /// Whether `descendant` is `ancestor` or descends from it; the walk stops
     /// as soon as it is found.
-    pub fn is_ancestor(&mut self, store: &Store, ancestor: ObjectId, descendant: ObjectId) -> Result<bool> {
+    pub fn is_ancestor(
+        &mut self,
+        store: &Store,
+        ancestor: ObjectId,
+        descendant: ObjectId,
+    ) -> Result<bool> {
         self.walk(store, descendant, |id| id == ancestor)
     }
 
     /// Visit `tip` and its ancestors, each once, until `stop` says so;
     /// whether it did.
-    fn walk(&mut self, store: &Store, tip: ObjectId, mut stop: impl FnMut(ObjectId) -> bool) -> Result<bool> {
+    fn walk(
+        &mut self,
+        store: &Store,
+        tip: ObjectId,
+        mut stop: impl FnMut(ObjectId) -> bool,
+    ) -> Result<bool> {
         let mut seen = HashSet::new();
         let mut stack = vec![tip];
         while let Some(id) = stack.pop() {
@@ -109,7 +138,10 @@ impl Graph {
                 return Ok(true);
             }
             if seen.len() > MAX_HISTORY {
-                bail!("history of {} is longer than {MAX_HISTORY} snapshots", tip.short());
+                bail!(
+                    "history of {} is longer than {MAX_HISTORY} snapshots",
+                    tip.short()
+                );
             }
             stack.extend(self.parents(store, id)?);
         }
@@ -127,7 +159,12 @@ impl Graph {
         if worth_compacting(lines, self.parents.len()) {
             // The file's lines that still prove themselves, and what was
             // learned: one line per snapshot.
-            let mut kept: Vec<Line> = self.file.read::<Line>()?.into_iter().filter(|l| l.verified().is_some()).collect();
+            let mut kept: Vec<Line> = self
+                .file
+                .read::<Line>()?
+                .into_iter()
+                .filter(|l| l.verified().is_some())
+                .collect();
             kept.extend(self.learned.iter().cloned());
             kept.sort_by(|a, b| a.id.cmp(&b.id));
             kept.dedup_by(|a, b| a.id == b.id);
@@ -153,7 +190,11 @@ mod tests {
     use super::*;
 
     fn line(id: ObjectId, inputs: [u8; 32], parents: &[ObjectId]) -> Line {
-        Line { id: id.hex(), inputs: crate::journal::encode_hash(&inputs), parents: parents.iter().map(ObjectId::hex).collect() }
+        Line {
+            id: id.hex(),
+            inputs: crate::journal::encode_hash(&inputs),
+            parents: parents.iter().map(ObjectId::hex).collect(),
+        }
     }
 
     /// A line proves itself: forge its parents and it is ignored.
@@ -161,9 +202,16 @@ mod tests {
     fn a_line_whose_id_does_not_match_is_ignored() {
         let (inputs, parent) = ([7u8; 32], ObjectId([1; 32]));
         let id = snapshot_id(&inputs, &[parent]);
-        assert_eq!(line(id, inputs, &[parent]).verified(), Some((id, vec![parent])));
+        assert_eq!(
+            line(id, inputs, &[parent]).verified(),
+            Some((id, vec![parent]))
+        );
         assert_eq!(line(id, inputs, &[]).verified(), None, "a parent dropped");
-        assert_eq!(line(id, inputs, &[ObjectId([2; 32])]).verified(), None, "a parent swapped");
+        assert_eq!(
+            line(id, inputs, &[ObjectId([2; 32])]).verified(),
+            None,
+            "a parent swapped"
+        );
     }
 
     /// Answered from the cache: the store holds none of these objects.
@@ -176,11 +224,23 @@ mod tests {
         let c = snapshot_id(&[3; 32], &[b]);
         let file = graph_file(&store);
         let lock = file.lock().unwrap();
-        file.append(&lock, &[line(a, [1; 32], &[]), line(b, [2; 32], &[a]), line(c, [3; 32], &[b])], Durability::NoSync).unwrap();
+        file.append(
+            &lock,
+            &[
+                line(a, [1; 32], &[]),
+                line(b, [2; 32], &[a]),
+                line(c, [3; 32], &[b]),
+            ],
+            Durability::NoSync,
+        )
+        .unwrap();
         drop(lock);
         let mut graph = Graph::load(&store);
         assert!(graph.is_ancestor(&store, a, c).unwrap());
         assert!(!graph.is_ancestor(&store, c, a).unwrap_or(false));
-        assert_eq!(graph.ancestors(&store, c).unwrap(), HashSet::from([a, b, c]));
+        assert_eq!(
+            graph.ancestors(&store, c).unwrap(),
+            HashSet::from([a, b, c])
+        );
     }
 }

@@ -22,10 +22,17 @@ fn touched_reports_the_last_write_as_text_and_json() {
     let run = |args: &[&str]| run_ambits(root, args);
 
     let text = run(&["touched", "src/lib.rs"]);
-    assert!(text.contains("last written 2026-09-26T10:00:00Z by agent-1 (Edit)"), "{text}");
-    assert!(text.contains("unknown"), "a file-level Edit has no hash: {text}");
+    assert!(
+        text.contains("last written 2026-09-26T10:00:00Z by agent-1 (Edit)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("unknown"),
+        "a file-level Edit has no hash: {text}"
+    );
 
-    let json: serde_json::Value = serde_json::from_str(&run(&["touched", "--format", "json", "src/lib.rs"])).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&run(&["touched", "--format", "json", "src/lib.rs"])).unwrap();
     assert_eq!(json["last_write"]["op"], "toolu_1");
     assert_eq!(json["last_write"]["session"], "s1");
     assert_eq!(json["last_write"]["status"], "unknown");

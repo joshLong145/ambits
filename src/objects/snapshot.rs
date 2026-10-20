@@ -5,11 +5,11 @@ use std::path::Path;
 use color_eyre::eyre::{bail, eyre, Result};
 use serde_json::{json, Value};
 
+use super::graph::Graph;
 use super::inputs::{self, Inputs};
 use super::refs::{self, RefName};
 use super::store::Store;
 use super::sync_ignore::SyncIgnore;
-use super::graph::Graph;
 use super::{b3, gc, record, Kind, ObjectId};
 use crate::ingest::tool_config::SyncConfig;
 use crate::symbols::ProjectTree;
@@ -47,7 +47,10 @@ impl Snapshot {
         obj.insert("writes".into(), json!(self.writes.hex()));
         let mut parents = self.parents.clone();
         parents.sort();
-        obj.insert("parents".into(), json!(parents.iter().map(ObjectId::hex).collect::<Vec<_>>()));
+        obj.insert(
+            "parents".into(),
+            json!(parents.iter().map(ObjectId::hex).collect::<Vec<_>>()),
+        );
         obj.insert("state_digest".into(), json!(b3(&self.state_digest)));
         v
     }
@@ -66,12 +69,22 @@ impl Snapshot {
                 id.short()
             );
         }
-        let text = |k: &str| v.get(k).and_then(Value::as_str).ok_or_else(|| eyre!("snapshot {}: missing {k}", id.short()));
+        let text = |k: &str| {
+            v.get(k)
+                .and_then(Value::as_str)
+                .ok_or_else(|| eyre!("snapshot {}: missing {k}", id.short()))
+        };
         let hash = |k: &str| -> Result<[u8; 32]> {
-            crate::journal::decode_hash(text(k)?).ok_or_else(|| eyre!("snapshot {}: bad {k}", id.short()))
+            crate::journal::decode_hash(text(k)?)
+                .ok_or_else(|| eyre!("snapshot {}: bad {k}", id.short()))
         };
         let oid = |k: &str| ObjectId::parse(text(k)?);
-        let list = |k: &str| v.get(k).and_then(Value::as_array).cloned().unwrap_or_default();
+        let list = |k: &str| {
+            v.get(k)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        };
 
         let git = text("git")?;
         let inputs = Inputs {
@@ -82,10 +95,18 @@ impl Snapshot {
             ignore: hash("ignore")?,
             dirty: list("dirty")
                 .iter()
-                .filter_map(|d| Some((d.get(0)?.as_str()?.to_string(), d.get(1)?.as_str()?.to_string())))
+                .filter_map(|d| {
+                    Some((
+                        d.get(0)?.as_str()?.to_string(),
+                        d.get(1)?.as_str()?.to_string(),
+                    ))
+                })
                 .collect(),
         };
-        let parents = list("parents").iter().map(|p| ObjectId::parse(p.as_str().unwrap_or_default())).collect::<Result<Vec<_>>>()?;
+        let parents = list("parents")
+            .iter()
+            .map(|p| ObjectId::parse(p.as_str().unwrap_or_default()))
+            .collect::<Result<Vec<_>>>()?;
         let snapshot = Self {
             id,
             inputs_digest: hash("inputs")?,
@@ -98,8 +119,16 @@ impl Snapshot {
         // Fields are validated as untrusted input (§9.1), and the payload
         // must be exactly what these values encode to: an extra key would
         // ride along covered by no digest.
-        let git_ok = snapshot.inputs.git.as_deref().is_none_or(crate::git::is_commit_id);
-        let dirty_ok = snapshot.inputs.dirty.iter().all(|(p, _)| super::valid_record_path(p));
+        let git_ok = snapshot
+            .inputs
+            .git
+            .as_deref()
+            .is_none_or(crate::git::is_commit_id);
+        let dirty_ok = snapshot
+            .inputs
+            .dirty
+            .iter()
+            .all(|(p, _)| super::valid_record_path(p));
         if !git_ok || !dirty_ok || !crate::ingest::claude::is_uuid(&snapshot.inputs.session) {
             bail!("snapshot {}: malformed fields", id.short());
         }
@@ -107,13 +136,21 @@ impl Snapshot {
             bail!("snapshot {}: unexpected or malformed fields", id.short());
         }
         if snapshot.inputs.digest()? != snapshot.inputs_digest {
-            bail!("snapshot {}: its inputs do not match its inputs digest", id.short());
+            bail!(
+                "snapshot {}: its inputs do not match its inputs digest",
+                id.short()
+            );
         }
         if inputs::snapshot_id(&snapshot.inputs_digest, &snapshot.parents) != id {
             bail!("snapshot {}: does not match its id", id.short());
         }
-        if state_digest(&snapshot.coverage, &snapshot.writes, &snapshot.parents) != snapshot.state_digest {
-            bail!("snapshot {}: its contents do not match its state digest", id.short());
+        if state_digest(&snapshot.coverage, &snapshot.writes, &snapshot.parents)
+            != snapshot.state_digest
+        {
+            bail!(
+                "snapshot {}: its contents do not match its state digest",
+                id.short()
+            );
         }
         Ok(snapshot)
     }
@@ -142,7 +179,13 @@ pub struct Request<'a> {
 pub enum Outcome {
     /// Inputs equal the tip's and nothing is pending: nothing written (§6.4).
     NothingChanged(ObjectId),
-    Created { id: ObjectId, parents: Vec<ObjectId>, reads: usize, writes: usize, dirty: usize },
+    Created {
+        id: ObjectId,
+        parents: Vec<ObjectId>,
+        reads: usize,
+        writes: usize,
+        dirty: usize,
+    },
 }
 
 /// Make a snapshot of `req.session` (§6.4).
@@ -156,7 +199,10 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
     let prefix = record::read_prefix(req.project_root, req.session)?;
     let env = inputs::environment(req.project_root, req.tree, &ignore)?;
     if req.require_clean && !env.dirty.is_empty() {
-        bail!("working tree has {} dirty file(s); commit or stash them, or drop --require-clean", env.dirty.len());
+        bail!(
+            "working tree has {} dirty file(s); commit or stash them, or drop --require-clean",
+            env.dirty.len()
+        );
     }
     let inputs = Inputs {
         session: req.session.to_string(),
@@ -175,7 +221,13 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
     let mut graph = (!prefix.contents.merges.is_empty()).then(|| Graph::load(&store));
     let mut pending: Vec<ObjectId> = Vec::new();
     if let Some(graph) = graph.as_mut() {
-        for m in prefix.contents.merges.iter().filter_map(|m| ObjectId::parse(m).ok()).filter(|m| store.contains(m)) {
+        for m in prefix
+            .contents
+            .merges
+            .iter()
+            .filter_map(|m| ObjectId::parse(m).ok())
+            .filter(|m| store.contains(m))
+        {
             let merged = match tip {
                 Some(t) => graph.is_ancestor(&store, m, t)?,
                 None => false,
@@ -189,7 +241,10 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
     if let (Some(tip), true) = (tip, pending.is_empty()) {
         let current = Snapshot::load(&store, tip)?;
         if current.inputs_digest == inputs_digest {
-            if [current.coverage, current.writes].iter().all(|id| store.contains(id)) {
+            if [current.coverage, current.writes]
+                .iter()
+                .all(|id| store.contains(id))
+            {
                 return Ok(Outcome::NothingChanged(tip));
             }
             // The tip survived a crash its objects did not. Same inputs,
@@ -221,7 +276,10 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
     let records = record::write_records(&store, req.session, &prefix.contents, &ignore)?;
     if let Some(tip) = repair {
         if (tip.coverage, tip.writes) != (records.coverage, records.writes) {
-            bail!("snapshot {} is missing objects that cannot be rebuilt from the current state", tip.id.short());
+            bail!(
+                "snapshot {} is missing objects that cannot be rebuilt from the current state",
+                tip.id.short()
+            );
         }
         store.sync_dirs()?;
         return Ok(Outcome::NothingChanged(tip.id));
@@ -241,7 +299,10 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
         // corruption or a forged object, never something to skip (§6.3).
         let existing = Snapshot::load(&store, id)?;
         if existing.state_digest != snapshot.state_digest {
-            bail!("snapshot {} already exists with different contents; the store may be corrupt", id.short());
+            bail!(
+                "snapshot {} already exists with different contents; the store may be corrupt",
+                id.short()
+            );
         }
     }
     // Every object durable before the snapshot that references them, and
@@ -252,7 +313,13 @@ pub fn snapshot(req: &Request<'_>) -> Result<Outcome> {
     refs::write_note(&store, &id, req.message)?;
     refs::update(&store, &name, tip, id, "snapshot")?;
 
-    Ok(Outcome::Created { id, parents, reads: records.reads, writes: records.write_count, dirty })
+    Ok(Outcome::Created {
+        id,
+        parents,
+        reads: records.reads,
+        writes: records.write_count,
+        dirty,
+    })
 }
 
 /// The most snapshots one history may hold (§9.5).
@@ -267,7 +334,8 @@ pub fn resolve(store: &Store, arg: &str) -> Result<ObjectId> {
     }
     if let Some((remote, session)) = arg.split_once('/') {
         let name = RefName::tracking(remote, session)?;
-        return refs::read(store, &name)?.ok_or_else(|| eyre!("{arg}: not fetched from {remote}; run `ambits fetch {remote}`"));
+        return refs::read(store, &name)?
+            .ok_or_else(|| eyre!("{arg}: not fetched from {remote}; run `ambits fetch {remote}`"));
     }
     if let Ok(id) = ObjectId::parse(arg) {
         return Ok(id);
@@ -285,7 +353,10 @@ pub fn resolve(store: &Store, arg: &str) -> Result<ObjectId> {
     match matches.as_slice() {
         [one] => Ok(*one),
         [] => Err(eyre!("no snapshot starts with {arg}")),
-        _ => Err(eyre!("{arg} is ambiguous: {} snapshots start with it", matches.len())),
+        _ => Err(eyre!(
+            "{arg} is ambiguous: {} snapshots start with it",
+            matches.len()
+        )),
     }
 }
 
@@ -301,7 +372,11 @@ pub struct LogEntry {
 /// `start` and its ancestors, newest first by note time.
 pub fn history(store: &Store, start: ObjectId) -> Result<Vec<LogEntry>> {
     let count = |id: &ObjectId, kind: Kind, key: &str| -> Result<usize> {
-        Ok(store.get(id, kind)?.get(key).and_then(Value::as_array).map_or(0, Vec::len))
+        Ok(store
+            .get(id, kind)?
+            .get(key)
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len))
     };
     let mut notes = refs::notes(store)?;
     let mut out = Vec::new();
@@ -334,14 +409,25 @@ pub fn print_log(out: &mut impl std::io::Write, entries: &[LogEntry]) -> std::io
             writeln!(out)?;
         }
         let s = &e.snapshot;
-        let time = e.note.as_ref().map_or("unknown time".to_string(), |n| super::printable(&n.time));
+        let time = e
+            .note
+            .as_ref()
+            .map_or("unknown time".to_string(), |n| super::printable(&n.time));
         writeln!(out, "snapshot {}  {time}", s.id.short())?;
-        let git = s.inputs.git.as_deref().map_or("none", |g| g.get(..7).unwrap_or(g));
+        let git = s
+            .inputs
+            .git
+            .as_deref()
+            .map_or("none", |g| g.get(..7).unwrap_or(g));
         let dirty = match s.inputs.dirty.len() {
             0 => String::new(),
             n => format!(" (dirty: {n} file{})", if n == 1 { "" } else { "s" }),
         };
-        writeln!(out, "  git {git}{dirty}   reads {}   writes {}", e.reads, e.writes)?;
+        writeln!(
+            out,
+            "  git {git}{dirty}   reads {}   writes {}",
+            e.reads, e.writes
+        )?;
         if !s.parents.is_empty() {
             let parents: Vec<String> = s.parents.iter().map(ObjectId::short).collect();
             writeln!(out, "  parents {}", parents.join(" "))?;
@@ -358,7 +444,13 @@ pub fn print_log(out: &mut impl std::io::Write, entries: &[LogEntry]) -> std::io
 pub fn print_outcome(out: &mut impl std::io::Write, outcome: &Outcome) -> std::io::Result<()> {
     match outcome {
         Outcome::NothingChanged(tip) => writeln!(out, "nothing changed: {}", tip.short()),
-        Outcome::Created { id, parents, reads, writes, dirty } => {
+        Outcome::Created {
+            id,
+            parents,
+            reads,
+            writes,
+            dirty,
+        } => {
             let parent = parents.first().map_or("none".to_string(), ObjectId::short);
             writeln!(
                 out,

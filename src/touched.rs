@@ -78,7 +78,12 @@ pub fn latest(project_root: &Path, target: &Target) -> Option<(String, WriteReco
 }
 
 /// Whether `write`'s version of `target` is still on disk.
-pub fn status(project_root: &Path, registry: &ParserRegistry, target: &Target, write: &WriteRecord) -> Status {
+pub fn status(
+    project_root: &Path,
+    registry: &ParserRegistry,
+    target: &Target,
+    write: &WriteRecord,
+) -> Status {
     // Raw bytes, never through a symlink (§9.1): a file that is not UTF-8
     // is still there, and hashes the way the write's `fh` did.
     let Some(bytes) = crate::objects::read_regular(&project_root.join(target.file())) else {
@@ -119,7 +124,9 @@ pub fn run(project_root: &Path, arg: &str, json: bool) -> Result<()> {
     let target = Target::parse(arg);
     let found = latest(project_root, &target);
     let registry = ParserRegistry::new();
-    let status = found.as_ref().map(|(_, w)| status(project_root, &registry, &target, w));
+    let status = found
+        .as_ref()
+        .map(|(_, w)| status(project_root, &registry, &target, w));
     // Only the parts of the write that are about the target: a symbol and
     // what is nested in it, or the whole file.
     let landed = match &found {
@@ -128,7 +135,11 @@ pub fn run(project_root: &Path, arg: &str, json: bool) -> Result<()> {
                 Target::Symbol(id) => nested_in(&u.target, id),
                 Target::File(_) => true,
             };
-            Some(crate::linkage::landed(crate::linkage::Resolver::new(project_root).as_mut(), w, &keep)?)
+            Some(crate::linkage::landed(
+                crate::linkage::Resolver::new(project_root).as_mut(),
+                w,
+                &keep,
+            )?)
         }
         None => None,
     };
@@ -138,17 +149,19 @@ pub fn run(project_root: &Path, arg: &str, json: bool) -> Result<()> {
         let dto = TouchedDto {
             schema_version: SCHEMA_VERSION,
             target: arg,
-            last_write: found.as_ref().zip(status).zip(landed).map(|(((session, w), status), landed)| WriteDto {
-                session,
-                op: &w.op,
-                agent: &w.a,
-                time: &w.t,
-                tool: &w.tool,
-                level: w.level,
-                status,
-                landed,
-                origin: w.origin.as_deref(),
-            }),
+            last_write: found.as_ref().zip(status).zip(landed).map(
+                |(((session, w), status), landed)| WriteDto {
+                    session,
+                    op: &w.op,
+                    agent: &w.a,
+                    time: &w.t,
+                    tool: &w.tool,
+                    level: w.level,
+                    status,
+                    landed,
+                    origin: w.origin.as_deref(),
+                },
+            ),
         };
         writeln!(out, "{}", serde_json::to_string(&dto)?)?;
         return Ok(());
@@ -160,8 +173,18 @@ pub fn run(project_root: &Path, arg: &str, json: bool) -> Result<()> {
     };
     // Agent, tool and origin may come from another machine: printed plain.
     use crate::objects::printable;
-    let origin = w.origin.as_deref().map(|o| format!(", pulled from {}", printable(o))).unwrap_or_default();
-    writeln!(out, "{arg} — last written {} by {} ({}){origin}", printable(&w.t), printable(&w.a), printable(&w.tool))?;
+    let origin = w
+        .origin
+        .as_deref()
+        .map(|o| format!(", pulled from {}", printable(o)))
+        .unwrap_or_default();
+    writeln!(
+        out,
+        "{arg} — last written {} by {} ({}){origin}",
+        printable(&w.t),
+        printable(&w.a),
+        printable(&w.tool)
+    )?;
     writeln!(out, "  session {session}, write {}", w.op)?;
     writeln!(out, "  {}", status.phrase())?;
     if let Some(landed) = &landed {
@@ -172,13 +195,25 @@ pub fn run(project_root: &Path, arg: &str, json: bool) -> Result<()> {
 
 fn landed_line(landed: &crate::linkage::Landed) -> String {
     use crate::linkage::Landed;
-    let short = |commits: &[String]| commits.iter().map(|c| c.get(..7).unwrap_or(c)).collect::<Vec<_>>().join(", ");
+    let short = |commits: &[String]| {
+        commits
+            .iter()
+            .map(|c| c.get(..7).unwrap_or(c))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     match landed {
         Landed::Verified { commits } => format!("landed in {} (verified)", short(commits)),
         Landed::Unverified { commits } => {
-            format!("landed in {} (unverified: the first commit to touch the file after the write)", short(commits))
+            format!(
+                "landed in {} (unverified: the first commit to touch the file after the write)",
+                short(commits)
+            )
         }
-        Landed::Partial { commits, unverified } => format!(
+        Landed::Partial {
+            commits,
+            unverified,
+        } => format!(
             // "In no commit" rather than "uncommitted": the rest may have
             // been changed again before committing, and so never land as
             // the agent wrote it.
@@ -199,10 +234,18 @@ mod tests {
     const SRC: &str = "fn alpha() {}\nfn beta() {}\n";
 
     fn hash_of(src: &str, name: &str) -> String {
-        FileContents::read("src/lib.rs", src.as_bytes(), &ParserRegistry::new()).hashes(name)[0].clone()
+        FileContents::read("src/lib.rs", src.as_bytes(), &ParserRegistry::new()).hashes(name)[0]
+            .clone()
     }
 
-    fn write(op: &str, t: &str, level: Level, syms: Vec<(&str, String)>, removed: Vec<&str>, fh: Option<String>) -> WriteRecord {
+    fn write(
+        op: &str,
+        t: &str,
+        level: Level,
+        syms: Vec<(&str, String)>,
+        removed: Vec<&str>,
+        fh: Option<String>,
+    ) -> WriteRecord {
         WriteRecord {
             op: op.into(),
             av: crate::writes::ATTRIBUTION_VERSION,
@@ -227,7 +270,8 @@ mod tests {
         let jdir = journal_dir(dir.path());
         std::fs::create_dir_all(&jdir).unwrap();
         for (session, w) in writes {
-            let line = serde_json::to_string(&crate::journal::Record::Write(Box::new(w.clone()))).unwrap();
+            let line =
+                serde_json::to_string(&crate::journal::Record::Write(Box::new(w.clone()))).unwrap();
             let path = jdir.join(format!("{session}.ndjson"));
             let mut existing = std::fs::read_to_string(&path).unwrap_or_default();
             existing.push_str(&line);
@@ -246,8 +290,14 @@ mod tests {
 
     #[test]
     fn targets_parse_as_symbols_or_paths() {
-        assert_eq!(Target::parse("src/a.rs::A/b"), Target::Symbol("src/a.rs::A/b".into()));
-        assert_eq!(Target::parse("./src\\a.rs"), Target::File("src/a.rs".into()));
+        assert_eq!(
+            Target::parse("src/a.rs::A/b"),
+            Target::Symbol("src/a.rs::A/b".into())
+        );
+        assert_eq!(
+            Target::parse("./src\\a.rs"),
+            Target::File("src/a.rs".into())
+        );
     }
 
     #[test]
@@ -261,8 +311,28 @@ mod tests {
     fn the_latest_write_across_sessions_wins() {
         let a = hash_of(SRC, "alpha");
         let dir = project(&[
-            ("s-old", write("toolu_1", "2026-09-26T09:00:00Z", Level::Symbol, vec![("src/lib.rs::alpha", a.clone())], vec![], None)),
-            ("s-new", write("toolu_2", "2026-09-26T11:00:00Z", Level::Symbol, vec![("src/lib.rs::alpha", a)], vec![], None)),
+            (
+                "s-old",
+                write(
+                    "toolu_1",
+                    "2026-09-26T09:00:00Z",
+                    Level::Symbol,
+                    vec![("src/lib.rs::alpha", a.clone())],
+                    vec![],
+                    None,
+                ),
+            ),
+            (
+                "s-new",
+                write(
+                    "toolu_2",
+                    "2026-09-26T11:00:00Z",
+                    Level::Symbol,
+                    vec![("src/lib.rs::alpha", a)],
+                    vec![],
+                    None,
+                ),
+            ),
         ]);
         let (session, op, _) = check(&dir, "src/lib.rs::alpha").unwrap();
         assert_eq!((session.as_str(), op.as_str()), ("s-new", "toolu_2"));
@@ -270,10 +340,24 @@ mod tests {
 
     #[test]
     fn a_symbol_is_current_until_it_changes() {
-        let dir = project(&[("s1", write("toolu_1", "t", Level::Symbol, vec![("src/lib.rs::alpha", hash_of(SRC, "alpha"))], vec![], None))]);
+        let dir = project(&[(
+            "s1",
+            write(
+                "toolu_1",
+                "t",
+                Level::Symbol,
+                vec![("src/lib.rs::alpha", hash_of(SRC, "alpha"))],
+                vec![],
+                None,
+            ),
+        )]);
         assert_eq!(check(&dir, "src/lib.rs::alpha").unwrap().2, Status::Current);
 
-        std::fs::write(dir.path().join("src/lib.rs"), "fn alpha() { 1; }\nfn beta() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "fn alpha() { 1; }\nfn beta() {}\n",
+        )
+        .unwrap();
         assert_eq!(check(&dir, "src/lib.rs::alpha").unwrap().2, Status::Changed);
 
         std::fs::write(dir.path().join("src/lib.rs"), "fn beta() {}\n").unwrap();
@@ -282,7 +366,17 @@ mod tests {
 
     #[test]
     fn a_symbol_the_write_removed_is_removed() {
-        let dir = project(&[("s1", write("toolu_1", "t", Level::Symbol, vec![], vec!["src/lib.rs::gone"], None))]);
+        let dir = project(&[(
+            "s1",
+            write(
+                "toolu_1",
+                "t",
+                Level::Symbol,
+                vec![],
+                vec!["src/lib.rs::gone"],
+                None,
+            ),
+        )]);
         assert_eq!(check(&dir, "src/lib.rs::gone").unwrap().2, Status::Removed);
     }
 
@@ -290,7 +384,17 @@ mod tests {
     /// deleted it has changed since.
     #[test]
     fn a_removed_symbol_that_came_back_has_changed() {
-        let dir = project(&[("s1", write("toolu_1", "t", Level::Symbol, vec![], vec!["src/lib.rs::beta"], None))]);
+        let dir = project(&[(
+            "s1",
+            write(
+                "toolu_1",
+                "t",
+                Level::Symbol,
+                vec![],
+                vec!["src/lib.rs::beta"],
+                None,
+            ),
+        )]);
         assert_eq!(check(&dir, "src/lib.rs::beta").unwrap().2, Status::Changed);
     }
 
@@ -300,19 +404,40 @@ mod tests {
     fn a_parent_is_touched_through_its_children() {
         let src = "impl S {\n    fn a() {}\n    fn b() {}\n}\n";
         let a = {
-            let file = ParserRegistry::new().parser_for(Path::new("src/lib.rs")).unwrap()
-                .parse_file(Path::new("src/lib.rs"), src).unwrap();
+            let file = ParserRegistry::new()
+                .parser_for(Path::new("src/lib.rs"))
+                .unwrap()
+                .parse_file(Path::new("src/lib.rs"), src)
+                .unwrap();
             let child = &file.symbols[0].children[0];
             (child.id.clone(), encode_hash(&child.content_hash))
         };
-        let dir = project(&[("s1", write("toolu_1", "t", Level::Symbol, vec![(a.0.as_str(), a.1.clone())], vec![], None))]);
+        let dir = project(&[(
+            "s1",
+            write(
+                "toolu_1",
+                "t",
+                Level::Symbol,
+                vec![(a.0.as_str(), a.1.clone())],
+                vec![],
+                None,
+            ),
+        )]);
         std::fs::write(dir.path().join("src/lib.rs"), src).unwrap();
         let parent = a.0.rsplit_once('/').unwrap().0.to_string();
 
         assert_eq!(check(&dir, &parent).unwrap().2, Status::Current);
-        std::fs::write(dir.path().join("src/lib.rs"), src.replace("fn a() {}", "fn a() { 1; }")).unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            src.replace("fn a() {}", "fn a() { 1; }"),
+        )
+        .unwrap();
         assert_eq!(check(&dir, &parent).unwrap().2, Status::Changed);
-        assert_eq!(check(&dir, &format!("{parent}X")), None, "a longer name is not a child");
+        assert_eq!(
+            check(&dir, &format!("{parent}X")),
+            None,
+            "a longer name is not a child"
+        );
     }
 
     /// A symbol-level write names every symbol it changed, so one that
@@ -320,9 +445,39 @@ mod tests {
     #[test]
     fn only_a_symbol_level_write_naming_it_touches_a_symbol() {
         let dir = project(&[
-            ("s1", write("toolu_1", "2026-09-26T09:00:00Z", Level::Symbol, vec![("src/lib.rs::alpha", hash_of(SRC, "alpha"))], vec![], None)),
-            ("s1", write("toolu_2", "2026-09-26T10:00:00Z", Level::Symbol, vec![("src/lib.rs::beta", hash_of(SRC, "beta"))], vec![], None)),
-            ("s1", write("toolu_3", "2026-09-26T11:00:00Z", Level::File, vec![], vec![], None)),
+            (
+                "s1",
+                write(
+                    "toolu_1",
+                    "2026-09-26T09:00:00Z",
+                    Level::Symbol,
+                    vec![("src/lib.rs::alpha", hash_of(SRC, "alpha"))],
+                    vec![],
+                    None,
+                ),
+            ),
+            (
+                "s1",
+                write(
+                    "toolu_2",
+                    "2026-09-26T10:00:00Z",
+                    Level::Symbol,
+                    vec![("src/lib.rs::beta", hash_of(SRC, "beta"))],
+                    vec![],
+                    None,
+                ),
+            ),
+            (
+                "s1",
+                write(
+                    "toolu_3",
+                    "2026-09-26T11:00:00Z",
+                    Level::File,
+                    vec![],
+                    vec![],
+                    None,
+                ),
+            ),
         ]);
         assert_eq!(check(&dir, "src/lib.rs::alpha").unwrap().1, "toolu_1");
     }
@@ -332,8 +487,28 @@ mod tests {
     fn a_timestamp_tie_resolves_by_op() {
         let a = hash_of(SRC, "alpha");
         let dir = project(&[
-            ("s2", write("toolu_b", "2026-09-26T09:00:00Z", Level::Symbol, vec![("src/lib.rs::alpha", a.clone())], vec![], None)),
-            ("s1", write("toolu_a", "2026-09-26T09:00:00Z", Level::Symbol, vec![("src/lib.rs::alpha", a)], vec![], None)),
+            (
+                "s2",
+                write(
+                    "toolu_b",
+                    "2026-09-26T09:00:00Z",
+                    Level::Symbol,
+                    vec![("src/lib.rs::alpha", a.clone())],
+                    vec![],
+                    None,
+                ),
+            ),
+            (
+                "s1",
+                write(
+                    "toolu_a",
+                    "2026-09-26T09:00:00Z",
+                    Level::Symbol,
+                    vec![("src/lib.rs::alpha", a)],
+                    vec![],
+                    None,
+                ),
+            ),
         ]);
         assert_eq!(check(&dir, "src/lib.rs::alpha").unwrap().1, "toolu_b");
     }
@@ -344,7 +519,10 @@ mod tests {
     fn a_non_utf8_file_is_present_and_a_symlink_is_not_followed() {
         let bytes = [0xffu8, 0xfe, b'\n'];
         let fh = crate::objects::file_hash(&bytes);
-        let dir = project(&[("s1", write("toolu_1", "t", Level::File, vec![], vec![], Some(fh)))]);
+        let dir = project(&[(
+            "s1",
+            write("toolu_1", "t", Level::File, vec![], vec![], Some(fh)),
+        )]);
         std::fs::write(dir.path().join("src/lib.rs"), bytes).unwrap();
         assert_eq!(check(&dir, "src/lib.rs").unwrap().2, Status::Current);
 
@@ -362,21 +540,41 @@ mod tests {
     #[test]
     fn file_status_uses_the_content_hash_or_is_unknown() {
         let fh = encode_hash(blake3::hash(SRC.as_bytes()).as_bytes());
-        let dir = project(&[("s1", write("toolu_1", "t", Level::File, vec![], vec![], Some(fh)))]);
+        let dir = project(&[(
+            "s1",
+            write("toolu_1", "t", Level::File, vec![], vec![], Some(fh)),
+        )]);
         assert_eq!(check(&dir, "src/lib.rs").unwrap().2, Status::Current);
         std::fs::write(dir.path().join("src/lib.rs"), "fn other() {}\n").unwrap();
         assert_eq!(check(&dir, "src/lib.rs").unwrap().2, Status::Changed);
 
-        let dir = project(&[("s1", write("toolu_1", "t", Level::File, vec![], vec![], None))]);
+        let dir = project(&[(
+            "s1",
+            write("toolu_1", "t", Level::File, vec![], vec![], None),
+        )]);
         assert_eq!(check(&dir, "src/lib.rs").unwrap().2, Status::Unknown);
     }
 
     /// A symbol-level write answers for the file through its symbols.
     #[test]
     fn a_file_with_symbol_writes_is_current_while_they_all_are() {
-        let dir = project(&[("s1", write("toolu_1", "t", Level::Symbol, vec![("src/lib.rs::beta", hash_of(SRC, "beta"))], vec![], None))]);
+        let dir = project(&[(
+            "s1",
+            write(
+                "toolu_1",
+                "t",
+                Level::Symbol,
+                vec![("src/lib.rs::beta", hash_of(SRC, "beta"))],
+                vec![],
+                None,
+            ),
+        )]);
         assert_eq!(check(&dir, "src/lib.rs").unwrap().2, Status::Current);
-        std::fs::write(dir.path().join("src/lib.rs"), "fn alpha() {}\nfn beta() { 2; }\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "fn alpha() {}\nfn beta() { 2; }\n",
+        )
+        .unwrap();
         assert_eq!(check(&dir, "src/lib.rs").unwrap().2, Status::Changed);
     }
 }

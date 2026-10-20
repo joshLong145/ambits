@@ -1,8 +1,8 @@
-use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::Frame;
 
 use ambits::app::{App, FocusPanel};
 use ambits::tracking::ReadDepth;
@@ -23,20 +23,29 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .border_style(border_style);
 
     // File bars line up in a column after the longest path, within reason.
-    let align = app.tree_rows.iter().filter(|r| r.is_file()).map(|r| super::width(&r.display_name)).max().unwrap_or(0).min(48);
-    let items: Vec<ListItem> = app.tree_rows.iter().map(|row| ListItem::new(row_line(row, align))).collect();
+    let align = app
+        .tree_rows
+        .iter()
+        .filter(|r| r.is_file())
+        .map(|r| super::width(&r.display_name))
+        .max()
+        .unwrap_or(0)
+        .min(48);
+    let items: Vec<ListItem> = app
+        .tree_rows
+        .iter()
+        .map(|row| ListItem::new(row_line(row, align)))
+        .collect();
 
     let mut state = ListState::default();
     state.select(Some(app.selected_index));
 
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(
-            Style::default()
-                .bg(colors::HIGHLIGHT_BG)
-                .fg(colors::HIGHLIGHT_FG)
-                .add_modifier(Modifier::BOLD),
-        );
+    let list = List::new(items).block(block).highlight_style(
+        Style::default()
+            .bg(colors::HIGHLIGHT_BG)
+            .fg(colors::HIGHLIGHT_FG)
+            .add_modifier(Modifier::BOLD),
+    );
 
     f.render_stateful_widget(list, area, &mut state);
 }
@@ -62,18 +71,37 @@ pub(super) fn row_line(row: &ambits::app::TreeRow, align: usize) -> Line<'static
     let mut spans = vec![Span::raw(indent), Span::styled(fold, dim)];
 
     if row.is_file() {
-        spans.push(Span::styled(row.display_name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(
+            row.display_name.clone(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
         if row.coverage_total > 0 {
-            spans.push(Span::raw(" ".repeat(2 + align.saturating_sub(super::width(&row.display_name)))));
-            spans.extend(coverage_bar(row.coverage_full, row.coverage_seen, row.coverage_total, 10));
-            spans.push(Span::styled(format!("  {}/{}", row.coverage_seen, row.coverage_total), Style::default().fg(Color::Gray)));
+            spans.push(Span::raw(
+                " ".repeat(2 + align.saturating_sub(super::width(&row.display_name))),
+            ));
+            spans.extend(coverage_bar(
+                row.coverage_full,
+                row.coverage_seen,
+                row.coverage_total,
+                10,
+            ));
+            spans.push(Span::styled(
+                format!("  {}/{}", row.coverage_seen, row.coverage_total),
+                Style::default().fg(Color::Gray),
+            ));
         }
         spans.extend(counts(row));
         spans.push(Span::styled(format!("  ({})", row.line_range), dim));
         return Line::from(spans);
     }
 
-    let depth = if row.read_depth.is_seen() { row.read_depth } else { ReadDepth::Unseen };
+    let depth = if row.read_depth.is_seen() {
+        row.read_depth
+    } else {
+        ReadDepth::Unseen
+    };
     let freshness = if row.stale && depth.is_seen() {
         Span::styled("!", Style::default().fg(colors::DEPTH_STALE))
     } else if row.restored && depth.is_seen() {
@@ -85,20 +113,40 @@ pub(super) fn row_line(row: &ambits::app::TreeRow, align: usize) -> Line<'static
         Some(mark) => Span::styled("✎", Style::default().fg(write_color(mark.status))),
         None => Span::raw(" "),
     };
-    spans.push(Span::styled(depth_glyph(depth).to_string(), Style::default().fg(depth_color(depth, false))));
+    spans.push(Span::styled(
+        depth_glyph(depth).to_string(),
+        Style::default().fg(depth_color(depth, false)),
+    ));
     spans.push(freshness);
     spans.push(write);
     // `impl Status` already says what it is.
-    let label = if row.display_name.starts_with(&format!("{} ", row.label)) { String::from(" ") } else { format!(" {} ", row.label) };
+    let label = if row.display_name.starts_with(&format!("{} ", row.label)) {
+        String::from(" ")
+    } else {
+        format!(" {} ", row.label)
+    };
     spans.push(Span::styled(label, dim));
-    let name_color = if depth.is_seen() { Color::White } else { Color::Gray };
-    spans.push(Span::styled(row.display_name.clone(), Style::default().fg(name_color)));
+    let name_color = if depth.is_seen() {
+        Color::White
+    } else {
+        Color::Gray
+    };
+    spans.push(Span::styled(
+        row.display_name.clone(),
+        Style::default().fg(name_color),
+    ));
     // A folded symbol summarizes what it hides, as a file does.
     if row.coverage_status.is_some() && row.coverage_total > 0 {
-        spans.push(Span::styled(format!("  {}/{}", row.coverage_seen, row.coverage_total), Style::default().fg(Color::Gray)));
+        spans.push(Span::styled(
+            format!("  {}/{}", row.coverage_seen, row.coverage_total),
+            Style::default().fg(Color::Gray),
+        ));
         spans.extend(counts(row).into_iter().filter(|s| s.content.contains('!')));
     }
-    spans.push(Span::styled(format!("  {} ~{} tok", row.line_range, row.token_count), dim));
+    spans.push(Span::styled(
+        format!("  {} ~{} tok", row.line_range, row.token_count),
+        dim,
+    ));
     Line::from(spans)
 }
 
@@ -106,24 +154,50 @@ pub(super) fn row_line(row: &ambits::app::TreeRow, align: usize) -> Line<'static
 fn counts(row: &ambits::app::TreeRow) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     if row.stale_count > 0 {
-        out.push(Span::styled(format!("  !{}", row.stale_count), Style::default().fg(colors::DEPTH_STALE)));
+        out.push(Span::styled(
+            format!("  !{}", row.stale_count),
+            Style::default().fg(colors::DEPTH_STALE),
+        ));
     }
     if let Some(mark) = &row.write {
-        out.push(Span::styled(format!("  ✎{}", mark.count), Style::default().fg(write_color(mark.status))));
+        out.push(Span::styled(
+            format!("  ✎{}", mark.count),
+            Style::default().fg(write_color(mark.status)),
+        ));
     }
     out
 }
 
 /// `width` cells in proportion: `█` read in full, `▓` partly read, `░` unseen.
-pub(super) fn coverage_bar(full: usize, seen: usize, total: usize, width: usize) -> Vec<Span<'static>> {
+pub(super) fn coverage_bar(
+    full: usize,
+    seen: usize,
+    total: usize,
+    width: usize,
+) -> Vec<Span<'static>> {
     let cells = |n: usize| (n * width + total / 2).checked_div(total).unwrap_or(0);
     // Anything read shows at least one cell.
     let full_cells = if full > 0 { cells(full).max(1) } else { 0 };
-    let seen_cells = if seen > 0 { cells(seen).max(full_cells + usize::from(seen > full)).min(width) } else { 0 };
+    let seen_cells = if seen > 0 {
+        cells(seen)
+            .max(full_cells + usize::from(seen > full))
+            .min(width)
+    } else {
+        0
+    };
     vec![
-        Span::styled("█".repeat(full_cells), Style::default().fg(colors::DEPTH_FULL_BODY)),
-        Span::styled("▓".repeat(seen_cells - full_cells), Style::default().fg(colors::DEPTH_OVERVIEW)),
-        Span::styled("░".repeat(width - seen_cells), Style::default().fg(colors::DEPTH_UNSEEN)),
+        Span::styled(
+            "█".repeat(full_cells),
+            Style::default().fg(colors::DEPTH_FULL_BODY),
+        ),
+        Span::styled(
+            "▓".repeat(seen_cells - full_cells),
+            Style::default().fg(colors::DEPTH_OVERVIEW),
+        ),
+        Span::styled(
+            "░".repeat(width - seen_cells),
+            Style::default().fg(colors::DEPTH_UNSEEN),
+        ),
     ]
 }
 
@@ -166,22 +240,29 @@ pub(super) fn write_color(status: Status) -> Color {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use ambits::symbols::{FileSymbols, ProjectTree, SymbolCategory, SymbolNode};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
-    use ambits::symbols::{ProjectTree, FileSymbols, SymbolCategory, SymbolNode};
+    use std::path::PathBuf;
 
     fn sym(id: &str, name: &str) -> SymbolNode {
         let hash = ambits::symbols::merkle::content_hash(name);
         SymbolNode {
-            id: id.into(), name: name.into(), category: SymbolCategory::Function,
-            label: "fn", file_path: std::sync::Arc::new(PathBuf::new()),
-            byte_range: 0..100, line_range: 1..10, head_line: 1, content_hash: hash,
-            merkle_hash: hash, children: Vec::new(), estimated_tokens: 30,
+            id: id.into(),
+            name: name.into(),
+            category: SymbolCategory::Function,
+            label: "fn",
+            file_path: std::sync::Arc::new(PathBuf::new()),
+            byte_range: 0..100,
+            line_range: 1..10,
+            head_line: 1,
+            content_hash: hash,
+            merkle_hash: hash,
+            children: Vec::new(),
+            estimated_tokens: 30,
         }
     }
 
@@ -189,8 +270,16 @@ mod tests {
         let tree = ProjectTree {
             root: PathBuf::from("/test"),
             files: vec![
-                FileSymbols { file_path: "mock/a.rs".into(), symbols: vec![sym("a1", "alpha"), sym("a2", "beta")], total_lines: 50 },
-                FileSymbols { file_path: "mock/b.rs".into(), symbols: vec![sym("b1", "gamma")], total_lines: 30 },
+                FileSymbols {
+                    file_path: "mock/a.rs".into(),
+                    symbols: vec![sym("a1", "alpha"), sym("a2", "beta")],
+                    total_lines: 50,
+                },
+                FileSymbols {
+                    file_path: "mock/b.rs".into(),
+                    symbols: vec![sym("b1", "gamma")],
+                    total_lines: 30,
+                },
             ],
         };
         App::new(tree, PathBuf::from("/test"))
@@ -209,10 +298,22 @@ mod tests {
     #[test]
     fn depth_color_variants() {
         assert_eq!(depth_color(ReadDepth::Unseen, false), colors::DEPTH_UNSEEN);
-        assert_eq!(depth_color(ReadDepth::NameOnly, false), colors::DEPTH_NAME_ONLY);
-        assert_eq!(depth_color(ReadDepth::Overview, false), colors::DEPTH_OVERVIEW);
-        assert_eq!(depth_color(ReadDepth::Signature, false), colors::DEPTH_SIGNATURE);
-        assert_eq!(depth_color(ReadDepth::FullBody, false), colors::DEPTH_FULL_BODY);
+        assert_eq!(
+            depth_color(ReadDepth::NameOnly, false),
+            colors::DEPTH_NAME_ONLY
+        );
+        assert_eq!(
+            depth_color(ReadDepth::Overview, false),
+            colors::DEPTH_OVERVIEW
+        );
+        assert_eq!(
+            depth_color(ReadDepth::Signature, false),
+            colors::DEPTH_SIGNATURE
+        );
+        assert_eq!(
+            depth_color(ReadDepth::FullBody, false),
+            colors::DEPTH_FULL_BODY
+        );
     }
 
     #[test]
@@ -229,7 +330,14 @@ mod tests {
     fn render_marks_written_rows() {
         let tree = ProjectTree {
             root: PathBuf::from("/test"),
-            files: vec![FileSymbols { file_path: "mock/w.rs".into(), symbols: vec![sym("mock/w.rs::alpha", "alpha"), sym("mock/w.rs::beta", "beta")], total_lines: 5 }],
+            files: vec![FileSymbols {
+                file_path: "mock/w.rs".into(),
+                symbols: vec![
+                    sym("mock/w.rs::alpha", "alpha"),
+                    sym("mock/w.rs::beta", "beta"),
+                ],
+                total_lines: 5,
+            }],
         };
         let mut app = App::new(tree, PathBuf::from("/test"));
         app.set_session_id(Some("sess".into()));
@@ -239,7 +347,10 @@ mod tests {
             op: "toolu_1".into(),
             file: "mock/w.rs".into(),
             level: ambits::writes::Level::Symbol,
-            syms: vec![(alpha.id.clone(), ambits::journal::encode_hash(&alpha.content_hash))],
+            syms: vec![(
+                alpha.id.clone(),
+                ambits::journal::encode_hash(&alpha.content_hash),
+            )],
             ..Default::default()
         };
         app.record_write("sess", write);
@@ -247,9 +358,19 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(80, 6)).unwrap();
         terminal.draw(|f| render(f, &app, f.area())).unwrap();
-        assert_eq!(fg_color_of(terminal.backend(), 1, "✎1"), Some(colors::WRITE_CURRENT));
-        assert_eq!(fg_color_of(terminal.backend(), 2, "✎"), Some(colors::WRITE_CURRENT));
-        assert_eq!(fg_color_of(terminal.backend(), 3, "✎"), None, "beta was not written");
+        assert_eq!(
+            fg_color_of(terminal.backend(), 1, "✎1"),
+            Some(colors::WRITE_CURRENT)
+        );
+        assert_eq!(
+            fg_color_of(terminal.backend(), 2, "✎"),
+            Some(colors::WRITE_CURRENT)
+        );
+        assert_eq!(
+            fg_color_of(terminal.backend(), 3, "✎"),
+            None,
+            "beta was not written"
+        );
     }
 
     fn text_of(line: &Line) -> String {
@@ -259,11 +380,20 @@ mod tests {
     /// The bar is in proportion, and anything read shows.
     #[test]
     fn the_file_bar_shows_full_partial_and_unseen() {
-        let bar = |full, seen, total| coverage_bar(full, seen, total, 10).iter().map(|s| s.content.to_string()).collect::<String>();
+        let bar = |full, seen, total| {
+            coverage_bar(full, seen, total, 10)
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
         assert_eq!(bar(0, 0, 10), "░░░░░░░░░░");
         assert_eq!(bar(5, 8, 10), "█████▓▓▓░░");
         assert_eq!(bar(10, 10, 10), "██████████");
-        assert_eq!(bar(1, 2, 1000), "█▓░░░░░░░░", "one read in a thousand still shows");
+        assert_eq!(
+            bar(1, 2, 1000),
+            "█▓░░░░░░░░",
+            "one read in a thousand still shows"
+        );
         assert_eq!(bar(0, 0, 0), "░░░░░░░░░░");
     }
 
@@ -272,20 +402,39 @@ mod tests {
     fn a_symbol_row_spells_its_states_in_the_gutter() {
         let mut app = test_app();
         app.set_expanded("mock/a.rs", ambits::expansion::RowKind::File, true);
-        app.ledger.record("a1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+        app.ledger
+            .record("a1".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
         app.ledger.mark_stale("a1");
-        app.ledger.record("a2".into(), ReadDepth::NameOnly, [0; 32], "ag".into(), 10);
+        app.ledger
+            .record("a2".into(), ReadDepth::NameOnly, [0; 32], "ag".into(), 10);
         app.rebuild_tree_rows();
-        let rows: Vec<String> = app.tree_rows.iter().map(|r| text_of(&row_line(r, 0))).collect();
-        assert!(rows[0].starts_with("▼ mock/a.rs  ") && rows[0].contains("2/2") && rows[0].contains("!1"), "{}", rows[0]);
+        let rows: Vec<String> = app
+            .tree_rows
+            .iter()
+            .map(|r| text_of(&row_line(r, 0)))
+            .collect();
+        assert!(
+            rows[0].starts_with("▼ mock/a.rs  ")
+                && rows[0].contains("2/2")
+                && rows[0].contains("!1"),
+            "{}",
+            rows[0]
+        );
         assert!(rows[1].starts_with("    ●!  fn alpha"), "{}", rows[1]);
         assert!(rows[2].starts_with("    ◔   fn beta"), "{}", rows[2]);
-        assert!(rows[3].starts_with("▶ mock/b.rs  ░░░░░░░░░░  0/1"), "{}", rows[3]);
+        assert!(
+            rows[3].starts_with("▶ mock/b.rs  ░░░░░░░░░░  0/1"),
+            "{}",
+            rows[3]
+        );
 
         app.ledger.mark_all_restored();
         app.rebuild_tree_rows();
         assert!(text_of(&row_line(&app.tree_rows[2], 0)).starts_with("    ◔◌  fn beta"));
-        assert!(text_of(&row_line(&app.tree_rows[3], 12)).starts_with("▶ mock/b.rs     ░"), "bars align after the longest path");
+        assert!(
+            text_of(&row_line(&app.tree_rows[3], 12)).starts_with("▶ mock/b.rs     ░"),
+            "bars align after the longest path"
+        );
     }
 
     /// Row text of `row` in the rendered buffer.
@@ -300,12 +449,17 @@ mod tests {
         parent.children = vec![sym("p/a", "a"), sym("p/b", "b")];
         let tree = ProjectTree {
             root: PathBuf::from("/test"),
-            files: vec![FileSymbols { file_path: "mock/p.rs".into(), symbols: vec![parent], total_lines: 20 }],
+            files: vec![FileSymbols {
+                file_path: "mock/p.rs".into(),
+                symbols: vec![parent],
+                total_lines: 20,
+            }],
         };
         let mut app = App::new(tree, PathBuf::from("/test"));
         app.set_expanded("mock/p.rs", ambits::expansion::RowKind::File, true);
         app.set_expanded("p", ambits::expansion::RowKind::Symbol, false);
-        app.ledger.record("p/a".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
+        app.ledger
+            .record("p/a".into(), ReadDepth::FullBody, [0; 32], "ag".into(), 10);
         app.rebuild_tree_rows();
         app.selected_index = 0;
         app
@@ -335,14 +489,24 @@ mod tests {
         app.rebuild_tree_rows();
         let terminal = draw(&app);
         assert!(!row_text(terminal.backend(), 2).contains("1/2"));
-        assert!(row_text(terminal.backend(), 3).contains("●   fn a"), "{}", row_text(terminal.backend(), 3));
-        assert_eq!(fg_color_of(terminal.backend(), 3, "●"), Some(colors::DEPTH_FULL_BODY));
+        assert!(
+            row_text(terminal.backend(), 3).contains("●   fn a"),
+            "{}",
+            row_text(terminal.backend(), 3)
+        );
+        assert_eq!(
+            fg_color_of(terminal.backend(), 3, "●"),
+            Some(colors::DEPTH_FULL_BODY)
+        );
     }
 
     /// A name-only read must not look unread.
     #[test]
     fn name_only_is_distinguishable_from_unseen() {
         assert_ne!(colors::DEPTH_NAME_ONLY, colors::DEPTH_UNSEEN);
-        assert_ne!(depth_color(ReadDepth::NameOnly, false), depth_color(ReadDepth::Unseen, false));
+        assert_ne!(
+            depth_color(ReadDepth::NameOnly, false),
+            depth_color(ReadDepth::Unseen, false)
+        );
     }
 }

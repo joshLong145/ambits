@@ -29,23 +29,48 @@ fn fixture() -> Fixture {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-qm", "init"]);
     std::fs::create_dir_all(state.join("coverage")).unwrap();
-    std::fs::write(state.join("coverage").join(format!("{SESSION}.ndjson")), format!("{READ}\n")).unwrap();
-    Fixture { _dir: dir, root, state }
+    std::fs::write(
+        state.join("coverage").join(format!("{SESSION}.ndjson")),
+        format!("{READ}\n"),
+    )
+    .unwrap();
+    Fixture {
+        _dir: dir,
+        root,
+        state,
+    }
 }
 
 fn assert_project_untouched(root: &Path) {
-    assert!(!root.join(".ambits").exists(), "state leaked into the project");
-    assert_eq!(git(root, &["status", "--porcelain"]), "", "the work tree changed");
+    assert!(
+        !root.join(".ambits").exists(),
+        "state leaked into the project"
+    );
+    assert_eq!(
+        git(root, &["status", "--porcelain"]),
+        "",
+        "the work tree changed"
+    );
 }
 
 #[test]
 fn the_flag_keeps_snapshots_out_of_the_project() {
     let f = fixture();
     let state = f.state.to_str().unwrap();
-    let out = ambits(&f.root).args(["--state-dir", state, "--session", SESSION, "snapshot"]).output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = ambits(&f.root)
+        .args(["--state-dir", state, "--session", SESSION, "snapshot"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
-    assert!(f.state.join("objects").is_dir(), "the snapshot went elsewhere");
+    assert!(
+        f.state.join("objects").is_dir(),
+        "the snapshot went elsewhere"
+    );
     assert!(f.state.join("reflog.ndjson").is_file());
     assert_project_untouched(&f.root);
 }
@@ -54,8 +79,16 @@ fn the_flag_keeps_snapshots_out_of_the_project() {
 fn the_environment_variable_does_the_same() {
     let f = fixture();
     let run = |args: &[&str]| {
-        let out = ambits(&f.root).env("AMBITS_STATE_DIR", &f.state).args(args).output().unwrap();
-        assert!(out.status.success(), "ambits {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        let out = ambits(&f.root)
+            .env("AMBITS_STATE_DIR", &f.state)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "ambits {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8(out.stdout).unwrap()
     };
     assert!(run(&["--session", SESSION, "snapshot", "-m", "first"]).starts_with("snapshot "));
@@ -67,8 +100,15 @@ fn the_environment_variable_does_the_same() {
 #[test]
 fn a_relative_state_dir_resolves_against_the_working_directory() {
     let f = fixture();
-    let out = ambits(&f.root).args(["--state-dir", "../state", "--session", SESSION, "snapshot"]).output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = ambits(&f.root)
+        .args(["--state-dir", "../state", "--session", SESSION, "snapshot"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(f.state.join("objects").is_dir());
     assert_project_untouched(&f.root);
 }
@@ -79,9 +119,23 @@ fn a_remote_inside_the_external_store_is_refused() {
     let inside = f.state.join("objects");
     std::fs::create_dir_all(&inside).unwrap();
     let out = ambits(&f.root)
-        .args(["--state-dir", f.state.to_str().unwrap(), "remote", "add", "self", inside.to_str().unwrap()])
+        .args([
+            "--state-dir",
+            f.state.to_str().unwrap(),
+            "remote",
+            "add",
+            "self",
+            inside.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
-    assert!(!out.status.success(), "a remote inside the store was accepted");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("own store"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        !out.status.success(),
+        "a remote inside the store was accepted"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("own store"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

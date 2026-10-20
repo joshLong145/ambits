@@ -16,7 +16,8 @@ pub fn sym(id: &str, name: &str) -> SymbolNode {
         label: "fn",
         file_path: Arc::new(PathBuf::new()),
         byte_range: 0..100,
-        line_range: 1..10, head_line: 1,
+        line_range: 1..10,
+        head_line: 1,
         content_hash: hash,
         merkle_hash: hash,
         children: Vec::new(),
@@ -120,7 +121,13 @@ pub fn tool_call_targeted(tool: &str, path: &str, depth: ReadDepth, symbol: &str
 }
 
 /// Create a tool call targeting a line range.
-pub fn tool_call_lines(tool: &str, path: &str, depth: ReadDepth, start: usize, end: usize) -> AgentToolCall {
+pub fn tool_call_lines(
+    tool: &str,
+    path: &str,
+    depth: ReadDepth,
+    start: usize,
+    end: usize,
+) -> AgentToolCall {
     let mut tc = tool_call(tool, path, depth);
     tc.target_lines = Some(start as u32..end as u32);
     tc

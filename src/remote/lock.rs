@@ -46,19 +46,33 @@ impl RemoteLock {
         Self::acquire_within(remote, store_id, std::time::Duration::from_secs(3))
     }
 
-    pub fn acquire_within(remote: &Store, store_id: &str, patience: std::time::Duration) -> Result<Self> {
+    pub fn acquire_within(
+        remote: &Store,
+        store_id: &str,
+        patience: std::time::Duration,
+    ) -> Result<Self> {
         create_private_dir(remote.root())?;
         let path = lock_path(remote);
-        let holder = Holder { store: store_id.to_string(), pid: std::process::id(), start: now_secs(), token: random_token() };
+        let holder = Holder {
+            store: store_id.to_string(),
+            pid: std::process::id(),
+            start: now_secs(),
+            token: random_token(),
+        };
         let deadline = std::time::Instant::now() + patience;
         let mut file = loop {
             match private_options().create_new(true).open(&path) {
                 Ok(f) => break f,
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && std::time::Instant::now() < deadline => {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        && std::time::Instant::now() < deadline =>
+                {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let age = read_holder(remote).map(|h| format!("taken {}s ago", now_secs().saturating_sub(h.start))).unwrap_or_default();
+                    let age = read_holder(remote)
+                        .map(|h| format!("taken {}s ago", now_secs().saturating_sub(h.start)))
+                        .unwrap_or_default();
                     bail!("the remote is locked by another push ({age}); if none is running, retry with --break-lock");
                 }
                 Err(e) => return Err(e).wrap_err_with(|| format!("locking {}", path.display())),
@@ -66,7 +80,10 @@ impl RemoteLock {
         };
         file.write_all(serde_json::to_string(&holder)?.as_bytes())?;
         file.sync_all()?;
-        Ok(Self { path, token: holder.token })
+        Ok(Self {
+            path,
+            token: holder.token,
+        })
     }
 }
 
@@ -126,20 +143,34 @@ pub enum Broken {
 /// Remove an abandoned lock (spec §12.2): only once it is older than
 /// [`BREAK_AFTER_SECS`], and then only if this store took it and its process
 /// is gone, or `confirm` — asked with a description — says yes.
-pub fn break_lock(remote: &Store, store_id: &str, confirm: impl FnOnce(&str) -> bool) -> Result<Broken> {
+pub fn break_lock(
+    remote: &Store,
+    store_id: &str,
+    confirm: impl FnOnce(&str) -> bool,
+) -> Result<Broken> {
     let Some(holder) = read_holder(remote) else {
         if lock_path(remote).exists() {
-            bail!("{} is unreadable; inspect it and delete it by hand", lock_path(remote).display());
+            bail!(
+                "{} is unreadable; inspect it and delete it by hand",
+                lock_path(remote).display()
+            );
         }
         return Ok(Broken::NoLock);
     };
     let age = now_secs().saturating_sub(holder.start);
     if age < BREAK_AFTER_SECS {
-        bail!("the remote lock was taken {age}s ago; a push may still be running — wait {}s", BREAK_AFTER_SECS - age);
+        bail!(
+            "the remote lock was taken {age}s ago; a push may still be running — wait {}s",
+            BREAK_AFTER_SECS - age
+        );
     }
     let ours_and_dead = holder.store == store_id && pid_alive(holder.pid) == Some(false);
     if !ours_and_dead {
-        let who = if holder.store == store_id { "this store" } else { "another store" };
+        let who = if holder.store == store_id {
+            "this store"
+        } else {
+            "another store"
+        };
         let prompt = format!(
             "the remote lock is held by {who} (pid {}, {age}s ago). Breaking a live push's lock can lose that push. Break it?",
             holder.pid
@@ -151,7 +182,9 @@ pub fn break_lock(remote: &Store, store_id: &str, confirm: impl FnOnce(&str) -> 
     // Move it aside and look again before deleting: if the lock was released
     // and retaken meanwhile, what was moved is someone else's live lock.
     let path = lock_path(remote);
-    let aside = remote.root().join(format!("refs.lock.breaking-{}", random_token()));
+    let aside = remote
+        .root()
+        .join(format!("refs.lock.breaking-{}", random_token()));
     std::fs::rename(&path, &aside)?;
     if read_holder_at(&aside).is_some_and(|h| h.token == holder.token) {
         std::fs::remove_file(&aside)?;
@@ -160,7 +193,9 @@ pub fn break_lock(remote: &Store, store_id: &str, confirm: impl FnOnce(&str) -> 
     if !path.exists() {
         std::fs::rename(&aside, &path)?;
     }
-    Err(color_eyre::eyre::eyre!("the remote lock changed hands while it was being broken; nothing was removed"))
+    Err(color_eyre::eyre::eyre!(
+        "the remote lock changed hands while it was being broken; nothing was removed"
+    ))
 }
 
 #[cfg(test)]
@@ -168,7 +203,12 @@ mod tests {
     use super::*;
 
     fn aged(remote: &Store, store: &str, pid: u32, age: u64) {
-        let holder = Holder { store: store.into(), pid, start: now_secs() - age, token: "t".into() };
+        let holder = Holder {
+            store: store.into(),
+            pid,
+            start: now_secs() - age,
+            token: "t".into(),
+        };
         std::fs::create_dir_all(remote.root()).unwrap();
         std::fs::write(lock_path(remote), serde_json::to_string(&holder).unwrap()).unwrap();
     }
@@ -178,7 +218,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let remote = Store::at_root(dir.path());
         let held = RemoteLock::acquire(&remote, "me").unwrap();
-        let err = RemoteLock::acquire_within(&remote, "you", std::time::Duration::ZERO).unwrap_err();
+        let err =
+            RemoteLock::acquire_within(&remote, "you", std::time::Duration::ZERO).unwrap_err();
         assert!(err.to_string().contains("--break-lock"));
         drop(held);
         RemoteLock::acquire(&remote, "you").unwrap();
@@ -199,8 +240,14 @@ mod tests {
         let remote = Store::at_root(dir.path());
         // A pid far past any real one.
         aged(&remote, "me", 4_000_000, BREAK_AFTER_SECS + 1);
-        assert!(matches!(break_lock(&remote, "me", |_| panic!("not asked")).unwrap(), Broken::Broken(_)));
-        assert_eq!(break_lock(&remote, "me", |_| panic!("not asked")).unwrap(), Broken::NoLock);
+        assert!(matches!(
+            break_lock(&remote, "me", |_| panic!("not asked")).unwrap(),
+            Broken::Broken(_)
+        ));
+        assert_eq!(
+            break_lock(&remote, "me", |_| panic!("not asked")).unwrap(),
+            Broken::NoLock
+        );
     }
 
     /// Another machine's pid proves nothing: the user decides.
@@ -211,6 +258,9 @@ mod tests {
         aged(&remote, "them", 4_000_000, BREAK_AFTER_SECS + 1);
         assert!(break_lock(&remote, "me", |_| false).is_err());
         assert!(lock_path(&remote).exists());
-        assert!(matches!(break_lock(&remote, "me", |p| p.contains("another store")).unwrap(), Broken::Broken(_)));
+        assert!(matches!(
+            break_lock(&remote, "me", |p| p.contains("another store")).unwrap(),
+            Broken::Broken(_)
+        ));
     }
 }

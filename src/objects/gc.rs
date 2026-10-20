@@ -29,7 +29,8 @@ use super::{canonical, Kind, ObjectId};
 /// Unreachable objects younger than this many days are kept (§8).
 pub const DEFAULT_GRACE_DAYS: u64 = 14;
 /// [`DEFAULT_GRACE_DAYS`] as a duration.
-pub const DEFAULT_GRACE: Duration = Duration::from_secs(DEFAULT_GRACE_DAYS * crate::time::SECS_PER_DAY);
+pub const DEFAULT_GRACE: Duration =
+    Duration::from_secs(DEFAULT_GRACE_DAYS * crate::time::SECS_PER_DAY);
 
 /// `.ambits/gc.lock`, held for as long as this value lives.
 pub struct GcLock(#[allow(dead_code)] fs::File);
@@ -78,18 +79,27 @@ pub struct GcStats {
 /// reflog entries older than `reflog_expiry` (§8; 90 days by default).
 pub fn gc(store: &Store, grace: Duration, reflog_expiry: Duration) -> Result<GcStats> {
     let _lock = GcLock::exclusive(store)?;
-    let mut stats = GcStats { reflog_entries_expired: refs::expire_reflogs(store, reflog_expiry)?, ..Default::default() };
+    let mut stats = GcStats {
+        reflog_entries_expired: refs::expire_reflogs(store, reflog_expiry)?,
+        ..Default::default()
+    };
 
     let reachable = mark(store)?;
     stats.reachable = reachable.len();
 
     // The unreachable subgraph, with who references whom inside it.
-    let unreachable: HashMap<ObjectId, PathBuf> =
-        store.list().into_iter().filter(|(id, _)| !reachable.contains(id)).collect();
+    let unreachable: HashMap<ObjectId, PathBuf> = store
+        .list()
+        .into_iter()
+        .filter(|(id, _)| !reachable.contains(id))
+        .collect();
     let mut children: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
     let mut referrers: HashMap<ObjectId, usize> = unreachable.keys().map(|id| (*id, 0)).collect();
     for id in unreachable.keys() {
-        let refs: Vec<ObjectId> = references_of(store, id).into_iter().filter(|c| unreachable.contains_key(c)).collect();
+        let refs: Vec<ObjectId> = references_of(store, id)
+            .into_iter()
+            .filter(|c| unreachable.contains_key(c))
+            .collect();
         for c in &refs {
             *referrers.get_mut(c).expect("present") += 1;
         }
@@ -99,7 +109,11 @@ pub fn gc(store: &Store, grace: Duration, reflog_expiry: Duration) -> Result<GcS
     // Kahn's order: an object becomes deletable only once every unreachable
     // object referencing it is gone. A kept object never releases its
     // children, so they are kept too.
-    let mut ready: Vec<ObjectId> = referrers.iter().filter(|(_, n)| **n == 0).map(|(id, _)| *id).collect();
+    let mut ready: Vec<ObjectId> = referrers
+        .iter()
+        .filter(|(_, n)| **n == 0)
+        .map(|(id, _)| *id)
+        .collect();
     ready.sort();
     while let Some(id) = ready.pop() {
         let path = &unreachable[&id];
@@ -122,8 +136,15 @@ pub fn gc(store: &Store, grace: Duration, reflog_expiry: Duration) -> Result<GcS
     stats.notes_removed = refs::prune_notes(store, |id| store.contains(id))?;
     // Temp files a crash left, wherever ambits writes atomically: the
     // store directories, and `.ambits` itself, where the flat files live.
-    let top = fs::read_dir(store.root()).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_file());
-    let nested = crate::state_dir::STORE_DIRS.iter().flat_map(|dir| walk_files(&store.root().join(dir)));
+    let top = fs::read_dir(store.root())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file());
+    let nested = crate::state_dir::STORE_DIRS
+        .iter()
+        .flat_map(|dir| walk_files(&store.root().join(dir)));
     for path in top.chain(nested) {
         if is_temp(&path) && older_than(&path, grace) && fs::remove_file(&path).is_ok() {
             stats.temp_files_removed += 1;
@@ -156,7 +177,8 @@ fn mark(store: &Store) -> Result<HashSet<ObjectId>> {
         if !store.contains(&id) || !reachable.insert(id) {
             continue;
         }
-        let snapshot = Snapshot::load(store, id).wrap_err("gc refuses to run on a store it cannot read")?;
+        let snapshot =
+            Snapshot::load(store, id).wrap_err("gc refuses to run on a store it cannot read")?;
         for (child, kind) in snapshot.references() {
             match kind {
                 Kind::Snapshot => snapshots.push(child),
@@ -172,17 +194,28 @@ fn mark(store: &Store) -> Result<HashSet<ObjectId>> {
 /// What an object references, read without trusting it: an object that
 /// cannot be parsed references nothing, and is simply collected.
 fn references_of(store: &Store, id: &ObjectId) -> Vec<ObjectId> {
-    let Some((kind, payload)) = fs::read(store.path_of(id)).ok().and_then(|b| canonical::from_bytes(&b).ok()).and_then(|v| {
-        let kind = Kind::from_name(v.get("type")?.as_str()?)?;
-        Some((kind, v.get("payload")?.clone()))
-    }) else {
+    let Some((kind, payload)) = fs::read(store.path_of(id))
+        .ok()
+        .and_then(|b| canonical::from_bytes(&b).ok())
+        .and_then(|v| {
+            let kind = Kind::from_name(v.get("type")?.as_str()?)?;
+            Some((kind, v.get("payload")?.clone()))
+        })
+    else {
         return Vec::new();
     };
     match kind {
         Kind::Snapshot => ["coverage", "writes"]
             .iter()
             .filter_map(|k| payload.get(*k).and_then(Value::as_str))
-            .chain(payload.get("parents").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str))
+            .chain(
+                payload
+                    .get("parents")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            )
             .filter_map(|s| ObjectId::parse(s).ok())
             .collect(),
         // Coverage and writes objects reference nothing.

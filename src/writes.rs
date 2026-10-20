@@ -147,7 +147,8 @@ impl WriteRecord {
     /// writes count — a file-level write cannot say which symbols it
     /// changed, and a symbol-level one names every symbol it did (§2.3).
     pub fn touches_symbol(&self, id: &str) -> bool {
-        self.syms.iter().any(|(s, _)| nested_in(s, id)) || self.removed.iter().any(|s| nested_in(s, id))
+        self.syms.iter().any(|(s, _)| nested_in(s, id))
+            || self.removed.iter().any(|s| nested_in(s, id))
     }
 
     /// Latest first: by timestamp (RFC 3339 UTC, so lexicographic order is
@@ -189,9 +190,15 @@ impl FileContents {
     /// not at hand, so a write known only by its file hash is
     /// [`Status::Unknown`] here.
     pub fn from_symbols(file: &FileSymbols) -> Self {
-        let mut out = Self { parsed: true, ..Default::default() };
+        let mut out = Self {
+            parsed: true,
+            ..Default::default()
+        };
         for sym in file.walk() {
-            out.symbols.entry(sym.name_path().to_string()).or_default().push(crate::journal::encode_hash(&sym.content_hash));
+            out.symbols
+                .entry(sym.name_path().to_string())
+                .or_default()
+                .push(crate::journal::encode_hash(&sym.content_hash));
         }
         out
     }
@@ -211,9 +218,21 @@ impl FileContents {
         if !self.any_within(&name(id)) {
             return Status::Removed;
         }
-        let written_intact = write.syms.iter().filter(|(s, _)| nested_in(s, id)).all(|(s, h)| self.has(&name(s), h));
-        let deleted_gone = write.removed.iter().filter(|s| nested_in(s, id)).all(|s| self.hashes(&name(s)).is_empty());
-        if written_intact && deleted_gone { Status::Current } else { Status::Changed }
+        let written_intact = write
+            .syms
+            .iter()
+            .filter(|(s, _)| nested_in(s, id))
+            .all(|(s, h)| self.has(&name(s), h));
+        let deleted_gone = write
+            .removed
+            .iter()
+            .filter(|s| nested_in(s, id))
+            .all(|s| self.hashes(&name(s)).is_empty());
+        if written_intact && deleted_gone {
+            Status::Current
+        } else {
+            Status::Changed
+        }
     }
 
     /// Whether `write`'s version of the whole file is what this holds: by
@@ -221,13 +240,21 @@ impl FileContents {
     /// wrote. A file-level write with no hash cannot say (spec §3.1).
     pub fn file_status(&self, write: &WriteRecord) -> Status {
         if let (Some(fh), false) = (&write.fh, self.hash.is_empty()) {
-            return if *fh == self.hash { Status::Current } else { Status::Changed };
+            return if *fh == self.hash {
+                Status::Current
+            } else {
+                Status::Changed
+            };
         }
         if write.level == Level::File || write.syms.is_empty() || !self.parsed {
             return Status::Unknown;
         }
         let unchanged = write.syms.iter().all(|(s, h)| self.has(split_id(s).1, h));
-        if unchanged { Status::Current } else { Status::Changed }
+        if unchanged {
+            Status::Current
+        } else {
+            Status::Changed
+        }
     }
 
     /// Whether a symbol at `name_path` has content hash `hash`.
@@ -242,7 +269,9 @@ impl FileContents {
 
     /// Whether any symbol is at `name_path` or nested in it.
     pub fn any_within(&self, name_path: &str) -> bool {
-        self.symbols.keys().any(|k| crate::symbols::nested_in(k, name_path))
+        self.symbols
+            .keys()
+            .any(|k| crate::symbols::nested_in(k, name_path))
     }
 }
 
@@ -282,9 +311,12 @@ pub fn build_record(
                 let after = apply_edit(before, old, new, *replace_all)?;
                 attribute(parser, rel, before, &after, Diff::Hunks(hunks))
             }
-            WriteSource::Write { create: true, content, user_modified: false, .. } => {
-                attribute(parser, rel, "", content, Diff::Created)
-            }
+            WriteSource::Write {
+                create: true,
+                content,
+                user_modified: false,
+                ..
+            } => attribute(parser, rel, "", content, Diff::Created),
             WriteSource::Write {
                 original: Some(before),
                 content,
@@ -347,21 +379,29 @@ pub fn recover_originals(events: &mut [WriteEvent], later: &[WriteEvent], projec
     let mut chains: BTreeMap<String, Vec<Link<'_>>> = BTreeMap::new();
     for (i, e) in events.iter().enumerate() {
         if let Some(file) = crate::objects::project_file(&e.path, project_root) {
-            chains.entry(file).or_default().push((&e.timestamp, &e.op, Some(i)));
+            chains
+                .entry(file)
+                .or_default()
+                .push((&e.timestamp, &e.op, Some(i)));
         }
     }
     let later_index: HashMap<&str, &WriteEvent> = later.iter().map(|e| (&*e.op, e)).collect();
     for e in later {
         if let Some(file) = crate::objects::project_file(&e.path, project_root) {
             if chains.contains_key(&file) {
-                chains.entry(file).or_default().push((&e.timestamp, &e.op, None));
+                chains
+                    .entry(file)
+                    .or_default()
+                    .push((&e.timestamp, &e.op, None));
             }
         }
     }
     let mut recovered: Vec<(usize, String)> = Vec::new();
     for (file, mut chain) in chains {
         chain.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-        let Some(mut text) = crate::objects::read_regular(&project_root.join(&file)).and_then(|b| String::from_utf8(b).ok()) else {
+        let Some(mut text) = crate::objects::read_regular(&project_root.join(&file))
+            .and_then(|b| String::from_utf8(b).ok())
+        else {
             continue;
         };
         for (_, op, own) in chain.into_iter().rev() {
@@ -369,9 +409,18 @@ pub fn recover_originals(events: &mut [WriteEvent], later: &[WriteEvent], projec
                 Some(i) => &events[i],
                 None => later_index[op],
             };
-            let Some(before) = undo(&event.source, &text) else { break };
-            if let (Some(i), WriteSource::Edit { original: None, .. } | WriteSource::Write { original: None, create: false, .. }) =
-                (own, &event.source)
+            let Some(before) = undo(&event.source, &text) else {
+                break;
+            };
+            if let (
+                Some(i),
+                WriteSource::Edit { original: None, .. }
+                | WriteSource::Write {
+                    original: None,
+                    create: false,
+                    ..
+                },
+            ) = (own, &event.source)
             {
                 recovered.push((i, before.clone()));
             }
@@ -380,7 +429,9 @@ pub fn recover_originals(events: &mut [WriteEvent], later: &[WriteEvent], projec
     }
     for (i, before) in recovered {
         match &mut events[i].source {
-            WriteSource::Edit { original, .. } | WriteSource::Write { original, .. } => *original = Some(before),
+            WriteSource::Edit { original, .. } | WriteSource::Write { original, .. } => {
+                *original = Some(before)
+            }
             WriteSource::Opaque => {}
         }
     }
@@ -390,11 +441,25 @@ pub fn recover_originals(events: &mut [WriteEvent], later: &[WriteEvent], projec
 /// against `after`. `None` when it cannot be known.
 fn undo(source: &WriteSource, after: &str) -> Option<String> {
     let hunks = match source {
-        WriteSource::Edit { hunks: Some(hunks), user_modified: false, .. } => hunks,
-        WriteSource::Write { hunks: Some(hunks), user_modified: false, create: false, content, .. } if content == after => hunks,
+        WriteSource::Edit {
+            hunks: Some(hunks),
+            user_modified: false,
+            ..
+        } => hunks,
+        WriteSource::Write {
+            hunks: Some(hunks),
+            user_modified: false,
+            create: false,
+            content,
+            ..
+        } if content == after => hunks,
         _ => return None,
     };
-    if hunks.iter().flat_map(|h| &h.lines).any(|l| l.starts_with('\\')) {
+    if hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .any(|l| l.starts_with('\\'))
+    {
         return None;
     }
     let reversed: Vec<Hunk> = hunks
@@ -515,7 +580,12 @@ pub fn attribute(
                     && innermost_at(&after_syms, line).is_none()
             });
             // A new file: everything in it is new.
-            let created = touched.iter().map(|(id, _)| id.clone()).collect::<BTreeSet<_>>().into_iter().collect();
+            let created = touched
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
             return Some(Attribution {
                 touched: touched.into_iter().collect(),
                 created,
@@ -577,7 +647,11 @@ pub fn attribute(
         }
     }
 
-    let created: BTreeSet<SymbolId> = touched.iter().filter(|(id, _)| with_id(&before_syms, id).is_empty()).map(|(id, _)| id.clone()).collect();
+    let created: BTreeSet<SymbolId> = touched
+        .iter()
+        .filter(|(id, _)| with_id(&before_syms, id).is_empty())
+        .map(|(id, _)| id.clone())
+        .collect();
     Some(Attribution {
         touched: touched.into_iter().collect(),
         removed: removed.into_iter().collect(),
@@ -593,7 +667,10 @@ fn lines(text: &str) -> Vec<&str> {
     if text.is_empty() {
         return Vec::new();
     }
-    text.strip_suffix('\n').unwrap_or(text).split('\n').collect()
+    text.strip_suffix('\n')
+        .unwrap_or(text)
+        .split('\n')
+        .collect()
 }
 
 /// Apply `hunks` to `before`, checking every context and `-` line against it.
@@ -606,10 +683,17 @@ fn apply_hunks<'a>(before: &[&'a str], hunks: &'a [Hunk]) -> Option<Vec<&'a str>
     let mut next = 0; // index of the first `before` line not yet consumed
     for hunk in ordered {
         let body = |l: &'a String| l.get(1..).unwrap_or("");
-        let consumes = hunk.lines.iter().any(|l| matches!(l.as_bytes().first(), Some(b' ' | b'-')));
+        let consumes = hunk
+            .lines
+            .iter()
+            .any(|l| matches!(l.as_bytes().first(), Some(b' ' | b'-')));
         // Unified-diff convention: a hunk with no old lines inserts *after*
         // line `old_start`; any other starts *at* it.
-        let start = if consumes { (hunk.old_start as usize).checked_sub(1)? } else { hunk.old_start as usize };
+        let start = if consumes {
+            (hunk.old_start as usize).checked_sub(1)?
+        } else {
+            hunk.old_start as usize
+        };
         if start < next || start > before.len() {
             return None;
         }
@@ -638,12 +722,17 @@ fn apply_hunks<'a>(before: &[&'a str], hunks: &'a [Hunk]) -> Option<Vec<&'a str>
 
 /// The deepest symbol whose inclusive line range contains `line`.
 fn innermost_at(symbols: &[SymbolNode], line: u32) -> Option<&SymbolNode> {
-    crate::symbols::innermost(symbols, &|s| s.line_range.start <= line && line <= s.line_range.end)
+    crate::symbols::innermost(symbols, &|s| {
+        s.line_range.start <= line && line <= s.line_range.end
+    })
 }
 
 /// Every symbol, at any depth, whose id is `id`.
 fn with_id<'a>(symbols: &'a [SymbolNode], id: &str) -> Vec<&'a SymbolNode> {
-    crate::symbols::walk_symbols(symbols).into_iter().filter(|s| &*s.id == id).collect()
+    crate::symbols::walk_symbols(symbols)
+        .into_iter()
+        .filter(|s| &*s.id == id)
+        .collect()
 }
 
 #[cfg(test)]
@@ -668,7 +757,11 @@ fn gamma() {
 ";
 
     fn hunk(old_start: u32, new_start: u32, lines: &[&str]) -> Hunk {
-        Hunk { old_start, new_start, lines: lines.iter().map(|l| l.to_string()).collect() }
+        Hunk {
+            old_start,
+            new_start,
+            lines: lines.iter().map(|l| l.to_string()).collect(),
+        }
     }
 
     fn run(before: &str, after: &str, diff: Diff<'_>) -> Attribution {
@@ -685,16 +778,20 @@ fn gamma() {
     #[test]
     fn only_changed_lines_attribute_not_hunk_context() {
         let after = BEFORE.replace("let b = 2;", "let b = 20;");
-        let hunks = [hunk(3, 3, &[
-            " }",
-            " ",
-            " fn beta() {",
-            "-    let b = 2;",
-            "+    let b = 20;",
-            " }",
-            " ",
-            " fn gamma() {",
-        ])];
+        let hunks = [hunk(
+            3,
+            3,
+            &[
+                " }",
+                " ",
+                " fn beta() {",
+                "-    let b = 2;",
+                "+    let b = 20;",
+                " }",
+                " ",
+                " fn gamma() {",
+            ],
+        )];
         let a = run(BEFORE, &after, Diff::Hunks(&hunks));
         assert_eq!(touched_ids(&a), vec!["src/lib.rs::beta"]);
         assert!(a.removed.is_empty());
@@ -714,7 +811,10 @@ fn gamma() {
             .into_iter()
             .find(|s| &*s.name == "beta")
             .unwrap();
-        assert_eq!(a.touched, vec![("src/lib.rs::beta".to_string(), after_beta.content_hash)]);
+        assert_eq!(
+            a.touched,
+            vec![("src/lib.rs::beta".to_string(), after_beta.content_hash)]
+        );
     }
 
     /// A pure deletion inside a function has no `+` lines; the `-` line still
@@ -723,7 +823,11 @@ fn gamma() {
     fn a_pure_deletion_inside_a_function_touches_it() {
         let before = "fn alpha() {\n    let a = 1;\n    let z = 9;\n}\n";
         let after = "fn alpha() {\n    let a = 1;\n}\n";
-        let hunks = [hunk(1, 1, &[" fn alpha() {", "     let a = 1;", "-    let z = 9;", " }"])];
+        let hunks = [hunk(
+            1,
+            1,
+            &[" fn alpha() {", "     let a = 1;", "-    let z = 9;", " }"],
+        )];
         let a = run(before, after, Diff::Hunks(&hunks));
         assert_eq!(touched_ids(&a), vec!["src/lib.rs::alpha"]);
         assert!(a.removed.is_empty());
@@ -733,29 +837,46 @@ fn gamma() {
     #[test]
     fn deleting_a_function_removes_it() {
         let after = "fn alpha() {\n    let a = 1;\n}\n\nfn gamma() {\n    let c = 3;\n}\n";
-        let hunks = [hunk(4, 4, &[
-            " ",
-            "-fn beta() {",
-            "-    let b = 2;",
-            "-}",
-            "-",
-            " fn gamma() {",
-        ])];
+        let hunks = [hunk(
+            4,
+            4,
+            &[
+                " ",
+                "-fn beta() {",
+                "-    let b = 2;",
+                "-}",
+                "-",
+                " fn gamma() {",
+            ],
+        )];
         let a = run(BEFORE, after, Diff::Hunks(&hunks));
         assert_eq!(a.removed, vec!["src/lib.rs::beta".to_string()]);
         assert!(a.touched.is_empty(), "{:?}", a.touched);
-        assert!(a.outside_symbols, "the removed blank line sat between symbols");
+        assert!(
+            a.outside_symbols,
+            "the removed blank line sat between symbols"
+        );
     }
 
     /// A symbol no id named before the write was created by it; one edited
     /// in place was not. Every symbol of a new file was.
     #[test]
     fn a_new_symbol_is_created_and_an_edited_one_is_not() {
-        let after = format!("{}\nfn delta() {{}}\n", BEFORE.replace("let a = 1;", "let a = 9;"));
-        let hunks = [hunk(2, 2, &["-    let a = 1;", "+    let a = 9;"]), hunk(11, 11, &[" }", "+", "+fn delta() {}"])];
+        let after = format!(
+            "{}\nfn delta() {{}}\n",
+            BEFORE.replace("let a = 1;", "let a = 9;")
+        );
+        let hunks = [
+            hunk(2, 2, &["-    let a = 1;", "+    let a = 9;"]),
+            hunk(11, 11, &[" }", "+", "+fn delta() {}"]),
+        ];
         let a = run(BEFORE, &after, Diff::Hunks(&hunks));
         assert_eq!(a.created, vec!["src/lib.rs::delta".to_string()]);
-        assert!(a.touched.iter().any(|(id, _)| id == "src/lib.rs::alpha"), "{:?}", a.touched);
+        assert!(
+            a.touched.iter().any(|(id, _)| id == "src/lib.rs::alpha"),
+            "{:?}",
+            a.touched
+        );
         let new_file = run("", BEFORE, Diff::Created);
         assert_eq!(new_file.created.len(), new_file.touched.len());
     }
@@ -806,13 +927,18 @@ fn gamma() {
     /// Two hunks attribute independently.
     #[test]
     fn several_hunks_attribute_independently() {
-        let after = BEFORE.replace("let a = 1;", "let a = 10;").replace("let c = 3;", "let c = 30;");
+        let after = BEFORE
+            .replace("let a = 1;", "let a = 10;")
+            .replace("let c = 3;", "let c = 30;");
         let hunks = [
             hunk(2, 2, &["-    let a = 1;", "+    let a = 10;"]),
             hunk(10, 10, &["-    let c = 3;", "+    let c = 30;"]),
         ];
         let a = run(BEFORE, &after, Diff::Hunks(&hunks));
-        assert_eq!(touched_ids(&a), vec!["src/lib.rs::alpha", "src/lib.rs::gamma"]);
+        assert_eq!(
+            touched_ids(&a),
+            vec!["src/lib.rs::alpha", "src/lib.rs::gamma"]
+        );
     }
 
     /// A create has no hunks: every innermost symbol is touched.
@@ -825,7 +951,10 @@ fn gamma() {
         let ids = touched_ids(&a);
         assert!(ids.contains(&"src/lib.rs::S/m"), "{ids:?}");
         assert!(ids.contains(&"src/lib.rs::free"), "{ids:?}");
-        assert!(!ids.contains(&"src/lib.rs::S"), "the impl has children; only innermost: {ids:?}");
+        assert!(
+            !ids.contains(&"src/lib.rs::S"),
+            "the impl has children; only innermost: {ids:?}"
+        );
     }
 
     /// `\ No newline at end of file` occupies no line.
@@ -833,12 +962,16 @@ fn gamma() {
     fn a_no_newline_marker_does_not_shift_lines() {
         let before = "fn alpha() {}\nfn beta() {}";
         let after = "fn alpha() {}\nfn beta() { 1; }";
-        let hunks = [hunk(2, 2, &[
-            "-fn beta() {}",
-            "\\ No newline at end of file",
-            "+fn beta() { 1; }",
-            "\\ No newline at end of file",
-        ])];
+        let hunks = [hunk(
+            2,
+            2,
+            &[
+                "-fn beta() {}",
+                "\\ No newline at end of file",
+                "+fn beta() { 1; }",
+                "\\ No newline at end of file",
+            ],
+        )];
         let a = run(before, after, Diff::Hunks(&hunks));
         assert_eq!(touched_ids(&a), vec!["src/lib.rs::beta"]);
     }
@@ -847,30 +980,53 @@ fn gamma() {
     /// symbols in.
     #[test]
     fn output_is_sorted_and_deduplicated() {
-        let after = BEFORE.replace("let c = 3;", "let c = 30;").replace("let a = 1;", "let a = 10;");
+        let after = BEFORE
+            .replace("let c = 3;", "let c = 30;")
+            .replace("let a = 1;", "let a = 10;");
         let hunks = [
             hunk(10, 10, &["-    let c = 3;", "+    let c = 30;"]),
             hunk(2, 2, &["-    let a = 1;", "+    let a = 10;"]),
         ];
         let a = run(BEFORE, &after, Diff::Hunks(&hunks));
-        assert_eq!(touched_ids(&a), vec!["src/lib.rs::alpha", "src/lib.rs::gamma"]);
+        assert_eq!(
+            touched_ids(&a),
+            vec!["src/lib.rs::alpha", "src/lib.rs::gamma"]
+        );
     }
 
     /// Hunks must account for every change: one the patch leaves out means
     /// a symbol the record would not name — a false "untouched" (spec §2.3).
     #[test]
     fn hunks_that_leave_a_change_out_refuse_attribution() {
-        let after = BEFORE.replace("let c = 3;", "let c = 30;").replace("let a = 1;", "let a = 10;");
+        let after = BEFORE
+            .replace("let c = 3;", "let c = 30;")
+            .replace("let a = 1;", "let a = 10;");
         let hunks = [hunk(2, 2, &["-    let a = 1;", "+    let a = 10;"])];
-        let refused = attribute(&RustParser::new(), Path::new(PATH), BEFORE, &after, Diff::Hunks(&hunks));
+        let refused = attribute(
+            &RustParser::new(),
+            Path::new(PATH),
+            BEFORE,
+            &after,
+            Diff::Hunks(&hunks),
+        );
         assert_eq!(refused, None);
     }
 
     #[test]
     fn a_wrong_context_line_refuses_attribution() {
         let after = BEFORE.replace("let b = 2;", "let b = 20;");
-        let hunks = [hunk(5, 5, &[" fn not_beta() {", "-    let b = 2;", "+    let b = 20;"])];
-        let refused = attribute(&RustParser::new(), Path::new(PATH), BEFORE, &after, Diff::Hunks(&hunks));
+        let hunks = [hunk(
+            5,
+            5,
+            &[" fn not_beta() {", "-    let b = 2;", "+    let b = 20;"],
+        )];
+        let refused = attribute(
+            &RustParser::new(),
+            Path::new(PATH),
+            BEFORE,
+            &after,
+            Diff::Hunks(&hunks),
+        );
         assert_eq!(refused, None);
     }
 
@@ -904,15 +1060,27 @@ fn gamma() {
             hunk(6, 6, &["-    let b = 2;", "+    let b = 20;"]),
         ];
         assert_eq!(
-            attribute(&RustParser::new(), Path::new(PATH), BEFORE, &after, Diff::Hunks(&hunks)),
+            attribute(
+                &RustParser::new(),
+                Path::new(PATH),
+                BEFORE,
+                &after,
+                Diff::Hunks(&hunks)
+            ),
             None
         );
     }
 
     #[test]
     fn apply_edit_replaces_first_or_all_and_refuses_a_missing_match() {
-        assert_eq!(apply_edit("a b a", "a", "x", false).as_deref(), Some("x b a"));
-        assert_eq!(apply_edit("a b a", "a", "x", true).as_deref(), Some("x b x"));
+        assert_eq!(
+            apply_edit("a b a", "a", "x", false).as_deref(),
+            Some("x b a")
+        );
+        assert_eq!(
+            apply_edit("a b a", "a", "x", true).as_deref(),
+            Some("x b x")
+        );
         assert_eq!(apply_edit("a b a", "zz", "x", false), None);
         assert_eq!(apply_edit("a b a", "", "x", false), None);
     }
@@ -949,7 +1117,10 @@ mod record_tests {
             hunks: Some(vec![Hunk {
                 old_start: 2,
                 new_start: 2,
-                lines: vec![format!("-    let b = 2; // {CANARY}"), "+    let b = 20;".into()],
+                lines: vec![
+                    format!("-    let b = 2; // {CANARY}"),
+                    "+    let b = 20;".into(),
+                ],
             }]),
             user_modified,
         }
@@ -969,7 +1140,10 @@ mod record_tests {
         assert_eq!(rec.syms.len(), 1);
         assert_eq!(rec.syms[0].0, "src/lib.rs::beta");
         assert!(rec.syms[0].1.starts_with("b3:"));
-        assert_eq!((rec.op.as_str(), rec.av, rec.a.as_str()), ("toolu_01abc", ATTRIBUTION_VERSION, "agent-1"));
+        assert_eq!(
+            (rec.op.as_str(), rec.av, rec.a.as_str()),
+            ("toolu_01abc", ATTRIBUTION_VERSION, "agent-1")
+        );
         assert_eq!(rec.fh, None, "only a Write carries a file hash");
     }
 
@@ -1005,7 +1179,9 @@ mod record_tests {
             .collect();
         overloads.sort();
         assert_eq!(overloads.len(), 2);
-        assert!(overloads.iter().all(|(id, _)| id == "src/Shape.java::Shape/area"));
+        assert!(overloads
+            .iter()
+            .all(|(id, _)| id == "src/Shape.java::Shape/area"));
         assert_eq!(rec.syms, overloads);
         assert!(rec.removed.is_empty() && !rec.outside_symbols);
     }
@@ -1023,10 +1199,25 @@ mod record_tests {
     /// symbol-level claim — least of all "no symbol changed".
     #[test]
     fn an_edit_without_a_structured_patch_is_file_level() {
-        let WriteSource::Edit { original, old, new, replace_all, user_modified, .. } = edit(Some(BEFORE), false) else {
+        let WriteSource::Edit {
+            original,
+            old,
+            new,
+            replace_all,
+            user_modified,
+            ..
+        } = edit(Some(BEFORE), false)
+        else {
             unreachable!()
         };
-        let source = WriteSource::Edit { original, old, new, replace_all, hunks: None, user_modified };
+        let source = WriteSource::Edit {
+            original,
+            old,
+            new,
+            replace_all,
+            hunks: None,
+            user_modified,
+        };
         let rec = build(&event("/proj/src/lib.rs", source)).unwrap();
         assert_eq!(rec.level, Level::File);
         assert!(rec.syms.is_empty() && rec.removed.is_empty());
@@ -1036,10 +1227,25 @@ mod record_tests {
     /// unaccounted for.
     #[test]
     fn an_edit_whose_patch_is_empty_is_file_level() {
-        let WriteSource::Edit { original, old, new, replace_all, user_modified, .. } = edit(Some(BEFORE), false) else {
+        let WriteSource::Edit {
+            original,
+            old,
+            new,
+            replace_all,
+            user_modified,
+            ..
+        } = edit(Some(BEFORE), false)
+        else {
             unreachable!()
         };
-        let source = WriteSource::Edit { original, old, new, replace_all, hunks: Some(vec![]), user_modified };
+        let source = WriteSource::Edit {
+            original,
+            old,
+            new,
+            replace_all,
+            hunks: Some(vec![]),
+            user_modified,
+        };
         let rec = build(&event("/proj/src/lib.rs", source)).unwrap();
         assert_eq!(rec.level, Level::File);
     }
@@ -1064,28 +1270,41 @@ mod record_tests {
 
     #[test]
     fn a_create_is_symbol_level_with_a_file_hash() {
-        let ev = event("/proj/src/new.rs", WriteSource::Write {
-            original: None,
-            content: "fn a() {}\nfn b() {}\n".into(),
-            create: true,
-            hunks: None,
-            user_modified: false,
-        });
+        let ev = event(
+            "/proj/src/new.rs",
+            WriteSource::Write {
+                original: None,
+                content: "fn a() {}\nfn b() {}\n".into(),
+                create: true,
+                hunks: None,
+                user_modified: false,
+            },
+        );
         let rec = build(&ev).unwrap();
         assert_eq!(rec.level, Level::Symbol);
         let ids: Vec<&str> = rec.syms.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["src/new.rs::a", "src/new.rs::b"]);
         assert_eq!(
             rec.fh.as_deref(),
-            Some(crate::journal::encode_hash(blake3::hash(b"fn a() {}\nfn b() {}\n").as_bytes()).as_str())
+            Some(
+                crate::journal::encode_hash(blake3::hash(b"fn a() {}\nfn b() {}\n").as_bytes())
+                    .as_str()
+            )
         );
     }
 
     #[test]
     fn a_file_with_no_parser_is_file_level() {
-        let ev = event("/proj/notes.txt", WriteSource::Write {
-            original: None, content: "hello".into(), create: true, hunks: None, user_modified: false,
-        });
+        let ev = event(
+            "/proj/notes.txt",
+            WriteSource::Write {
+                original: None,
+                content: "hello".into(),
+                create: true,
+                hunks: None,
+                user_modified: false,
+            },
+        );
         let rec = build(&ev).unwrap();
         assert_eq!((rec.level, rec.file.as_str()), (Level::File, "notes.txt"));
         assert!(rec.fh.is_some());
@@ -1096,7 +1315,10 @@ mod record_tests {
     fn a_write_outside_the_project_is_dropped() {
         assert!(build(&event("/elsewhere/.aws/config", WriteSource::Opaque)).is_none());
         assert!(build(&event("../escape.rs", WriteSource::Opaque)).is_none());
-        assert!(build(&event("/proj", WriteSource::Opaque)).is_none(), "the root itself is not a file");
+        assert!(
+            build(&event("/proj", WriteSource::Opaque)).is_none(),
+            "the root itself is not a file"
+        );
     }
 
     /// File contents never reach a record (spec §9.6): not the original, not
@@ -1129,7 +1351,15 @@ mod recover_tests {
     const V1: &str = "fn alpha() {\n    let a = 10;\n}\n\nfn beta() {\n    let b = 2;\n}\n";
     const V2: &str = "fn alpha() {\n    let a = 10;\n}\n\nfn beta() {\n    let b = 20;\n}\n";
 
-    fn edit(op: &str, at: &str, path: &Path, start: u32, old: &str, new: &str, user_modified: bool) -> WriteEvent {
+    fn edit(
+        op: &str,
+        at: &str,
+        path: &Path,
+        start: u32,
+        old: &str,
+        new: &str,
+        user_modified: bool,
+    ) -> WriteEvent {
         WriteEvent {
             op: Arc::from(op),
             agent_id: Arc::from("agent-1"),
@@ -1141,7 +1371,11 @@ mod recover_tests {
                 old: old.trim().into(),
                 new: new.trim().into(),
                 replace_all: false,
-                hunks: Some(vec![Hunk { old_start: start, new_start: start, lines: vec![format!("-{old}"), format!("+{new}")] }]),
+                hunks: Some(vec![Hunk {
+                    old_start: start,
+                    new_start: start,
+                    lines: vec![format!("-{old}"), format!("+{new}")],
+                }]),
                 user_modified,
             },
         }
@@ -1149,7 +1383,9 @@ mod recover_tests {
 
     fn original(e: &WriteEvent) -> Option<&str> {
         match &e.source {
-            WriteSource::Edit { original, .. } | WriteSource::Write { original, .. } => original.as_deref(),
+            WriteSource::Edit { original, .. } | WriteSource::Write { original, .. } => {
+                original.as_deref()
+            }
             WriteSource::Opaque => None,
         }
     }
@@ -1162,11 +1398,27 @@ mod recover_tests {
     }
 
     fn alpha_edit(file: &Path) -> WriteEvent {
-        edit("e1", "2026-10-10T10:00:01Z", file, 2, "    let a = 1;", "    let a = 10;", false)
+        edit(
+            "e1",
+            "2026-10-10T10:00:01Z",
+            file,
+            2,
+            "    let a = 1;",
+            "    let a = 10;",
+            false,
+        )
     }
 
     fn beta_edit(file: &Path) -> WriteEvent {
-        edit("e2", "2026-10-10T10:00:02Z", file, 6, "    let b = 2;", "    let b = 20;", false)
+        edit(
+            "e2",
+            "2026-10-10T10:00:02Z",
+            file,
+            6,
+            "    let b = 2;",
+            "    let b = 20;",
+            false,
+        )
     }
 
     #[test]
@@ -1174,11 +1426,22 @@ mod recover_tests {
         let (dir, file) = project(V2);
         let mut events = vec![beta_edit(&file), alpha_edit(&file)];
         recover_originals(&mut events, &[], dir.path());
-        assert_eq!(original(&events[1]), Some(V0), "the earlier edit, final newline included");
+        assert_eq!(
+            original(&events[1]),
+            Some(V0),
+            "the earlier edit, final newline included"
+        );
         assert_eq!(original(&events[0]), Some(V1));
         let record = build_record(&events[1], dir.path(), &ParserRegistry::new(), true).unwrap();
         assert_eq!(record.level, Level::Symbol);
-        assert_eq!(record.syms.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), ["a.rs::alpha"]);
+        assert_eq!(
+            record
+                .syms
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["a.rs::alpha"]
+        );
     }
 
     #[test]
@@ -1196,7 +1459,11 @@ mod recover_tests {
         std::fs::write(&other, V1).unwrap();
         let mut events = vec![alpha_edit(&file), beta_edit(&file), alpha_edit(&other)];
         recover_originals(&mut events, &[], dir.path());
-        assert_eq!(original(&events[1]).map(|t| t.contains("let b = 2;")), Some(true), "after the outside change: recovered");
+        assert_eq!(
+            original(&events[1]).map(|t| t.contains("let b = 2;")),
+            Some(true),
+            "after the outside change: recovered"
+        );
         assert_eq!(original(&events[0]), None, "before it: unknowable");
         assert_eq!(original(&events[2]), Some(V0), "another file is unaffected");
     }
@@ -1204,18 +1471,34 @@ mod recover_tests {
     #[test]
     fn a_user_modified_write_ends_the_chain() {
         let (dir, file) = project(V2);
-        let mut events = vec![alpha_edit(&file), edit("e2", "2026-10-10T10:00:02Z", &file, 6, "    let b = 2;", "    let b = 20;", true)];
+        let mut events = vec![
+            alpha_edit(&file),
+            edit(
+                "e2",
+                "2026-10-10T10:00:02Z",
+                &file,
+                6,
+                "    let b = 2;",
+                "    let b = 20;",
+                true,
+            ),
+        ];
         recover_originals(&mut events, &[], dir.path());
         assert_eq!((original(&events[0]), original(&events[1])), (None, None));
     }
 
     #[test]
     fn a_pure_insertion_and_a_pure_deletion_undo_exactly() {
-        let inserted = "fn alpha() {\n    let a = 1;\n}\n// note\n\nfn beta() {\n    let b = 2;\n}\n";
+        let inserted =
+            "fn alpha() {\n    let a = 1;\n}\n// note\n\nfn beta() {\n    let b = 2;\n}\n";
         let (dir, file) = project(inserted);
         let mut insert = edit("e1", "2026-10-10T10:00:01Z", &file, 0, "", "", false);
         if let WriteSource::Edit { hunks, .. } = &mut insert.source {
-            *hunks = Some(vec![Hunk { old_start: 3, new_start: 4, lines: vec!["+// note".into()] }]);
+            *hunks = Some(vec![Hunk {
+                old_start: 3,
+                new_start: 4,
+                lines: vec!["+// note".into()],
+            }]);
         }
         let mut events = vec![insert];
         recover_originals(&mut events, &[], dir.path());
@@ -1224,7 +1507,11 @@ mod recover_tests {
         let (dir, file) = project(inserted);
         let mut delete = edit("e1", "2026-10-10T10:00:01Z", &file, 0, "", "", false);
         if let WriteSource::Edit { hunks, .. } = &mut delete.source {
-            *hunks = Some(vec![Hunk { old_start: 4, new_start: 3, lines: vec!["-// gone".into()] }]);
+            *hunks = Some(vec![Hunk {
+                old_start: 4,
+                new_start: 3,
+                lines: vec!["-// gone".into()],
+            }]);
         }
         let mut events = vec![delete];
         recover_originals(&mut events, &[], dir.path());
@@ -1238,14 +1525,32 @@ mod recover_tests {
             op: Arc::from("w1"),
             timestamp: "2026-10-10T10:00:01Z".into(),
             tool_name: Arc::from("Write"),
-            source: WriteSource::Write { original: None, content: V1.into(), create: true, hunks: None, user_modified: false },
+            source: WriteSource::Write {
+                original: None,
+                content: V1.into(),
+                create: true,
+                hunks: None,
+                user_modified: false,
+            },
             ..alpha_edit(&file)
         };
-        let earlier = edit("e0", "2026-10-10T10:00:00Z", &file, 2, "    let a = 0;", "    let a = 1;", false);
+        let earlier = edit(
+            "e0",
+            "2026-10-10T10:00:00Z",
+            &file,
+            2,
+            "    let a = 0;",
+            "    let a = 1;",
+            false,
+        );
         let mut events = vec![earlier, create, beta_edit(&file)];
         recover_originals(&mut events, &[], dir.path());
         assert_eq!(original(&events[2]), Some(V1), "the edit after the create");
         assert_eq!(original(&events[1]), None, "a create has no original");
-        assert_eq!(original(&events[0]), None, "the file before it was created is unknowable");
+        assert_eq!(
+            original(&events[0]),
+            None,
+            "the file before it was created is unknowable"
+        );
     }
 }

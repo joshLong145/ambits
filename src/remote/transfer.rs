@@ -27,13 +27,24 @@ pub fn closure(store: &Store, tip: ObjectId) -> Result<Vec<Snapshot>> {
             out.push(snap);
             continue;
         }
-        let parents: Vec<ObjectId> = snap.parents.iter().filter(|p| queued.insert(**p)).copied().collect();
+        let parents: Vec<ObjectId> = snap
+            .parents
+            .iter()
+            .filter(|p| queued.insert(**p))
+            .copied()
+            .collect();
         if queued.len() > MAX_HISTORY {
-            bail!("history of {} is longer than {MAX_HISTORY} snapshots", tip.short());
+            bail!(
+                "history of {} is longer than {MAX_HISTORY} snapshots",
+                tip.short()
+            );
         }
         stack.push((snap, true));
         for p in parents {
-            stack.push((Snapshot::load(store, p).wrap_err("history is incomplete")?, false));
+            stack.push((
+                Snapshot::load(store, p).wrap_err("history is incomplete")?,
+                false,
+            ));
         }
     }
     Ok(out)
@@ -59,7 +70,9 @@ fn held_whole(store: &Store, id: ObjectId) -> Option<Snapshot> {
         return None;
     }
     let snap = Snapshot::load(store, id).ok()?;
-    (store.get(&snap.coverage, Kind::Coverage).is_ok() && store.get(&snap.writes, Kind::Writes).is_ok()).then_some(snap)
+    (store.get(&snap.coverage, Kind::Coverage).is_ok()
+        && store.get(&snap.writes, Kind::Writes).is_ok())
+    .then_some(snap)
 }
 
 /// The part of `tip`'s history `to` needs from `from`, loaded and verified
@@ -67,7 +80,13 @@ fn held_whole(store: &Store, id: ObjectId) -> Option<Snapshot> {
 /// stops at each snapshot `to` holds whole — after checking it is the same
 /// snapshot there, not another under its id — so a push or fetch costs what
 /// is new, not the whole history.
-pub fn missing(graph: &mut Graph, from: &Store, to: &Store, tip: ObjectId, verify: Verify) -> Result<Vec<Snapshot>> {
+pub fn missing(
+    graph: &mut Graph,
+    from: &Store,
+    to: &Store,
+    tip: ObjectId,
+    verify: Verify,
+) -> Result<Vec<Snapshot>> {
     let mut out = Vec::new();
     let mut queued: HashSet<ObjectId> = HashSet::from([tip]);
     let mut stack: Vec<(ObjectId, Option<Snapshot>)> = vec![(tip, None)];
@@ -79,7 +98,10 @@ pub fn missing(graph: &mut Graph, from: &Store, to: &Store, tip: ObjectId, verif
         if verify == Verify::Frontier {
             if let Some(there) = held_whole(to, id) {
                 if Snapshot::load(from, id)?.state_digest != there.state_digest {
-                    bail!("snapshot {} already exists with different contents; refusing it", id.short());
+                    bail!(
+                        "snapshot {} already exists with different contents; refusing it",
+                        id.short()
+                    );
                 }
                 graph.learn(&there);
                 continue;
@@ -87,9 +109,17 @@ pub fn missing(graph: &mut Graph, from: &Store, to: &Store, tip: ObjectId, verif
         }
         let snap = Snapshot::load(from, id).wrap_err("history is incomplete")?;
         graph.learn(&snap);
-        let parents: Vec<ObjectId> = snap.parents.iter().filter(|p| queued.insert(**p)).copied().collect();
+        let parents: Vec<ObjectId> = snap
+            .parents
+            .iter()
+            .filter(|p| queued.insert(**p))
+            .copied()
+            .collect();
         if queued.len() > MAX_HISTORY {
-            bail!("history of {} is longer than {MAX_HISTORY} snapshots", tip.short());
+            bail!(
+                "history of {} is longer than {MAX_HISTORY} snapshots",
+                tip.short()
+            );
         }
         stack.push((id, Some(snap)));
         stack.extend(parents.into_iter().map(|p| (p, None)));
@@ -124,7 +154,10 @@ pub fn transfer(from: &Store, to: &Store, history: &[Snapshot]) -> Result<Stats>
             // A snapshot id is derived, not a content hash: the same id with
             // other contents is a forgery or corruption, never a skip (§6.3).
             Some(Ok(there)) if there.state_digest != snap.state_digest => {
-                bail!("snapshot {} already exists with different contents; refusing it", snap.id.short());
+                bail!(
+                    "snapshot {} already exists with different contents; refusing it",
+                    snap.id.short()
+                );
             }
             Some(Ok(_)) => {
                 refresh_age(&to.path_of(&snap.id));

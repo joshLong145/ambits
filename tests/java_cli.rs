@@ -75,14 +75,24 @@ fn a_java_file_dumps_as_a_tree_and_its_methods_show_by_id() {
         "{dump}"
     );
 
-    let shown: serde_json::Value =
-        serde_json::from_str(&run_ambits(root, &["show", "src/Shapes.java::Shapes/Renderer/visible"])).unwrap();
+    let shown: serde_json::Value = serde_json::from_str(&run_ambits(
+        root,
+        &["show", "src/Shapes.java::Shapes/Renderer/visible"],
+    ))
+    .unwrap();
     let only = &shown["results"][0]["matches"][0];
     assert_eq!(only["label"], "method");
     assert_eq!(only["lines"], serde_json::json!([22, 24]));
-    assert!(only["definition"].as_str().unwrap().starts_with("default boolean visible()"));
+    assert!(only["definition"]
+        .as_str()
+        .unwrap()
+        .starts_with("default boolean visible()"));
 
     let overloads: serde_json::Value =
         serde_json::from_str(&run_ambits(root, &["show", "src/Shapes.java::Shapes/draw"])).unwrap();
-    assert_eq!(overloads["results"][0]["matches"].as_array().unwrap().len(), 2, "both overloads match the id");
+    assert_eq!(
+        overloads["results"][0]["matches"].as_array().unwrap().len(),
+        2,
+        "both overloads match the id"
+    );
 }

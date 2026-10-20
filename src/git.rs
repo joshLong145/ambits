@@ -31,7 +31,13 @@ fn command(dir: &Path) -> Command {
     command
         .arg("-C")
         .arg(dir)
-        .args(["-c", "core.fsmonitor=false", "-c", "diff.external=", "--no-pager"])
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "diff.external=",
+            "--no-pager",
+        ])
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0");
@@ -48,9 +54,14 @@ pub fn config_get(dir: &Path, scope: &str, key: &str) -> color_eyre::Result<Opti
     cmd.env_remove("GIT_CONFIG_NOSYSTEM");
     let out = cmd.args(["config", scope, "--get", key]).output()?;
     match out.status.code() {
-        Some(0) => Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_string())),
+        Some(0) => Ok(Some(
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        )),
         Some(1) => Ok(None),
-        _ => Err(color_eyre::eyre::eyre!("git config {scope} --get {key} failed: {}", String::from_utf8_lossy(&out.stderr).trim())),
+        _ => Err(color_eyre::eyre::eyre!(
+            "git config {scope} --get {key} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
     }
 }
 
@@ -61,14 +72,23 @@ pub fn config_get(dir: &Path, scope: &str, key: &str) -> color_eyre::Result<Opti
 #[doc(hidden)]
 pub fn test_git(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> String {
     let mut cmd = command(dir);
-    for (k, v) in [("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")]
-        .into_iter()
-        .chain(env.iter().copied())
+    for (k, v) in [
+        ("GIT_AUTHOR_NAME", "t"),
+        ("GIT_AUTHOR_EMAIL", "t@t"),
+        ("GIT_COMMITTER_NAME", "t"),
+        ("GIT_COMMITTER_EMAIL", "t@t"),
+    ]
+    .into_iter()
+    .chain(env.iter().copied())
     {
         cmd.env(k, v);
     }
     let out = cmd.args(args).output().expect("git runs");
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -101,19 +121,36 @@ pub struct Commit {
 /// Commits on local branches or `HEAD` made from `since` to `until`
 /// (milliseconds), by committer time; empty outside a repository.
 pub fn commits_between(dir: &Path, since: u64, until: u64) -> Vec<Commit> {
-    let (since, until) = (format!("--since=@{}", since / 1000), format!("--until=@{}", until.div_ceil(1000)));
+    let (since, until) = (
+        format!("--since=@{}", since / 1000),
+        format!("--until=@{}", until.div_ceil(1000)),
+    );
     let args = [
-        "log", "--no-show-signature", "--no-color", "--no-ext-diff", "-z", "--format=%H%x1f%ct%x1f%s", "--branches", "HEAD",
-        &since, &until,
+        "log",
+        "--no-show-signature",
+        "--no-color",
+        "--no-ext-diff",
+        "-z",
+        "--format=%H%x1f%ct%x1f%s",
+        "--branches",
+        "HEAD",
+        &since,
+        &until,
     ];
-    let Some(out) = git(dir, &args) else { return Vec::new() };
+    let Some(out) = git(dir, &args) else {
+        return Vec::new();
+    };
     String::from_utf8_lossy(&out)
         .split('\0')
         .filter_map(|record| {
             let mut fields = record.trim_start_matches('\n').splitn(3, '\x1f');
             let sha = fields.next().filter(|s| is_commit_id(s))?.to_string();
             let t = fields.next()?.parse::<u64>().ok()? * 1000;
-            Some(Commit { sha, t, subject: fields.next().unwrap_or_default().to_string() })
+            Some(Commit {
+                sha,
+                t,
+                subject: fields.next().unwrap_or_default().to_string(),
+            })
         })
         .collect()
 }
@@ -138,9 +175,23 @@ impl Repo {
         }
         let prefix = git_line(dir, &["rev-parse", "--show-prefix"]).unwrap_or_default();
         let top = PathBuf::from(git_line(dir, &["rev-parse", "--show-toplevel"])?);
-        let head = git_line(dir, &["rev-parse", "--verify", "--quiet", "--end-of-options", "HEAD^{commit}"])
-            .filter(|h| is_commit_id(h));
-        Some(Self { prefix, top, head, dir: dir.to_path_buf() })
+        let head = git_line(
+            dir,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                "HEAD^{commit}",
+            ],
+        )
+        .filter(|h| is_commit_id(h));
+        Some(Self {
+            prefix,
+            top,
+            head,
+            dir: dir.to_path_buf(),
+        })
     }
 
     /// The directory the repository was discovered from.
@@ -154,13 +205,29 @@ impl Repo {
     /// deletion plus an addition.
     pub fn status(&self) -> Option<Vec<StatusEntry>> {
         // `-- .` keeps git from walking the rest of a larger repository.
-        let out = git(&self.dir, &["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--", "."])?;
+        let out = git(
+            &self.dir,
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--no-renames",
+                "--",
+                ".",
+            ],
+        )?;
         let mut entries = Vec::new();
         for record in out.split(|&b| b == 0).filter(|r| r.len() > 3) {
             let code = &record[..2];
             let path = String::from_utf8_lossy(&record[3..]).into_owned();
-            let Some(rel) = path.strip_prefix(&self.prefix) else { continue };
-            entries.push(StatusEntry { path: rel.to_string(), untracked: code == b"??" });
+            let Some(rel) = path.strip_prefix(&self.prefix) else {
+                continue;
+            };
+            entries.push(StatusEntry {
+                path: rel.to_string(),
+                untracked: code == b"??",
+            });
         }
         Some(entries)
     }
@@ -205,14 +272,21 @@ mod tests {
         let commit = |msg: &str, at: &str| {
             std::fs::write(root.join("f"), msg).unwrap();
             sh(root, &["add", "."]);
-            test_git(root, &["commit", "-qm", msg], &[("GIT_COMMITTER_DATE", at), ("GIT_AUTHOR_DATE", at)]);
+            test_git(
+                root,
+                &["commit", "-qm", msg],
+                &[("GIT_COMMITTER_DATE", at), ("GIT_AUTHOR_DATE", at)],
+            );
         };
         commit("first", "@1790000000 +0000");
         commit("second: with a colon", "@1790000100 +0000");
         commit("third", "@1790000200 +0000");
         let found = commits_between(root, 1_790_000_050_000, 1_790_000_150_000);
         assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!((found[0].t, found[0].subject.as_str()), (1_790_000_100_000, "second: with a colon"));
+        assert_eq!(
+            (found[0].t, found[0].subject.as_str()),
+            (1_790_000_100_000, "second: with a colon")
+        );
         assert!(is_commit_id(&found[0].sha));
         assert!(commits_between(&root.join("nowhere"), 0, u64::MAX / 2).is_empty());
     }
@@ -227,7 +301,11 @@ mod tests {
         std::fs::write(root.join("outside.rs"), "fn o() {}\n").unwrap();
         sh(root, &["add", "."]);
         sh(root, &["commit", "-qm", "init"]);
-        assert!(Repo::discover(&root.join("proj")).unwrap().status().unwrap().is_empty());
+        assert!(Repo::discover(&root.join("proj"))
+            .unwrap()
+            .status()
+            .unwrap()
+            .is_empty());
 
         std::fs::write(root.join("proj/src/a.rs"), "fn a() { 1; }\n").unwrap();
         std::fs::write(root.join("proj/src/new.rs"), "fn n() {}\n").unwrap();
@@ -240,8 +318,14 @@ mod tests {
         assert_eq!(
             status,
             vec![
-                StatusEntry { path: "src/a.rs".into(), untracked: false },
-                StatusEntry { path: "src/new.rs".into(), untracked: true },
+                StatusEntry {
+                    path: "src/a.rs".into(),
+                    untracked: false
+                },
+                StatusEntry {
+                    path: "src/new.rs".into(),
+                    untracked: true
+                },
             ]
         );
     }
@@ -251,7 +335,11 @@ mod tests {
     #[test]
     fn inherited_repository_variables_are_cleared() {
         let cmd = command(Path::new("."));
-        let cleared: Vec<_> = cmd.get_envs().filter(|(_, v)| v.is_none()).map(|(k, _)| k.to_owned()).collect();
+        let cleared: Vec<_> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_owned())
+            .collect();
         for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
             assert!(cleared.iter().any(|k| k == var), "{var} not cleared");
         }

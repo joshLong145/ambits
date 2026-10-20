@@ -59,7 +59,9 @@ pub struct DepthOrdinalCache {
 
 impl DepthOrdinalCache {
     pub fn new() -> Self {
-        Self { map: HashMap::new() }
+        Self {
+            map: HashMap::new(),
+        }
     }
 
     /// Record that `agent_id` read `symbol_id` at `depth`. Only upgrades the
@@ -541,12 +543,18 @@ mod tests {
         let mut cache = DepthOrdinalCache::new();
         cache.record("s1", "agent_a", ReadDepth::FullBody);
         cache.record("s1", "agent_a", ReadDepth::Overview);
-        assert_eq!(cache.get("s1", "agent_a"), depth_ordinal(ReadDepth::FullBody));
+        assert_eq!(
+            cache.get("s1", "agent_a"),
+            depth_ordinal(ReadDepth::FullBody)
+        );
     }
 
     #[test]
     fn cache_get_defaults_to_unseen_for_untracked() {
         let cache = DepthOrdinalCache::new();
-        assert_eq!(cache.get("nope", "agent_a"), depth_ordinal(ReadDepth::Unseen));
+        assert_eq!(
+            cache.get("nope", "agent_a"),
+            depth_ordinal(ReadDepth::Unseen)
+        );
     }
 }

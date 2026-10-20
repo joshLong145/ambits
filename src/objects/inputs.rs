@@ -88,16 +88,28 @@ pub struct Environment {
 /// In a repository, the dirty files are the tracked files git reports
 /// changed plus the untracked files the scan picked up. Outside one — or
 /// before the first commit — every scanned file is dirty (§7).
-pub fn environment(project_root: &Path, tree: &ProjectTree, ignore: &SyncIgnore) -> Result<Environment> {
+pub fn environment(
+    project_root: &Path,
+    tree: &ProjectTree,
+    ignore: &SyncIgnore,
+) -> Result<Environment> {
     // Scanned files by normalized path, keeping the raw path to open them by
     // (git on Linux hands back names in whatever form they were created).
     let scanned: std::collections::HashMap<String, std::path::PathBuf> = tree
         .files
         .iter()
-        .map(|f| (normalize_path(&f.file_path.to_string_lossy()), f.file_path.clone()))
+        .map(|f| {
+            (
+                normalize_path(&f.file_path.to_string_lossy()),
+                f.file_path.clone(),
+            )
+        })
         .collect();
     let repo = Repo::discover(project_root);
-    let status = repo.as_ref().filter(|r| r.head.is_some()).and_then(Repo::status);
+    let status = repo
+        .as_ref()
+        .filter(|r| r.head.is_some())
+        .and_then(Repo::status);
 
     let mut candidates: Vec<(String, std::path::PathBuf)> = match &status {
         Some(entries) => entries
@@ -112,8 +124,14 @@ pub fn environment(project_root: &Path, tree: &ProjectTree, ignore: &SyncIgnore)
     candidates.sort();
     candidates.dedup_by(|a, b| a.0 == b.0);
 
-    let dirty = candidates.into_iter().map(|(path, raw)| (path, fingerprint(&project_root.join(raw)))).collect();
-    Ok(Environment { git: repo.and_then(|r| r.head), dirty })
+    let dirty = candidates
+        .into_iter()
+        .map(|(path, raw)| (path, fingerprint(&project_root.join(raw))))
+        .collect();
+    Ok(Environment {
+        git: repo.and_then(|r| r.head),
+        dirty,
+    })
 }
 
 /// BLAKE3 of a file's raw bytes (§7): `"deleted"` when it is gone, and

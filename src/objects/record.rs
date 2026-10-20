@@ -33,7 +33,10 @@ pub fn read_prefix(project_root: &Path, session: &str) -> Result<JournalPrefix> 
     for path in journal::session_shard_paths(&dir, session) {
         let mut bytes = std::fs::read(&path)?;
         bytes.truncate(bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1));
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         shards.push((path, name, bytes));
     }
 
@@ -42,7 +45,10 @@ pub fn read_prefix(project_root: &Path, session: &str) -> Result<JournalPrefix> 
     // is last-hash-wins, so order matters.
     let mut contents = JournalContents::default();
     for (path, _, bytes) in &shards {
-        journal::merge_shard(&mut contents, journal::fold_journal_text(path, &String::from_utf8_lossy(bytes)));
+        journal::merge_shard(
+            &mut contents,
+            journal::fold_journal_text(path, &String::from_utf8_lossy(bytes)),
+        );
     }
 
     // Digest in name order, the order §6.2 specifies.
@@ -56,7 +62,10 @@ pub fn read_prefix(project_root: &Path, session: &str) -> Result<JournalPrefix> 
             hasher.update(part);
         }
     }
-    Ok(JournalPrefix { digest: *hasher.finalize().as_bytes(), contents })
+    Ok(JournalPrefix {
+        digest: *hasher.finalize().as_bytes(),
+        contents,
+    })
 }
 
 /// What [`write_records`] stored.
@@ -71,14 +80,27 @@ pub struct RecordStats {
 /// Store the `coverage` and `writes` objects for `contents`: the fold's
 /// result, sorted, with anything in an ignored file left out (§4). Neither
 /// carries `history` records or an origin (§5.1).
-pub fn write_records(store: &Store, session: &str, contents: &JournalContents, ignore: &SyncIgnore) -> Result<RecordStats> {
+pub fn write_records(
+    store: &Store,
+    session: &str,
+    contents: &JournalContents,
+    ignore: &SyncIgnore,
+) -> Result<RecordStats> {
     let mut reads: Vec<Value> = Vec::new();
     // v1 journals carried no attribution; the session is the reader, as in
     // `App::rehydrate_from_journal`.
     let attributed: Vec<(&str, &str, &[u8; 32], _)> = if contents.agent_reads.is_empty() {
-        contents.reads.iter().map(|(id, (h, d))| (id.as_str(), session, h, *d)).collect()
+        contents
+            .reads
+            .iter()
+            .map(|(id, (h, d))| (id.as_str(), session, h, *d))
+            .collect()
     } else {
-        contents.agent_reads.iter().map(|((id, agent), (h, d))| (id.as_str(), agent.as_str(), h, *d)).collect()
+        contents
+            .agent_reads
+            .iter()
+            .map(|((id, agent), (h, d))| (id.as_str(), agent.as_str(), h, *d))
+            .collect()
     };
     for (id, agent, hash, depth) in attributed {
         // Normalized before matching, or `secret\k.rs` escapes `secret/`.
@@ -94,7 +116,10 @@ pub fn write_records(store: &Store, session: &str, contents: &JournalContents, i
     for record in contents.writes.values() {
         if !ignore.is_ignored(&super::normalize_path(&record.file)) {
             // Where a record came from is this machine's business.
-            let record = crate::writes::WriteRecord { origin: None, ..record.clone() };
+            let record = crate::writes::WriteRecord {
+                origin: None,
+                ..record.clone()
+            };
             writes.push(serde_json::to_value(&record)?);
         }
     }
@@ -112,7 +137,10 @@ pub fn write_records(store: &Store, session: &str, contents: &JournalContents, i
 /// Sort by canonical bytes, so equal sets give equal objects whatever order
 /// the fold produced them in.
 fn sort_canonically(items: &mut Vec<Value>) -> Result<()> {
-    let mut keyed = items.drain(..).map(|v| Ok((canonical::to_bytes(&v)?, v))).collect::<Result<Vec<_>>>()?;
+    let mut keyed = items
+        .drain(..)
+        .map(|v| Ok((canonical::to_bytes(&v)?, v)))
+        .collect::<Result<Vec<_>>>()?;
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
     items.extend(keyed.into_iter().map(|(_, v)| v));
     Ok(())
@@ -129,7 +157,11 @@ mod tests {
     fn journal(root: &Path, shard: &str, lines: &str) {
         let dir = journal::journal_dir(root);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(shard)).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(shard))
+            .unwrap();
         f.write_all(lines.as_bytes()).unwrap();
     }
 
@@ -168,7 +200,11 @@ mod tests {
     #[test]
     fn ignore_matching_sees_normalized_paths() {
         let dir = tempfile::tempdir().unwrap();
-        journal(dir.path(), "s.ndjson", &format!("{}\n", READ_B.replace("secret/k.rs", "secret\\\\k.rs")));
+        journal(
+            dir.path(),
+            "s.ndjson",
+            &format!("{}\n", READ_B.replace("secret/k.rs", "secret\\\\k.rs")),
+        );
         let prefix = read_prefix(dir.path(), "s").unwrap();
         let ignore = SyncIgnore::new(&crate::ingest::tool_config::SyncConfig {
             ignore: Some(vec!["secret/".into()]),
@@ -184,7 +220,10 @@ mod tests {
     #[test]
     fn shards_fold_primary_first_like_the_tui() {
         let dir = tempfile::tempdir().unwrap();
-        let newer = READ_A.replace("\"h\":\"b3:0000000000000000000000000000000000000000000000000000000000000000\"", "\"h\":\"b3:1111111111111111111111111111111111111111111111111111111111111111\"");
+        let newer = READ_A.replace(
+            "\"h\":\"b3:0000000000000000000000000000000000000000000000000000000000000000\"",
+            "\"h\":\"b3:1111111111111111111111111111111111111111111111111111111111111111\"",
+        );
         journal(dir.path(), "s.ndjson", &format!("{READ_A}\n"));
         journal(dir.path(), "s.find.ndjson", &format!("{newer}\n"));
         let prefix = read_prefix(dir.path(), "s").unwrap();
@@ -206,7 +245,10 @@ mod tests {
         .unwrap();
         let stats = write_records(&store, "s", &prefix.contents, &ignore).unwrap();
         assert_eq!(stats.reads, 1);
-        let coverage = store.get(&stats.coverage, Kind::Coverage).unwrap().to_string();
+        let coverage = store
+            .get(&stats.coverage, Kind::Coverage)
+            .unwrap()
+            .to_string();
         assert!(!coverage.contains("secret"), "{coverage}");
     }
 }

@@ -102,8 +102,8 @@ fn parse_raw_pickle(value: &Value) -> Result<Vec<FileSymbols>> {
         if items.len() < 2 {
             continue;
         }
-        let symbol_list =
-            as_list(&items[1]).ok_or_else(|| eyre!("Symbol list not an array for {file_path_str}"))?;
+        let symbol_list = as_list(&items[1])
+            .ok_or_else(|| eyre!("Symbol list not an array for {file_path_str}"))?;
 
         let path_prefix = file_path.to_string_lossy();
         let file_path_arc = std::sync::Arc::new(file_path.clone());
@@ -179,9 +179,7 @@ fn convert_symbol(
         .ok_or_else(|| eyre!("Symbol missing 'name'"))?
         .to_string();
 
-    let kind_int = dict_get(val, "kind")
-        .and_then(as_i64)
-        .unwrap_or(12); // default to Function
+    let kind_int = dict_get(val, "kind").and_then(as_i64).unwrap_or(12); // default to Function
     let (category, label) = lsp_kind_to_category_and_label(kind_int);
 
     let (start_line, start_char, end_line, end_char) = extract_range(val);
@@ -243,12 +241,18 @@ fn extract_range(val: &Value) -> (usize, usize, usize, usize) {
     let start = range.and_then(|r| dict_get(r, "start"));
     let end = range.and_then(|r| dict_get(r, "end"));
 
-    let start_line = start.and_then(|s| dict_get(s, "line")).and_then(as_i64).unwrap_or(0) as usize;
+    let start_line = start
+        .and_then(|s| dict_get(s, "line"))
+        .and_then(as_i64)
+        .unwrap_or(0) as usize;
     let start_char = start
         .and_then(|s| dict_get(s, "character"))
         .and_then(as_i64)
         .unwrap_or(0) as usize;
-    let end_line = end.and_then(|e| dict_get(e, "line")).and_then(as_i64).unwrap_or(0) as usize;
+    let end_line = end
+        .and_then(|e| dict_get(e, "line"))
+        .and_then(as_i64)
+        .unwrap_or(0) as usize;
     let end_char = end
         .and_then(|e| dict_get(e, "character"))
         .and_then(as_i64)

@@ -49,8 +49,11 @@ fn fixture() -> tempfile::TempDir {
     let filler = dir.path().join("filler");
     std::fs::create_dir_all(&filler).unwrap();
     for i in 0..FILLER_FILES {
-        std::fs::write(filler.join(format!("padding_file_with_a_long_name_{i:05}.txt")), "x\n")
-            .unwrap();
+        std::fs::write(
+            filler.join(format!("padding_file_with_a_long_name_{i:05}.txt")),
+            "x\n",
+        )
+        .unwrap();
     }
     dir
 }
@@ -72,7 +75,9 @@ fn ambits(root: &Path, args: &[&str]) -> Command {
 fn code(status: std::process::ExitStatus) -> i32 {
     // `None` means killed by a signal — an abort is exactly what these tests
     // exist to catch, so report it rather than unwrap.
-    status.code().unwrap_or_else(|| panic!("terminated by a signal: {status:?}"))
+    status
+        .code()
+        .unwrap_or_else(|| panic!("terminated by a signal: {status:?}"))
 }
 
 /// Run every case at once. Each is its own process, so a test costs its
@@ -103,7 +108,10 @@ fn run_stdout_closed(root: &Path, args: &[&str]) -> (i32, String) {
         .unwrap();
     drop(child.stdout.take());
     let out = child.wait_with_output().unwrap();
-    (code(out.status), String::from_utf8_lossy(&out.stderr).into_owned())
+    (
+        code(out.status),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 /// stderr into a pipe nobody reads, stdout discarded. Dropped straight after
@@ -131,7 +139,10 @@ const CASES: &[(&[&str], i32)] = &[
     (&["rg", LIMIT, "callee"], 0),
     (&["rg", LIMIT, "--json", "callee"], 0),
     (&["rg", "-l", LIMIT, "."], 0),
-    (&["rg", "--files-without-match", "absent_from_every_file"], 1),
+    (
+        &["rg", "--files-without-match", "absent_from_every_file"],
+        1,
+    ),
     (&["grep", LIMIT, "callee"], 0),
     (&["grep", "-L", "absent_from_every_file"], 1),
     (&["callers", "callee"], 0),
@@ -153,8 +164,14 @@ fn a_closed_stdout_ends_quietly_with_the_same_exit_code() {
         );
 
         let (code, stderr) = run_stdout_closed(root, args);
-        assert_eq!(code, expected, "ambits {args:?} into a closed pipe, stderr:\n{stderr}");
-        assert!(stderr.is_empty(), "ambits {args:?}: expected nothing on stderr, got:\n{stderr}");
+        assert_eq!(
+            code, expected,
+            "ambits {args:?} into a closed pipe, stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.is_empty(),
+            "ambits {args:?}: expected nothing on stderr, got:\n{stderr}"
+        );
     });
 }
 

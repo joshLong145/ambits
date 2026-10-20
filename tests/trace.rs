@@ -23,7 +23,11 @@ fn tool_result(at: &str, id: &str, detail: Value) -> Value {
 
 fn write_log(path: &Path, lines: &[Value]) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+    std::fs::write(
+        path,
+        lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+    )
+    .unwrap();
 }
 
 /// A project with `src/a.rs`, and a session that reads it, then delegates
@@ -38,18 +42,42 @@ fn project() -> (tempfile::TempDir, std::path::PathBuf) {
     write_log(
         &logs.join(format!("{SESSION}.jsonl")),
         &[
-            tool_use(SESSION, "2026-09-27T10:00:00.000Z", "toolu_r", "Read", json!({"file_path": file})),
+            tool_use(
+                SESSION,
+                "2026-09-27T10:00:00.000Z",
+                "toolu_r",
+                "Read",
+                json!({"file_path": file}),
+            ),
             tool_result("2026-09-27T10:00:00.250Z", "toolu_r", json!({})),
-            tool_use(SESSION, "2026-09-27T10:00:01.000Z", "toolu_d", "Agent", json!({"description": "look around", "prompt": "p"})),
-            tool_result("2026-09-27T10:00:01.100Z", "toolu_d", json!({"agentId": AGENT, "status": "async_launched"})),
+            tool_use(
+                SESSION,
+                "2026-09-27T10:00:01.000Z",
+                "toolu_d",
+                "Agent",
+                json!({"description": "look around", "prompt": "p"}),
+            ),
+            tool_result(
+                "2026-09-27T10:00:01.100Z",
+                "toolu_d",
+                json!({"agentId": AGENT, "status": "async_launched"}),
+            ),
             json!({"type": "queue-operation", "operation": "enqueue", "sessionId": SESSION, "timestamp": "2026-09-27T10:00:30.000Z",
                    "content": format!("<task-notification>\n<task-id>{AGENT}</task-id>\n<tool-use-id>toolu_d</tool-use-id>\n<status>completed</status>\n</task-notification>")}),
         ],
     );
     write_log(
-        &logs.join(SESSION).join(format!("subagents/agent-{AGENT}.jsonl")),
+        &logs
+            .join(SESSION)
+            .join(format!("subagents/agent-{AGENT}.jsonl")),
         &[
-            tool_use(AGENT, "2026-09-27T10:00:02.000Z", "toolu_x", "Read", json!({"file_path": file})),
+            tool_use(
+                AGENT,
+                "2026-09-27T10:00:02.000Z",
+                "toolu_x",
+                "Read",
+                json!({"file_path": file}),
+            ),
             tool_result("2026-09-27T10:00:02.500Z", "toolu_x", json!({})),
         ],
     );
@@ -58,12 +86,27 @@ fn project() -> (tempfile::TempDir, std::path::PathBuf) {
 
 fn trace(root: &Path, format: &str) -> Value {
     let logs = root.join("logs").to_string_lossy().into_owned();
-    let out = run_ambits(root, &["--log-dir", &logs, "--session", SESSION, "trace", "--format", format]);
+    let out = run_ambits(
+        root,
+        &[
+            "--log-dir",
+            &logs,
+            "--session",
+            SESSION,
+            "trace",
+            "--format",
+            format,
+        ],
+    );
     serde_json::from_str(&out).expect("JSON output")
 }
 
 fn attr<'a>(span: &'a Value, key: &str) -> Option<&'a Value> {
-    span["attributes"].as_array()?.iter().find(|a| a["key"] == key).map(|a| &a["value"])
+    span["attributes"]
+        .as_array()?
+        .iter()
+        .find(|a| a["key"] == key)
+        .map(|a| &a["value"])
 }
 
 /// One trace: a session root, main's read and the delegation under it, the
@@ -72,19 +115,29 @@ fn attr<'a>(span: &'a Value, key: &str) -> Option<&'a Value> {
 fn otlp_nests_the_subagent_under_its_delegation() {
     let (_dir, root) = project();
     let out = trace(&root, "otlp");
-    let spans = out["resourceSpans"][0]["scopeSpans"][0]["spans"].as_array().unwrap();
+    let spans = out["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap();
     assert_eq!(spans.len(), 4, "{spans:#?}");
     let named = |pred: &dyn Fn(&Value) -> bool| spans.iter().find(|s| pred(s)).unwrap();
     let session = named(&|s| s.get("parentSpanId").is_none());
-    let delegation = named(&|s| attr(s, "gen_ai.operation.name") == Some(&json!({"stringValue": "invoke_agent"})));
+    let delegation = named(&|s| {
+        attr(s, "gen_ai.operation.name") == Some(&json!({"stringValue": "invoke_agent"}))
+    });
     let sub_read = named(&|s| attr(s, "gen_ai.agent.id") == Some(&json!({"stringValue": AGENT})));
 
     assert_eq!(delegation["parentSpanId"], session["spanId"]);
     assert_eq!(sub_read["parentSpanId"], delegation["spanId"]);
     assert!(spans.iter().all(|s| s["traceId"] == session["traceId"]));
-    assert_eq!(attr(sub_read, "code.file.path"), Some(&json!({"stringValue": "src/a.rs"})));
+    assert_eq!(
+        attr(sub_read, "code.file.path"),
+        Some(&json!({"stringValue": "src/a.rs"}))
+    );
     let nanos = |s: &Value, k: &str| s[k].as_str().unwrap().parse::<u64>().unwrap();
-    assert_eq!(nanos(delegation, "endTimeUnixNano") - nanos(delegation, "startTimeUnixNano"), 29_000_000_000);
+    assert_eq!(
+        nanos(delegation, "endTimeUnixNano") - nanos(delegation, "startTimeUnixNano"),
+        29_000_000_000
+    );
 }
 
 /// Chrome: one thread per agent, complete events, and a flow arrow from the
@@ -94,8 +147,11 @@ fn chrome_puts_each_agent_on_its_own_thread() {
     let (_dir, root) = project();
     let out = trace(&root, "chrome");
     let events = out["traceEvents"].as_array().unwrap();
-    let threads: Vec<&str> =
-        events.iter().filter(|e| e["name"] == "thread_name").map(|e| e["args"]["name"].as_str().unwrap()).collect();
+    let threads: Vec<&str> = events
+        .iter()
+        .filter(|e| e["name"] == "thread_name")
+        .map(|e| e["args"]["name"].as_str().unwrap())
+        .collect();
     assert_eq!(threads.len(), 2, "{threads:?}");
     assert!(threads[1].contains("look around"), "{threads:?}");
     assert_eq!(events.iter().filter(|e| e["ph"] == "X").count(), 3);
@@ -108,12 +164,33 @@ fn chrome_puts_each_agent_on_its_own_thread() {
 fn the_agent_filter_keeps_one_agents_spans() {
     let (_dir, root) = project();
     let logs = root.join("logs").to_string_lossy().into_owned();
-    let out = run_ambits(&root, &["--log-dir", &logs, "--session", SESSION, "--agent", AGENT, "trace"]);
+    let out = run_ambits(
+        &root,
+        &[
+            "--log-dir",
+            &logs,
+            "--session",
+            SESSION,
+            "--agent",
+            AGENT,
+            "trace",
+        ],
+    );
     let out: Value = serde_json::from_str(&out).unwrap();
-    let spans = out["resourceSpans"][0]["scopeSpans"][0]["spans"].as_array().unwrap();
-    let children: Vec<&Value> = spans.iter().filter(|s| s.get("parentSpanId").is_some()).collect();
+    let spans = out["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap();
+    let children: Vec<&Value> = spans
+        .iter()
+        .filter(|s| s.get("parentSpanId").is_some())
+        .collect();
     assert_eq!(children.len(), 1, "{spans:#?}");
-    assert!(children.iter().all(|s| attr(s, "gen_ai.agent.id") == Some(&json!({"stringValue": AGENT}))), "{spans:#?}");
+    assert!(
+        children
+            .iter()
+            .all(|s| attr(s, "gen_ai.agent.id") == Some(&json!({"stringValue": AGENT}))),
+        "{spans:#?}"
+    );
 }
 
 /// A report's delegation ends where its trace's does: with its subagent's
@@ -123,20 +200,49 @@ fn a_report_delegation_ends_with_its_subagents_last_span() {
     let (_dir, root) = project();
     let file = root.join("src/a.rs").to_string_lossy().into_owned();
     write_log(
-        &root.join("logs").join(SESSION).join(format!("subagents/agent-{AGENT}.jsonl")),
+        &root
+            .join("logs")
+            .join(SESSION)
+            .join(format!("subagents/agent-{AGENT}.jsonl")),
         &[
-            tool_use(AGENT, "2026-09-27T10:00:31.000Z", "toolu_x", "Read", json!({"file_path": file})),
+            tool_use(
+                AGENT,
+                "2026-09-27T10:00:31.000Z",
+                "toolu_x",
+                "Read",
+                json!({"file_path": file}),
+            ),
             tool_result("2026-09-27T10:00:40.000Z", "toolu_x", json!({})),
         ],
     );
     let logs = root.join("logs").to_string_lossy().into_owned();
-    let out: Value = serde_json::from_str(&run_ambits(&root, &["--log-dir", &logs, "--session", SESSION, "report"])).unwrap();
-    let delegation = out["spans"].as_array().unwrap().iter().find(|s| s["kind"] == "delegate").unwrap();
-    assert_eq!(delegation["end_ms"].as_u64().unwrap() - delegation["start_ms"].as_u64().unwrap(), 39_000);
+    let out: Value = serde_json::from_str(&run_ambits(
+        &root,
+        &["--log-dir", &logs, "--session", SESSION, "report"],
+    ))
+    .unwrap();
+    let delegation = out["spans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["kind"] == "delegate")
+        .unwrap();
+    assert_eq!(
+        delegation["end_ms"].as_u64().unwrap() - delegation["start_ms"].as_u64().unwrap(),
+        39_000
+    );
 
     let otlp = trace(&root, "otlp");
-    let spans = otlp["resourceSpans"][0]["scopeSpans"][0]["spans"].as_array().unwrap();
-    let traced = spans.iter().find(|s| attr(s, "ambits.subagent.id").is_some()).unwrap();
+    let spans = otlp["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap();
+    let traced = spans
+        .iter()
+        .find(|s| attr(s, "ambits.subagent.id").is_some())
+        .unwrap();
     let nanos = |k: &str| traced[k].as_str().unwrap().parse::<u64>().unwrap();
-    assert_eq!(nanos("endTimeUnixNano") - nanos("startTimeUnixNano"), 39_000_000_000);
+    assert_eq!(
+        nanos("endTimeUnixNano") - nanos("startTimeUnixNano"),
+        39_000_000_000
+    );
 }

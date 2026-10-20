@@ -81,7 +81,9 @@ fn write_string(s: &str, out: &mut Vec<u8>) {
             '\n' => out.extend_from_slice(b"\\n"),
             '\r' => out.extend_from_slice(b"\\r"),
             '\t' => out.extend_from_slice(b"\\t"),
-            c if (c as u32) < 0x20 => out.extend_from_slice(format!("\\u{:04x}", c as u32).as_bytes()),
+            c if (c as u32) < 0x20 => {
+                out.extend_from_slice(format!("\\u{:04x}", c as u32).as_bytes())
+            }
             c => {
                 let mut buf = [0u8; 4];
                 out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
@@ -102,7 +104,10 @@ mod tests {
 
     #[test]
     fn keys_sort_and_whitespace_goes() {
-        assert_eq!(canon(json!({"b": 1, "a": [true, null], "c": {"z": 0, "y": -2}})), r#"{"a":[true,null],"b":1,"c":{"y":-2,"z":0}}"#);
+        assert_eq!(
+            canon(json!({"b": 1, "a": [true, null], "c": {"z": 0, "y": -2}})),
+            r#"{"a":[true,null],"b":1,"c":{"y":-2,"z":0}}"#
+        );
     }
 
     /// RFC 8785 orders keys by UTF-16 code units, which differs from UTF-8
@@ -111,7 +116,10 @@ mod tests {
     fn keys_sort_by_utf16_code_units() {
         // U+FF61 is one unit (0xFF61); U+1F600 is a surrogate pair (0xD83D …),
         // so it sorts first in UTF-16 though last in UTF-8.
-        assert_eq!(canon(json!({"\u{ff61}": 1, "\u{1f600}": 2})), "{\"\u{1f600}\":2,\"\u{ff61}\":1}");
+        assert_eq!(
+            canon(json!({"\u{ff61}": 1, "\u{1f600}": 2})),
+            "{\"\u{1f600}\":2,\"\u{ff61}\":1}"
+        );
     }
 
     #[test]

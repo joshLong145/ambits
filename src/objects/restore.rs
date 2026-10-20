@@ -80,20 +80,33 @@ impl CoverageRead {
     /// This read as a journal record, at `symbol` — its address now, which
     /// a move may have changed.
     pub(crate) fn record_at(&self, symbol: &str) -> Record {
-        Record::Read { symbol_id: symbol.to_string(), hash: journal::encode_hash(&self.hash), depth: self.depth.into(), agent: Some(self.agent.clone()) }
+        Record::Read {
+            symbol_id: symbol.to_string(),
+            hash: journal::encode_hash(&self.hash),
+            depth: self.depth.into(),
+            agent: Some(self.agent.clone()),
+        }
     }
 }
 
 pub(crate) fn coverage_reads(payload: &Value) -> Result<Vec<CoverageRead>> {
-    let entries = payload.get("reads").and_then(Value::as_array).ok_or_else(|| eyre!("coverage object has no reads"))?;
+    let entries = payload
+        .get("reads")
+        .and_then(Value::as_array)
+        .ok_or_else(|| eyre!("coverage object has no reads"))?;
     entries
         .iter()
         .map(|e| {
-            let field = |i: usize| e.get(i).and_then(Value::as_str).ok_or_else(|| eyre!("malformed coverage entry {e}"));
+            let field = |i: usize| {
+                e.get(i)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| eyre!("malformed coverage entry {e}"))
+            };
             let depth: DepthDto = serde_json::from_value(e.get(2).cloned().unwrap_or_default())?;
             Ok(CoverageRead {
                 symbol: field(0)?.to_string(),
-                hash: journal::decode_hash(field(1)?).ok_or_else(|| eyre!("malformed hash in {e}"))?,
+                hash: journal::decode_hash(field(1)?)
+                    .ok_or_else(|| eyre!("malformed hash in {e}"))?,
                 depth: depth.into(),
                 agent: field(3)?.to_string(),
             })
@@ -103,9 +116,21 @@ pub(crate) fn coverage_reads(payload: &Value) -> Result<Vec<CoverageRead>> {
 
 /// A new session id: a random (version 4) UUID, as Claude Code mints them.
 pub fn mint_session_id() -> String {
-    let hex = format!("{}{}", super::store::random_token(), super::store::random_token());
+    let hex = format!(
+        "{}{}",
+        super::store::random_token(),
+        super::store::random_token()
+    );
     let variant = ["8", "9", "a", "b"][usize::from_str_radix(&hex[16..17], 16).unwrap_or(0) % 4];
-    format!("{}-{}-4{}-{}{}-{}", &hex[..8], &hex[8..12], &hex[13..16], variant, &hex[17..20], &hex[20..32])
+    format!(
+        "{}-{}-4{}-{}{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[13..16],
+        variant,
+        &hex[17..20],
+        &hex[20..32]
+    )
 }
 
 /// Restore `req.reference` into a session (§12.1).
@@ -126,7 +151,8 @@ pub fn restore(req: &Request<'_>) -> Result<Report> {
     // 2. Classify the snapshot's reads against the project as it is now.
     let reads = coverage_reads(&store.get(&snap.coverage, Kind::Coverage)?)?;
     let verdicts = classify_reads(&reads, req.tree);
-    let dirty: std::collections::HashSet<&str> = snap.inputs.dirty.iter().map(|(p, _)| p.as_str()).collect();
+    let dirty: std::collections::HashSet<&str> =
+        snap.inputs.dirty.iter().map(|(p, _)| p.as_str()).collect();
 
     // 3. Append what the target does not already have, to its own shard.
     let dir = journal::journal_dir(req.project_root);
@@ -150,13 +176,23 @@ pub fn restore(req: &Request<'_>) -> Result<Report> {
     }
     let reads_appended = new_records.len();
     let writes = store.get(&snap.writes, Kind::Writes)?;
-    for write in writes.get("writes").and_then(Value::as_array).into_iter().flatten() {
-        let Some(rest) = write.as_object() else { continue };
+    for write in writes
+        .get("writes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(rest) = write.as_object() else {
+            continue;
+        };
         let op = rest.get("op").and_then(Value::as_str).unwrap_or_default();
         if existing.history_writes.contains(op) {
             continue;
         }
-        new_records.push(Record::History { of: "write".into(), rest: rest.clone() });
+        new_records.push(Record::History {
+            of: "write".into(),
+            rest: rest.clone(),
+        });
     }
     let writes_appended = new_records.len() - reads_appended;
 
@@ -171,7 +207,15 @@ pub fn restore(req: &Request<'_>) -> Result<Report> {
         refs::update(&store, &target, current, id, "restore")?;
     }
 
-    Ok(Report { snapshot: id, session, pinned_elsewhere, files, reads_appended, writes_appended, ref_moved })
+    Ok(Report {
+        snapshot: id,
+        session,
+        pinned_elsewhere,
+        files,
+        reads_appended,
+        writes_appended,
+        ref_moved,
+    })
 }
 
 /// Whether a read still holds, and under which id.
@@ -184,10 +228,15 @@ pub(crate) enum Verdict {
 /// hash per symbol, but two agents may have read two versions of one
 /// symbol, so reads are split into layers with at most one hash per symbol
 /// and each layer classified — almost always there is just one.
-pub(crate) fn classify_reads<'a>(reads: &'a [CoverageRead], tree: &ProjectTree) -> HashMap<(&'a str, [u8; 32]), Verdict> {
+pub(crate) fn classify_reads<'a>(
+    reads: &'a [CoverageRead],
+    tree: &ProjectTree,
+) -> HashMap<(&'a str, [u8; 32]), Verdict> {
     let mut layers: Vec<ReadSet> = Vec::new();
     for read in reads {
-        let slot = layers.iter_mut().find(|l| l.get(&read.symbol).is_none_or(|(h, _)| *h == read.hash));
+        let slot = layers
+            .iter_mut()
+            .find(|l| l.get(&read.symbol).is_none_or(|(h, _)| *h == read.hash));
         let layer = match slot {
             Some(layer) => layer,
             None => {
@@ -195,7 +244,9 @@ pub(crate) fn classify_reads<'a>(reads: &'a [CoverageRead], tree: &ProjectTree) 
                 layers.last_mut().expect("just pushed")
             }
         };
-        let entry = layer.entry(read.symbol.clone()).or_insert((read.hash, read.depth));
+        let entry = layer
+            .entry(read.symbol.clone())
+            .or_insert((read.hash, read.depth));
         entry.1 = entry.1.max(read.depth);
     }
 
@@ -208,12 +259,16 @@ pub(crate) fn classify_reads<'a>(reads: &'a [CoverageRead], tree: &ProjectTree) 
             valid.insert(original, r.symbol_id.clone());
         }
         for read in reads {
-            let Some((hash, _)) = layer.get(&read.symbol) else { continue };
+            let Some((hash, _)) = layer.get(&read.symbol) else {
+                continue;
+            };
             if *hash != read.hash {
                 continue;
             }
             let verdict = match valid.get(read.symbol.as_str()) {
-                Some(symbol) => Verdict::Valid { symbol: symbol.clone() },
+                Some(symbol) => Verdict::Valid {
+                    symbol: symbol.clone(),
+                },
                 None => Verdict::Invalid,
             };
             verdicts.insert((read.symbol.as_str(), read.hash), verdict);
@@ -224,9 +279,17 @@ pub(crate) fn classify_reads<'a>(reads: &'a [CoverageRead], tree: &ProjectTree) 
 
 /// Print a restore's report.
 pub fn print_report(out: &mut impl std::io::Write, report: &Report) -> std::io::Result<()> {
-    writeln!(out, "restored snapshot {} into session {}", report.snapshot.short(), report.session)?;
+    writeln!(
+        out,
+        "restored snapshot {} into session {}",
+        report.snapshot.short(),
+        report.session
+    )?;
     if let Some((pinned, head)) = &report.pinned_elsewhere {
-        let short = |c: &Option<String>| c.as_deref().map_or("none".to_string(), |c| c.get(..7).unwrap_or(c).to_string());
+        let short = |c: &Option<String>| {
+            c.as_deref()
+                .map_or("none".to_string(), |c| c.get(..7).unwrap_or(c).to_string())
+        };
         writeln!(
             out,
             "  warning: the snapshot is pinned to {}, but HEAD is {}; nothing was checked out",
@@ -243,7 +306,10 @@ pub fn print_report(out: &mut impl std::io::Write, report: &Report) -> std::io::
             parts.push(format!("{} drifted", r.drifted));
         }
         if r.unverifiable > 0 {
-            parts.push(format!("{} unverifiable here (dirty when snapshotted)", r.unverifiable));
+            parts.push(format!(
+                "{} unverifiable here (dirty when snapshotted)",
+                r.unverifiable
+            ));
         }
         writeln!(out, "  {file}: {}", parts.join(", "))?;
     }
@@ -252,6 +318,10 @@ pub fn print_report(out: &mut impl std::io::Write, report: &Report) -> std::io::
         "  {} read(s) and {} write(s) appended{}",
         report.reads_appended,
         report.writes_appended,
-        if report.ref_moved { "" } else { "; the session already pointed at this snapshot" }
+        if report.ref_moved {
+            ""
+        } else {
+            "; the session already pointed at this snapshot"
+        }
     )
 }

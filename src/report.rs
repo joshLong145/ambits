@@ -111,13 +111,18 @@ impl Phases {
     /// The timeline in `json`, refused when a span ends before it starts or a
     /// lane has no name.
     pub fn parse(json: &str) -> Result<Self> {
-        let phases: Self = serde_json::from_str(json).map_err(|e| color_eyre::eyre::eyre!("not a phases document: {e}"))?;
+        let phases: Self = serde_json::from_str(json)
+            .map_err(|e| color_eyre::eyre::eyre!("not a phases document: {e}"))?;
         for lane in &phases.lanes {
             if lane.name.trim().is_empty() {
                 color_eyre::eyre::bail!("a phases lane has no name");
             }
             if let Some(s) = lane.spans.iter().find(|s| s.end_ms < s.start_ms) {
-                color_eyre::eyre::bail!("phase {:?} in lane {:?} ends before it starts", s.name, lane.name);
+                color_eyre::eyre::bail!(
+                    "phase {:?} in lane {:?} ends before it starts",
+                    s.name,
+                    lane.name
+                );
             }
         }
         Ok(phases)
@@ -207,10 +212,18 @@ pub enum ContentDto {
     /// A write's change. `exact` when the hunks are the tool's own patch,
     /// with line numbers; else what the call asked for. `cut` lines were
     /// left out.
-    Change { exact: bool, cut: usize, hunks: Vec<HunkDto> },
+    Change {
+        exact: bool,
+        cut: usize,
+        hunks: Vec<HunkDto>,
+    },
     /// The text a read returned, its first line numbered `start`; `cut`
     /// lines were left out.
-    Read { start: u32, lines: Vec<String>, cut: usize },
+    Read {
+        start: u32,
+        lines: Vec<String>,
+        cut: usize,
+    },
     /// What any other call returned: a command's output, a search's matches,
     /// a subagent's answer. `cut` lines were left out.
     Output { lines: Vec<String>, cut: usize },
@@ -320,11 +333,26 @@ pub fn content_kind(kind: SpanKind) -> Option<ContentKind> {
 
 /// The report for `inputs`, before any size limit.
 pub fn build(inputs: Inputs<'_>) -> Result<Report> {
-    let Inputs { project_root, session_id, tree, ledger, trace, agents, writes, registry, details, phases } = inputs;
+    let Inputs {
+        project_root,
+        session_id,
+        tree,
+        ledger,
+        trace,
+        agents,
+        writes,
+        registry,
+        details,
+        phases,
+    } = inputs;
 
     let spans = spans(trace, &details, project_root);
-    let span_of_op: HashMap<&str, usize> =
-        trace.spans().iter().enumerate().filter_map(|(i, s)| Some((s.id.as_deref()?, i))).collect();
+    let span_of_op: HashMap<&str, usize> = trace
+        .spans()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| Some((s.id.as_deref()?, i)))
+        .collect();
 
     let mut writes = writes;
     writes.sort_by(|a, b| a.recency().cmp(&b.recency()));
@@ -333,14 +361,30 @@ pub fn build(inputs: Inputs<'_>) -> Result<Report> {
     let mut write_dtos = Vec::with_capacity(writes.len());
     for w in &writes {
         let now = file_now.entry(w.file.clone()).or_insert_with(|| {
-            crate::objects::read_regular(&project_root.join(&w.file)).map(|bytes| FileContents::read(&w.file, &bytes, registry))
+            crate::objects::read_regular(&project_root.join(&w.file))
+                .map(|bytes| FileContents::read(&w.file, &bytes, registry))
         });
         let (status, symbols) = match now {
             Some(now) => (
                 now.file_status(w),
-                w.syms.iter().map(|(id, _)| WrittenSymbol { id: id.clone(), status: now.symbol_status(id, w) }).collect(),
+                w.syms
+                    .iter()
+                    .map(|(id, _)| WrittenSymbol {
+                        id: id.clone(),
+                        status: now.symbol_status(id, w),
+                    })
+                    .collect(),
             ),
-            None => (Status::Removed, w.syms.iter().map(|(id, _)| WrittenSymbol { id: id.clone(), status: Status::Removed }).collect()),
+            None => (
+                Status::Removed,
+                w.syms
+                    .iter()
+                    .map(|(id, _)| WrittenSymbol {
+                        id: id.clone(),
+                        status: Status::Removed,
+                    })
+                    .collect(),
+            ),
         };
         write_dtos.push(WriteDto {
             op: w.op.clone(),
@@ -366,7 +410,12 @@ pub fn build(inputs: Inputs<'_>) -> Result<Report> {
         }
     }
 
-    let mut totals = Totals { files: tree.files.len(), spans: spans.len(), writes: write_dtos.len(), ..Totals::default() };
+    let mut totals = Totals {
+        files: tree.files.len(),
+        spans: spans.len(),
+        writes: write_dtos.len(),
+        ..Totals::default()
+    };
     let mut files = Vec::with_capacity(tree.files.len());
     for file in &tree.files {
         let path = crate::objects::normalize_path(&file.file_path.to_string_lossy());
@@ -375,7 +424,13 @@ pub fn build(inputs: Inputs<'_>) -> Result<Report> {
             ledger
                 .entries
                 .get(id)
-                .map(|e| e.agent_depths.iter().filter(|(_, d)| d.is_seen()).map(|(a, d)| (a.clone(), DepthDto::from(*d))).collect())
+                .map(|e| {
+                    e.agent_depths
+                        .iter()
+                        .filter(|(_, d)| d.is_seen())
+                        .map(|(a, d)| (a.clone(), DepthDto::from(*d)))
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         let symbols: Vec<SymbolDto> = all
@@ -394,9 +449,13 @@ pub fn build(inputs: Inputs<'_>) -> Result<Report> {
         let symbols_written = symbols.iter().filter(|s| !s.writes.is_empty()).count();
         totals.symbols += symbols.len();
         totals.symbols_read += symbols_read;
-        totals.symbols_read_full += symbols.iter().filter(|s| s.reads.values().any(|d| *d == DepthDto::FullBody)).count();
+        totals.symbols_read_full += symbols
+            .iter()
+            .filter(|s| s.reads.values().any(|d| *d == DepthDto::FullBody))
+            .count();
         totals.symbols_written += symbols_written;
-        let active = symbols_read > 0 || symbols_written > 0 || writes.iter().any(|w| w.file == path);
+        let active =
+            symbols_read > 0 || symbols_written > 0 || writes.iter().any(|w| w.file == path);
         files.push(FileDto {
             path,
             total_lines: file.total_lines,
@@ -410,11 +469,19 @@ pub fn build(inputs: Inputs<'_>) -> Result<Report> {
     let mut agent_list: Vec<Agent> = agents
         .agents
         .values()
-        .map(|a| Agent { id: a.id.clone(), label: a.label.clone(), parent: a.parent_id.clone() })
+        .map(|a| Agent {
+            id: a.id.clone(),
+            label: a.label.clone(),
+            parent: a.parent_id.clone(),
+        })
         .collect();
     for span in trace.spans() {
         if !agent_list.iter().any(|a| a.id == *span.agent) {
-            agent_list.push(Agent { id: span.agent.to_string(), label: span.agent.to_string(), parent: None });
+            agent_list.push(Agent {
+                id: span.agent.to_string(),
+                label: span.agent.to_string(),
+                parent: None,
+            });
         }
     }
     agent_list.sort_by(|a, b| (a.parent.is_some(), &a.id).cmp(&(b.parent.is_some(), &b.id)));
@@ -426,7 +493,10 @@ pub fn build(inputs: Inputs<'_>) -> Result<Report> {
         generated_at: crate::time::now_rfc3339(),
         session_id: session_id.to_string(),
         project: Project {
-            name: project_root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            name: project_root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             head: crate::git::git(project_root, &["rev-parse", "HEAD"])
                 .and_then(|out| String::from_utf8(out).ok())
                 .map(|s| s.trim().to_string())
@@ -451,12 +521,17 @@ fn arg_value(key: &str, value: &str, project_root: &Path) -> String {
     if !PATH_ARGS.contains(&key) {
         return value.to_string();
     }
-    Path::new(value)
-        .strip_prefix(project_root)
-        .map_or_else(|_| value.to_string(), |rel| crate::objects::normalize_path(&rel.to_string_lossy()))
+    Path::new(value).strip_prefix(project_root).map_or_else(
+        |_| value.to_string(),
+        |rel| crate::objects::normalize_path(&rel.to_string_lossy()),
+    )
 }
 
-fn spans(trace: &Trace, details: &HashMap<String, CallDetail>, project_root: &Path) -> Vec<SpanDto> {
+fn spans(
+    trace: &Trace,
+    details: &HashMap<String, CallDetail>,
+    project_root: &Path,
+) -> Vec<SpanDto> {
     let mut parent: HashMap<usize, usize> = HashMap::new();
     let mut end: HashMap<usize, u64> = HashMap::new();
     fn walk(node: &Node, parent: &mut HashMap<usize, usize>, end: &mut HashMap<usize, u64>) {
@@ -497,16 +572,34 @@ fn spans(trace: &Trace, details: &HashMap<String, CallDetail>, project_root: &Pa
                 SpanKind::Read(d) => Some(d.into()),
                 _ => None,
             },
-            read: s.read.iter().map(|(id, d)| (id.clone(), DepthDto::from(*d))).collect(),
+            read: s
+                .read
+                .iter()
+                .map(|(id, d)| (id.clone(), DepthDto::from(*d)))
+                .collect(),
             read_count: s.read.len(),
             child_agent: s.child_agent.as_deref().map(str::to_string),
             args: s
                 .id
                 .as_deref()
                 .and_then(|id| details.get(id))
-                .map(|d| d.args.iter().map(|a| ArgDto { key: a.key.clone(), value: arg_value(&a.key, &a.value, project_root), bulk: a.bulk }).collect())
+                .map(|d| {
+                    d.args
+                        .iter()
+                        .map(|a| ArgDto {
+                            key: a.key.clone(),
+                            value: arg_value(&a.key, &a.value, project_root),
+                            bulk: a.bulk,
+                        })
+                        .collect()
+                })
                 .unwrap_or_default(),
-            content: s.id.as_deref().and_then(|id| details.get(id)).and_then(|d| d.content.as_ref()).and_then(content),
+            content: s
+                .id
+                .as_deref()
+                .and_then(|id| details.get(id))
+                .and_then(|d| d.content.as_ref())
+                .and_then(content),
         })
         .collect()
 }
@@ -533,8 +626,15 @@ fn content(c: &CallContent) -> Option<ContentDto> {
                 })
                 .collect(),
         }),
-        CallContent::Read { start, lines, cut } => Some(ContentDto::Read { start: *start, lines: lines.clone(), cut: *cut }),
-        CallContent::Output { lines, cut } => Some(ContentDto::Output { lines: lines.clone(), cut: *cut }),
+        CallContent::Read { start, lines, cut } => Some(ContentDto::Read {
+            start: *start,
+            lines: lines.clone(),
+            cut: *cut,
+        }),
+        CallContent::Output { lines, cut } => Some(ContentDto::Output {
+            lines: lines.clone(),
+            cut: *cut,
+        }),
     }
 }
 
@@ -542,9 +642,17 @@ fn instant(i: &crate::trace::Instant) -> InstantDto {
     let (kind, sha, subject) = match &i.kind {
         InstantKind::Compaction => ("compaction", None, None),
         InstantKind::Snapshot(id) => ("snapshot", Some(id.clone()), None),
-        InstantKind::Commit { sha, subject } => ("commit", Some(sha.clone()), Some(subject.clone())),
+        InstantKind::Commit { sha, subject } => {
+            ("commit", Some(sha.clone()), Some(subject.clone()))
+        }
     };
-    InstantDto { t_ms: i.t, agent: i.agent.as_deref().map(str::to_string), kind, sha, subject }
+    InstantDto {
+        t_ms: i.t,
+        agent: i.agent.as_deref().map(str::to_string),
+        kind,
+        sha,
+        subject,
+    }
 }
 
 /// Cut `report` until its JSON fits in `max_bytes`, recording each cut in
@@ -559,20 +667,47 @@ fn instant(i: &crate::trace::Instant) -> InstantDto {
 pub fn fit(report: &mut Report, max_bytes: usize) -> Result<()> {
     type Cut = fn(&mut Report);
     let cuts: [(&'static str, Cut); 8] = [
-        ("unwritten_file_symbols", |r| r.files.iter_mut().filter(|f| f.symbols_written == 0).for_each(|f| f.symbols.clear())),
-        ("read_text", |r| r.spans.iter_mut().filter(|s| matches!(s.content, Some(ContentDto::Read { .. }))).for_each(|s| s.content = None)),
-        ("output", |r| r.spans.iter_mut().filter(|s| matches!(s.content, Some(ContentDto::Output { .. }))).for_each(|s| s.content = None)),
-        ("span_reads", |r| r.spans.iter_mut().for_each(|s| s.read.clear())),
-        ("arguments", |r| r.spans.iter_mut().for_each(|s| s.args.clear())),
+        ("unwritten_file_symbols", |r| {
+            r.files
+                .iter_mut()
+                .filter(|f| f.symbols_written == 0)
+                .for_each(|f| f.symbols.clear())
+        }),
+        ("read_text", |r| {
+            r.spans
+                .iter_mut()
+                .filter(|s| matches!(s.content, Some(ContentDto::Read { .. })))
+                .for_each(|s| s.content = None)
+        }),
+        ("output", |r| {
+            r.spans
+                .iter_mut()
+                .filter(|s| matches!(s.content, Some(ContentDto::Output { .. })))
+                .for_each(|s| s.content = None)
+        }),
+        ("span_reads", |r| {
+            r.spans.iter_mut().for_each(|s| s.read.clear())
+        }),
+        ("arguments", |r| {
+            r.spans.iter_mut().for_each(|s| s.args.clear())
+        }),
         ("phase_attrs", |r| {
             if let Some(p) = r.phases.as_mut() {
-                p.lanes.iter_mut().flat_map(|l| l.spans.iter_mut()).for_each(|s| s.attrs.clear());
+                p.lanes
+                    .iter_mut()
+                    .flat_map(|l| l.spans.iter_mut())
+                    .for_each(|s| s.attrs.clear());
                 p.markers.iter_mut().for_each(|m| m.attrs.clear());
             }
         }),
-        ("diffs", |r| r.spans.iter_mut().for_each(|s| s.content = None)),
+        ("diffs", |r| {
+            r.spans.iter_mut().for_each(|s| s.content = None)
+        }),
         // Ids stay as they are, so `parent` and a write's `span` still resolve.
-        ("other_spans", |r| r.spans.retain(|s| matches!(s.kind, "prompt" | "read" | "write" | "delegate"))),
+        ("other_spans", |r| {
+            r.spans
+                .retain(|s| matches!(s.kind, "prompt" | "read" | "write" | "delegate"))
+        }),
     ];
     let size = |r: &Report| serde_json::to_vec(r).map(|v| v.len());
     for (name, cut) in cuts {
@@ -590,10 +725,16 @@ const VIEW: &str = include_str!("report_view.html");
 /// The report page for `json`, a document `report` printed: one HTML file
 /// that loads nothing and runs only its own script, the document embedded.
 pub fn render_html(json: &str) -> Result<String> {
-    let value: serde_json::Value = serde_json::from_str(json).map_err(|e| color_eyre::eyre::eyre!("not a JSON report: {e}"))?;
-    match value.get("schema_version").and_then(serde_json::Value::as_u64) {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| color_eyre::eyre::eyre!("not a JSON report: {e}"))?;
+    match value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+    {
         Some(v) if v == u64::from(SCHEMA_VERSION) => {}
-        other => color_eyre::eyre::bail!("not an ambits report of schema version {SCHEMA_VERSION} (found {other:?})"),
+        other => color_eyre::eyre::bail!(
+            "not an ambits report of schema version {SCHEMA_VERSION} (found {other:?})"
+        ),
     }
     let csp = format!(
         "default-src 'none'; script-src '{}'; style-src '{}'; img-src data:; base-uri 'none'; form-action 'none'",
@@ -601,12 +742,17 @@ pub fn render_html(json: &str) -> Result<String> {
         csp_hash(inline(VIEW, "<style>")),
     );
     let data = embeddable(&serde_json::to_string(&value)?);
-    Ok(VIEW.replacen("{{CSP}}", &csp, 1).replacen("{{DATA}}", &data, 1))
+    Ok(VIEW
+        .replacen("{{CSP}}", &csp, 1)
+        .replacen("{{DATA}}", &data, 1))
 }
 
 /// The text between `open` and the next closing tag of the same element.
 fn inline<'a>(page: &'a str, open: &str) -> &'a str {
-    let name: String = open[1..].chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+    let name: String = open[1..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
     let close = format!("</{name}>");
     let start = page.find(open).expect("the template has the element") + open.len();
     let end = start + page[start..].find(&close).expect("the element is closed");
@@ -640,9 +786,15 @@ fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let n = (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | u32::from(*chunk.get(2).unwrap_or(&0));
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
         for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
-            out.push(if i <= chunk.len() { ALPHABET[(n >> shift) as usize & 63] as char } else { '=' });
+            out.push(if i <= chunk.len() {
+                ALPHABET[(n >> shift) as usize & 63] as char
+            } else {
+                '='
+            });
         }
     }
     out
@@ -653,7 +805,8 @@ mod tests {
     use super::*;
 
     fn minimal(detail: &str) -> String {
-        serde_json::json!({"schema_version": SCHEMA_VERSION, "session_id": "s", "detail": detail}).to_string()
+        serde_json::json!({"schema_version": SCHEMA_VERSION, "session_id": "s", "detail": detail})
+            .to_string()
     }
 
     #[test]
@@ -670,8 +823,14 @@ mod tests {
         let page = render_html(&minimal("x")).unwrap();
         let script = csp_hash(inline(&page, "<script>"));
         let style = csp_hash(inline(&page, "<style>"));
-        assert!(page.contains(&format!("script-src '{script}'")), "the script hash is stale");
-        assert!(page.contains(&format!("style-src '{style}'")), "the style hash is stale");
+        assert!(
+            page.contains(&format!("script-src '{script}'")),
+            "the script hash is stale"
+        );
+        assert!(
+            page.contains(&format!("style-src '{style}'")),
+            "the style hash is stale"
+        );
         assert!(page.contains("default-src 'none'"));
     }
 
@@ -679,11 +838,21 @@ mod tests {
     fn data_cannot_close_its_script_element() {
         let hostile = "</script><script>alert(1)</script><!-- \u{2028} & >";
         let page = render_html(&minimal(hostile)).unwrap();
-        assert_eq!(page.matches("</script>").count(), 2, "only the template's own two elements close");
+        assert_eq!(
+            page.matches("</script>").count(),
+            2,
+            "only the template's own two elements close"
+        );
         assert!(!page.contains("<!--"));
-        let embedded = inline(&page, "<script id=\"report-data\" type=\"application/json\">");
+        let embedded = inline(
+            &page,
+            "<script id=\"report-data\" type=\"application/json\">",
+        );
         let back: serde_json::Value = serde_json::from_str(embedded).unwrap();
-        assert_eq!(back["detail"], hostile, "the escaped JSON parses back to the same text");
+        assert_eq!(
+            back["detail"], hostile,
+            "the escaped JSON parses back to the same text"
+        );
     }
 
     #[test]

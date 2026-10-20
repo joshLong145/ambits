@@ -156,34 +156,56 @@ impl DepthSpec {
         use crate::tracking::ReadDepth;
         let (depth, variant, detail) = match self {
             DepthSpec::Fixed { value } => (ReadDepth::from(*value), "fixed", String::new()),
-            DepthSpec::Conditional { condition_key, if_true, if_false, default } => {
-                match input.get(condition_key) {
-                    Some(serde_json::Value::Bool(true)) =>
-                        (ReadDepth::from(*if_true), "conditional", format!("{condition_key}=true")),
-                    Some(serde_json::Value::Bool(false)) =>
-                        (ReadDepth::from(*if_false), "conditional", format!("{condition_key}=false")),
-                    _ =>
-                        (ReadDepth::from(*default), "conditional", format!("{condition_key} absent/non-bool, default")),
-                }
-            }
-            DepthSpec::PatternMatch { key, patterns, default } => {
+            DepthSpec::Conditional {
+                condition_key,
+                if_true,
+                if_false,
+                default,
+            } => match input.get(condition_key) {
+                Some(serde_json::Value::Bool(true)) => (
+                    ReadDepth::from(*if_true),
+                    "conditional",
+                    format!("{condition_key}=true"),
+                ),
+                Some(serde_json::Value::Bool(false)) => (
+                    ReadDepth::from(*if_false),
+                    "conditional",
+                    format!("{condition_key}=false"),
+                ),
+                _ => (
+                    ReadDepth::from(*default),
+                    "conditional",
+                    format!("{condition_key} absent/non-bool, default"),
+                ),
+            },
+            DepthSpec::PatternMatch {
+                key,
+                patterns,
+                default,
+            } => {
                 let cmd = input.get(key).and_then(|v| v.as_str()).unwrap_or("");
                 match patterns
                     .iter()
                     .enumerate()
                     .find(|(_, p)| match p.match_type {
-                        MatchType::Prefix   => cmd.starts_with(p.prefix.as_str()),
+                        MatchType::Prefix => cmd.starts_with(p.prefix.as_str()),
                         MatchType::Contains => cmd.contains(p.prefix.as_str()),
-                        MatchType::Exact    => cmd == p.prefix.as_str(),
+                        MatchType::Exact => cmd == p.prefix.as_str(),
                         MatchType::AmbitsSubcommand => {
                             cmd.contains("ambits")
                                 && cmd.split_whitespace().any(|t| t == p.prefix.as_str())
                         }
                     }) {
-                    Some((i, p)) =>
-                        (ReadDepth::from(p.depth), "pattern_match", format!("pattern[{i}] '{}' ({:?})", p.prefix, p.match_type)),
-                    None =>
-                        (ReadDepth::from(*default), "pattern_match", "no pattern matched, default".to_string()),
+                    Some((i, p)) => (
+                        ReadDepth::from(p.depth),
+                        "pattern_match",
+                        format!("pattern[{i}] '{}' ({:?})", p.prefix, p.match_type),
+                    ),
+                    None => (
+                        ReadDepth::from(*default),
+                        "pattern_match",
+                        "no pattern matched, default".to_string(),
+                    ),
                 }
             }
         };
@@ -242,11 +264,11 @@ pub enum ReadDepthDe {
 impl From<ReadDepthDe> for ReadDepth {
     fn from(d: ReadDepthDe) -> Self {
         match d {
-            ReadDepthDe::Unseen    => ReadDepth::Unseen,
-            ReadDepthDe::NameOnly  => ReadDepth::NameOnly,
-            ReadDepthDe::Overview  => ReadDepth::Overview,
+            ReadDepthDe::Unseen => ReadDepth::Unseen,
+            ReadDepthDe::NameOnly => ReadDepth::NameOnly,
+            ReadDepthDe::Overview => ReadDepth::Overview,
             ReadDepthDe::Signature => ReadDepth::Signature,
-            ReadDepthDe::FullBody  => ReadDepth::FullBody,
+            ReadDepthDe::FullBody => ReadDepth::FullBody,
         }
     }
 }
@@ -340,8 +362,14 @@ impl ResultSelectorSpec {
     /// so `ambits show X | rg y` is not a search.
     pub fn applies(&self, input: &serde_json::Value) -> Option<ReadDepth> {
         let cmd = input.get(&self.key)?.as_str()?;
-        let invocations = cmd.split(&self.requires).skip(1).map(|segment| segment.split(['|', ';', '&', '\n']).next().unwrap_or(""));
-        let searches = invocations.into_iter().any(|inv| inv.split_whitespace().any(|t| self.subcommands.iter().any(|s| s == t)));
+        let invocations = cmd
+            .split(&self.requires)
+            .skip(1)
+            .map(|segment| segment.split(['|', ';', '&', '\n']).next().unwrap_or(""));
+        let searches = invocations.into_iter().any(|inv| {
+            inv.split_whitespace()
+                .any(|t| self.subcommands.iter().any(|s| s == t))
+        });
         searches.then(|| ReadDepth::from(self.depth))
     }
 }
@@ -407,7 +435,12 @@ impl TargetSelectorSpec {
         for segment in cmd.split(&self.requires).skip(1) {
             let (depth, shown_whole) = match (self.shallow_flag.as_deref(), shallow) {
                 (Some(flag), Some(d)) if segment.contains(flag) => (d, false),
-                _ => (full, self.cut_flag.as_deref().is_none_or(|cut| !segment.contains(cut))),
+                _ => (
+                    full,
+                    self.cut_flag
+                        .as_deref()
+                        .is_none_or(|cut| !segment.contains(cut)),
+                ),
             };
             // `any` consumes through the match, so what remains is exactly
             // the subcommand's own arguments — which is where selectors live,
@@ -427,7 +460,11 @@ impl TargetSelectorSpec {
                     crate::lookup::parse_selector(token),
                     crate::lookup::Selector::Id(_) | crate::lookup::Selector::Hash(_)
                 ) {
-                    out.push(crate::ingest::SelectorRead { selector: token.to_string(), depth, whole: shown_whole });
+                    out.push(crate::ingest::SelectorRead {
+                        selector: token.to_string(),
+                        depth,
+                        whole: shown_whole,
+                    });
                 }
             }
         }
@@ -455,16 +492,43 @@ pub struct TargetLinesSpec {
 
 #[derive(Debug, Clone)]
 pub enum ConfigWarning {
-    ParseError             { path: String, message: String },
-    UnsupportedVersion     { path: String, found: u32, supported: u32 },
-    EmptyNames             { stanza_index: usize },
-    DuplicateName          { name: String, kept_index: usize, dropped_index: usize },
-    ConditionalKeyNonBoolean { tool_name: String, key: String },
-    EmptyPatterns          { tool_name: String },
-    MissingDepth           { stanza_index: usize },
-    DepthOnWrite           { stanza_index: usize },
-    LegacyConfigPath       { path: String, moved_to: String },
-    MissingOverride        { path: String },
+    ParseError {
+        path: String,
+        message: String,
+    },
+    UnsupportedVersion {
+        path: String,
+        found: u32,
+        supported: u32,
+    },
+    EmptyNames {
+        stanza_index: usize,
+    },
+    DuplicateName {
+        name: String,
+        kept_index: usize,
+        dropped_index: usize,
+    },
+    ConditionalKeyNonBoolean {
+        tool_name: String,
+        key: String,
+    },
+    EmptyPatterns {
+        tool_name: String,
+    },
+    MissingDepth {
+        stanza_index: usize,
+    },
+    DepthOnWrite {
+        stanza_index: usize,
+    },
+    LegacyConfigPath {
+        path: String,
+        moved_to: String,
+    },
+    MissingOverride {
+        path: String,
+    },
 }
 
 impl std::fmt::Display for ConfigWarning {
@@ -612,7 +676,10 @@ impl ToolMappingConfig {
         // because `user` is consumed below.
         let cache = CacheConfig {
             enabled: user.cache.enabled.or(base.cache.enabled),
-            flush_interval_ms: user.cache.flush_interval_ms.or(base.cache.flush_interval_ms),
+            flush_interval_ms: user
+                .cache
+                .flush_interval_ms
+                .or(base.cache.flush_interval_ms),
         };
         // `[editor]` follows the same plain-scalar merge as `[cache]`.
         let editor = EditorConfig {
@@ -725,7 +792,8 @@ impl ToolMappingConfig {
             .flat_map(|m| m.names.iter().map(|n| n.as_str()))
             .collect();
 
-        let filtered_base: Vec<ToolMapping> = base.tools
+        let filtered_base: Vec<ToolMapping> = base
+            .tools
             .into_iter()
             .filter(|b| !b.names.iter().any(|n| user_name_set.contains(n.as_str())))
             .collect();
@@ -789,8 +857,12 @@ impl ToolMappingConfig {
 
         let mut layers: Vec<PathBuf> = global.map(Path::to_path_buf).into_iter().collect();
 
-        let local = project_root.join(crate::state_dir::STATE_DIR).join("tools.toml");
-        let legacy = project_root.join(crate::state_dir::LEGACY_STATE_DIR).join("tools.toml");
+        let local = project_root
+            .join(crate::state_dir::STATE_DIR)
+            .join("tools.toml");
+        let legacy = project_root
+            .join(crate::state_dir::LEGACY_STATE_DIR)
+            .join("tools.toml");
         if local.exists() {
             layers.push(local);
         } else if legacy.exists() {
@@ -847,8 +919,8 @@ impl super::ToolCallMapper for ToolMappingConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
     use serde_json;
+    use std::collections::HashSet;
 
     fn bash_input(cmd: &str) -> serde_json::Value {
         serde_json::json!({ "command": cmd })
@@ -857,11 +929,26 @@ mod tests {
     #[test]
     fn an_ambits_search_is_credited_from_its_output_and_nothing_else_is() {
         let cfg = ToolMappingConfig::builtin().unwrap();
-        let spec = cfg.tools[cfg.index["Bash"]].result_selectors.as_ref().expect("Bash carries a result spec");
-        for cmd in ["ambits -p . rg 'fn run' src", "cd x && ambits grep -rn TODO docs/ | head", "ambits show a::b && ambits -p . rg x"] {
-            assert_eq!(spec.applies(&bash_input(cmd)), Some(ReadDepth::NameOnly), "{cmd}");
+        let spec = cfg.tools[cfg.index["Bash"]]
+            .result_selectors
+            .as_ref()
+            .expect("Bash carries a result spec");
+        for cmd in [
+            "ambits -p . rg 'fn run' src",
+            "cd x && ambits grep -rn TODO docs/ | head",
+            "ambits show a::b && ambits -p . rg x",
+        ] {
+            assert_eq!(
+                spec.applies(&bash_input(cmd)),
+                Some(ReadDepth::NameOnly),
+                "{cmd}"
+            );
         }
-        for cmd in ["rg 'fn run' src", "ambits -p . show 'src/a.rs::App' | rg run", "ambits -p . show x; grep y z"] {
+        for cmd in [
+            "rg 'fn run' src",
+            "ambits -p . show 'src/a.rs::App' | rg run",
+            "ambits -p . show x; grep y z",
+        ] {
             assert_eq!(spec.applies(&bash_input(cmd)), None, "{cmd}");
         }
     }
@@ -873,7 +960,18 @@ mod tests {
 
     #[test]
     fn words_are_read_as_the_shell_reads_them() {
-        assert_eq!(shell_words(r#" -p . show 'a.rs::impl App' "d.md::Doc/Read \"me\"" b\ c x | head"#), vec!["-p", ".", "show", "a.rs::impl App", "d.md::Doc/Read \"me\"", "b c", "x"]);
+        assert_eq!(
+            shell_words(r#" -p . show 'a.rs::impl App' "d.md::Doc/Read \"me\"" b\ c x | head"#),
+            vec![
+                "-p",
+                ".",
+                "show",
+                "a.rs::impl App",
+                "d.md::Doc/Read \"me\"",
+                "b c",
+                "x"
+            ]
+        );
     }
 
     /// An id with a space in it — an impl block, a trait impl, a Markdown
@@ -885,7 +983,14 @@ mod tests {
             .resolve(&bash_input("ambits -p . show 'src/a.rs::impl App' \"src/b.rs::Display for App\" 'docs/s.md::Sharing/What leaves the machine' | head"))
             .unwrap());
         let ids: Vec<&str> = got.iter().map(|(s, _)| s.as_str()).collect();
-        assert_eq!(ids, vec!["src/a.rs::impl App", "src/b.rs::Display for App", "docs/s.md::Sharing/What leaves the machine"]);
+        assert_eq!(
+            ids,
+            vec![
+                "src/a.rs::impl App",
+                "src/b.rs::Display for App",
+                "docs/s.md::Sharing/What leaves the machine"
+            ]
+        );
     }
 
     /// A full `show` printed the whole definition; `--no-body` printed none
@@ -897,7 +1002,10 @@ mod tests {
             .resolve(&bash_input("ambits show a.rs::A && ambits show a.rs::B --no-body && ambits show a.rs::C --max-bytes 400"))
             .unwrap();
         let whole: Vec<(&str, bool)> = got.iter().map(|s| (s.selector.as_str(), s.whole)).collect();
-        assert_eq!(whole, vec![("a.rs::A", true), ("a.rs::B", false), ("a.rs::C", false)]);
+        assert_eq!(
+            whole,
+            vec![("a.rs::A", true), ("a.rs::B", false), ("a.rs::C", false)]
+        );
     }
 
     fn selector_spec(cfg: &ToolMappingConfig) -> &TargetSelectorSpec {
@@ -911,15 +1019,20 @@ mod tests {
     #[test]
     fn show_command_yields_its_selectors_at_full_body() {
         let cfg = ToolMappingConfig::builtin().unwrap();
-        let got = pairs(selector_spec(&cfg)
-            .resolve(&bash_input(
-                "ambits -p . show 'src/filter.rs::PathFilter/matches' 6e42b7a3",
-            ))
-            .expect("selectors found"));
+        let got = pairs(
+            selector_spec(&cfg)
+                .resolve(&bash_input(
+                    "ambits -p . show 'src/filter.rs::PathFilter/matches' 6e42b7a3",
+                ))
+                .expect("selectors found"),
+        );
         assert_eq!(
             got,
             vec![
-                ("src/filter.rs::PathFilter/matches".to_string(), ReadDepth::FullBody),
+                (
+                    "src/filter.rs::PathFilter/matches".to_string(),
+                    ReadDepth::FullBody
+                ),
                 ("6e42b7a3".to_string(), ReadDepth::FullBody),
             ]
         );
@@ -930,9 +1043,11 @@ mod tests {
     #[test]
     fn a_metadata_only_lookup_earns_a_shallower_depth() {
         let cfg = ToolMappingConfig::builtin().unwrap();
-        let got = pairs(selector_spec(&cfg)
-            .resolve(&bash_input("ambits -p . show 'a.rs::x' --no-body"))
-            .unwrap());
+        let got = pairs(
+            selector_spec(&cfg)
+                .resolve(&bash_input("ambits -p . show 'a.rs::x' --no-body"))
+                .unwrap(),
+        );
         assert_eq!(got, vec![("a.rs::x".to_string(), ReadDepth::NameOnly)]);
     }
 
@@ -941,9 +1056,13 @@ mod tests {
     #[test]
     fn flags_and_their_values_are_not_mistaken_for_selectors() {
         let cfg = ToolMappingConfig::builtin().unwrap();
-        let got = pairs(selector_spec(&cfg)
-            .resolve(&bash_input("ambits show a.rs::x --max-bytes 4000 --no-body"))
-            .unwrap());
+        let got = pairs(
+            selector_spec(&cfg)
+                .resolve(&bash_input(
+                    "ambits show a.rs::x --max-bytes 4000 --no-body",
+                ))
+                .unwrap(),
+        );
         assert_eq!(got, vec![("a.rs::x".to_string(), ReadDepth::NameOnly)]);
     }
 
@@ -954,11 +1073,13 @@ mod tests {
     #[test]
     fn each_invocation_gets_its_own_depth() {
         let cfg = ToolMappingConfig::builtin().unwrap();
-        let got = pairs(selector_spec(&cfg)
-            .resolve(&bash_input(
-                "ambits show a.rs::shallow --no-body && ambits show b.rs::deep",
-            ))
-            .unwrap());
+        let got = pairs(
+            selector_spec(&cfg)
+                .resolve(&bash_input(
+                    "ambits show a.rs::shallow --no-body && ambits show b.rs::deep",
+                ))
+                .unwrap(),
+        );
         assert_eq!(
             got,
             vec![
@@ -972,9 +1093,11 @@ mod tests {
     #[test]
     fn a_marker_inside_a_path_contributes_nothing() {
         let cfg = ToolMappingConfig::builtin().unwrap();
-        let got = pairs(selector_spec(&cfg)
-            .resolve(&bash_input("./target/debug/ambits -p . show a.rs::x"))
-            .unwrap());
+        let got = pairs(
+            selector_spec(&cfg)
+                .resolve(&bash_input("./target/debug/ambits -p . show a.rs::x"))
+                .unwrap(),
+        );
         assert_eq!(got, vec![("a.rs::x".to_string(), ReadDepth::FullBody)]);
     }
 
@@ -1006,11 +1129,13 @@ mod tests {
     #[test]
     fn a_search_beside_a_lookup_credits_only_the_lookup() {
         let cfg = ToolMappingConfig::builtin().unwrap();
-        let got = pairs(selector_spec(&cfg)
-            .resolve(&bash_input(
-                "ambits -p . rg 'a.rs::pattern' && ambits -p . show b.rs::real",
-            ))
-            .unwrap());
+        let got = pairs(
+            selector_spec(&cfg)
+                .resolve(&bash_input(
+                    "ambits -p . rg 'a.rs::pattern' && ambits -p . show b.rs::real",
+                ))
+                .unwrap(),
+        );
         assert_eq!(got, vec![("b.rs::real".to_string(), ReadDepth::FullBody)]);
     }
 
@@ -1056,13 +1181,21 @@ mod tests {
     #[test]
     fn builtin_covers_all_tool_names() {
         let cfg = ToolMappingConfig::builtin().unwrap();
-        let all_names: HashSet<&str> = cfg.tools.iter()
+        let all_names: HashSet<&str> = cfg
+            .tools
+            .iter()
             .flat_map(|m| m.names.iter().map(|n| n.as_str()))
             .collect();
 
         let expected = [
-            "Read", "Edit", "Write", "Glob", "Grep", "NotebookEdit",
-            "Bash", "TodoWrite",
+            "Read",
+            "Edit",
+            "Write",
+            "Glob",
+            "Grep",
+            "NotebookEdit",
+            "Bash",
+            "TodoWrite",
             "mcp__serena__find_symbol",
             "mcp__serena__find_referencing_symbols",
             "mcp__serena__replace_symbol_body",
@@ -1085,7 +1218,9 @@ mod tests {
             "mcp__plugin_serena_serena__insert_after_symbol",
             "mcp__plugin_serena_serena__insert_before_symbol",
             "mcp__plugin_serena_serena__rename_symbol",
-            "mcp__acp__Read", "mcp__acp__Edit", "mcp__acp__Write",
+            "mcp__acp__Read",
+            "mcp__acp__Edit",
+            "mcp__acp__Write",
             "mcp__serena__find_file",
         ];
         for name in &expected {
@@ -1101,8 +1236,7 @@ mod tests {
         let cfg = ToolMappingConfig::builtin().unwrap();
         for name in cfg.index.keys() {
             let idx_result = cfg.index.get(name).copied();
-            let linear_result = cfg.tools.iter()
-                .position(|m| m.names.contains(name));
+            let linear_result = cfg.tools.iter().position(|m| m.names.contains(name));
             assert_eq!(idx_result, linear_result, "index mismatch for '{name}'");
         }
     }
@@ -1135,8 +1269,10 @@ description  = "custom Read {custom_path}"
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
 
         // mcp__acp__Read was in the same built-in stanza — it should also be dropped.
-        assert!(!merged.index.contains_key("mcp__acp__Read"),
-            "mcp__acp__Read should be dropped when Read is overridden");
+        assert!(
+            !merged.index.contains_key("mcp__acp__Read"),
+            "mcp__acp__Read should be dropped when Read is overridden"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1218,7 +1354,9 @@ description  = "new"
         let idx = *merged.index.get("NewTool").unwrap();
         assert_eq!(merged.tools[idx].path_keys, vec!["new_key"]);
         // Expect one DuplicateName warning.
-        assert!(warnings.iter().any(|w| matches!(w, ConfigWarning::DuplicateName { name, .. } if name == "NewTool")));
+        assert!(warnings
+            .iter()
+            .any(|w| matches!(w, ConfigWarning::DuplicateName { name, .. } if name == "NewTool")));
     }
 
     /// Extending `Bash` to add one command prefix must not cost the selector
@@ -1272,7 +1410,10 @@ extends      = "mcp__serena__find_symbol"
         let mut warnings = Vec::new();
         let merged = ToolMappingConfig::merge(base, user, &mut warnings);
 
-        let idx = *merged.index.get("MyFindSymbol").expect("MyFindSymbol must exist");
+        let idx = *merged
+            .index
+            .get("MyFindSymbol")
+            .expect("MyFindSymbol must exist");
         let mapping = &merged.tools[idx];
         // target_symbol inherited from find_symbol base stanza.
         assert!(mapping.target_symbol.is_some());
@@ -1335,7 +1476,9 @@ description  = "Foo"
         let tmp = write_temp_toml(bad_toml);
         let (result, warnings) = ToolMappingConfig::load(tmp.path());
         assert!(result.is_none(), "should reject unsupported version");
-        assert!(warnings.iter().any(|w| matches!(w, ConfigWarning::UnsupportedVersion { .. })));
+        assert!(warnings
+            .iter()
+            .any(|w| matches!(w, ConfigWarning::UnsupportedVersion { .. })));
     }
 
     // -----------------------------------------------------------------------
@@ -1347,7 +1490,9 @@ description  = "Foo"
         let tmp = write_temp_toml(bad_toml);
         let (result, warnings) = ToolMappingConfig::load(tmp.path());
         assert!(result.is_none(), "should reject malformed TOML");
-        assert!(warnings.iter().any(|w| matches!(w, ConfigWarning::ParseError { .. })));
+        assert!(warnings
+            .iter()
+            .any(|w| matches!(w, ConfigWarning::ParseError { .. })));
     }
 
     // -----------------------------------------------------------------------
@@ -1397,7 +1542,11 @@ description  = "Foo"
     #[test]
     fn the_project_config_is_found_under_the_project_root() {
         let root = tempfile::tempdir().unwrap();
-        write_config(root.path(), ".ambits/tools.toml", "[editor]\ncommand = \"from-project-root\"\n");
+        write_config(
+            root.path(),
+            ".ambits/tools.toml",
+            "[editor]\ncommand = \"from-project-root\"\n",
+        );
 
         let (cfg, _) = ToolMappingConfig::resolve_with(None, root.path(), None);
         assert_eq!(cfg.editor.command.as_deref(), Some("from-project-root"));
@@ -1406,12 +1555,18 @@ description  = "Foo"
     #[test]
     fn a_legacy_config_under_the_project_root_is_read_with_a_warning() {
         let root = tempfile::tempdir().unwrap();
-        write_config(root.path(), ".ambit/tools.toml", "[editor]\ncommand = \"from-legacy\"\n");
+        write_config(
+            root.path(),
+            ".ambit/tools.toml",
+            "[editor]\ncommand = \"from-legacy\"\n",
+        );
 
         let (cfg, warnings) = ToolMappingConfig::resolve_with(None, root.path(), None);
         assert_eq!(cfg.editor.command.as_deref(), Some("from-legacy"));
         assert!(
-            warnings.iter().any(|w| matches!(w, ConfigWarning::LegacyConfigPath { .. })),
+            warnings
+                .iter()
+                .any(|w| matches!(w, ConfigWarning::LegacyConfigPath { .. })),
             "{warnings:?}"
         );
     }
@@ -1427,21 +1582,37 @@ description  = "Foo"
         let global = write_config(
             home.path(),
             "tools.toml",
-            &format!("[editor]\ncommand = \"global-editor\"\n[cache]\nflush_interval_ms = 1234\n{}",
-                stanza("GlobalTool", "Overview")),
+            &format!(
+                "[editor]\ncommand = \"global-editor\"\n[cache]\nflush_interval_ms = 1234\n{}",
+                stanza("GlobalTool", "Overview")
+            ),
         );
         write_config(
             root.path(),
             ".ambits/tools.toml",
-            &format!("[editor]\ncommand = \"project-editor\"\n{}", stanza("ProjectTool", "FullBody")),
+            &format!(
+                "[editor]\ncommand = \"project-editor\"\n{}",
+                stanza("ProjectTool", "FullBody")
+            ),
         );
 
         let (cfg, warnings) = ToolMappingConfig::resolve_with(None, root.path(), Some(&global));
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(cfg.editor.command.as_deref(), Some("project-editor"), "project wins where both speak");
-        assert_eq!(cfg.cache.flush_interval_ms, Some(1234), "global applies where the project is silent");
+        assert_eq!(
+            cfg.editor.command.as_deref(),
+            Some("project-editor"),
+            "project wins where both speak"
+        );
+        assert_eq!(
+            cfg.cache.flush_interval_ms,
+            Some(1234),
+            "global applies where the project is silent"
+        );
         assert!(tool(&cfg, "GlobalTool").is_some(), "global stanzas survive");
-        assert!(tool(&cfg, "ProjectTool").is_some(), "project stanzas are added");
+        assert!(
+            tool(&cfg, "ProjectTool").is_some(),
+            "project stanzas are added"
+        );
         assert!(tool(&cfg, "Read").is_some(), "built-ins remain underneath");
     }
 
@@ -1452,13 +1623,26 @@ description  = "Foo"
         let home = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let global = write_config(home.path(), "tools.toml", &stanza("Shared", "Overview"));
-        write_config(root.path(), ".ambits/tools.toml", &stanza("Shared", "FullBody"));
+        write_config(
+            root.path(),
+            ".ambits/tools.toml",
+            &stanza("Shared", "FullBody"),
+        );
 
         let (cfg, _) = ToolMappingConfig::resolve_with(None, root.path(), Some(&global));
-        let shared: Vec<_> = cfg.tools.iter().filter(|t| t.names.iter().any(|n| n == "Shared")).collect();
+        let shared: Vec<_> = cfg
+            .tools
+            .iter()
+            .filter(|t| t.names.iter().any(|n| n == "Shared"))
+            .collect();
         assert_eq!(shared.len(), 1, "one stanza per name");
         assert!(
-            matches!(shared[0].depth, Some(DepthSpec::Fixed { value: ReadDepthDe::FullBody })),
+            matches!(
+                shared[0].depth,
+                Some(DepthSpec::Fixed {
+                    value: ReadDepthDe::FullBody
+                })
+            ),
             "the project's stanza: {:?}",
             shared[0].depth
         );
@@ -1469,14 +1653,29 @@ description  = "Foo"
     fn an_existing_override_replaces_both_layers() {
         let home = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let global = write_config(home.path(), "tools.toml", "[editor]\ncommand = \"global-editor\"\n");
-        write_config(root.path(), ".ambits/tools.toml", &stanza("ProjectTool", "FullBody"));
-        let over = write_config(home.path(), "override.toml", "[cache]\nflush_interval_ms = 42\n");
+        let global = write_config(
+            home.path(),
+            "tools.toml",
+            "[editor]\ncommand = \"global-editor\"\n",
+        );
+        write_config(
+            root.path(),
+            ".ambits/tools.toml",
+            &stanza("ProjectTool", "FullBody"),
+        );
+        let over = write_config(
+            home.path(),
+            "override.toml",
+            "[cache]\nflush_interval_ms = 42\n",
+        );
 
         let (cfg, _) = ToolMappingConfig::resolve_with(Some(&over), root.path(), Some(&global));
         assert_eq!(cfg.cache.flush_interval_ms, Some(42));
         assert_eq!(cfg.editor.command, None, "the global layer does not apply");
-        assert!(tool(&cfg, "ProjectTool").is_none(), "nor does the project layer");
+        assert!(
+            tool(&cfg, "ProjectTool").is_none(),
+            "nor does the project layer"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1498,8 +1697,14 @@ description  = "no path here"
         cfg.build_index();
 
         let input = serde_json::json!({ "unrelated": "value" });
-        let mapping = cfg.tools.iter().find(|m| m.names.contains(&"PathlessCmd".to_string())).unwrap();
-        let file_path_str: Option<&str> = mapping.path_keys.iter()
+        let mapping = cfg
+            .tools
+            .iter()
+            .find(|m| m.names.contains(&"PathlessCmd".to_string()))
+            .unwrap();
+        let file_path_str: Option<&str> = mapping
+            .path_keys
+            .iter()
             .find_map(|k| input.get(k).and_then(|v| v.as_str()));
         // path_required = false: no file_path but call should NOT return None.
         assert!(file_path_str.is_none());
@@ -1524,7 +1729,10 @@ description  = "no path here"
     fn glob_tool_has_path_required_false() {
         let cfg = ToolMappingConfig::builtin().unwrap();
         let idx = *cfg.index.get("Glob").unwrap();
-        assert!(!cfg.tools[idx].path_required, "Glob must not require a path");
+        assert!(
+            !cfg.tools[idx].path_required,
+            "Glob must not require a path"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1549,7 +1757,9 @@ description  = "empty names"
         let merged = ToolMappingConfig::merge(base, user, &mut warnings);
         // Stanza must be skipped and a warning emitted.
         assert!(!merged.index.is_empty());
-        assert!(warnings.iter().any(|w| matches!(w, ConfigWarning::EmptyNames { .. })));
+        assert!(warnings
+            .iter()
+            .any(|w| matches!(w, ConfigWarning::EmptyNames { .. })));
     }
 
     // -----------------------------------------------------------------------
@@ -1594,7 +1804,9 @@ description  = "empty names"
         let idx = *cfg.index.get("Grep").unwrap();
         let mapping = &cfg.tools[idx];
         assert!(mapping.pattern_keys.contains(&"pattern".to_string()));
-        assert!(mapping.pattern_keys.contains(&"substring_pattern".to_string()));
+        assert!(mapping
+            .pattern_keys
+            .contains(&"substring_pattern".to_string()));
     }
 
     // -----------------------------------------------------------------------
@@ -1740,7 +1952,10 @@ description = "T {pattern}"
             DepthSpec::PatternMatch { patterns, .. } => patterns,
             _ => panic!("expected PatternMatch"),
         };
-        assert!(matches!(patterns[0].match_type, MatchType::AmbitsSubcommand));
+        assert!(matches!(
+            patterns[0].match_type,
+            MatchType::AmbitsSubcommand
+        ));
     }
 
     /// A command that merely mentions "ambits" without the subcommand as its
@@ -1780,7 +1995,8 @@ mod effect_tests {
     fn merge_user(toml_src: &str) -> (ToolMappingConfig, Vec<ConfigWarning>) {
         let user: ToolMappingConfig = toml::from_str(toml_src).expect("valid toml");
         let mut warnings = Vec::new();
-        let cfg = ToolMappingConfig::merge(ToolMappingConfig::builtin().unwrap(), user, &mut warnings);
+        let cfg =
+            ToolMappingConfig::merge(ToolMappingConfig::builtin().unwrap(), user, &mut warnings);
         (cfg, warnings)
     }
 
@@ -1803,7 +2019,10 @@ mod effect_tests {
             "version = 1\n[[tool]]\nnames = [\"Scribe\"]\npath_keys = [\"path\"]\neffect = \"write\"\n\
              depth = { type = \"fixed\", value = \"FullBody\" }\ndescription = \"x\"\n",
         );
-        assert!(matches!(warnings.as_slice(), [ConfigWarning::DepthOnWrite { .. }]), "{warnings:?}");
+        assert!(
+            matches!(warnings.as_slice(), [ConfigWarning::DepthOnWrite { .. }]),
+            "{warnings:?}"
+        );
         assert!(stanza(&cfg, "Scribe").is_none(), "skipped");
     }
 
@@ -1812,7 +2031,10 @@ mod effect_tests {
         let (_, warnings) = merge_user(
             "version = 1\n[[tool]]\nnames = [\"Peek\"]\npath_keys = [\"path\"]\ndescription = \"x\"\n",
         );
-        assert!(matches!(warnings.as_slice(), [ConfigWarning::MissingDepth { .. }]), "{warnings:?}");
+        assert!(
+            matches!(warnings.as_slice(), [ConfigWarning::MissingDepth { .. }]),
+            "{warnings:?}"
+        );
     }
 
     /// Making a read tool a write via `extends` must not inherit its depth,
@@ -1826,7 +2048,11 @@ mod effect_tests {
         let edit = stanza(&cfg, "Edit").unwrap();
         assert_eq!(edit.effect(), Effect::Write);
         assert!(edit.depth.is_none());
-        assert_eq!(edit.path_keys, vec!["file_path".to_string(), "relative_path".to_string()], "other fields still inherited");
+        assert_eq!(
+            edit.path_keys,
+            vec!["file_path".to_string(), "relative_path".to_string()],
+            "other fields still inherited"
+        );
     }
 
     /// An unspecified effect is inherited.

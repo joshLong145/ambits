@@ -45,20 +45,30 @@ fn writes_flow_from_the_log_to_the_journal_without_file_contents() {
     let log = root.join("sess.jsonl");
     std::fs::write(&log, log_lines(&root).join("\n") + "\n").unwrap();
 
-    let mut app = App::new(ProjectTree { root: root.clone(), files: vec![] }, root.clone());
+    let mut app = App::new(
+        ProjectTree {
+            root: root.clone(),
+            files: vec![],
+        },
+        root.clone(),
+    );
     app.set_session_id(Some("sess".into()));
     app.enable_journal("tree-sitter", std::time::Duration::ZERO);
 
     let registry = ParserRegistry::new();
     let mut calls = 0;
-    for event in parse_log_file(&log, &ambits::ingest::tool_config::ToolMappingConfig::builtin().unwrap()) {
+    for event in parse_log_file(
+        &log,
+        &ambits::ingest::tool_config::ToolMappingConfig::builtin().unwrap(),
+    ) {
         match event {
             SessionEvent::ToolCall(tc) => {
                 calls += 1;
                 app.process_agent_event(tc);
             }
             SessionEvent::Write(w) => {
-                let record = ambits::writes::build_record(&w, &root, &registry, true).expect("inside the project");
+                let record = ambits::writes::build_record(&w, &root, &registry, true)
+                    .expect("inside the project");
                 app.record_write("sess", record);
             }
             _ => {}
@@ -73,7 +83,13 @@ fn writes_flow_from_the_log_to_the_journal_without_file_contents() {
 
     let edit = &contents.writes["toolu_01edit"];
     assert_eq!(edit.level, ambits::writes::Level::Symbol);
-    assert_eq!(edit.syms.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(), vec!["src/lib.rs::alpha"]);
+    assert_eq!(
+        edit.syms
+            .iter()
+            .map(|(s, _)| s.as_str())
+            .collect::<Vec<_>>(),
+        vec!["src/lib.rs::alpha"]
+    );
 
     let create = &contents.writes["toolu_02write"];
     assert_eq!(create.level, ambits::writes::Level::Symbol);
@@ -83,6 +99,10 @@ fn writes_flow_from_the_log_to_the_journal_without_file_contents() {
     // Spec §9.6: not a byte of any file's contents reaches the journal.
     for entry in std::fs::read_dir(&journal_dir).unwrap().flatten() {
         let text = std::fs::read_to_string(entry.path()).unwrap();
-        assert!(!text.contains(CANARY), "file contents leaked into {}", entry.path().display());
+        assert!(
+            !text.contains(CANARY),
+            "file contents leaked into {}",
+            entry.path().display()
+        );
     }
 }

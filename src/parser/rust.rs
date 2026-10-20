@@ -73,7 +73,15 @@ impl LanguageParser for RustParser {
         let file_path_arc = Arc::new(path.to_path_buf());
         let names = NameInterner::new();
 
-        extract_symbols(root, src, &file_path_arc, &names, &path_prefix, "", &mut symbols);
+        extract_symbols(
+            root,
+            src,
+            &file_path_arc,
+            &names,
+            &path_prefix,
+            "",
+            &mut symbols,
+        );
 
         for sym in symbols.iter_mut() {
             compute_merkle_hash(sym);
@@ -90,16 +98,46 @@ impl LanguageParser for RustParser {
 }
 
 /// Symbol metadata: category and display label
-const MOD: SymbolMeta = SymbolMeta { category: SymbolCategory::Module, label: "mod" };
-const STRUCT: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "struct" };
-const ENUM: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "enum" };
-const TRAIT: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "trait" };
-const IMPL: SymbolMeta = SymbolMeta { category: SymbolCategory::Implementation, label: "impl" };
-const FN: SymbolMeta = SymbolMeta { category: SymbolCategory::Function, label: "fn" };
-const CONST: SymbolMeta = SymbolMeta { category: SymbolCategory::Variable, label: "const" };
-const STATIC: SymbolMeta = SymbolMeta { category: SymbolCategory::Variable, label: "static" };
-const TYPE_ALIAS: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "type" };
-const MACRO: SymbolMeta = SymbolMeta { category: SymbolCategory::Macro, label: "macro" };
+const MOD: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Module,
+    label: "mod",
+};
+const STRUCT: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Type,
+    label: "struct",
+};
+const ENUM: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Type,
+    label: "enum",
+};
+const TRAIT: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Type,
+    label: "trait",
+};
+const IMPL: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Implementation,
+    label: "impl",
+};
+const FN: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Function,
+    label: "fn",
+};
+const CONST: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Variable,
+    label: "const",
+};
+const STATIC: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Variable,
+    label: "static",
+};
+const TYPE_ALIAS: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Type,
+    label: "type",
+};
+const MACRO: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Macro,
+    label: "macro",
+};
 
 /// Node kinds that belong to the item below them. Rust's two comment kinds —
 /// `///`, `//!` and plain `//` are all `line_comment`; `/* */` and `/** */`
@@ -176,8 +214,10 @@ fn extract_symbols(
             };
 
             // Recurse into container types for their children.
-            if matches!(meta.category, SymbolCategory::Implementation | SymbolCategory::Module)
-                || meta.label == "trait"
+            if matches!(
+                meta.category,
+                SymbolCategory::Implementation | SymbolCategory::Module
+            ) || meta.label == "trait"
             {
                 if let Some(body) = child_by_kind(&child, "declaration_list") {
                     // Members hang off the type, not the impl block, so the
@@ -185,10 +225,16 @@ fn extract_symbols(
                     // impls keep their full `Trait for Type` qualification —
                     // two traits can give one type the same method name, and
                     // only the qualification keeps those apart.
-                    let child_prefix = name_path
-                        .strip_prefix("impl ")
-                        .unwrap_or(&name_path);
-                    extract_body_children(body, src, file_path, names, path_prefix, child_prefix, &mut sym.children);
+                    let child_prefix = name_path.strip_prefix("impl ").unwrap_or(&name_path);
+                    extract_body_children(
+                        body,
+                        src,
+                        file_path,
+                        names,
+                        path_prefix,
+                        child_prefix,
+                        &mut sym.children,
+                    );
                 }
             }
 
@@ -245,7 +291,13 @@ fn extract_body_children(
 /// Extract name from a node that has an `identifier` or `type_identifier` child.
 fn named_symbol(node: &Node, src: &[u8], meta: &SymbolMeta) -> Option<(String, SymbolMeta)> {
     let name = find_name(node, src)?;
-    Some((name, SymbolMeta { category: meta.category, label: meta.label }))
+    Some((
+        name,
+        SymbolMeta {
+            category: meta.category,
+            label: meta.label,
+        },
+    ))
 }
 
 /// Build a descriptive name for `impl` blocks: "Foo" or "Trait for Foo".
@@ -367,11 +419,16 @@ mod tests {
     /// only `Trait for Type/method` keeps those apart.
     #[test]
     fn a_trait_impl_keeps_its_qualified_name() {
-        let syms = parse("struct P;
+        let syms = parse(
+            "struct P;
 impl Display for P {
     fn fmt(&self) {}
-}");
-        let imp = syms.iter().find(|s| s.category == SymbolCategory::Implementation).unwrap();
+}",
+        );
+        let imp = syms
+            .iter()
+            .find(|s| s.category == SymbolCategory::Implementation)
+            .unwrap();
         assert_eq!(imp.name.as_ref(), "Display for P");
         assert!(imp.children[0].id.ends_with("::Display for P/fmt"));
     }
@@ -402,7 +459,10 @@ impl Display for P {
     fn a_glued_doc_comment_widens_the_symbol() {
         let syms = parse("/// Adds one.\npub fn inc(x: i32) -> i32 { x + 1 }");
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].byte_range.start, 0, "the comment's own start, not the fn's");
+        assert_eq!(
+            syms[0].byte_range.start, 0,
+            "the comment's own start, not the fn's"
+        );
         assert_eq!(syms[0].line_range.start, 1);
     }
 
@@ -423,9 +483,13 @@ impl Display for P {
     /// two different preceding-sibling contexts.
     #[test]
     fn a_method_doc_comment_attaches_to_the_method_not_the_impl_block() {
-        let src = "struct Point;\nimpl Point {\n    /// Make one.\n    fn new() -> Self { Self }\n}";
+        let src =
+            "struct Point;\nimpl Point {\n    /// Make one.\n    fn new() -> Self { Self }\n}";
         let syms = parse(src);
-        let imp = syms.iter().find(|s| s.category == SymbolCategory::Implementation).unwrap();
+        let imp = syms
+            .iter()
+            .find(|s| s.category == SymbolCategory::Implementation)
+            .unwrap();
         assert_eq!(
             imp.byte_range.start as usize,
             src.find("impl Point").unwrap(),
@@ -454,7 +518,9 @@ impl Display for P {
     /// start: the byte offset of `from`.
     fn assert_starts_at(src: &str, from: &str) {
         let syms = parse(src);
-        let last = syms.last().unwrap_or_else(|| panic!("no symbols in {src:?}"));
+        let last = syms
+            .last()
+            .unwrap_or_else(|| panic!("no symbols in {src:?}"));
         assert_eq!(
             last.byte_range.start as usize,
             src.find(from).unwrap(),
@@ -481,7 +547,10 @@ impl Display for P {
     fn inner_doc_comments_never_widen_an_item() {
         assert_starts_at("//! Module docs.\npub fn f() {}\n", "pub fn f");
         assert_starts_at("/*! Module docs. */\npub fn f() {}\n", "pub fn f");
-        assert_starts_at("// note\n//! Module docs.\n/// Item docs.\nfn f() {}\n", "/// Item docs.");
+        assert_starts_at(
+            "// note\n//! Module docs.\n/// Item docs.\nfn f() {}\n",
+            "/// Item docs.",
+        );
     }
 
     /// The same newline quirk, one level down: a `///` comment followed by a
@@ -490,7 +559,10 @@ impl Display for P {
     #[test]
     fn a_doc_comment_above_a_blank_line_is_separated() {
         assert_starts_at("/// Orphan.\n\nfn f() {}\n", "fn f");
-        assert_starts_at("/// Orphan.\n\n/// Item docs.\nfn f() {}\n", "/// Item docs.");
+        assert_starts_at(
+            "/// Orphan.\n\n/// Item docs.\nfn f() {}\n",
+            "/// Item docs.",
+        );
     }
 
     /// tree-sitter parses an attribute as a sibling between an item and its
@@ -502,7 +574,11 @@ impl Display for P {
         assert_starts_at("#[test]\nfn t() {}\n", "#[test]");
         assert_starts_at("#[inline]\n/// Docs.\nfn f() {}\n", "#[inline]");
         let syms = parse("/// Docs.\n#[derive(Debug)]\npub struct S;\n");
-        assert_eq!((syms[0].line_range.start, syms[0].head_line), (1, 3), "named below its docs and attributes");
+        assert_eq!(
+            (syms[0].line_range.start, syms[0].head_line),
+            (1, 3),
+            "named below its docs and attributes"
+        );
         assert_starts_at(
             "/// Docs.\n#[derive(Debug)]\n#[serde(rename_all = \"snake_case\")]\nenum E { A }\n",
             "/// Docs.",

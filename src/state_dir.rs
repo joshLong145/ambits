@@ -215,12 +215,18 @@ mod tests {
 
     #[test]
     fn without_an_override_state_lives_under_the_project() {
-        assert_eq!(state_root_with(Path::new("/p"), None), Path::new("/p/.ambits"));
+        assert_eq!(
+            state_root_with(Path::new("/p"), None),
+            Path::new("/p/.ambits")
+        );
     }
 
     #[test]
     fn an_override_replaces_the_project_state_dir() {
-        assert_eq!(state_root_with(Path::new("/p"), Some(Path::new("/tmp/s"))), Path::new("/tmp/s"));
+        assert_eq!(
+            state_root_with(Path::new("/p"), Some(Path::new("/tmp/s"))),
+            Path::new("/tmp/s")
+        );
     }
 
     #[test]

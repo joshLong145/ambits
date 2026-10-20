@@ -218,8 +218,13 @@ impl EnvironmentManifest {
             ambit_version: env!("CARGO_PKG_VERSION").to_string(),
             backend: backend.to_string(),
             // Diagnostic only; generated from Cargo.lock at build time.
-            parsers: crate::parser::GRAMMARS.iter().map(|(n, v)| format!("{n}={v}")).collect(),
-            tool_config_version: Some(crate::ingest::tool_config::ToolMappingConfig::SUPPORTED_VERSION),
+            parsers: crate::parser::GRAMMARS
+                .iter()
+                .map(|(n, v)| format!("{n}={v}"))
+                .collect(),
+            tool_config_version: Some(
+                crate::ingest::tool_config::ToolMappingConfig::SUPPORTED_VERSION,
+            ),
             filter,
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
@@ -308,7 +313,10 @@ pub enum Record {
     },
     /// A pull merged `remote`'s snapshot `tip` into this session (§12.3):
     /// the next snapshot takes it as a second parent. Local-only.
-    Merge { remote: String, tip: String },
+    Merge {
+        remote: String,
+        tip: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -446,7 +454,10 @@ pub fn read_journal(path: &Path) -> JournalContents {
     match std::fs::read_to_string(path) {
         Ok(content) => fold_journal_text(path, &content),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => JournalContents::default(),
-        Err(e) => JournalContents { warnings: vec![format!("{}: {e}", path.display())], ..Default::default() },
+        Err(e) => JournalContents {
+            warnings: vec![format!("{}: {e}", path.display())],
+            ..Default::default()
+        },
     }
 }
 
@@ -628,11 +639,19 @@ pub fn read_journal_session(dir: &Path, session_id: &str) -> JournalContents {
 /// which outnumber writes several times over, are skipped by their prefix
 /// without being parsed. A shard with an unreadable schema contributes
 /// nothing, as in [`read_journal`].
-pub fn read_session_writes(dir: &Path, session_id: &str) -> std::collections::BTreeMap<String, crate::writes::WriteRecord> {
+pub fn read_session_writes(
+    dir: &Path,
+    session_id: &str,
+) -> std::collections::BTreeMap<String, crate::writes::WriteRecord> {
     let mut out = std::collections::BTreeMap::new();
     for path in session_shard_paths(dir, session_id) {
-        let Ok(content) = std::fs::read_to_string(&path) else { continue };
-        for record in fold_lines(&path, &content, Records::Writes).writes.into_values() {
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for record in fold_lines(&path, &content, Records::Writes)
+            .writes
+            .into_values()
+        {
             fold_write(&mut out, record);
         }
     }
@@ -709,7 +728,10 @@ pub fn append_shard(
     let mut journal = Journal::open_shard(project_root, session, shard, Duration::ZERO, manifest);
     for record in records {
         if !journal.append(record) {
-            color_eyre::eyre::bail!("cannot write the {shard} shard {}", journal.path().display());
+            color_eyre::eyre::bail!(
+                "cannot write the {shard} shard {}",
+                journal.path().display()
+            );
         }
     }
     Ok(())
@@ -719,7 +741,9 @@ impl JournalContents {
     /// Whether `agent` already has `symbol` at `hash`, at `depth` or deeper:
     /// a read that would add nothing.
     pub fn knows_read(&self, symbol: &str, agent: &str, hash: &[u8; 32], depth: ReadDepth) -> bool {
-        self.agent_reads.get(&(symbol.to_string(), agent.to_string())).is_some_and(|(h, d)| h == hash && *d >= depth)
+        self.agent_reads
+            .get(&(symbol.to_string(), agent.to_string()))
+            .is_some_and(|(h, d)| h == hash && *d >= depth)
     }
 }
 
@@ -825,11 +849,17 @@ impl Journal {
         match shard.map_or_else(|| fs4::FileExt::try_lock(&file), |_| Ok(())) {
             Ok(()) => {}
             Err(fs4::TryLockError::WouldBlock) => {
-                journal.error = Some(format!("{} is open for writing by another ambits process", path.display()));
+                journal.error = Some(format!(
+                    "{} is open for writing by another ambits process",
+                    path.display()
+                ));
                 return journal;
             }
             Err(fs4::TryLockError::Error(e)) => {
-                journal.warnings.push(format!("{}: cannot lock ({e}); another writer would not be refused", path.display()));
+                journal.warnings.push(format!(
+                    "{}: cannot lock ({e}); another writer would not be refused",
+                    path.display()
+                ));
             }
         }
         journal.file = Some(file);
@@ -902,7 +932,11 @@ impl Journal {
         if self.error.is_some() {
             return false;
         }
-        if self.written_ops.get(&record.op).is_some_and(|&av| av >= record.av) {
+        if self
+            .written_ops
+            .get(&record.op)
+            .is_some_and(|&av| av >= record.av)
+        {
             return false;
         }
         if !self.write(&Record::Write(Box::new(record.clone()))) {
@@ -1018,8 +1052,8 @@ fn timestamp() -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::helpers::*;
     use super::*;
+    use crate::helpers::*;
     use crate::symbols::merkle::content_hash;
 
     fn manifest() -> EnvironmentManifest {
@@ -1054,7 +1088,13 @@ mod tests {
             panic!("the manifest must not be built when the header is current")
         });
         let mut ledger = ContextLedger::new();
-        ledger.record("a.rs::x".into(), ReadDepth::FullBody, content_hash("b"), "ag".into(), 5);
+        ledger.record(
+            "a.rs::x".into(),
+            ReadDepth::FullBody,
+            content_hash("b"),
+            "ag".into(),
+            5,
+        );
         assert_eq!(second.sync(&ledger), 1, "and it still appends reads");
     }
 
@@ -1065,7 +1105,13 @@ mod tests {
         assert_eq!(first.error(), None);
 
         let second = Journal::open(dir.path(), "sess", Duration::ZERO, manifest);
-        assert!(second.error().is_some_and(|e| e.contains("another ambits process")), "{:?}", second.error());
+        assert!(
+            second
+                .error()
+                .is_some_and(|e| e.contains("another ambits process")),
+            "{:?}",
+            second.error()
+        );
 
         drop(second);
         drop(first);
@@ -1083,13 +1129,24 @@ mod tests {
         // `&Path` is Copy, so each `move` closure takes its own copy of the
         // reference and the `TempDir` itself outlives the scope.
         let root = dir.path();
-        drop(Journal::open_shard(root, "sess", "find", Duration::from_millis(0), manifest));
+        drop(Journal::open_shard(
+            root,
+            "sess",
+            "find",
+            Duration::from_millis(0),
+            manifest,
+        ));
 
         std::thread::scope(|scope| {
             for writer in 0..4 {
                 scope.spawn(move || {
-                    let mut journal =
-                        Journal::open_shard(root, "sess", "find", Duration::from_millis(0), manifest);
+                    let mut journal = Journal::open_shard(
+                        root,
+                        "sess",
+                        "find",
+                        Duration::from_millis(0),
+                        manifest,
+                    );
                     let mut ledger = ContextLedger::new();
                     for i in 0..25 {
                         ledger.record(
@@ -1151,7 +1208,8 @@ mod tests {
             "agent-cli".into(),
             5,
         );
-        Journal::open_shard(root, "sess", "find", Duration::from_millis(0), manifest).sync(&find_ledger);
+        Journal::open_shard(root, "sess", "find", Duration::from_millis(0), manifest)
+            .sync(&find_ledger);
 
         let dir_path = crate::cache::journal_dir(root);
         assert_eq!(
@@ -1209,7 +1267,11 @@ mod tests {
     fn decode_rejects_malformed_hashes() {
         assert_eq!(decode_hash("deadbeef"), None, "missing algorithm prefix");
         assert_eq!(decode_hash("b3:xyz"), None, "wrong length");
-        assert_eq!(decode_hash(&format!("b3:{}", "z".repeat(64))), None, "non-hex");
+        assert_eq!(
+            decode_hash(&format!("b3:{}", "z".repeat(64))),
+            None,
+            "non-hex"
+        );
     }
 
     #[test]
@@ -1289,7 +1351,10 @@ mod tests {
             contents.agent_reads.is_empty(),
             "no attribution existed to recover"
         );
-        assert!(contents.warnings.is_empty(), "an old version is not a fault");
+        assert!(
+            contents.warnings.is_empty(),
+            "an old version is not a fault"
+        );
     }
 
     /// A record carrying a new hash supersedes earlier depths rather than
@@ -1408,7 +1473,13 @@ mod tests {
     fn reopening_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let mut ledger = ContextLedger::new();
-        ledger.record("a.rs::x".into(), ReadDepth::FullBody, content_hash("b"), "ag".into(), 5);
+        ledger.record(
+            "a.rs::x".into(),
+            ReadDepth::FullBody,
+            content_hash("b"),
+            "ag".into(),
+            5,
+        );
 
         let mut j = journal_in(dir.path());
         j.sync(&ledger);
@@ -1425,7 +1496,13 @@ mod tests {
     fn torn_final_line_is_dropped_silently() {
         let dir = tempfile::tempdir().unwrap();
         let mut ledger = ContextLedger::new();
-        ledger.record("a.rs::x".into(), ReadDepth::FullBody, content_hash("b"), "ag".into(), 5);
+        ledger.record(
+            "a.rs::x".into(),
+            ReadDepth::FullBody,
+            content_hash("b"),
+            "ag".into(),
+            5,
+        );
         let mut j = journal_in(dir.path());
         j.sync(&ledger);
         let path = j.path().to_path_buf();
@@ -1438,7 +1515,10 @@ mod tests {
 
         let contents = read_journal(&path);
         assert_eq!(contents.reads.len(), 1);
-        assert!(contents.warnings.is_empty(), "a torn tail is expected, not an error");
+        assert!(
+            contents.warnings.is_empty(),
+            "a torn tail is expected, not an error"
+        );
     }
 
     #[test]
@@ -1496,7 +1576,13 @@ mod tests {
     fn interval_gates_syncing() {
         let dir = tempfile::tempdir().unwrap();
         let mut ledger = ContextLedger::new();
-        ledger.record("a.rs::x".into(), ReadDepth::FullBody, content_hash("b"), "ag".into(), 5);
+        ledger.record(
+            "a.rs::x".into(),
+            ReadDepth::FullBody,
+            content_hash("b"),
+            "ag".into(),
+            5,
+        );
 
         let mut j = Journal::open(dir.path(), "sess", Duration::from_secs(3600), manifest);
         assert_eq!(j.maybe_sync(&ledger), 0, "interval has not elapsed");
@@ -1556,7 +1642,9 @@ mod write_record_tests {
         drop((main, shard));
         let path = journal_dir(dir.path()).join("sess.ndjson");
         let mut text = std::fs::read_to_string(&path).unwrap();
-        text.push_str("{\"kind\":\"read\",\"sym\":\"src/lib.rs::a\",\"h\":\"b3:00\",\"d\":\"full_body\"}\n");
+        text.push_str(
+            "{\"kind\":\"read\",\"sym\":\"src/lib.rs::a\",\"h\":\"b3:00\",\"d\":\"full_body\"}\n",
+        );
         std::fs::write(&path, text).unwrap();
 
         let jdir = journal_dir(dir.path());
@@ -1570,10 +1658,19 @@ mod write_record_tests {
     /// holds only while serde writes the `kind` tag first.
     #[test]
     fn the_record_tag_is_serialized_first() {
-        let read = Record::Read { symbol_id: "a::b".into(), hash: "b3:00".into(), depth: DepthDto::FullBody, agent: None };
-        assert!(serde_json::to_string(&read).unwrap().starts_with(r#"{"kind":"read""#));
+        let read = Record::Read {
+            symbol_id: "a::b".into(),
+            hash: "b3:00".into(),
+            depth: DepthDto::FullBody,
+            agent: None,
+        };
+        assert!(serde_json::to_string(&read)
+            .unwrap()
+            .starts_with(r#"{"kind":"read""#));
         let write = Record::Write(Box::new(record("toolu_1", 2, "src/lib.rs::a")));
-        assert!(serde_json::to_string(&write).unwrap().starts_with(r#"{"kind":"write""#));
+        assert!(serde_json::to_string(&write)
+            .unwrap()
+            .starts_with(r#"{"kind":"write""#));
     }
 
     /// A later header does not revive a shard an unreadable one discarded:
@@ -1583,16 +1680,30 @@ mod write_record_tests {
         let dir = tempfile::tempdir().unwrap();
         let jdir = journal_dir(dir.path());
         std::fs::create_dir_all(&jdir).unwrap();
-        let header = |v: u32| format!(
+        let header = |v: u32| {
+            format!(
             "{{\"kind\":\"header\",\"schema_version\":{v},\"created_at\":\"0\",\"session_id\":\"sess\",\"project_root\":\"/p\",\"tree_fingerprint\":\"b3:00\",\"ambit_version\":\"0\",\"backend\":\"x\",\"os\":\"x\",\"arch\":\"x\"}}"
-        );
-        let write = serde_json::to_string(&Record::Write(Box::new(record("toolu_1", 2, "src/lib.rs::a")))).unwrap();
+        )
+        };
+        let write = serde_json::to_string(&Record::Write(Box::new(record(
+            "toolu_1",
+            2,
+            "src/lib.rs::a",
+        ))))
+        .unwrap();
         std::fs::write(
             jdir.join("sess.ndjson"),
-            format!("{}\n{}\n{write}\n", header(SUPPORTED_SCHEMA_VERSION + 1), header(SUPPORTED_SCHEMA_VERSION)),
+            format!(
+                "{}\n{}\n{write}\n",
+                header(SUPPORTED_SCHEMA_VERSION + 1),
+                header(SUPPORTED_SCHEMA_VERSION)
+            ),
         )
         .unwrap();
-        assert_eq!(read_session_writes(&jdir, "sess"), read_journal_session(&jdir, "sess").writes);
+        assert_eq!(
+            read_session_writes(&jdir, "sess"),
+            read_journal_session(&jdir, "sess").writes
+        );
     }
 
     #[test]
@@ -1616,8 +1727,14 @@ mod write_record_tests {
         assert!(j.record_write(&record("toolu_1", 1, "src/lib.rs::a")));
         let contents = read_journal_session(&journal_dir(dir.path()), "sess");
         assert_eq!(contents.writes.len(), 1);
-        assert_eq!(contents.writes["toolu_1"], record("toolu_1", 1, "src/lib.rs::a"));
-        assert_eq!(contents.header.as_ref().map(|h| h.0), Some(SUPPORTED_SCHEMA_VERSION));
+        assert_eq!(
+            contents.writes["toolu_1"],
+            record("toolu_1", 1, "src/lib.rs::a")
+        );
+        assert_eq!(
+            contents.header.as_ref().map(|h| h.0),
+            Some(SUPPORTED_SCHEMA_VERSION)
+        );
     }
 
     /// The TUI replays the whole log at startup; an op already on disk —
@@ -1625,10 +1742,17 @@ mod write_record_tests {
     #[test]
     fn a_write_is_journaled_once_across_reopens_and_shards() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(open(dir.path(), Some("pull")).record_write(&record("toolu_1", 1, "src/lib.rs::a")));
+        assert!(open(dir.path(), Some("pull")).record_write(&record(
+            "toolu_1",
+            1,
+            "src/lib.rs::a"
+        )));
 
         let mut primary = open(dir.path(), None);
-        assert!(!primary.record_write(&record("toolu_1", 1, "src/lib.rs::a")), "already in the pull shard");
+        assert!(
+            !primary.record_write(&record("toolu_1", 1, "src/lib.rs::a")),
+            "already in the pull shard"
+        );
         assert!(primary.record_write(&record("toolu_2", 1, "src/lib.rs::b")));
         drop(primary);
         assert!(!open(dir.path(), None).record_write(&record("toolu_2", 1, "src/lib.rs::b")));
@@ -1644,7 +1768,10 @@ mod write_record_tests {
         let mut j = open(dir.path(), None);
         assert!(j.record_write(&record("toolu_1", 1, "src/lib.rs::old")));
         assert!(j.record_write(&record("toolu_1", 2, "src/lib.rs::new")));
-        assert!(!j.record_write(&record("toolu_1", 1, "src/lib.rs::old")), "an older version never wins");
+        assert!(
+            !j.record_write(&record("toolu_1", 1, "src/lib.rs::old")),
+            "an older version never wins"
+        );
         let contents = read_journal_session(&journal_dir(dir.path()), "sess");
         assert_eq!(contents.writes["toolu_1"].av, 2);
         assert_eq!(contents.writes["toolu_1"].syms[0].0, "src/lib.rs::new");
@@ -1679,8 +1806,21 @@ mod write_record_tests {
             session_id: "sess".into(),
             environment: manifest(),
         }));
-        let read = Record::Read { symbol_id: "src/a.rs::x".into(), hash: encode_hash(&[0; 32]), depth: DepthDto::FullBody, agent: Some("ag".into()) };
-        std::fs::write(&path, format!("{}\n{}\n", serde_json::to_string(&header).unwrap(), serde_json::to_string(&read).unwrap())).unwrap();
+        let read = Record::Read {
+            symbol_id: "src/a.rs::x".into(),
+            hash: encode_hash(&[0; 32]),
+            depth: DepthDto::FullBody,
+            agent: Some("ag".into()),
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&read).unwrap()
+            ),
+        )
+        .unwrap();
 
         drop(open(dir.path(), None));
         let contents = read_journal(&path);

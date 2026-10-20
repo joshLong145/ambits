@@ -55,9 +55,9 @@ impl ProjectScope {
         builder.add(root.join(".gitignore"));
         builder.add(root.join(".git/info/exclude"));
 
-        let ignore = builder.build().unwrap_or_else(|_| {
-            ignore::gitignore::Gitignore::empty()
-        });
+        let ignore = builder
+            .build()
+            .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty());
 
         Self {
             root: root.to_path_buf(),
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn literal_empty_validate_is_noop() {
         // Empty filter degenerates to "no filter" — always validates.
-        let nowhere = PathBuf::from("/definitely/not/a/real/path/" );
+        let nowhere = PathBuf::from("/definitely/not/a/real/path/");
         lit("").validate(&nowhere).unwrap();
     }
 

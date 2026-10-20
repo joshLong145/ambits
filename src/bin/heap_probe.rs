@@ -28,9 +28,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1_000);
 
-    eprintln!(
-        "heap_probe: building tree with {n_files} files × {SYMBOLS_PER_FILE} symbols/file",
-    );
+    eprintln!("heap_probe: building tree with {n_files} files × {SYMBOLS_PER_FILE} symbols/file",);
 
     let project = make_monorepo_tree(n_files, SYMBOLS_PER_FILE);
 
@@ -127,7 +125,8 @@ fn make_sym(id: &str, name: &str) -> SymbolNode {
         label: "fn",
         file_path: Arc::new(PathBuf::from("src/bench.rs")),
         byte_range: 0..100,
-        line_range: 1..10, head_line: 1,
+        line_range: 1..10,
+        head_line: 1,
         content_hash: hash,
         merkle_hash: hash,
         children: Vec::new(),

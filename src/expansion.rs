@@ -74,7 +74,10 @@ mod tests {
             assert_eq!(e.is_expanded("x", kind), !default);
             assert!(e.set("x", kind, default), "{kind:?}: restore is a change");
             assert_eq!(e.is_expanded("x", kind), default);
-            assert!(e.0.iter().all(HashSet::is_empty), "{kind:?}: a default is never stored");
+            assert!(
+                e.0.iter().all(HashSet::is_empty),
+                "{kind:?}: a default is never stored"
+            );
         }
     }
 
@@ -94,6 +97,9 @@ mod tests {
     fn kinds_do_not_share_state() {
         let mut e = Expansion::default();
         e.set("same-id", RowKind::File, true);
-        assert!(e.is_expanded("same-id", RowKind::Symbol), "symbol still at its default");
+        assert!(
+            e.is_expanded("same-id", RowKind::Symbol),
+            "symbol still at its default"
+        );
     }
 }

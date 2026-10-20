@@ -53,15 +53,36 @@ impl Default for MarkdownParser {
 /// Heading metadata by depth (`HEADINGS[0]` is `h1`), mirroring the
 /// `SymbolMeta` const-table pattern the other parsers use for node kinds.
 const HEADINGS: [SymbolMeta; 6] = [
-    SymbolMeta { category: SymbolCategory::Module, label: "h1" },
-    SymbolMeta { category: SymbolCategory::Module, label: "h2" },
-    SymbolMeta { category: SymbolCategory::Module, label: "h3" },
-    SymbolMeta { category: SymbolCategory::Module, label: "h4" },
-    SymbolMeta { category: SymbolCategory::Module, label: "h5" },
-    SymbolMeta { category: SymbolCategory::Module, label: "h6" },
+    SymbolMeta {
+        category: SymbolCategory::Module,
+        label: "h1",
+    },
+    SymbolMeta {
+        category: SymbolCategory::Module,
+        label: "h2",
+    },
+    SymbolMeta {
+        category: SymbolCategory::Module,
+        label: "h3",
+    },
+    SymbolMeta {
+        category: SymbolCategory::Module,
+        label: "h4",
+    },
+    SymbolMeta {
+        category: SymbolCategory::Module,
+        label: "h5",
+    },
+    SymbolMeta {
+        category: SymbolCategory::Module,
+        label: "h6",
+    },
 ];
 
-const PREAMBLE: SymbolMeta = SymbolMeta { category: SymbolCategory::Module, label: "preamble" };
+const PREAMBLE: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Module,
+    label: "preamble",
+};
 
 impl LanguageParser for MarkdownParser {
     fn extensions(&self) -> &[&str] {
@@ -130,7 +151,12 @@ fn scan_headings(source: &str) -> Vec<Heading> {
             in_fence = !in_fence;
         } else if !in_fence {
             if let Some((level, text)) = parse_atx_heading(trimmed) {
-                headings.push(Heading { level, text, start_byte: offset, start_line: line_no });
+                headings.push(Heading {
+                    level,
+                    text,
+                    start_byte: offset,
+                    start_line: line_no,
+                });
             }
         }
 
@@ -195,8 +221,18 @@ fn build_tree(
     let mut stack: Vec<OpenHeading> = Vec::new();
 
     let first_start = headings.first().map(|h| h.start_byte).unwrap_or(total_len);
-    let first_end_line = headings.first().map(|h| h.start_line - 1).unwrap_or(total_lines);
-    if let Some(sym) = make_preamble(source, first_start, first_end_line, file_path, names, path_prefix) {
+    let first_end_line = headings
+        .first()
+        .map(|h| h.start_line - 1)
+        .unwrap_or(total_lines);
+    if let Some(sym) = make_preamble(
+        source,
+        first_start,
+        first_end_line,
+        file_path,
+        names,
+        path_prefix,
+    ) {
         roots.push(sym);
     }
 
@@ -231,7 +267,15 @@ fn build_tree(
     }
 
     while let Some(open) = stack.pop() {
-        let sym = finish_heading(open, total_len, total_lines, source, file_path, names, path_prefix);
+        let sym = finish_heading(
+            open,
+            total_len,
+            total_lines,
+            source,
+            file_path,
+            names,
+            path_prefix,
+        );
         push_child(&mut stack, &mut roots, sym);
     }
 
@@ -359,7 +403,10 @@ mod tests {
 
         let d = &syms[1];
         assert_eq!(d.id, "test.md::D");
-        assert!(d.children.is_empty(), "D is a sibling of A, not nested under it");
+        assert!(
+            d.children.is_empty(),
+            "D is a sibling of A, not nested under it"
+        );
     }
 
     #[test]

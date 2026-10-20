@@ -76,7 +76,10 @@ pub fn units(write: &WriteRecord) -> Vec<Unit> {
         Some(fh) => Proof::FileHash(fh.clone()),
         None => Proof::None,
     };
-    vec![Unit { target: write.file.clone(), proof }]
+    vec![Unit {
+        target: write.file.clone(),
+        proof,
+    }]
 }
 
 /// Where a unit landed.
@@ -123,7 +126,10 @@ enum Change {
     /// Modified or type-changed.
     Modified(String),
     Deleted(String),
-    Renamed { from: String, to: String },
+    Renamed {
+        from: String,
+        to: String,
+    },
 }
 
 /// The never-landed cache entry: the branch tips a unit was last searched
@@ -176,16 +182,34 @@ fn fold_links(lines: Vec<LinkLine>, into: &mut HashMap<String, Option<Link>>) {
     }
 }
 
-fn fold_never(lines: Vec<NeverLine>, never: &mut HashMap<String, Option<(String, Vec<String>)>>, tip_lists: &mut HashMap<String, Vec<String>>) {
+fn fold_never(
+    lines: Vec<NeverLine>,
+    never: &mut HashMap<String, Option<(String, Vec<String>)>>,
+    tip_lists: &mut HashMap<String, Vec<String>>,
+) {
     for l in lines {
         match l {
-            NeverLine { k: None, tips: Some(d), list: Some(list), .. } => {
+            NeverLine {
+                k: None,
+                tips: Some(d),
+                list: Some(list),
+                ..
+            } => {
                 tip_lists.insert(d, list);
             }
-            NeverLine { k: Some(k), tips: Some(d), names, .. } => {
+            NeverLine {
+                k: Some(k),
+                tips: Some(d),
+                names,
+                ..
+            } => {
                 never.insert(k, Some((d, names.unwrap_or_default())));
             }
-            NeverLine { k: Some(k), tips: None, .. } => {
+            NeverLine {
+                k: Some(k),
+                tips: None,
+                ..
+            } => {
                 never.insert(k, None);
             }
             _ => {}
@@ -195,7 +219,9 @@ fn fold_never(lines: Vec<NeverLine>, never: &mut HashMap<String, Option<(String,
 
 /// A set of branch tips, by content.
 fn tips_digest(tips: &[String]) -> String {
-    crate::objects::hash_framed("ambits-tips v1", tips.iter().map(|t| t.as_bytes())).to_hex().to_string()
+    crate::objects::hash_framed("ambits-tips v1", tips.iter().map(|t| t.as_bytes()))
+        .to_hex()
+        .to_string()
 }
 
 /// Resolves units against one repository.
@@ -222,8 +248,16 @@ pub struct Resolver {
 /// (`log.showSignature`), paths relative to the current directory
 /// (`diff.relative`), colour, external diff drivers.
 const LOG_ARGS: &[&str] = &[
-    "log", "--no-show-signature", "--no-relative", "--no-color", "--no-ext-diff", "-M", "--name-status", "-z",
-    "--format=commit %H %ct", "--reverse",
+    "log",
+    "--no-show-signature",
+    "--no-relative",
+    "--no-color",
+    "--no-ext-diff",
+    "-M",
+    "--name-status",
+    "-z",
+    "--format=commit %H %ct",
+    "--reverse",
 ];
 
 impl Resolver {
@@ -262,7 +296,10 @@ impl Resolver {
             return;
         }
         self.caches.loaded = true;
-        fold_links(self.links_file().read().unwrap_or_default(), &mut self.caches.links);
+        fold_links(
+            self.links_file().read().unwrap_or_default(),
+            &mut self.caches.links,
+        );
         let lines = self.never_file().read().unwrap_or_default();
         fold_never(lines, &mut self.caches.never, &mut self.caches.tip_lists);
     }
@@ -283,7 +320,11 @@ impl Resolver {
             let mut folded = HashMap::new();
             fold_links(on_disk, &mut folded);
             fold_links(new_links.clone(), &mut folded);
-            let live: Vec<LinkLine> = folded.into_iter().filter(|(_, l)| l.is_some()).map(|(k, link)| LinkLine { k, link }).collect();
+            let live: Vec<LinkLine> = folded
+                .into_iter()
+                .filter(|(_, l)| l.is_some())
+                .map(|(k, link)| LinkLine { k, link })
+                .collect();
             if worth_compacting(lines, live.len()) {
                 file.rewrite(&lock, &live, Durability::NoSync)?;
             } else {
@@ -298,12 +339,28 @@ impl Resolver {
             let (mut never, mut lists) = (HashMap::new(), HashMap::new());
             fold_never(file.read()?, &mut never, &mut lists);
             fold_never(new_never.clone(), &mut never, &mut lists);
-            let live: Vec<(String, (String, Vec<String>))> = never.into_iter().filter_map(|(k, v)| Some((k, v?))).collect();
-            let used: std::collections::HashSet<&String> = live.iter().map(|(_, (d, _))| d).collect();
+            let live: Vec<(String, (String, Vec<String>))> = never
+                .into_iter()
+                .filter_map(|(k, v)| Some((k, v?)))
+                .collect();
+            let used: std::collections::HashSet<&String> =
+                live.iter().map(|(_, (d, _))| d).collect();
             if worth_compacting(lines, live.len() + used.len()) {
-                let mut out: Vec<NeverLine> =
-                    lists.iter().filter(|(d, _)| used.contains(d)).map(|(d, l)| NeverLine { tips: Some(d.clone()), list: Some(l.clone()), ..Default::default() }).collect();
-                out.extend(live.iter().map(|(k, (d, names))| NeverLine { k: Some(k.clone()), tips: Some(d.clone()), names: Some(names.clone()), ..Default::default() }));
+                let mut out: Vec<NeverLine> = lists
+                    .iter()
+                    .filter(|(d, _)| used.contains(d))
+                    .map(|(d, l)| NeverLine {
+                        tips: Some(d.clone()),
+                        list: Some(l.clone()),
+                        ..Default::default()
+                    })
+                    .collect();
+                out.extend(live.iter().map(|(k, (d, names))| NeverLine {
+                    k: Some(k.clone()),
+                    tips: Some(d.clone()),
+                    names: Some(names.clone()),
+                    ..Default::default()
+                }));
                 file.rewrite(&lock, &out, Durability::NoSync)?;
             } else {
                 file.append(&lock, &new_never, Durability::NoSync)?;
@@ -343,12 +400,24 @@ impl Resolver {
             }
             // Amended or rebased away: resolve again.
             self.caches.links.insert(key.clone(), None);
-            self.caches.new_links.push(LinkLine { k: key.clone(), link: None });
+            self.caches.new_links.push(LinkLine {
+                k: key.clone(),
+                link: None,
+            });
         }
 
-        let cached: Option<NeverLanded> = self.caches.never.get(&key).cloned().flatten().and_then(|(digest, names)| {
-            Some(NeverLanded { tips: self.caches.tip_lists.get(&digest)?.clone(), names })
-        });
+        let cached: Option<NeverLanded> =
+            self.caches
+                .never
+                .get(&key)
+                .cloned()
+                .flatten()
+                .and_then(|(digest, names)| {
+                    Some(NeverLanded {
+                        tips: self.caches.tip_lists.get(&digest)?.clone(),
+                        names,
+                    })
+                });
         let (landing, names) = match cached {
             // Nothing has moved since it was last searched.
             Some(c) if c.tips == self.tips => return Ok(Landing::Uncommitted),
@@ -363,20 +432,39 @@ impl Resolver {
         match &landing {
             Landing::Landed(link) => {
                 self.caches.links.insert(key.clone(), Some(link.clone()));
-                self.caches.new_links.push(LinkLine { k: key.clone(), link: Some(link.clone()) });
+                self.caches.new_links.push(LinkLine {
+                    k: key.clone(),
+                    link: Some(link.clone()),
+                });
                 if matches!(self.caches.never.get(&key), Some(Some(_))) {
                     self.caches.never.insert(key.clone(), None);
-                    self.caches.new_never.push(NeverLine { k: Some(key), ..Default::default() });
+                    self.caches.new_never.push(NeverLine {
+                        k: Some(key),
+                        ..Default::default()
+                    });
                 }
             }
             Landing::Uncommitted => {
                 let digest = tips_digest(&self.tips);
                 if !self.caches.tip_lists.contains_key(&digest) {
-                    self.caches.tip_lists.insert(digest.clone(), self.tips.clone());
-                    self.caches.new_never.push(NeverLine { tips: Some(digest.clone()), list: Some(self.tips.clone()), ..Default::default() });
+                    self.caches
+                        .tip_lists
+                        .insert(digest.clone(), self.tips.clone());
+                    self.caches.new_never.push(NeverLine {
+                        tips: Some(digest.clone()),
+                        list: Some(self.tips.clone()),
+                        ..Default::default()
+                    });
                 }
-                self.caches.never.insert(key.clone(), Some((digest.clone(), names.clone())));
-                self.caches.new_never.push(NeverLine { k: Some(key), tips: Some(digest), names: Some(names), ..Default::default() });
+                self.caches
+                    .never
+                    .insert(key.clone(), Some((digest.clone(), names.clone())));
+                self.caches.new_never.push(NeverLine {
+                    k: Some(key),
+                    tips: Some(digest),
+                    names: Some(names),
+                    ..Default::default()
+                });
             }
         }
         Ok(landing)
@@ -389,7 +477,12 @@ impl Resolver {
         };
         let since = written_at.saturating_sub(SKEW_SECS);
         self.prime(since);
-        let commits: Vec<Commit> = self.log.iter().filter(|c| c.time >= since).cloned().collect();
+        let commits: Vec<Commit> = self
+            .log
+            .iter()
+            .filter(|c| c.time >= since)
+            .cloned()
+            .collect();
         let names = vec![format!("{}{}", self.repo.prefix, write.file)];
         self.search(write, unit, &commits, names)
     }
@@ -412,7 +505,13 @@ impl Resolver {
     /// (repo-relative); a rename adds its new name and keeps the old, since
     /// the log mixes branches and a rename on one says nothing about the
     /// others. Returns the names as they stand at the end, for the cache.
-    fn search(&mut self, write: &WriteRecord, unit: &Unit, commits: &[Commit], mut names: Vec<String>) -> (Landing, Vec<String>) {
+    fn search(
+        &mut self,
+        write: &WriteRecord,
+        unit: &Unit,
+        commits: &[Commit],
+        mut names: Vec<String>,
+    ) -> (Landing, Vec<String>) {
         let written_at = crate::time::parse_rfc3339(&write.t).unwrap_or(0);
         if !valid_record_path(&write.file) {
             return (Landing::Uncommitted, names);
@@ -427,7 +526,9 @@ impl Resolver {
             let mut deleted = false;
             for change in &commit.changes {
                 match change {
-                    Change::Added(p) | Change::Modified(p) if names.contains(p) => candidates.push(p.clone()),
+                    Change::Added(p) | Change::Modified(p) if names.contains(p) => {
+                        candidates.push(p.clone())
+                    }
                     Change::Renamed { from, to } if names.contains(from) || names.contains(to) => {
                         if follow && !names.contains(to) {
                             names.push(to.clone());
@@ -452,13 +553,18 @@ impl Resolver {
                 }
             }
             for path in candidates {
-                let Some(rel) = path.strip_prefix(&prefix).map(str::to_string) else { continue };
+                let Some(rel) = path.strip_prefix(&prefix).map(str::to_string) else {
+                    continue;
+                };
                 let found = match &unit.proof {
                     Proof::None => commit.time >= written_at,
                     _ => self.contains(&commit.sha, &path, &rel, unit),
                 };
                 if found {
-                    return (Landing::Landed(self.link(write, unit, &commit.sha, rel)), names);
+                    return (
+                        Landing::Landed(self.link(write, unit, &commit.sha, rel)),
+                        names,
+                    );
                 }
             }
         }
@@ -470,7 +576,10 @@ impl Resolver {
     fn contains(&mut self, sha: &str, path: &str, rel: &str, unit: &Unit) -> bool {
         let key = (sha.to_string(), path.to_string());
         if !self.contents.contains_key(&key) {
-            let contents = self.blob(sha, path).map(|b| FileContents::read(rel, &b, &self.registry)).unwrap_or_default();
+            let contents = self
+                .blob(sha, path)
+                .map(|b| FileContents::read(rel, &b, &self.registry))
+                .unwrap_or_default();
             self.contents.insert(key.clone(), contents);
         }
         let contents = &self.contents[&key];
@@ -498,7 +607,15 @@ impl Resolver {
         if !is_commit_id(sha) || !valid_record_path(path) {
             return None;
         }
-        git(self.dir(), &["cat-file", "blob", "--end-of-options", &format!("{sha}:{path}")])
+        git(
+            self.dir(),
+            &[
+                "cat-file",
+                "blob",
+                "--end-of-options",
+                &format!("{sha}:{path}"),
+            ],
+        )
     }
 
     /// Whether `sha` is reachable from any local branch or `HEAD`.
@@ -512,9 +629,30 @@ impl Resolver {
     }
 
     fn ask_reachable(&self, sha: &str) -> bool {
-        let on_branch = git(self.dir(), &["for-each-ref", "--count=1", "--format=%(refname)", "--contains", sha, "refs/heads"])
-            .is_some_and(|out| !out.is_empty());
-        on_branch || git(self.dir(), &["merge-base", "--is-ancestor", "--end-of-options", sha, "HEAD"]).is_some()
+        let on_branch = git(
+            self.dir(),
+            &[
+                "for-each-ref",
+                "--count=1",
+                "--format=%(refname)",
+                "--contains",
+                sha,
+                "refs/heads",
+            ],
+        )
+        .is_some_and(|out| !out.is_empty());
+        on_branch
+            || git(
+                self.dir(),
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    "--end-of-options",
+                    sha,
+                    "HEAD",
+                ],
+            )
+            .is_some()
     }
 }
 
@@ -527,22 +665,37 @@ impl Resolver {
 /// header from its changes.
 fn parse_log(out: &[u8]) -> Vec<Commit> {
     let mut commits: Vec<Commit> = Vec::new();
-    let mut tokens = out.split(|&b| b == 0).map(|t| String::from_utf8_lossy(t).into_owned());
+    let mut tokens = out
+        .split(|&b| b == 0)
+        .map(|t| String::from_utf8_lossy(t).into_owned());
     while let Some(token) = tokens.next() {
         let token = token.strip_prefix('\n').unwrap_or(&token).to_string();
-        if let Some(rest) = token.rsplit('\n').next().and_then(|line| line.strip_prefix("commit ")) {
+        if let Some(rest) = token
+            .rsplit('\n')
+            .next()
+            .and_then(|line| line.strip_prefix("commit "))
+        {
             let mut parts = rest.split(' ');
             let sha = parts.next().unwrap_or_default().to_string();
             let time = parts.next().and_then(|t| t.parse().ok());
             if let (true, Some(time)) = (is_commit_id(&sha), time) {
-                commits.push(Commit { sha, time, changes: Vec::new() });
+                commits.push(Commit {
+                    sha,
+                    time,
+                    changes: Vec::new(),
+                });
                 continue;
             }
         }
-        let Some(commit) = commits.last_mut() else { continue };
+        let Some(commit) = commits.last_mut() else {
+            continue;
+        };
         let mut path = || tokens.next().unwrap_or_default();
         let change = match token.as_bytes().first() {
-            Some(b'R') => Change::Renamed { from: path(), to: path() },
+            Some(b'R') => Change::Renamed {
+                from: path(),
+                to: path(),
+            },
             Some(b'C') => {
                 let _source = path();
                 Change::Added(path())
@@ -561,7 +714,11 @@ fn parse_log(out: &[u8]) -> Vec<Commit> {
 /// never-landed cache is exact while these are unchanged, and otherwise
 /// only commits not reachable from the old tips need searching.
 fn tips(repo: &Repo) -> Vec<String> {
-    let heads = git(repo.dir(), &["for-each-ref", "--format=%(objectname)", "refs/heads"]).unwrap_or_default();
+    let heads = git(
+        repo.dir(),
+        &["for-each-ref", "--format=%(objectname)", "refs/heads"],
+    )
+    .unwrap_or_default();
     let mut tips: Vec<String> = String::from_utf8_lossy(&heads)
         .lines()
         .map(str::trim)
@@ -589,7 +746,10 @@ fn links_file(root: &Path) -> FlatLog {
 
 /// The never-landed cache of the store rooted at `root` (local only).
 fn never_file(root: &Path) -> FlatLog {
-    FlatLog::at(root.join(crate::state_dir::CACHE).join(crate::state_dir::NEVER_LANDED))
+    FlatLog::at(
+        root.join(crate::state_dir::CACHE)
+            .join(crate::state_dir::NEVER_LANDED),
+    )
 }
 
 /// The links index of the store at `root` (a project's `.ambits`, or a
@@ -597,20 +757,33 @@ fn never_file(root: &Path) -> FlatLog {
 pub fn links_of(root: &Path) -> Result<Vec<(String, Link)>> {
     let mut folded = HashMap::new();
     fold_links(links_file(root).read()?, &mut folded);
-    let mut out: Vec<(String, Link)> = folded.into_iter().filter_map(|(k, l)| Some((k, l?))).collect();
+    let mut out: Vec<(String, Link)> = folded
+        .into_iter()
+        .filter_map(|(k, l)| Some((k, l?)))
+        .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
 
 /// Add to the links index at `root` whichever of `links` it lacks — not
 /// overriding a tombstone's key with an older link. How many were added.
-pub fn add_links(root: &Path, links: Vec<(String, Link)>, durability: crate::objects::store::Durability) -> Result<usize> {
+pub fn add_links(
+    root: &Path,
+    links: Vec<(String, Link)>,
+    durability: crate::objects::store::Durability,
+) -> Result<usize> {
     let file = links_file(root);
     let lock = file.lock()?;
     let mut have = HashMap::new();
     fold_links(file.read()?, &mut have);
-    let new: Vec<LinkLine> =
-        links.into_iter().filter(|(k, _)| !have.contains_key(k)).map(|(k, link)| LinkLine { k, link: Some(link) }).collect();
+    let new: Vec<LinkLine> = links
+        .into_iter()
+        .filter(|(k, _)| !have.contains_key(k))
+        .map(|(k, link)| LinkLine {
+            k,
+            link: Some(link),
+        })
+        .collect();
     file.append(&lock, &new, durability)?;
     Ok(new.len())
 }
@@ -622,10 +795,14 @@ pub fn add_links(root: &Path, links: Vec<(String, Link)>, durability: crate::obj
 /// nothing and is dropped. Keys are recomputed, never taken from the
 /// remote. How many were added; none outside a repository.
 pub fn import_links(project_root: &Path, links: Vec<Link>) -> Result<usize> {
-    let Some(mut resolver) = Resolver::new(project_root) else { return Ok(0) };
+    let Some(mut resolver) = Resolver::new(project_root) else {
+        return Ok(0);
+    };
     let mut proven = Vec::new();
     for link in links {
-        let Some(hash) = link.hash.clone() else { continue };
+        let Some(hash) = link.hash.clone() else {
+            continue;
+        };
         let well_formed = crate::objects::valid_op(&link.op)
             && is_commit_id(&link.commit)
             && valid_record_path(&link.path)
@@ -635,24 +812,42 @@ pub fn import_links(project_root: &Path, links: Vec<Link>) -> Result<usize> {
             continue;
         }
         let proof = if link.target.contains("::") {
-            Proof::Symbol { name_path: crate::symbols::split_id(&link.target).1.to_string(), hash: hash.clone() }
+            Proof::Symbol {
+                name_path: crate::symbols::split_id(&link.target).1.to_string(),
+                hash: hash.clone(),
+            }
         } else {
             Proof::FileHash(hash.clone())
         };
-        let unit = Unit { target: link.target.clone(), proof };
+        let unit = Unit {
+            target: link.target.clone(),
+            proof,
+        };
         let path = format!("{}{}", resolver.repo.prefix, link.path);
         if resolver.contains(&link.commit, &path, &link.path, &unit) {
-            proven.push((link_key(&link.op, &link.target, Some(&hash)), Link { verified: true, ..link }));
+            proven.push((
+                link_key(&link.op, &link.target, Some(&hash)),
+                Link {
+                    verified: true,
+                    ..link
+                },
+            ));
         }
     }
     drop(resolver);
-    add_links(&crate::state_dir::state_root(project_root), proven, crate::objects::store::Durability::NoSync)
+    add_links(
+        &crate::state_dir::state_root(project_root),
+        proven,
+        crate::objects::store::Durability::NoSync,
+    )
 }
 
 /// A unit's key in both caches: a hash of `(op, target, hash)`.
 fn link_key(op: &str, target: &str, hash: Option<&str>) -> String {
     let parts = [op, target, hash.unwrap_or("")];
-    crate::objects::hash_framed("ambits-link v1", parts.iter().map(|p| p.as_bytes())).to_hex().to_string()
+    crate::objects::hash_framed("ambits-link v1", parts.iter().map(|p| p.as_bytes()))
+        .to_hex()
+        .to_string()
 }
 
 /// What [`refresh`] did.
@@ -667,10 +862,16 @@ pub struct RefreshStats {
 /// Resolve every unit of every write from the last `window`, across all
 /// sessions, within `budget` — for the post-commit hook, so later
 /// `touched` calls answer from the links index.
-pub fn refresh(project_root: &Path, window: std::time::Duration, budget: std::time::Duration) -> Result<RefreshStats> {
+pub fn refresh(
+    project_root: &Path,
+    window: std::time::Duration,
+    budget: std::time::Duration,
+) -> Result<RefreshStats> {
     let started = std::time::Instant::now();
     let mut stats = RefreshStats::default();
-    let Some(mut resolver) = Resolver::new(project_root) else { return Ok(stats) };
+    let Some(mut resolver) = Resolver::new(project_root) else {
+        return Ok(stats);
+    };
     let cutoff = crate::time::now_secs().saturating_sub(window.as_secs());
     let dir = crate::journal::journal_dir(project_root);
 
@@ -680,7 +881,12 @@ pub fn refresh(project_root: &Path, window: std::time::Duration, budget: std::ti
     let mut writes: Vec<(u64, WriteRecord)> = crate::cache::session_ids(&dir)
         .into_iter()
         .flat_map(|session| crate::journal::read_session_writes(&dir, &session).into_values())
-        .filter_map(|w| Some((crate::time::parse_rfc3339(&w.t).filter(|t| *t >= cutoff)?, w)))
+        .filter_map(|w| {
+            Some((
+                crate::time::parse_rfc3339(&w.t).filter(|t| *t >= cutoff)?,
+                w,
+            ))
+        })
         .collect();
     writes.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.op.cmp(&b.1.op)));
     // One history search for all of them.
@@ -708,21 +914,34 @@ pub fn refresh(project_root: &Path, window: std::time::Duration, budget: std::ti
 #[serde(rename_all = "snake_case", tag = "state")]
 pub enum Landed {
     /// Every unit is in a commit it was verified against.
-    Verified { commits: Vec<String> },
+    Verified {
+        commits: Vec<String>,
+    },
     /// The first commit touching the file after the write; nothing could be
     /// compared (a file-level `Edit`).
-    Unverified { commits: Vec<String> },
+    Unverified {
+        commits: Vec<String>,
+    },
     /// Some units landed, others are in no commit yet. `unverified` when
     /// any that landed could not be compared.
-    Partial { commits: Vec<String>, unverified: bool },
+    Partial {
+        commits: Vec<String>,
+        unverified: bool,
+    },
     Uncommitted,
     /// Not a git repository, or no commits yet.
     NoRepository,
 }
 
 /// Resolve every unit of `write` (those `keep` selects) and summarize.
-pub fn landed(resolver: Option<&mut Resolver>, write: &WriteRecord, keep: &dyn Fn(&Unit) -> bool) -> Result<Landed> {
-    let Some(resolver) = resolver else { return Ok(Landed::NoRepository) };
+pub fn landed(
+    resolver: Option<&mut Resolver>,
+    write: &WriteRecord,
+    keep: &dyn Fn(&Unit) -> bool,
+) -> Result<Landed> {
+    let Some(resolver) = resolver else {
+        return Ok(Landed::NoRepository);
+    };
     let mut commits: Vec<String> = Vec::new();
     let (mut missing, mut unverified) = (0, false);
     for unit in units(write).iter().filter(|u| keep(u)) {
@@ -738,7 +957,10 @@ pub fn landed(resolver: Option<&mut Resolver>, write: &WriteRecord, keep: &dyn F
     }
     Ok(match (commits.is_empty(), missing > 0, unverified) {
         (true, _, _) => Landed::Uncommitted,
-        (false, true, unverified) => Landed::Partial { commits, unverified },
+        (false, true, unverified) => Landed::Partial {
+            commits,
+            unverified,
+        },
         (false, false, true) => Landed::Unverified { commits },
         (false, false, false) => Landed::Verified { commits },
     })
@@ -760,7 +982,9 @@ mod tests {
         let commits = parse_log(out.as_bytes());
         assert_eq!(commits.len(), 3);
         assert_eq!(commits[1].time, 200);
-        assert!(matches!(&commits[1].changes[0], Change::Renamed { from, to } if from == "a.rs" && to == "b.rs"));
+        assert!(
+            matches!(&commits[1].changes[0], Change::Renamed { from, to } if from == "a.rs" && to == "b.rs")
+        );
         assert!(matches!(&commits[1].changes[1], Change::Modified(p) if p == "c.rs"));
         assert!(matches!(&commits[0].changes[0], Change::Added(p) if p == "a.rs"));
         // A path may begin with a newline; only status tokens lose theirs.
@@ -798,12 +1022,25 @@ mod tests {
         let file = resolver.never_file();
         let lock = file.lock().unwrap();
         let lines = [
-            NeverLine { tips: Some(digest.clone()), list: Some(resolver.tips.clone()), ..Default::default() },
-            NeverLine { k: Some(key), tips: Some(digest), names: Some(vec!["a.txt".into()]), ..Default::default() },
+            NeverLine {
+                tips: Some(digest.clone()),
+                list: Some(resolver.tips.clone()),
+                ..Default::default()
+            },
+            NeverLine {
+                k: Some(key),
+                tips: Some(digest),
+                names: Some(vec!["a.txt".into()]),
+                ..Default::default()
+            },
         ];
-        file.append(&lock, &lines, crate::objects::store::Durability::NoSync).unwrap();
+        file.append(&lock, &lines, crate::objects::store::Durability::NoSync)
+            .unwrap();
         drop(lock);
-        assert_eq!(resolver.landing(&write, unit).unwrap(), Landing::Uncommitted);
+        assert_eq!(
+            resolver.landing(&write, unit).unwrap(),
+            Landing::Uncommitted
+        );
     }
 
     /// A repo with one commit of `a.txt`, and `n` file-level writes to it
@@ -838,16 +1075,29 @@ mod tests {
         std::fs::create_dir_all(root.join(".ambits/cache/never-landed")).unwrap();
         {
             let mut r = Resolver::new(&root).unwrap();
-            assert!(!root.join(".ambits/links").exists(), "the per-entry cache is dropped");
+            assert!(
+                !root.join(".ambits/links").exists(),
+                "the per-entry cache is dropped"
+            );
             for w in &writes {
                 assert_eq!(r.landing(w, &units(w)[0]).unwrap(), Landing::Uncommitted);
             }
         }
         let file = never_file(&root.join(".ambits"));
         let lines: Vec<NeverLine> = file.read().unwrap();
-        assert_eq!(lines.iter().filter(|l| l.list.is_some()).count(), 1, "one tip list");
+        assert_eq!(
+            lines.iter().filter(|l| l.list.is_some()).count(),
+            1,
+            "one tip list"
+        );
         assert_eq!(lines.iter().filter(|l| l.k.is_some()).count(), 3);
-        assert_eq!(std::fs::read_dir(root.join(".ambits/cache")).unwrap().count(), 2, "the file and its lock");
+        assert_eq!(
+            std::fs::read_dir(root.join(".ambits/cache"))
+                .unwrap()
+                .count(),
+            2,
+            "the file and its lock"
+        );
 
         let mut r = Resolver::new(&root).unwrap();
         r.load();
@@ -862,7 +1112,10 @@ mod tests {
         for _ in 0..80 {
             // A branch moving each time makes every search a new entry.
             let mut r = Resolver::new(&root).unwrap();
-            r.tips.push(format!("{:040x}", r.tips.len() + crate::time::now_secs() as usize));
+            r.tips.push(format!(
+                "{:040x}",
+                r.tips.len() + crate::time::now_secs() as usize
+            ));
             r.tips.sort();
             r.landing(w, unit).unwrap();
         }
@@ -883,11 +1136,23 @@ mod tests {
             syms: vec![("src/a.rs::A/f".into(), "b3:00".into())],
             ..Default::default()
         };
-        assert_eq!(units(&w)[0].proof, Proof::Symbol { name_path: "A/f".into(), hash: "b3:00".into() });
+        assert_eq!(
+            units(&w)[0].proof,
+            Proof::Symbol {
+                name_path: "A/f".into(),
+                hash: "b3:00".into()
+            }
+        );
         w.level = Level::File;
         w.syms.clear();
         assert_eq!(units(&w)[0].proof, Proof::None);
         w.fh = Some("b3:11".into());
-        assert_eq!(units(&w), vec![Unit { target: "src/a.rs".into(), proof: Proof::FileHash("b3:11".into()) }]);
+        assert_eq!(
+            units(&w),
+            vec![Unit {
+                target: "src/a.rs".into(),
+                proof: Proof::FileHash("b3:11".into())
+            }]
+        );
     }
 }

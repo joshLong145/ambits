@@ -36,7 +36,11 @@ impl Clone {
         git(&root, &["add", "."]);
         git(&root, &["commit", "-qm", "init"]);
         remote::config::add(&root, "origin", remote).unwrap();
-        Self { _dir: dir, root, registry: ParserRegistry::new() }
+        Self {
+            _dir: dir,
+            root,
+            registry: ParserRegistry::new(),
+        }
     }
 
     fn store(&self) -> Store {
@@ -50,7 +54,11 @@ impl Clone {
 
     fn read_in(&self, session: &str, name: &str, agent: &str) {
         let tree = self.registry.scan_project(&self.root, None).unwrap();
-        let (_, sym) = tree.walk().into_iter().find(|(_, s)| &*s.name == name).unwrap();
+        let (_, sym) = tree
+            .walk()
+            .into_iter()
+            .find(|(_, s)| &*s.name == name)
+            .unwrap();
         let record = ambits::journal::Record::Read {
             symbol_id: sym.id.clone(),
             hash: ambits::journal::encode_hash(&sym.content_hash),
@@ -97,7 +105,8 @@ impl Clone {
     }
 
     fn reads(&self) -> Vec<String> {
-        let contents = ambits::journal::read_journal_session(&self.root.join(".ambits/coverage"), SESSION);
+        let contents =
+            ambits::journal::read_journal_session(&self.root.join(".ambits/coverage"), SESSION);
         let mut ids: Vec<String> = contents.reads.into_keys().collect();
         ids.sort();
         ids
@@ -141,22 +150,45 @@ fn two_clones_converge_and_then_settle() {
     let (_dir, remote, a, b) = pair();
     a.read("alpha", "agent-1");
     let s1 = created(a.snap());
-    assert!(matches!(a.push(false).unwrap(), PushOutcome::Pushed { from: None, .. }));
+    assert!(matches!(
+        a.push(false).unwrap(),
+        PushOutcome::Pushed { from: None, .. }
+    ));
     assert_eq!(remote_tip(&remote), Some(s1));
 
     assert!(matches!(b.pull(), PullOutcome::Merged { reads: 1, .. }));
     assert_eq!(b.reads(), vec!["src/a.rs::alpha"]);
     let s2 = created(b.snap());
-    assert_eq!(Snapshot::load(&b.store(), s2).unwrap().parents, vec![s1], "descends from A's");
-    assert!(matches!(b.push(false).unwrap(), PushOutcome::Pushed { forced: false, .. }));
+    assert_eq!(
+        Snapshot::load(&b.store(), s2).unwrap().parents,
+        vec![s1],
+        "descends from A's"
+    );
+    assert!(matches!(
+        b.push(false).unwrap(),
+        PushOutcome::Pushed { forced: false, .. }
+    ));
 
     for _ in 0..2 {
-        assert_eq!(a.pull(), PullOutcome::Behind, "behind, and B added nothing A lacks");
-        assert!(matches!(a.snap(), Outcome::NothingChanged(_)), "nothing new to snapshot");
-        assert!(matches!(a.push(false).unwrap(), PushOutcome::UpToDate { .. }));
+        assert_eq!(
+            a.pull(),
+            PullOutcome::Behind,
+            "behind, and B added nothing A lacks"
+        );
+        assert!(
+            matches!(a.snap(), Outcome::NothingChanged(_)),
+            "nothing new to snapshot"
+        );
+        assert!(matches!(
+            a.push(false).unwrap(),
+            PushOutcome::UpToDate { .. }
+        ));
         assert!(matches!(b.pull(), PullOutcome::UpToDate));
         assert!(matches!(b.snap(), Outcome::NothingChanged(_)));
-        assert!(matches!(b.push(false).unwrap(), PushOutcome::UpToDate { .. }));
+        assert!(matches!(
+            b.push(false).unwrap(),
+            PushOutcome::UpToDate { .. }
+        ));
     }
     assert_eq!(remote_tip(&remote), Some(s2));
 }
@@ -176,14 +208,24 @@ fn a_diverged_pull_with_nothing_new_makes_a_two_parent_snapshot() {
     let ours = created(b.snap());
     assert!(b.push(false).is_err(), "non-fast-forward");
 
-    assert!(matches!(b.pull(), PullOutcome::Merged { reads: 0, writes: 0, .. }));
+    assert!(matches!(
+        b.pull(),
+        PullOutcome::Merged {
+            reads: 0,
+            writes: 0,
+            ..
+        }
+    ));
     let merge = created(b.snap());
     let mut parents = Snapshot::load(&b.store(), merge).unwrap().parents;
     parents.sort();
     let mut want = vec![ours, theirs];
     want.sort();
     assert_eq!(parents, want);
-    assert!(matches!(b.push(false).unwrap(), PushOutcome::Pushed { forced: false, .. }));
+    assert!(matches!(
+        b.push(false).unwrap(),
+        PushOutcome::Pushed { forced: false, .. }
+    ));
     assert_eq!(remote_tip(&remote), Some(merge));
 }
 
@@ -199,15 +241,24 @@ fn after_a_force_with_lease_the_other_clone_still_fetches_and_pulls() {
     let forced = created(b.snap());
     assert!(b.push(true).is_err(), "no lease yet: B never fetched");
     remote::fetch(&b.root, None, Default::default()).unwrap();
-    assert!(matches!(b.push(true).unwrap(), PushOutcome::Pushed { forced: true, .. }));
+    assert!(matches!(
+        b.push(true).unwrap(),
+        PushOutcome::Pushed { forced: true, .. }
+    ));
     assert_eq!(remote_tip(&remote), Some(forced));
 
     let report = remote::fetch(&a.root, None, Default::default()).unwrap();
-    assert!(report.moved.iter().any(|m| m.forced && m.from == Some(s1) && m.to == forced));
+    assert!(report
+        .moved
+        .iter()
+        .any(|m| m.forced && m.from == Some(s1) && m.to == forced));
     assert!(matches!(a.pull(), PullOutcome::Merged { reads: 1, .. }));
     assert_eq!(a.reads(), vec!["src/a.rs::alpha", "src/a.rs::beta"]);
     let merge = created(a.snap());
-    assert!(matches!(a.push(false).unwrap(), PushOutcome::Pushed { forced: false, .. }));
+    assert!(matches!(
+        a.push(false).unwrap(),
+        PushOutcome::Pushed { forced: false, .. }
+    ));
     assert_eq!(remote_tip(&remote), Some(merge));
 }
 
@@ -220,10 +271,24 @@ fn a_stale_remote_read_becomes_history_once() {
     a.snap();
     a.push(false).unwrap();
     std::fs::write(b.root.join("src/a.rs"), "fn alpha() { 1; }\nfn beta() {}\n").unwrap();
-    assert!(matches!(b.pull(), PullOutcome::Merged { reads: 0, stale: 1, .. }));
+    assert!(matches!(
+        b.pull(),
+        PullOutcome::Merged {
+            reads: 0,
+            stale: 1,
+            ..
+        }
+    ));
     assert!(b.reads().is_empty());
-    assert!(matches!(b.pull(), PullOutcome::Merged { stale: 0, .. }), "not again");
-    let shard = std::fs::read_to_string(b.root.join(format!(".ambits/coverage/{SESSION}.pull.ndjson"))).unwrap();
+    assert!(
+        matches!(b.pull(), PullOutcome::Merged { stale: 0, .. }),
+        "not again"
+    );
+    let shard = std::fs::read_to_string(
+        b.root
+            .join(format!(".ambits/coverage/{SESSION}.pull.ndjson")),
+    )
+    .unwrap();
     assert_eq!(shard.matches(r#""of":"read""#).count(), 1);
 }
 
@@ -258,11 +323,21 @@ fn fetch_refuses_what_does_not_verify() {
     let refused = |why: &str| {
         let report = remote::fetch(&b.root, None, Default::default()).unwrap();
         assert_eq!(report.failed.len(), 1, "{why}: {report:?}");
-        assert_eq!(refs::read(&b.store(), &tracking).unwrap(), None, "{why}: nothing recorded");
+        assert_eq!(
+            refs::read(&b.store(), &tracking).unwrap(),
+            None,
+            "{why}: nothing recorded"
+        );
         report.failed[0].1.clone()
     };
 
-    std::fs::write(&coverage, String::from_utf8(original.clone()).unwrap().replace("full_body", "overview")).unwrap();
+    std::fs::write(
+        &coverage,
+        String::from_utf8(original.clone())
+            .unwrap()
+            .replace("full_body", "overview"),
+    )
+    .unwrap();
     assert!(refused("tampered").contains("does not match its id"));
 
     #[cfg(unix)]
@@ -273,7 +348,10 @@ fn fetch_refuses_what_does_not_verify() {
         std::fs::remove_file(&coverage).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &coverage).unwrap();
         let why = refused("symlink");
-        assert!(why.contains("symbolic link") || why.contains("regular file"), "{why}");
+        assert!(
+            why.contains("symbolic link") || why.contains("regular file"),
+            "{why}"
+        );
         std::fs::remove_file(&coverage).unwrap();
     }
     // The right bytes padded past the cap: only the size check can refuse it.
@@ -283,7 +361,10 @@ fn fetch_refuses_what_does_not_verify() {
     assert!(refused("oversized").contains("limit"));
 
     std::fs::write(&coverage, original).unwrap();
-    assert!(remote::fetch(&b.root, None, Default::default()).unwrap().failed.is_empty());
+    assert!(remote::fetch(&b.root, None, Default::default())
+        .unwrap()
+        .failed
+        .is_empty());
     assert_eq!(refs::read(&b.store(), &tracking).unwrap(), Some(tip));
 }
 
@@ -304,10 +385,26 @@ fn a_bad_session_does_not_stop_the_others() {
     std::fs::write(&coverage, "{}").unwrap();
 
     let report = remote::fetch(&b.root, None, Default::default()).unwrap();
-    assert_eq!(report.failed.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(), vec![OTHER]);
-    assert_eq!(refs::read(&b.store(), &RefName::tracking("origin", SESSION).unwrap()).unwrap(), Some(good));
-    assert_eq!(refs::read(&b.store(), &RefName::tracking("origin", OTHER).unwrap()).unwrap(), None);
-    assert!(matches!(b.pull(), PullOutcome::Merged { reads: 1, .. }), "the healthy session still pulls");
+    assert_eq!(
+        report
+            .failed
+            .iter()
+            .map(|(s, _)| s.as_str())
+            .collect::<Vec<_>>(),
+        vec![OTHER]
+    );
+    assert_eq!(
+        refs::read(&b.store(), &RefName::tracking("origin", SESSION).unwrap()).unwrap(),
+        Some(good)
+    );
+    assert_eq!(
+        refs::read(&b.store(), &RefName::tracking("origin", OTHER).unwrap()).unwrap(),
+        None
+    );
+    assert!(
+        matches!(b.pull(), PullOutcome::Merged { reads: 1, .. }),
+        "the healthy session still pulls"
+    );
 
     let out = common::ambits(&b.root).args(["fetch"]).output().unwrap();
     assert!(!out.status.success());
@@ -322,8 +419,15 @@ fn hostile_ref_names_on_the_remote_are_ignored() {
     a.snap();
     a.push(false).unwrap();
     let mut reflog = std::fs::read_to_string(remote.join("reflog.ndjson")).unwrap();
-    for name in ["refs/sessions/../../etc/passwd", "refs/other/x", "refs/sessions/not-a-uuid"] {
-        reflog.push_str(&format!(r#"{{"ref":"{name}","old":null,"new":"{}","secs":1,"time":"t","action":"x"}}"#, "0".repeat(64)));
+    for name in [
+        "refs/sessions/../../etc/passwd",
+        "refs/other/x",
+        "refs/sessions/not-a-uuid",
+    ] {
+        reflog.push_str(&format!(
+            r#"{{"ref":"{name}","old":null,"new":"{}","secs":1,"time":"t","action":"x"}}"#,
+            "0".repeat(64)
+        ));
         reflog.push('\n');
     }
     std::fs::write(remote.join("reflog.ndjson"), reflog).unwrap();
@@ -342,19 +446,27 @@ fn fetched_links_are_kept_only_when_proven() {
     a.push(false).unwrap();
     let head = git(&b.root, &["rev-parse", "HEAD"]);
     let tree = ParserRegistry::new().scan_project(&b.root, None).unwrap();
-    let (_, alpha) = tree.walk().into_iter().find(|(_, s)| &*s.name == "alpha").unwrap();
+    let (_, alpha) = tree
+        .walk()
+        .into_iter()
+        .find(|(_, s)| &*s.name == "alpha")
+        .unwrap();
     let real = ambits::journal::encode_hash(&alpha.content_hash);
-    let link = |op: &str, hash: &str| {
-        serde_json::json!({"k": op, "link": {"op": op, "target": "src/a.rs::alpha", "hash": hash, "commit": head, "verified": true, "path": "src/a.rs"}})
-    };
-    let lines = [link("toolu_real", &real), link("toolu_forged", &format!("b3:{}", "f".repeat(64)))];
+    let link = |op: &str, hash: &str| serde_json::json!({"k": op, "link": {"op": op, "target": "src/a.rs::alpha", "hash": hash, "commit": head, "verified": true, "path": "src/a.rs"}});
+    let lines = [
+        link("toolu_real", &real),
+        link("toolu_forged", &format!("b3:{}", "f".repeat(64))),
+    ];
     let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
     std::fs::write(remote.join("links.ndjson"), text).unwrap();
 
     let report = remote::fetch(&b.root, None, Default::default()).unwrap();
     assert_eq!(report.links, 1);
     let kept = ambits::linkage::links_of(&b.root.join(".ambits")).unwrap();
-    assert_eq!(kept.iter().map(|(_, l)| l.op.as_str()).collect::<Vec<_>>(), vec!["toolu_real"]);
+    assert_eq!(
+        kept.iter().map(|(_, l)| l.op.as_str()).collect::<Vec<_>>(),
+        vec!["toolu_real"]
+    );
 }
 
 /// Links resolved after a push (the post-commit hook runs after it) still
@@ -367,9 +479,20 @@ fn links_resolved_later_are_pushed_without_a_new_snapshot() {
     a.push(false).unwrap();
     let link = serde_json::json!({"k": "toolu_late", "link": {"op": "toolu_late", "target": "src/a.rs", "hash": null, "commit": "0".repeat(40), "verified": false, "path": "src/a.rs"}});
     std::fs::write(a.root.join(".ambits/links.ndjson"), format!("{link}\n")).unwrap();
-    assert!(matches!(a.push(false).unwrap(), PushOutcome::UpToDate { links: 1, .. }));
-    assert!(std::fs::read_to_string(remote.join("links.ndjson")).unwrap().contains("toolu_late"));
-    assert!(matches!(a.push(false).unwrap(), PushOutcome::UpToDate { links: 0, .. }), "once");
+    assert!(matches!(
+        a.push(false).unwrap(),
+        PushOutcome::UpToDate { links: 1, .. }
+    ));
+    assert!(std::fs::read_to_string(remote.join("links.ndjson"))
+        .unwrap()
+        .contains("toolu_late"));
+    assert!(
+        matches!(
+            a.push(false).unwrap(),
+            PushOutcome::UpToDate { links: 0, .. }
+        ),
+        "once"
+    );
 }
 
 /// A push sends only the links of writes it pushes, not the whole index.
@@ -379,10 +502,17 @@ fn a_push_sends_only_its_own_links() {
     journal_write(&a.root, SESSION, write_record("toolu_mine", "src/a.rs"));
     a.snap();
     let link = |op: &str| serde_json::json!({"k": op, "link": {"op": op, "target": "src/a.rs", "hash": null, "commit": "0".repeat(40), "verified": false, "path": "src/a.rs"}});
-    std::fs::write(a.root.join(".ambits/links.ndjson"), format!("{}\n{}\n", link("toolu_mine"), link("toolu_other_session"))).unwrap();
+    std::fs::write(
+        a.root.join(".ambits/links.ndjson"),
+        format!("{}\n{}\n", link("toolu_mine"), link("toolu_other_session")),
+    )
+    .unwrap();
     a.push(false).unwrap();
     let sent = std::fs::read_to_string(remote.join("links.ndjson")).unwrap();
-    assert!(sent.contains("toolu_mine") && !sent.contains("toolu_other_session"), "{sent}");
+    assert!(
+        sent.contains("toolu_mine") && !sent.contains("toolu_other_session"),
+        "{sent}"
+    );
 }
 
 /// Two clones pushing diverged histories at once: one wins, the other is
@@ -413,8 +543,17 @@ fn an_interrupted_push_leaves_no_ref() {
     let history = remote::transfer::closure(&a.store(), tip).unwrap();
     remote::transfer::transfer(&a.store(), &Store::at_root(&remote), &history).unwrap();
     assert_eq!(remote_tip(&remote), None);
-    assert!(remote::fetch(&b.root, None, Default::default()).unwrap().moved.is_empty());
-    assert!(matches!(a.push(false).unwrap(), PushOutcome::Pushed { objects: 0, .. }), "the objects are already there");
+    assert!(remote::fetch(&b.root, None, Default::default())
+        .unwrap()
+        .moved
+        .is_empty());
+    assert!(
+        matches!(
+            a.push(false).unwrap(),
+            PushOutcome::Pushed { objects: 0, .. }
+        ),
+        "the objects are already there"
+    );
 }
 
 /// A corrupt object already on the remote is repaired by the next push,
@@ -431,7 +570,9 @@ fn a_push_repairs_a_corrupt_object_it_would_have_skipped() {
     a.read("beta", "agent-1");
     a.snap();
     assert!(matches!(a.push(false).unwrap(), PushOutcome::Pushed { .. }));
-    assert!(remote_store.get(&coverage, ambits::objects::Kind::Coverage).is_ok());
+    assert!(remote_store
+        .get(&coverage, ambits::objects::Kind::Coverage)
+        .is_ok());
 }
 
 /// Damage behind the frontier — an old snapshot's object, under a newer
@@ -452,7 +593,12 @@ fn verify_all_repairs_what_the_frontier_does_not_look_at() {
     a.read("alpha", "agent-2");
     a.snap();
     a.push(false).unwrap();
-    assert!(remote_store.get(&coverage, ambits::objects::Kind::Coverage).is_err(), "not looked at");
+    assert!(
+        remote_store
+            .get(&coverage, ambits::objects::Kind::Coverage)
+            .is_err(),
+        "not looked at"
+    );
 
     a.read("beta", "agent-2");
     a.snap();
@@ -466,7 +612,12 @@ fn verify_all_repairs_what_the_frontier_does_not_look_at() {
         verify: remote::transfer::Verify::Everything,
     })
     .unwrap();
-    assert!(remote_store.get(&coverage, ambits::objects::Kind::Coverage).is_ok(), "repaired");
+    assert!(
+        remote_store
+            .get(&coverage, ambits::objects::Kind::Coverage)
+            .is_ok(),
+        "repaired"
+    );
 
     // Damaged again with nothing new to push: --verify-all still repairs.
     std::fs::write(remote_store.path_of(&coverage), "rot").unwrap();
@@ -480,8 +631,13 @@ fn verify_all_repairs_what_the_frontier_does_not_look_at() {
         verify: remote::transfer::Verify::Everything,
     })
     .unwrap();
-    assert!(matches!(outcome, PushOutcome::UpToDate { repaired: 1, .. }), "{outcome:?}");
-    assert!(remote_store.get(&coverage, ambits::objects::Kind::Coverage).is_ok());
+    assert!(
+        matches!(outcome, PushOutcome::UpToDate { repaired: 1, .. }),
+        "{outcome:?}"
+    );
+    assert!(remote_store
+        .get(&coverage, ambits::objects::Kind::Coverage)
+        .is_ok());
 }
 
 /// Two versions of one write at one attribution version: ours stays, theirs
@@ -495,8 +651,18 @@ fn a_write_conflict_keeps_ours_and_records_theirs_once() {
     a.snap();
     a.push(false).unwrap();
     b.snap();
-    assert!(matches!(b.pull(), PullOutcome::Merged { writes: 0, conflicts: 1, .. }));
-    assert!(matches!(b.pull(), PullOutcome::Merged { conflicts: 0, .. }), "kept once");
+    assert!(matches!(
+        b.pull(),
+        PullOutcome::Merged {
+            writes: 0,
+            conflicts: 1,
+            ..
+        }
+    ));
+    assert!(
+        matches!(b.pull(), PullOutcome::Merged { conflicts: 0, .. }),
+        "kept once"
+    );
     let contents = ambits::journal::read_journal_session(&b.root.join(".ambits/coverage"), SESSION);
     assert_eq!(contents.writes["toolu_1"].file, "src/b.rs", "ours stays");
 }
@@ -516,10 +682,20 @@ fn history_alone_while_behind_still_merges() {
     a.snap();
     a.push(false).unwrap();
     std::fs::write(b.root.join("src/a.rs"), "fn alpha() {}\nfn beta() { 2; }\n").unwrap();
-    assert!(matches!(b.pull(), PullOutcome::Merged { reads: 0, stale: 1, .. }));
+    assert!(matches!(
+        b.pull(),
+        PullOutcome::Merged {
+            reads: 0,
+            stale: 1,
+            ..
+        }
+    ));
     let next = created(b.snap());
     assert_ne!(next, behind);
-    assert!(matches!(b.push(false).unwrap(), PushOutcome::Pushed { forced: false, .. }));
+    assert!(matches!(
+        b.push(false).unwrap(),
+        PushOutcome::Pushed { forced: false, .. }
+    ));
     assert_eq!(remote_tip(&remote), Some(next));
 }
 
@@ -534,10 +710,18 @@ fn crash_then_gc_then_fetch_recovers() {
     remote::fetch(&b.root, None, Default::default()).unwrap();
     let snap = Snapshot::load(&b.store(), tip).unwrap();
     std::fs::remove_file(b.store().path_of(&snap.writes)).unwrap();
-    ambits::objects::gc::gc(&b.store(), std::time::Duration::ZERO, ambits::objects::refs::REFLOG_EXPIRY).unwrap();
+    ambits::objects::gc::gc(
+        &b.store(),
+        std::time::Duration::ZERO,
+        ambits::objects::refs::REFLOG_EXPIRY,
+    )
+    .unwrap();
     let report = remote::fetch(&b.root, None, Default::default()).unwrap();
     assert_eq!(report.objects, 1);
-    assert!(b.store().get(&snap.writes, ambits::objects::Kind::Writes).is_ok());
+    assert!(b
+        .store()
+        .get(&snap.writes, ambits::objects::Kind::Writes)
+        .is_ok());
 }
 
 /// A write pulled from a remote says where it came from.
@@ -552,7 +736,10 @@ fn touched_names_the_remote_a_write_came_from() {
     assert!(out.contains("pulled from origin"), "{out}");
     let json = run_ambits(&b.root, &["touched", "--format", "json", "src/a.rs"]);
     assert!(json.contains(r#""origin":"origin""#), "{json}");
-    assert!(!run_ambits(&a.root, &["touched", "src/a.rs"]).contains("pulled from"), "A's own");
+    assert!(
+        !run_ambits(&a.root, &["touched", "src/a.rs"]).contains("pulled from"),
+        "A's own"
+    );
 }
 
 /// The CLI: add a remote, push, and on the other clone fetch and restore
@@ -570,7 +757,10 @@ fn the_cli_pushes_fetches_and_restores_across_clones() {
     assert!(run_ambits(&a.root, &["remote", "list"]).starts_with("origin\t"));
 
     let out = run_ambits(&b.root, &["fetch"]);
-    assert!(out.contains(&format!("origin/{SESSION}: (none) →")), "{out}");
+    assert!(
+        out.contains(&format!("origin/{SESSION}: (none) →")),
+        "{out}"
+    );
     let out = run_ambits(&b.root, &["restore", &format!("origin/{SESSION}")]);
     assert!(out.contains("src/a.rs: 1 verified"), "{out}");
 }
@@ -581,10 +771,16 @@ fn the_cli_pushes_fetches_and_restores_across_clones() {
 #[test]
 #[ignore]
 fn history_walk_costs() {
-    let n: usize = std::env::var("SNAPSHOTS").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
+    let n: usize = std::env::var("SNAPSHOTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
     let (_dir, _remote, a, b) = pair();
     for i in 0..n {
-        a.read(if i % 2 == 0 { "alpha" } else { "beta" }, &format!("agent-{i}"));
+        a.read(
+            if i % 2 == 0 { "alpha" } else { "beta" },
+            &format!("agent-{i}"),
+        );
         a.snap();
     }
     let time = |what: &str, f: &mut dyn FnMut()| {
@@ -592,15 +788,35 @@ fn history_walk_costs() {
         f();
         eprintln!("{what:<32} {:>8.1} ms", t.elapsed().as_secs_f64() * 1000.0);
     };
-    time("first push", &mut || { let _ = a.push(false).unwrap(); });
-    time("push, nothing new", &mut || { let _ = a.push(false).unwrap(); });
+    time("first push", &mut || {
+        let _ = a.push(false).unwrap();
+    });
+    time("push, nothing new", &mut || {
+        let _ = a.push(false).unwrap();
+    });
     a.read("alpha", "agent-last");
-    time("snapshot, one new read", &mut || { let _ = a.snap(); });
-    time("push, one new snapshot", &mut || { let _ = a.push(false).unwrap(); });
-    time("first fetch", &mut || { let _ = remote::fetch(&b.root, None, Default::default()).unwrap(); });
-    time("fetch, nothing new", &mut || { let _ = remote::fetch(&b.root, None, Default::default()).unwrap(); });
-    time("pull (merge)", &mut || { let _ = b.pull(); });
-    time("snapshot after pull", &mut || { let _ = b.snap(); });
-    time("pull, up to date", &mut || { let _ = b.pull(); });
-    time("snapshot, nothing changed", &mut || { let _ = b.snap(); });
+    time("snapshot, one new read", &mut || {
+        let _ = a.snap();
+    });
+    time("push, one new snapshot", &mut || {
+        let _ = a.push(false).unwrap();
+    });
+    time("first fetch", &mut || {
+        let _ = remote::fetch(&b.root, None, Default::default()).unwrap();
+    });
+    time("fetch, nothing new", &mut || {
+        let _ = remote::fetch(&b.root, None, Default::default()).unwrap();
+    });
+    time("pull (merge)", &mut || {
+        let _ = b.pull();
+    });
+    time("snapshot after pull", &mut || {
+        let _ = b.snap();
+    });
+    time("pull, up to date", &mut || {
+        let _ = b.pull();
+    });
+    time("snapshot, nothing changed", &mut || {
+        let _ = b.snap();
+    });
 }

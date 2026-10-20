@@ -134,9 +134,8 @@ pub fn call_sites_filtered(
     // compound as it descends. Bounded so a pathological nesting cannot spin.
     let mut queue = Vec::new();
     collect_macro_bodies(tree.root_node(), src, 0, 0, &mut queue);
-    let keep = |text: &str| {
-        wanted.is_none_or(|names| names.iter().any(|n| text.contains(n.as_str())))
-    };
+    let keep =
+        |text: &str| wanted.is_none_or(|names| names.iter().any(|n| text.contains(n.as_str())));
     queue.retain(|(_, _, text)| keep(text));
     let mut depth = 0;
     while let Some((start_byte, start_row, text)) = queue.pop() {
@@ -156,7 +155,13 @@ pub fn call_sites_filtered(
             &mut out,
         );
         let before = queue.len();
-        collect_macro_bodies(sub.root_node(), text.as_bytes(), start_byte, start_row, &mut queue);
+        collect_macro_bodies(
+            sub.root_node(),
+            text.as_bytes(),
+            start_byte,
+            start_row,
+            &mut queue,
+        );
         // Nested bodies get the same treatment as the outer ones.
         let mut added: Vec<_> = queue.split_off(before);
         added.retain(|(_, _, t)| keep(t));
@@ -445,8 +450,14 @@ const SAMPLE: &str = "helper() inside a string literal";
     /// a string is not a call node, so it cannot be reported as one.
     #[test]
     fn comments_and_string_literals_are_not_call_sites() {
-        let found = sites(SRC).into_iter().filter(|(n, _, _)| n == "helper").count();
-        assert_eq!(found, 3, "the doc comment and the string literal are excluded");
+        let found = sites(SRC)
+            .into_iter()
+            .filter(|(n, _, _)| n == "helper")
+            .count();
+        assert_eq!(
+            found, 3,
+            "the doc comment and the string literal are excluded"
+        );
         assert!(
             SRC.matches("helper()").count() > found,
             "the text really does contain more occurrences than there are calls"
@@ -487,8 +498,14 @@ fn caller() {
     let s = format!("{}", crate::m::target(2));
 }
 "#;
-        let found = sites(src).into_iter().filter(|(n, _, _)| n == "target").count();
-        assert_eq!(found, 2, "one bare and one path-qualified, both inside macros");
+        let found = sites(src)
+            .into_iter()
+            .filter(|(n, _, _)| n == "target")
+            .count();
+        assert_eq!(
+            found, 2,
+            "one bare and one path-qualified, both inside macros"
+        );
     }
 
     /// Macros nest. `ui/stats.rs` wraps a `format!` inside a `vec![`, and the
@@ -502,7 +519,10 @@ fn caller() {
     let v = vec![format!("{}", target(1))];
 }
 "#;
-        let found = sites(src).into_iter().filter(|(n, _, _)| n == "target").count();
+        let found = sites(src)
+            .into_iter()
+            .filter(|(n, _, _)| n == "target")
+            .count();
         assert_eq!(found, 1, "format! inside vec! must still be reached");
     }
 

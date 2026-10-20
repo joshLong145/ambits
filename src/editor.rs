@@ -77,7 +77,12 @@ mod tests {
     #[test]
     fn cli_wins_over_everything() {
         assert_eq!(
-            resolve_editor_template(Some("cli-editor"), Some("cfg"), Some("visual"), Some("editor")),
+            resolve_editor_template(
+                Some("cli-editor"),
+                Some("cfg"),
+                Some("visual"),
+                Some("editor")
+            ),
             Some("cli-editor".to_string())
         );
     }

@@ -29,7 +29,11 @@ pub fn ambits(root: &Path) -> Command {
 #[allow(dead_code)]
 pub fn run_ambits(root: &Path, args: &[&str]) -> String {
     let out = ambits(root).args(args).output().expect("ambits runs");
-    assert!(out.status.success(), "ambits {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "ambits {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout).expect("utf-8 output")
 }
 
@@ -54,7 +58,11 @@ pub fn append_journal(root: &Path, session: &str, records: &[ambits::journal::Re
     use std::io::Write as _;
     let dir = root.join(".ambits/coverage");
     std::fs::create_dir_all(&dir).unwrap();
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{session}.ndjson"))).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(format!("{session}.ndjson")))
+        .unwrap();
     for record in records {
         writeln!(file, "{}", serde_json::to_string(record).unwrap()).unwrap();
     }
@@ -63,5 +71,9 @@ pub fn append_journal(root: &Path, session: &str, records: &[ambits::journal::Re
 /// [`append_journal`] of one write.
 #[allow(dead_code)]
 pub fn journal_write(root: &Path, session: &str, write: ambits::writes::WriteRecord) {
-    append_journal(root, session, &[ambits::journal::Record::Write(Box::new(write))]);
+    append_journal(
+        root,
+        session,
+        &[ambits::journal::Record::Write(Box::new(write))],
+    );
 }

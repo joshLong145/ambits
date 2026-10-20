@@ -141,17 +141,44 @@ impl LanguageParser for JavaParser {
 // ---------------------------------------------------------------------------
 
 // -- Type declarations ------------------------------------------------------
-const CLASS: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "class" };
-const ABSTRACT_CLASS: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "abstract class" };
-const IFACE: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "interface" };
-const ENUM: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "enum" };
-const RECORD: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "record" };
-const ANNOTATION: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "@interface" };
+const CLASS: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Type,
+    label: "class",
+};
+const ABSTRACT_CLASS: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Type,
+    label: "abstract class",
+};
+const IFACE: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Type,
+    label: "interface",
+};
+const ENUM: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Type,
+    label: "enum",
+};
+const RECORD: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Type,
+    label: "record",
+};
+const ANNOTATION: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Type,
+    label: "@interface",
+};
 
 // -- Members ----------------------------------------------------------------
-const METHOD: SymbolMeta = SymbolMeta { category: SymbolCategory::Function, label: "method" };
-const CONSTRUCTOR: SymbolMeta = SymbolMeta { category: SymbolCategory::Function, label: "constructor" };
-const FIELD: SymbolMeta = SymbolMeta { category: SymbolCategory::Variable, label: "field" };
+const METHOD: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Function,
+    label: "method",
+};
+const CONSTRUCTOR: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Function,
+    label: "constructor",
+};
+const FIELD: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Variable,
+    label: "field",
+};
 
 /// tree-sitter-java's two comment kinds: `//` is `line_comment`; `/* */` and
 /// Javadoc `/** */` are `block_comment`.
@@ -210,7 +237,14 @@ fn extract_symbols(node: Node, ctx: &FileCtx, parent_name_path: &str, out: &mut 
                 extract_symbols(body, ctx, &join(parent_name_path, &name), &mut children);
             }
         }
-        out.push(make_symbol(&name, &meta, child, ctx, parent_name_path, children));
+        out.push(make_symbol(
+            &name,
+            &meta,
+            child,
+            ctx,
+            parent_name_path,
+            children,
+        ));
     }
 }
 
@@ -222,7 +256,14 @@ fn extract_fields(node: Node, ctx: &FileCtx, parent_name_path: &str, out: &mut V
     let mut cursor = node.walk();
     for declarator in node.children_by_field_name("declarator", &mut cursor) {
         if let Some(name) = child_name(&declarator, ctx.src) {
-            out.push(make_symbol(&name, &FIELD, node, ctx, parent_name_path, Vec::new()));
+            out.push(make_symbol(
+                &name,
+                &FIELD,
+                node,
+                ctx,
+                parent_name_path,
+                Vec::new(),
+            ));
         }
     }
 }
@@ -320,7 +361,10 @@ mod tests {
 
     /// `(name, label)` of each child of `sym`, in order.
     fn members(sym: &SymbolNode) -> Vec<(&str, &str)> {
-        sym.children.iter().map(|c| (c.name.as_ref(), c.label)).collect()
+        sym.children
+            .iter()
+            .map(|c| (c.name.as_ref(), c.label))
+            .collect()
     }
 
     #[test]
@@ -331,7 +375,9 @@ mod tests {
     #[test]
     fn the_registry_picks_this_parser_for_java_files() {
         let registry = crate::parser::ParserRegistry::new();
-        let parser = registry.parser_for(Path::new("src/Main.java")).expect("a parser for .java");
+        let parser = registry
+            .parser_for(Path::new("src/Main.java"))
+            .expect("a parser for .java");
         assert_eq!(parser.extensions(), &["java"]);
     }
 
@@ -342,7 +388,9 @@ mod tests {
 
     #[test]
     fn package_and_imports_are_not_symbols() {
-        let syms = parse("package com.example;\n\nimport java.util.List;\nimport static java.lang.Math.max;\n");
+        let syms = parse(
+            "package com.example;\n\nimport java.util.List;\nimport static java.lang.Math.max;\n",
+        );
         assert!(syms.is_empty());
     }
 
@@ -375,7 +423,13 @@ mod tests {
         let kinds: Vec<(&str, &str)> = syms.iter().map(|s| (s.name.as_ref(), s.label)).collect();
         assert_eq!(
             kinds,
-            vec![("A", "class"), ("B", "interface"), ("C", "enum"), ("D", "record"), ("E", "@interface")]
+            vec![
+                ("A", "class"),
+                ("B", "interface"),
+                ("C", "enum"),
+                ("D", "record"),
+                ("E", "@interface")
+            ]
         );
         assert!(syms.iter().all(|s| s.category == SymbolCategory::Type));
     }
@@ -403,7 +457,12 @@ mod tests {
         );
         assert_eq!(
             members(&syms[0]),
-            vec![("db", "field"), ("Svc", "constructor"), ("run", "method"), ("count", "method")]
+            vec![
+                ("db", "field"),
+                ("Svc", "constructor"),
+                ("run", "method"),
+                ("count", "method")
+            ]
         );
         assert_eq!(syms[0].children[0].category, SymbolCategory::Variable);
         assert_eq!(syms[0].children[1].category, SymbolCategory::Function);
@@ -429,8 +488,13 @@ mod tests {
     #[test]
     fn overloads_share_an_id_but_not_a_hash() {
         let syms = parse("class M {\n    void draw() {}\n    void draw(int scale) {}\n}");
-        let [a, b] = &syms[0].children[..] else { panic!("two overloads: {:?}", members(&syms[0])) };
-        assert_eq!((a.id.as_str(), b.id.as_str()), ("Test.java::M/draw", "Test.java::M/draw"));
+        let [a, b] = &syms[0].children[..] else {
+            panic!("two overloads: {:?}", members(&syms[0]))
+        };
+        assert_eq!(
+            (a.id.as_str(), b.id.as_str()),
+            ("Test.java::M/draw", "Test.java::M/draw")
+        );
         assert_eq!((a.line_range.start, b.line_range.start), (2, 3));
         assert_ne!(a.content_hash, b.content_hash);
     }
@@ -448,7 +512,12 @@ mod tests {
         assert_eq!(syms[0].label, "interface");
         assert_eq!(
             members(&syms[0]),
-            vec![("PI", "field"), ("area", "method"), ("describe", "method"), ("unit", "method")]
+            vec![
+                ("PI", "field"),
+                ("area", "method"),
+                ("describe", "method"),
+                ("unit", "method")
+            ]
         );
     }
 
@@ -468,7 +537,11 @@ mod tests {
         );
         assert_eq!(
             members(&syms[0]),
-            vec![("v", "field"), ("Color", "constructor"), ("value", "method")]
+            vec![
+                ("v", "field"),
+                ("Color", "constructor"),
+                ("value", "method")
+            ]
         );
         assert_eq!(syms[0].children[2].id, "Test.java::Color/value");
     }
@@ -482,14 +555,20 @@ mod tests {
             }",
         );
         assert_eq!(syms[0].label, "record");
-        assert_eq!(members(&syms[0]), vec![("Point", "constructor"), ("origin", "method")]);
+        assert_eq!(
+            members(&syms[0]),
+            vec![("Point", "constructor"), ("origin", "method")]
+        );
     }
 
     #[test]
     fn annotation_type_elements_and_constants() {
         let syms = parse("@interface Retry {\n    int times() default 3;\n    int MAX = 10;\n}");
         assert_eq!(syms[0].label, "@interface");
-        assert_eq!(members(&syms[0]), vec![("times", "method"), ("MAX", "field")]);
+        assert_eq!(
+            members(&syms[0]),
+            vec![("times", "method"), ("MAX", "field")]
+        );
     }
 
     // ---------------------------------------------------------------
@@ -514,7 +593,10 @@ mod tests {
         let deep = &syms[0].children[0].children[0];
         assert_eq!(deep.id, "Test.java::Outer/Nested/Deep");
         assert_eq!(deep.children[0].id, "Test.java::Outer/Nested/Deep/go");
-        assert_eq!(syms[0].children[1].children[0].id, "Test.java::Outer/Inner/m");
+        assert_eq!(
+            syms[0].children[1].children[0].id,
+            "Test.java::Outer/Inner/m"
+        );
     }
 
     /// Nothing inside a method body is a symbol — no other parser here looks
@@ -563,7 +645,10 @@ mod tests {
         assert_eq!(m.name.as_ref(), "toString");
         assert_eq!(m.byte_range.start as usize, src.find("@Override").unwrap());
         assert_eq!(m.line_range.start, 2);
-        assert_eq!(m.head_line, 4, "its name is on the line after its annotations");
+        assert_eq!(
+            m.head_line, 4,
+            "its name is on the line after its annotations"
+        );
     }
 
     /// A Javadoc glued to a declaration widens it, as `///` does in Rust,
@@ -574,7 +659,10 @@ mod tests {
         let syms = parse(src);
         assert_eq!(syms[0].byte_range.start, 0);
         let run = &syms[0].children[0];
-        assert_eq!(run.byte_range.start as usize, src.find("    /**").unwrap() + 4);
+        assert_eq!(
+            run.byte_range.start as usize,
+            src.find("    /**").unwrap() + 4
+        );
         assert_eq!(run.line_range.start, 4);
     }
 
@@ -585,15 +673,24 @@ mod tests {
         let src = "class A {\n    // Makes one.\n    A() {}\n}";
         let syms = parse(src);
         let ctor = &syms[0].children[0];
-        assert_eq!(ctor.byte_range.start as usize, src.find("// Makes one.").unwrap());
-        assert_eq!(syms[0].byte_range.start, 0, "the class is not widened by its member's comment");
+        assert_eq!(
+            ctor.byte_range.start as usize,
+            src.find("// Makes one.").unwrap()
+        );
+        assert_eq!(
+            syms[0].byte_range.start, 0,
+            "the class is not widened by its member's comment"
+        );
     }
 
     #[test]
     fn a_comment_separated_by_a_blank_line_does_not_widen() {
         let src = "// unrelated\n\nclass A {}";
         let syms = parse(src);
-        assert_eq!(syms[0].byte_range.start as usize, src.find("class").unwrap());
+        assert_eq!(
+            syms[0].byte_range.start as usize,
+            src.find("class").unwrap()
+        );
     }
 
     #[test]
@@ -633,10 +730,20 @@ mod tests {
         let src = "class A {\n    void f() {\n        helper(1);\n        this.list.add(2);\n        new Foo();\n        new java.util.ArrayList<String>();\n        new Outer.Inner();\n        new Box<>();\n    }\n}";
         let registry = crate::parser::ParserRegistry::new();
         let sites = crate::callers::call_sites(&registry, Path::new("A.java"), src);
-        let names: Vec<(&str, u32)> = sites.iter().map(|(n, line, _)| (n.as_str(), *line)).collect();
+        let names: Vec<(&str, u32)> = sites
+            .iter()
+            .map(|(n, line, _)| (n.as_str(), *line))
+            .collect();
         assert_eq!(
             names,
-            vec![("helper", 3), ("add", 4), ("Foo", 5), ("ArrayList", 6), ("Inner", 7), ("Box", 8)]
+            vec![
+                ("helper", 3),
+                ("add", 4),
+                ("Foo", 5),
+                ("ArrayList", 6),
+                ("Inner", 7),
+                ("Box", 8)
+            ]
         );
     }
 }

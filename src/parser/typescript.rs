@@ -122,22 +122,58 @@ impl LanguageParser for TypescriptParser {
 
 /// Pairs a [`SymbolCategory`] with a display label for use in [`SymbolNode`].
 // -- Top-level declarations -------------------------------------------------
-const FN: SymbolMeta = SymbolMeta { category: SymbolCategory::Function, label: "function" };
-const CLASS: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "class" };
-const ABSTRACT_CLASS: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "abstract class" };
-const IFACE: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "interface" };
-const TYPE: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "type" };
-const ENUM: SymbolMeta = SymbolMeta { category: SymbolCategory::Type, label: "enum" };
-const NS: SymbolMeta = SymbolMeta { category: SymbolCategory::Module, label: "namespace" };
+const FN: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Function,
+    label: "function",
+};
+const CLASS: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Type,
+    label: "class",
+};
+const ABSTRACT_CLASS: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Type,
+    label: "abstract class",
+};
+const IFACE: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Type,
+    label: "interface",
+};
+const TYPE: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Type,
+    label: "type",
+};
+const ENUM: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Type,
+    label: "enum",
+};
+const NS: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Module,
+    label: "namespace",
+};
 
 // -- Class / interface members ----------------------------------------------
-const METHOD: SymbolMeta = SymbolMeta { category: SymbolCategory::Function, label: "method" };
-const PROP: SymbolMeta = SymbolMeta { category: SymbolCategory::Variable, label: "property" };
-const GET: SymbolMeta = SymbolMeta { category: SymbolCategory::Function, label: "get" };
-const SET: SymbolMeta = SymbolMeta { category: SymbolCategory::Function, label: "set" };
+const METHOD: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Function,
+    label: "method",
+};
+const PROP: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Variable,
+    label: "property",
+};
+const GET: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Function,
+    label: "get",
+};
+const SET: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Function,
+    label: "set",
+};
 
 // -- Ambient (declare) ------------------------------------------------------
-const DECLARE: SymbolMeta = SymbolMeta { category: SymbolCategory::Variable, label: "declare" };
+const DECLARE: SymbolMeta = SymbolMeta {
+    category: SymbolCategory::Variable,
+    label: "declare",
+};
 
 /// tree-sitter-typescript's one comment node kind, covering both `//` and
 /// `/* */`/`/** */` forms.
@@ -173,12 +209,7 @@ struct FileCtx<'a> {
     path_prefix: &'a str,
 }
 
-fn extract_symbols(
-    node: Node,
-    ctx: &FileCtx,
-    parent_name_path: &str,
-    out: &mut Vec<SymbolNode>,
-) {
+fn extract_symbols(node: Node, ctx: &FileCtx, parent_name_path: &str, out: &mut Vec<SymbolNode>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         // Unwrap export_statement: extract the inner declaration and adjust the
@@ -220,17 +251,35 @@ fn extract_symbols(
         match target.kind() {
             // `function foo()` or `function* gen()` - leaf symbol, no children.
             "function_declaration" | "generator_function_declaration" => {
-                if let Some(sym) = build_named_symbol(&target, ctx, parent_name_path, &FN, byte_range, leading) {
+                if let Some(sym) =
+                    build_named_symbol(&target, ctx, parent_name_path, &FN, byte_range, leading)
+                {
                     out.push(sym);
                 }
             }
             // `class Foo { ... }` - container, recurse into class_body for members.
             "class_declaration" => {
-                emit_class(&target, ctx, parent_name_path, &CLASS, byte_range, leading, out);
+                emit_class(
+                    &target,
+                    ctx,
+                    parent_name_path,
+                    &CLASS,
+                    byte_range,
+                    leading,
+                    out,
+                );
             }
             // `abstract class Base { ... }` - same as class but different label.
             "abstract_class_declaration" => {
-                emit_class(&target, ctx, parent_name_path, &ABSTRACT_CLASS, byte_range, leading, out);
+                emit_class(
+                    &target,
+                    ctx,
+                    parent_name_path,
+                    &ABSTRACT_CLASS,
+                    byte_range,
+                    leading,
+                    out,
+                );
             }
             // `interface Config { ... }` - container, recurse into interface_body.
             "interface_declaration" => {
@@ -238,13 +287,17 @@ fn extract_symbols(
             }
             // `type Alias = ...` - leaf symbol.
             "type_alias_declaration" => {
-                if let Some(sym) = build_named_symbol(&target, ctx, parent_name_path, &TYPE, byte_range, leading) {
+                if let Some(sym) =
+                    build_named_symbol(&target, ctx, parent_name_path, &TYPE, byte_range, leading)
+                {
                     out.push(sym);
                 }
             }
             // `enum Status { ... }` - leaf (we don't extract enum members).
             "enum_declaration" => {
-                if let Some(sym) = build_named_symbol(&target, ctx, parent_name_path, &ENUM, byte_range, leading) {
+                if let Some(sym) =
+                    build_named_symbol(&target, ctx, parent_name_path, &ENUM, byte_range, leading)
+                {
                     out.push(sym);
                 }
             }
@@ -317,7 +370,11 @@ fn extract_arrow_fns(
         out.push(make_symbol(
             name,
             &FN,
-            SymbolSpan { line_node: *node, byte_range, leading },
+            SymbolSpan {
+                line_node: *node,
+                byte_range,
+                leading,
+            },
             ctx,
             parent_name_path,
             Vec::new(),
@@ -346,9 +403,14 @@ fn extract_ambient(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         let name = match child.kind() {
-            "function_signature" | "class_declaration" | "abstract_class_declaration"
-            | "interface_declaration" | "enum_declaration" | "type_alias_declaration"
-            | "internal_module" | "module" => child_name(&child, ctx.src),
+            "function_signature"
+            | "class_declaration"
+            | "abstract_class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "type_alias_declaration"
+            | "internal_module"
+            | "module" => child_name(&child, ctx.src),
             "lexical_declaration" | "variable_declaration" => {
                 // Extract variable names from declare const/let/var.
                 extract_ambient_vars(&child, ctx, parent_name_path, &ambient_range, leading, out);
@@ -361,7 +423,11 @@ fn extract_ambient(
             out.push(make_symbol(
                 name,
                 &DECLARE,
-                SymbolSpan { line_node: *node, byte_range: ambient_range, leading },
+                SymbolSpan {
+                    line_node: *node,
+                    byte_range: ambient_range,
+                    leading,
+                },
                 ctx,
                 parent_name_path,
                 Vec::new(),
@@ -397,7 +463,11 @@ fn extract_ambient_vars(
         out.push(make_symbol(
             name,
             &DECLARE,
-            SymbolSpan { line_node: child, byte_range: ambient_range.clone(), leading },
+            SymbolSpan {
+                line_node: child,
+                byte_range: ambient_range.clone(),
+                leading,
+            },
             ctx,
             parent_name_path,
             Vec::new(),
@@ -441,7 +511,11 @@ fn emit_class(
     out.push(make_symbol(
         name,
         meta,
-        SymbolSpan { line_node: *node, byte_range, leading },
+        SymbolSpan {
+            line_node: *node,
+            byte_range,
+            leading,
+        },
         ctx,
         parent_name_path,
         children,
@@ -457,12 +531,7 @@ fn emit_class(
 ///   interface properties (e.g. `host: string`).
 /// - `abstract_method_signature` / `method_signature` - abstract and
 ///   interface method declarations without bodies.
-fn extract_members(
-    body: Node,
-    ctx: &FileCtx,
-    parent_name_path: &str,
-    out: &mut Vec<SymbolNode>,
-) {
+fn extract_members(body: Node, ctx: &FileCtx, parent_name_path: &str, out: &mut Vec<SymbolNode>) {
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
         let (name, meta) = match child.kind() {
@@ -480,18 +549,14 @@ fn extract_members(
                 };
                 (name, meta)
             }
-            "public_field_definition" | "property_signature" => {
-                match child_name(&child, ctx.src) {
-                    Some(n) => (n, &PROP),
-                    None => continue,
-                }
-            }
-            "abstract_method_signature" | "method_signature" => {
-                match child_name(&child, ctx.src) {
-                    Some(n) => (n, &METHOD),
-                    None => continue,
-                }
-            }
+            "public_field_definition" | "property_signature" => match child_name(&child, ctx.src) {
+                Some(n) => (n, &PROP),
+                None => continue,
+            },
+            "abstract_method_signature" | "method_signature" => match child_name(&child, ctx.src) {
+                Some(n) => (n, &METHOD),
+                None => continue,
+            },
             _ => continue,
         };
 
@@ -503,7 +568,11 @@ fn extract_members(
         out.push(make_symbol(
             name,
             meta,
-            SymbolSpan { line_node: child, byte_range, leading },
+            SymbolSpan {
+                line_node: child,
+                byte_range,
+                leading,
+            },
             ctx,
             parent_name_path,
             Vec::new(),
@@ -542,7 +611,11 @@ fn emit_interface(
     out.push(make_symbol(
         name,
         &IFACE,
-        SymbolSpan { line_node: *node, byte_range, leading },
+        SymbolSpan {
+            line_node: *node,
+            byte_range,
+            leading,
+        },
         ctx,
         parent_name_path,
         children,
@@ -588,7 +661,11 @@ fn emit_namespace(
     out.push(make_symbol(
         name,
         &NS,
-        SymbolSpan { line_node: *node, byte_range, leading },
+        SymbolSpan {
+            line_node: *node,
+            byte_range,
+            leading,
+        },
         ctx,
         parent_name_path,
         children,
@@ -646,7 +723,10 @@ fn make_symbol(
     let id = format!("{}::{name_path}", ctx.path_prefix);
     let (start_byte, start_line) = match span.leading {
         Some(l) => (l.start_byte(), l.start_position().row + 1),
-        None => (span.byte_range.start, span.line_node.start_position().row + 1),
+        None => (
+            span.byte_range.start,
+            span.line_node.start_position().row + 1,
+        ),
     };
     let end_line = span.line_node.end_position().row + 1;
     let byte_range = span.byte_range;
@@ -683,7 +763,11 @@ fn build_named_symbol(
     Some(make_symbol(
         name,
         meta,
-        SymbolSpan { line_node: *node, byte_range, leading },
+        SymbolSpan {
+            line_node: *node,
+            byte_range,
+            leading,
+        },
         ctx,
         parent_name_path,
         Vec::new(),
@@ -1020,7 +1104,11 @@ mod tests {
         assert_eq!(syms[0].name.as_ref(), "Status");
         assert_eq!(syms[0].label, "enum");
         assert_eq!(syms[0].category, SymbolCategory::Type);
-        assert_eq!(syms[0].children.len(), 0, "enum should not recurse into members");
+        assert_eq!(
+            syms[0].children.len(),
+            0,
+            "enum should not recurse into members"
+        );
     }
 
     #[test]
@@ -1182,7 +1270,11 @@ mod tests {
     #[test]
     fn export_star_ignored() {
         let syms = parse("export * from './utils';");
-        assert_eq!(syms.len(), 0, "wildcard re-exports should not produce symbols");
+        assert_eq!(
+            syms.len(),
+            0,
+            "wildcard re-exports should not produce symbols"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -1223,9 +1315,7 @@ mod tests {
 
     #[test]
     fn line_ranges_are_correct() {
-        let syms = parse(
-            "function a() {}\nfunction b() {}\nfunction c() {}",
-        );
+        let syms = parse("function a() {}\nfunction b() {}\nfunction c() {}");
         assert_eq!(syms.len(), 3);
         assert_eq!(syms[0].line_range, 1..1);
         assert_eq!(syms[1].line_range, 2..2);
@@ -1234,9 +1324,7 @@ mod tests {
 
     #[test]
     fn multiline_class_range() {
-        let syms = parse(
-            "class Foo {\n  bar(): void {}\n  baz(): void {}\n}",
-        );
+        let syms = parse("class Foo {\n  bar(): void {}\n  baz(): void {}\n}");
         assert_eq!(syms[0].line_range, 1..4);
     }
 
@@ -1313,7 +1401,10 @@ declare function require(id: string): any;
         let src = "// unrelated note\n\nfunction inc(x: number): number { return x + 1; }";
         let syms = parse(src);
         assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].byte_range.start as usize, src.find("function").unwrap());
+        assert_eq!(
+            syms[0].byte_range.start as usize,
+            src.find("function").unwrap()
+        );
     }
 
     /// A comment trailing code on its own row is about that code, not the
@@ -1331,11 +1422,18 @@ declare function require(id: string): any;
     /// the class — the two have different preceding-sibling contexts.
     #[test]
     fn a_method_comment_attaches_to_the_method_not_the_class() {
-        let src = "class Point {\n  // Make one.\n  static make(): Point { return new Point(); }\n}";
+        let src =
+            "class Point {\n  // Make one.\n  static make(): Point { return new Point(); }\n}";
         let syms = parse(src);
-        assert_eq!(syms[0].byte_range.start as usize, src.find("class").unwrap());
+        assert_eq!(
+            syms[0].byte_range.start as usize,
+            src.find("class").unwrap()
+        );
         let method = &syms[0].children[0];
-        assert_eq!(method.byte_range.start as usize, src.find("// Make one.").unwrap());
+        assert_eq!(
+            method.byte_range.start as usize,
+            src.find("// Make one.").unwrap()
+        );
     }
 
     /// The case this whole design has to get right for TypeScript

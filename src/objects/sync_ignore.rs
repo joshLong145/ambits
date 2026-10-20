@@ -24,7 +24,10 @@ impl SyncIgnore {
     pub fn new(config: &SyncConfig) -> Result<Self> {
         let project = config.ignore.clone().unwrap_or_default();
         let global = config.global_ignore.clone();
-        let digest = *blake3::hash(&super::canonical::to_bytes(&json!({"global": global, "project": project}))?).as_bytes();
+        let digest = *blake3::hash(&super::canonical::to_bytes(
+            &json!({"global": global, "project": project}),
+        )?)
+        .as_bytes();
         Ok(Self {
             project: matcher(&project).wrap_err("[sync] ignore")?,
             global: matcher(&global).wrap_err("user-global [sync] ignore")?,
@@ -80,7 +83,10 @@ mod tests {
     fn patterns_use_gitignore_syntax() {
         let s = sync(&["secrets/**", "vendor/", "*.gen.rs"], &[]);
         assert!(s.is_ignored("secrets/key.rs"));
-        assert!(s.is_ignored("vendor/lib/x.rs"), "a directory pattern covers what is under it");
+        assert!(
+            s.is_ignored("vendor/lib/x.rs"),
+            "a directory pattern covers what is under it"
+        );
         assert!(s.is_ignored("src/a.gen.rs"));
         assert!(!s.is_ignored("src/a.rs"));
         assert!(s.ignores_symbol("secrets/key.rs::Key/new"));
