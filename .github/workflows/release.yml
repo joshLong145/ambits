@@ -1,0 +1,104 @@
+name: Release
+
+# Pushing a version tag (`0.21.0`, no `v`, matching Cargo.toml) builds a
+# binary per target and publishes them, with checksums, as a GitHub Release.
+
+on:
+  push:
+    tags: ['[0-9]+.[0-9]+.[0-9]+']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # A tag that disagrees with Cargo.toml would ship binaries whose --version
+  # names another release.
+  version:
+    name: Tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare
+        run: |
+          crate=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "ambits") | .version')
+          if [ "$crate" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $crate" >&2
+            exit 1
+          fi
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static Linux builds, each on its own architecture so the C
+          # grammars need no cross compiler.
+          - { runner: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { runner: macos-latest, target: aarch64-apple-darwin }
+          # Apple's toolchain builds Intel from the arm64 runner; the binary
+          # cannot run there, so it is only checked to be x86_64.
+          - { runner: macos-latest, target: x86_64-apple-darwin }
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+      - name: Check the binary is static and runs
+        if: contains(matrix.target, 'musl')
+        run: .github/scripts/check-static.sh target/${{ matrix.target }}/release/ambits
+      - name: Check the binary runs
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: target/${{ matrix.target }}/release/ambits --version
+      - name: Check the binary is x86_64
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: lipo -archs target/${{ matrix.target }}/release/ambits | grep -qx x86_64
+      - name: Package
+        run: |
+          name=ambits-$GITHUB_REF_NAME-${{ matrix.target }}
+          mkdir "$name"
+          cp target/${{ matrix.target }}/release/ambits README.md "$name/"
+          tar -czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ambits-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Checksums
+        run: sha256sum ambits-*.tar.gz > SHA256SUMS && cat SHA256SUMS
+      # Create the release, or on a re-run replace its assets.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" ambits-*.tar.gz SHA256SUMS --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" ambits-*.tar.gz SHA256SUMS \
+              --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+          fi
