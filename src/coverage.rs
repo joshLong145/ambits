@@ -524,6 +524,7 @@ impl CoverageFormatter for JsonFormatter {
 ///
 /// Resolves the log directory and session automatically when not provided.
 /// Supports optional agent-prefix filtering.
+#[allow(clippy::too_many_arguments)]
 pub fn run_report(
     project_path: &Path,
     project_tree: &ProjectTree,

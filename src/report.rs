@@ -732,9 +732,11 @@ pub fn render_html(json: &str) -> Result<String> {
         .and_then(serde_json::Value::as_u64)
     {
         Some(v) if v == u64::from(SCHEMA_VERSION) => {}
-        other => color_eyre::eyre::bail!(
-            "not an ambits report of schema version {SCHEMA_VERSION} (found {other:?})"
-        ),
+        other => {
+            color_eyre::eyre::bail!(
+                "not an ambits report of schema version {SCHEMA_VERSION} (found {other:?})"
+            );
+        }
     }
     let csp = format!(
         "default-src 'none'; script-src '{}'; style-src '{}'; img-src data:; base-uri 'none'; form-action 'none'",

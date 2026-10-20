@@ -2408,6 +2408,7 @@ fn run_restore_context(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,

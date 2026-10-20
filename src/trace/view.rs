@@ -118,7 +118,7 @@ pub fn offset(ms: u64) -> String {
 pub fn duration(ms: u64) -> String {
     match ms {
         0..1_000 => format!("{ms}ms"),
-        1_000..10_000 if ms % 1_000 != 0 => format!("{:.1}s", ms as f64 / 1_000.0),
+        1_000..10_000 if !ms.is_multiple_of(1_000) => format!("{:.1}s", ms as f64 / 1_000.0),
         1_000..60_000 => format!("{}s", ms / 1_000),
         60_000..3_600_000 => match (ms / 60_000, ms / 1_000 % 60) {
             (m, 0) => format!("{m}m"),
