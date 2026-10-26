@@ -16,8 +16,8 @@ binary (build-time dependencies are listed with scope `excluded`), for feeding
 to a vulnerability or license scanner.
 
 ```bash
-tar -xzf ambits-0.25.0-aarch64-apple-darwin.tar.gz
-mv ambits-0.25.0-aarch64-apple-darwin/ambits ~/.local/bin/
+tar -xzf ambits-0.25.1-aarch64-apple-darwin.tar.gz
+mv ambits-0.25.1-aarch64-apple-darwin/ambits ~/.local/bin/
 ambits --version
 ```
 

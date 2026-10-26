@@ -1,6 +1,6 @@
 name: Release
 
-# Pushing a version tag (`0.25.0`, no `v`, matching Cargo.toml) builds a
+# Pushing a version tag (`0.25.1`, no `v`, matching Cargo.toml) builds a
 # binary per target and publishes them, each with a CycloneDX SBOM and all
 # with checksums, as a GitHub Release.
 
