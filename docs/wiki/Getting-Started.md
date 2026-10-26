@@ -10,7 +10,10 @@ Or download a prebuilt binary from
 [Releases](https://github.com/joshLong145/ambits/releases): static Linux builds
 for x86_64 and aarch64, and macOS builds for Apple Silicon and Intel. Each is a
 `.tar.gz` named `ambits-<version>-<target>`, with `SHA256SUMS` to check it
-against.
+against. Next to each archive is `ambits-<version>-<target>.cdx.json`, a
+[CycloneDX](https://cyclonedx.org/) 1.5 SBOM of the crates compiled into that
+binary (build-time dependencies are listed with scope `excluded`), for feeding
+to a vulnerability or license scanner.
 
 ```bash
 tar -xzf ambits-0.25.0-aarch64-apple-darwin.tar.gz
