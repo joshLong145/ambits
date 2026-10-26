@@ -50,7 +50,12 @@ the `version` in `Cargo.toml`, or the run fails before building.
    git tag -a 0.25.0 -m 0.25.0
    git push origin 0.25.0
    ```
-3. Watch the run with `gh run watch`. Re-running it replaces the assets.
+3. Watch the run with `gh run watch`.
+
+Releases are immutable (the repository's immutable-releases setting): once
+published, a release's assets and tag cannot be added to, replaced or removed.
+A failed run that published nothing can be re-run, but a published release
+with a mistake is fixed by releasing a new patch version, never by editing it.
 
 ## Landing the Plane (Session Completion)
 
