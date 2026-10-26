@@ -1,7 +1,8 @@
 name: Release
 
 # Pushing a version tag (`0.25.0`, no `v`, matching Cargo.toml) builds a
-# binary per target and publishes them, with checksums, as a GitHub Release.
+# binary per target and publishes them, each with a CycloneDX SBOM and all
+# with checksums, as a GitHub Release.
 
 on:
   push:
@@ -72,10 +73,23 @@ jobs:
           mkdir "$name"
           cp target/${{ matrix.target }}/release/ambits README.md "$name/"
           tar -czf "$name.tar.gz" "$name"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx@0.5.9
+      # The dependencies compiled into this target's binary, from Cargo.lock.
+      # Build-time dependencies are listed with scope "excluded". Dated by the
+      # commit, so the same commit gives the same SBOM.
+      - name: SBOM
+        run: |
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) cargo cyclonedx \
+            --format json --spec-version 1.5 --describe binaries --target ${{ matrix.target }}
+          mv -f ambits_bin.cdx.json "ambits-$GITHUB_REF_NAME-${{ matrix.target }}.cdx.json"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: ambits-*.tar.gz
+          path: |
+            ambits-*.tar.gz
+            ambits-*.cdx.json
           if-no-files-found: error
 
   release:
@@ -88,8 +102,18 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
+      # With CycloneDX's own CLI, pinned and checked against its release digest.
+      - name: Validate SBOMs
+        run: |
+          curl -fsSLo cyclonedx https://github.com/CycloneDX/cyclonedx-cli/releases/download/v0.33.1/cyclonedx-linux-x64
+          echo "bfc8b2538da86fe239bc53658bbb63c1c8c510a293c1e6891aa5bea5d3c58746  cyclonedx" | sha256sum -c -
+          chmod +x cyclonedx
+          for f in ambits-*.cdx.json; do
+            ./cyclonedx validate --input-file "$f" --input-format json --input-version v1_5 --fail-on-errors
+          done
+          rm -f cyclonedx
       - name: Checksums
-        run: sha256sum ambits-*.tar.gz > SHA256SUMS && cat SHA256SUMS
+        run: sha256sum ambits-*.tar.gz ambits-*.cdx.json > SHA256SUMS && cat SHA256SUMS
       # Create the release, or on a re-run replace its assets.
       - name: Publish
         env:
@@ -97,8 +121,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" ambits-*.tar.gz SHA256SUMS --clobber
+            gh release upload "$GITHUB_REF_NAME" ambits-*.tar.gz ambits-*.cdx.json SHA256SUMS --clobber
           else
-            gh release create "$GITHUB_REF_NAME" ambits-*.tar.gz SHA256SUMS \
+            gh release create "$GITHUB_REF_NAME" ambits-*.tar.gz ambits-*.cdx.json SHA256SUMS \
               --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
           fi

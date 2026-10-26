@@ -39,7 +39,8 @@ To publish, copy `docs/wiki/*.md` into a clone of
 
 `.github/workflows/release.yml` runs when a version tag is pushed. It builds
 static Linux (x86_64, aarch64) and macOS (arm64, x86_64) binaries and publishes
-them, with `SHA256SUMS`, as a GitHub Release. The tag has no `v` and must equal
+them, each with a CycloneDX SBOM from `cargo-cyclonedx` (validated with the
+official `cyclonedx` CLI) and all listed in `SHA256SUMS`, as a GitHub Release. The tag has no `v` and must equal
 the `version` in `Cargo.toml`, or the run fails before building.
 
 1. Bump `version` in `Cargo.toml` (and `Cargo.lock` via `cargo build`) on a
