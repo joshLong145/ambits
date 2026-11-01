@@ -333,12 +333,14 @@ pub fn extract_agent_label(path: &Path) -> String {
         return fallback;
     }
 
-    // Truncate to a short label: first line, max 50 chars.
+    // Truncate to a short label: first line, max 50 chars. Counted in
+    // chars, not bytes, so a multi-byte prompt is never cut mid-character.
     let first_line_content = content.lines().next().unwrap_or(content);
-    if first_line_content.len() <= 50 {
-        first_line_content.to_string()
-    } else {
-        format!("{}...", &first_line_content[..47])
+    match first_line_content.char_indices().nth(47) {
+        Some((cut, _)) if first_line_content.chars().count() > 50 => {
+            format!("{}...", &first_line_content[..cut])
+        }
+        _ => first_line_content.to_string(),
     }
 }
 
@@ -2835,6 +2837,34 @@ mod tests {
 
         let label = extract_agent_label(&log);
         assert_eq!(label, "Explore the parser module");
+    }
+
+    #[test]
+    fn extract_label_truncates_a_multibyte_prompt_on_a_char_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("agent-abc1234.jsonl");
+        // Three-byte chars put byte 47 inside the 16th char.
+        let long_prompt = "日".repeat(60);
+        let content = format!(
+            r#"{{"agentId":"abc1234","type":"user","message":{{"role":"user","content":"{long_prompt}"}},"sessionId":"sess-1","timestamp":"2025-01-01T00:00:00Z"}}"#
+        );
+        fs::write(&log, content).unwrap();
+
+        let label = extract_agent_label(&log);
+        assert_eq!(label, format!("{}...", "日".repeat(47)));
+    }
+
+    #[test]
+    fn extract_label_keeps_a_multibyte_prompt_of_fifty_chars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("agent-abc1234.jsonl");
+        let prompt = "é".repeat(50);
+        let content = format!(
+            r#"{{"agentId":"abc1234","type":"user","message":{{"role":"user","content":"{prompt}"}},"sessionId":"sess-1","timestamp":"2025-01-01T00:00:00Z"}}"#
+        );
+        fs::write(&log, content).unwrap();
+
+        assert_eq!(extract_agent_label(&log), prompt);
     }
 
     #[test]
