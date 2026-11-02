@@ -650,10 +650,18 @@ pub fn run_report(
                         tool_call_count = 0;
                         compactions.clear();
                     }
-                    // Writes grant no read credit (spec D9).
+                    // What the call read, as its result says, and what its
+                    // output showed (`ambits rg`, `grep -n`).
                     SessionEvent::ToolFinished(f) => {
-                        crate::app::apply_shown(project_tree, &f, &mut ledger, &mut depth_cache);
+                        crate::app::apply_finished(
+                            project_tree,
+                            project_path,
+                            &f,
+                            &mut ledger,
+                            &mut depth_cache,
+                        );
                     }
+                    // Writes grant no read credit (spec D9).
                     SessionEvent::Write(_) | SessionEvent::Prompt(_) => {}
                 }
             }
@@ -1384,6 +1392,7 @@ mod tests {
             result_depth: None,
             file_reads: Vec::new(),
             searches: Vec::new(),
+            credited_by_result: false,
         })
     }
 

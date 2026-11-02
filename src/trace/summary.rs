@@ -443,6 +443,7 @@ mod tests {
             child_agent: child.map(Arc::from),
             shown: Vec::new(),
             printed: Vec::new(),
+            read: None,
         });
     }
 
@@ -628,6 +629,7 @@ mod tests {
                 child_agent: None,
                 shown: Vec::new(),
                 printed: Vec::new(),
+                read: None,
             });
         }
         let d = detail(&t, &TraceIndex::new(&t), 0).unwrap();

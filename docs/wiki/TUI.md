@@ -89,8 +89,8 @@ Each symbol row starts with three columns, one state each:
 |---|---|---|
 | Read depth | `●` | Full body read |
 | | `◕` | Signature seen |
-| | `◑` | Overview (grep match, symbol listing) |
-| | `◔` | Name only (a glob, a listing, a `callers` or `show --no-body` result) |
+| | `◑` | Overview (a symbol listing, Serena's pattern search) |
+| | `◔` | Name only (a glob, a listing, a grep match, a `callers` or `show --no-body` result) |
 | | `·` | Unseen |
 | Freshness | `!` | Changed since it was read: what the agent knows is out of date |
 | | `◌` | Read before a compaction: no longer in the agent's context |

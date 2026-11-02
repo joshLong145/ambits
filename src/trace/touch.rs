@@ -118,6 +118,7 @@ mod tests {
             child_agent: None,
             shown: Vec::new(),
             printed: Vec::new(),
+            read: None,
         });
     }
 

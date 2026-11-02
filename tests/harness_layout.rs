@@ -1119,3 +1119,149 @@ fn a_grep_without_line_numbers_credits_nothing() {
     let l = shell_only_printing("grep alpha repo/src/a.rs", "fn alpha() { let _x = 1; }");
     assert!(reads_of_a(&report(&l, &[])).is_empty());
 }
+
+/// A layout whose only read is `name`, called with the input `input` makes
+/// of `src/a.rs`'s absolute path, answered with `content`, the line's
+/// `toolUseResult` and `is_error`.
+fn only_call(
+    name: &str,
+    input: impl Fn(&str) -> Value,
+    content: &str,
+    tool_use_result: Value,
+    failed: bool,
+) -> Layout {
+    use std::io::Write as _;
+    let l = shell_only_printing("true", "");
+    let file = l.clone.join("src/a.rs").to_string_lossy().into_owned();
+    let cwd = l.clone.to_string_lossy().into_owned();
+    let call = json!({"type": "assistant", "sessionId": SESSION, "cwd": cwd, "timestamp": "2026-10-10T10:00:07.000Z",
+        "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_c", "name": name, "input": input(&file)}]}});
+    let result = json!({"type": "user", "sessionId": SESSION, "cwd": cwd, "timestamp": "2026-10-10T10:00:07.100Z",
+        "toolUseResult": tool_use_result,
+        "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_c", "content": content, "is_error": failed}]}});
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(l.logs.join(format!("{SESSION}.jsonl")))
+        .unwrap();
+    writeln!(log, "{call}\n{result}").unwrap();
+    l
+}
+
+/// What `l`'s session read of `src/a.rs`, by each path that credits it: the
+/// report, `--coverage` and `restore-context`'s replay of the logs.
+fn credited(l: &Layout) -> (Vec<(String, String)>, Value, Value) {
+    let coverage = run(l, &["--coverage", "--format", "json"]);
+    let restored = run(l, &["restore-context", "--format", "json"]);
+    (
+        reads_of_a(&report(l, &[])),
+        coverage["totals"]["seen"].clone(),
+        restored,
+    )
+}
+
+#[test]
+fn a_failed_read_credits_nothing() {
+    let too_large = "File content (40000 tokens) exceeds maximum allowed tokens (25000).";
+    let l = only_call(
+        "Read",
+        |file| json!({"file_path": file}),
+        too_large,
+        json!(format!("Error: {too_large}")),
+        true,
+    );
+    let (report, coverage_seen, _) = credited(&l);
+    assert!(report.is_empty(), "{report:?}");
+    assert_eq!(coverage_seen, 0);
+}
+
+#[test]
+fn a_read_credits_the_lines_its_result_returned() {
+    // A plain Read returns at most 2000 lines of a longer file; the result
+    // says how many. Here, one of three.
+    let l = only_call(
+        "Read",
+        |file| json!({"file_path": file}),
+        "1\tfn alpha() { let _x = 1; }",
+        json!({"type": "text", "file": {"filePath": "a.rs", "content": "fn alpha() { let _x = 1; }", "numLines": 1, "startLine": 1, "totalLines": 3}}),
+        false,
+    );
+    let (report, coverage_seen, _) = credited(&l);
+    assert_eq!(report, [("alpha".into(), "full_body".into())]);
+    assert_eq!(coverage_seen, 1);
+}
+
+#[test]
+fn a_serena_read_that_answers_with_an_error_credits_nothing() {
+    let l = only_call(
+        "mcp__plugin_serena_serena__read_file",
+        |_| json!({"relative_path": "src/a.rs"}),
+        "Error: Tool 'read_file' is not active.",
+        Value::Null,
+        false,
+    );
+    assert!(credited(&l).0.is_empty());
+}
+
+#[test]
+fn a_file_piped_through_a_filter_credits_nothing() {
+    for command in [
+        "cat repo/src/a.rs | grep alpha",
+        "cat repo/src/a.rs > copy.rs",
+    ] {
+        let l = shell_only(command);
+        assert!(reads_of_a(&report(&l, &[])).is_empty(), "{command}");
+    }
+}
+
+#[test]
+fn a_file_cut_short_by_head_credits_what_head_showed() {
+    let l = shell_only("cat -n repo/src/a.rs | head -n 1");
+    assert_eq!(
+        reads_of_a(&report(&l, &[])),
+        [("alpha".into(), "full_body".into())]
+    );
+}
+
+#[test]
+fn a_shell_read_after_a_git_command_is_credited() {
+    let l = shell_only("git status; sed -n 3p repo/src/a.rs");
+    assert_eq!(
+        reads_of_a(&report(&l, &[])),
+        [("beta".into(), "full_body".into())]
+    );
+}
+
+#[test]
+fn grep_credits_only_the_lines_it_printed_in_content_mode() {
+    let l = only_call(
+        "Grep",
+        |_| json!({"pattern": "beta", "path": "src/a.rs", "output_mode": "content"}),
+        "3:fn beta() {}",
+        json!({"mode": "content", "numFiles": 0, "filenames": [], "content": "3:fn beta() {}", "numLines": 1}),
+        false,
+    );
+    let (report, coverage_seen, _) = credited(&l);
+    assert_eq!(report, [("beta".into(), "name_only".into())]);
+    assert_eq!(coverage_seen, 1, "--coverage credits printed lines too");
+
+    let l = only_call(
+        "Grep",
+        |_| json!({"pattern": "beta", "path": "src/a.rs"}),
+        "src/a.rs",
+        json!({"mode": "files_with_matches", "filenames": ["src/a.rs"], "numFiles": 1}),
+        false,
+    );
+    assert!(credited(&l).0.is_empty(), "a file name shows no code");
+}
+
+#[test]
+fn a_shell_search_is_credited_by_coverage_and_restore_context() {
+    let l = shell_only_printing(
+        "cd repo && grep -n alpha src/a.rs",
+        "1:fn alpha() { let _x = 1; }",
+    );
+    let (report, coverage_seen, restored) = credited(&l);
+    assert_eq!(report, [("alpha".into(), "name_only".into())]);
+    assert_eq!(coverage_seen, 1);
+    assert!(restored.to_string().contains("alpha"), "{restored}");
+}

@@ -443,11 +443,14 @@ pub struct ToolResult {
     /// File lines the output printed, filled in by the correlator for a
     /// line-numbered search.
     pub printed: Vec<(PathBuf, u32)>,
+    /// What a read call read, filled in by the correlator for a call
+    /// credited by its result.
+    pub read: Option<AgentToolCall>,
 }
 
 /// Pairs the calls whose results matter with those results: a write's, to
 /// attribute it (spec §1); a search's, to credit the symbols its output
-/// named.
+/// named; a read's, to credit only what it returned.
 ///
 /// A result line names only its `tool_use_id`; the tool, path and agent live
 /// on the earlier `tool_use` line. So the pairing is stateful: callers that
@@ -458,7 +461,7 @@ pub struct ToolResult {
 /// Bounded: a call whose result never comes (an interrupted session) would
 /// otherwise stay for the tailer's whole life. Past [`Self::MAX_PENDING`]
 /// the oldest call is forgotten, and its write, if it ever completes, is
-/// not journaled.
+/// not journaled, nor its read credited.
 #[derive(Debug, Default)]
 pub struct ResultCorrelator {
     /// Each pending call with the order it was noted in.
@@ -467,29 +470,32 @@ pub struct ResultCorrelator {
 }
 
 impl ResultCorrelator {
-    /// Far above the handful of writes that can be in flight at once.
+    /// Far above the handful of calls that can be in flight at once.
     pub const MAX_PENDING: usize = 1024;
 
-    /// The write and search calls still awaiting results, oldest first, for
-    /// handing to a tailer.
+    /// The calls still awaiting results, oldest first, for handing to a
+    /// tailer.
     pub fn into_pending(self) -> Vec<AgentToolCall> {
         let mut pending: Vec<_> = self.pending.into_values().collect();
         pending.sort_by_key(|(seq, _)| *seq);
         pending.into_iter().map(|(_, call)| call).collect()
     }
 
-    /// Remember write and search calls until their results arrive.
-    pub fn note_calls(&mut self, calls: &[AgentToolCall]) {
+    /// Remember write, search and read calls until their results arrive,
+    /// marking each read to be credited then (`credited_by_result`). A call
+    /// with no id has no result to wait for, so is credited as it is made.
+    pub fn note_calls(&mut self, calls: &mut [AgentToolCall]) {
         for call in calls {
             let write = call.effect == Effect::Write && call.file_path.is_some();
-            if !write && call.result_depth.is_none() && call.searches.is_empty() {
+            let reads = reads_code(call);
+            if !write && !reads && call.result_depth.is_none() && call.searches.is_empty() {
                 continue;
             }
-            let Some(id) = &call.tool_use_id else {
+            let Some(id) = call.tool_use_id.clone() else {
                 continue;
             };
-            self.pending
-                .insert(id.clone(), (self.next_seq, call.clone()));
+            call.credited_by_result |= reads;
+            self.pending.insert(id, (self.next_seq, call.clone()));
             self.next_seq += 1;
             if self.pending.len() > Self::MAX_PENDING {
                 // O(n) at the cap, which only a stream of unanswered calls reaches.
@@ -505,17 +511,22 @@ impl ResultCorrelator {
         }
     }
 
-    /// Settle the pending calls these results answer: a search's names the
-    /// symbols its output showed (in `shown`), a write's becomes a write
-    /// event. Failed or rejected writes are dropped: nothing changed on disk.
-    /// A search's output is credited even when the command failed — it was
-    /// shown all the same, and an error prints no symbols.
+    /// Settle the pending calls these results answer: a read's says what it
+    /// read (in `read`), a search's names the symbols and lines its output
+    /// showed (in `shown` and `printed`), a write's becomes a write event.
+    /// Failed or rejected reads and writes are dropped: nothing was returned,
+    /// nothing changed on disk. A search's output is credited even when the
+    /// command failed — it was shown all the same, and an error prints no
+    /// symbols.
     pub fn resolve(&mut self, results: &mut [ToolResult]) -> Vec<WriteEvent> {
         let mut out = Vec::new();
         for result in results.iter_mut() {
             let Some((_, call)) = self.pending.remove(&result.tool_use_id) else {
                 continue;
             };
+            if call.credited_by_result {
+                result.read = read_from_result(&call, result);
+            }
             if let Some(depth) = call.result_depth {
                 let text = result
                     .content
@@ -537,7 +548,7 @@ impl ResultCorrelator {
                 result.printed = super::command_reads::printed_lines(&text, &call.searches);
                 continue;
             }
-            if result.is_error {
+            if result.is_error || call.effect != Effect::Write {
                 continue;
             }
             let Some(path) = call.file_path else { continue };
@@ -560,6 +571,56 @@ impl ResultCorrelator {
 
 /// Classify a `toolUseResult` object by shape (spec §2.2). Anything that is
 /// not a recognizable `Edit` or `Write` result is `Opaque`: file-level only.
+/// Whether crediting `call` would read code: a read naming a file, symbols
+/// or a shell command's printed lines.
+fn reads_code(call: &AgentToolCall) -> bool {
+    call.effect == Effect::Read
+        && ((call.file_path.is_some() && call.read_depth.is_seen())
+            || !call.target_selectors.is_empty()
+            || !call.file_reads.is_empty())
+}
+
+/// What a read call read, as its result tells it: nothing when it failed or
+/// was rejected; for a `Read`, the lines its result says it returned (its
+/// `toolUseResult.file`), which a file shorter than the range asked for, or
+/// one too large to read whole, makes fewer than the call asked for.
+fn read_from_result(call: &AgentToolCall, result: &ToolResult) -> Option<AgentToolCall> {
+    // A tool reading a named file and failing may say so only in its text:
+    // Serena answers `Error: ...`, or that the answer was too long to give.
+    let failed_in_text = || {
+        call.file_path.is_some()
+            && result
+                .content
+                .as_ref()
+                .and_then(content_text)
+                .is_some_and(|t| reads_as_failure(&t) || t.starts_with("The answer is too long"))
+    };
+    if result.is_error || failed_in_text() {
+        return None;
+    }
+    let mut read = AgentToolCall {
+        credited_by_result: false,
+        ..call.clone()
+    };
+    let returned = result.detail.as_ref().and_then(|d| d.get("file"));
+    if let Some(file) = returned {
+        let field = |key: &str| {
+            file.get(key)
+                .and_then(Value::as_u64)
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+        };
+        if let (Some(start), Some(count)) = (field("startLine"), field("numLines")) {
+            if count == 0 {
+                return None;
+            }
+            let start = start.max(1);
+            let whole = start == 1 && field("totalLines").is_some_and(|total| count >= total);
+            read.target_lines = (!whole).then(|| start..start.saturating_add(count));
+        }
+    }
+    Some(read)
+}
+
 fn write_source(detail: &Value) -> WriteSource {
     let text = |k: &str| detail.get(k).and_then(|v| v.as_str()).map(String::from);
     let flag = |k: &str| detail.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
@@ -687,6 +748,7 @@ fn parse_tool_results(obj: &mut Value) -> Vec<ToolResult> {
                 content,
                 shown: Vec::new(),
                 printed: Vec::new(),
+                read: None,
             })
         })
         .collect()
@@ -1297,7 +1359,7 @@ impl LineFeed {
                     }
                     call.label = self.label.clone();
                 }
-                writes.note_calls(&calls);
+                writes.note_calls(&mut calls);
                 out.extend(calls.into_iter().map(SessionEvent::ToolCall));
             }
             ParsedLine::ToolResults(mut results) => {
@@ -1319,6 +1381,7 @@ impl LineFeed {
                         message: r.message.clone(),
                         shown: std::mem::take(&mut r.shown),
                         printed: std::mem::take(&mut r.printed),
+                        read: r.read.take().map(Box::new),
                     }));
                 }
                 out.extend(written.into_iter().map(SessionEvent::Write));
@@ -1349,6 +1412,7 @@ impl LineFeed {
                         .then(|| format!("ended: {}", crate::objects::printable(&status))),
                     shown: Vec::new(),
                     printed: Vec::new(),
+                    read: None,
                 }))
             }
             ParsedLine::Prompt {
@@ -1604,6 +1668,7 @@ pub fn parse_jsonl_line(
                     result_depth: None,
                     file_reads: Vec::new(),
                     searches: Vec::new(),
+                    credited_by_result: false,
                 }
             }
         };
@@ -1842,25 +1907,10 @@ pub fn map_tool_call(
         None => (Vec::new(), read_depth),
     };
 
-    // The lines a call asked for, half-open: an offset alone reads the
-    // tool's default number of lines, a limit alone starts at line 1, and
-    // neither is the whole file.
-    let target_lines = mapping.target_lines.as_ref().and_then(|spec| {
-        let as_line = |key: &str| {
-            input
-                .get(key)
-                .and_then(Value::as_u64)
-                .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
-        };
-        let (offset, limit) = (as_line(&spec.offset_key), as_line(&spec.limit_key));
-        let limit = match (offset, limit) {
-            (None, None) => return None,
-            (_, Some(limit)) => limit,
-            (Some(_), None) => spec.default_limit?,
-        };
-        let start = offset.unwrap_or(1).max(1);
-        Some(start..start.saturating_add(limit))
-    });
+    let target_lines = mapping
+        .target_lines
+        .as_ref()
+        .and_then(|spec| spec.lines(input));
 
     // Intern agent_id once and share between agent_id and label fields.
     let agent_arc: Arc<str> = Arc::from(agent_id);
@@ -1886,12 +1936,17 @@ pub fn map_tool_call(
             .and_then(|key| input.get(key)?.as_str())
             .map(super::command_reads::file_reads)
             .unwrap_or_default(),
-        searches: mapping
-            .command_reads
-            .as_ref()
-            .and_then(|key| input.get(key)?.as_str())
-            .map(super::command_reads::searches)
-            .unwrap_or_default(),
+        searches: match &mapping.search_lines {
+            Some(spec) => spec.search(input).into_iter().collect(),
+            None => mapping
+                .command_reads
+                .as_ref()
+                .and_then(|key| input.get(key)?.as_str())
+                .map(super::command_reads::searches)
+                .unwrap_or_default(),
+        },
+        // Set by the result correlator, which waits for the result.
+        credited_by_result: false,
         // Set by `parse_jsonl_line`, which sees the tool_use block's id.
         tool_use_id: None,
         effect,
@@ -1958,9 +2013,9 @@ impl LogTailer {
 
     /// Continue exactly where a batch replay stopped: each file from its
     /// replay offset, still awaiting the replay's unresolved write calls.
-    pub fn resume(handoff: Handoff, mapper: Arc<dyn ToolCallMapper>) -> Self {
+    pub fn resume(mut handoff: Handoff, mapper: Arc<dyn ToolCallMapper>) -> Self {
         let mut writes = ResultCorrelator::default();
-        writes.note_calls(&handoff.awaiting);
+        writes.note_calls(&mut handoff.awaiting);
         let files = handoff.files.iter().map(|(f, _)| f.clone()).collect();
         let positions = handoff.files.into_iter().collect();
         Self {
@@ -2360,9 +2415,41 @@ mod tests {
         );
         assert_eq!(
             lines(serde_json::json!({"file_path": "/p/a.rs"})),
-            None,
-            "neither: the whole file"
+            Some(1..2001),
+            "neither: the first 2000 lines"
         );
+    }
+
+    /// Serena's `read_file` counts from 0 and includes its last line.
+    #[test]
+    fn a_serena_read_names_the_lines_it_returns() {
+        let config = ToolMappingConfig::builtin().expect("builtin config");
+        let lines = |input: serde_json::Value| {
+            map_tool_call(
+                &config,
+                "mcp__plugin_serena_serena__read_file",
+                &input,
+                "a",
+                "t",
+            )
+            .unwrap()
+            .target_lines
+        };
+        assert_eq!(
+            lines(serde_json::json!({"relative_path": "a.rs", "start_line": 9, "end_line": 19})),
+            Some(10..21)
+        );
+        assert_eq!(
+            lines(serde_json::json!({"relative_path": "a.rs", "start_line": 9})),
+            Some(10..u32::MAX),
+            "to the end"
+        );
+        assert_eq!(
+            lines(serde_json::json!({"relative_path": "a.rs", "end_line": 4})),
+            Some(1..6),
+            "from the start"
+        );
+        assert_eq!(lines(serde_json::json!({"relative_path": "a.rs"})), None);
     }
 
     /// One pass for many calls finds what one lookup per call does.
@@ -2451,10 +2538,34 @@ mod tests {
 
     #[test]
     fn test_parse_grep_tool_call() {
-        let line = r#"{"type":"assistant","sessionId":"abc","message":{"role":"assistant","content":[{"type":"tool_use","name":"Grep","input":{"pattern":"AuthService"}}]}}"#;
+        let line = r#"{"type":"assistant","sessionId":"abc","message":{"role":"assistant","content":[{"type":"tool_use","name":"Grep","input":{"pattern":"AuthService","path":"src/a.rs"}}]}}"#;
         let events = parse_events(line, "default");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].read_depth, ReadDepth::Overview);
+        assert_eq!(events[0].read_depth, ReadDepth::NameOnly);
+        assert_eq!(events[0].file_path, None, "the file searched is not read");
+        assert!(
+            events[0].searches.is_empty(),
+            "its default mode lists file names, which show no code"
+        );
+    }
+
+    #[test]
+    fn a_grep_in_content_mode_credits_the_lines_it_printed() {
+        let search = |input: &str| {
+            let line = format!(
+                r#"{{"type":"assistant","sessionId":"abc","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Grep","input":{input}}}]}}}}"#
+            );
+            parse_events(&line, "default").remove(0).searches
+        };
+        assert_eq!(
+            search(r#"{"pattern":"x","path":"src/a.rs","output_mode":"content"}"#),
+            [super::super::command_reads::Search {
+                dir: "".into(),
+                file: Some("src/a.rs".into())
+            }]
+        );
+        assert!(search(r#"{"pattern":"x","output_mode":"content","-n":false}"#).is_empty());
+        assert!(search(r#"{"pattern":"x","output_mode":"count"}"#).is_empty());
     }
 
     #[test]
@@ -2831,7 +2942,7 @@ mod tests {
         let events = parse_events(line, "d");
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].read_depth, ReadDepth::FullBody);
-        assert_eq!(events[1].read_depth, ReadDepth::Overview);
+        assert_eq!(events[1].read_depth, ReadDepth::NameOnly);
     }
 
     #[test]
@@ -4236,10 +4347,10 @@ mod write_tests {
     #[test]
     fn the_correlator_forgets_the_oldest_call_past_its_cap() {
         let mut c = ResultCorrelator::default();
-        let calls: Vec<_> = (0..=ResultCorrelator::MAX_PENDING)
+        let mut calls: Vec<_> = (0..=ResultCorrelator::MAX_PENDING)
             .map(|i| write_call(&format!("t{i}")))
             .collect();
-        c.note_calls(&calls);
+        c.note_calls(&mut calls);
         let ids = pending_ids(c);
         assert_eq!(ids.len(), ResultCorrelator::MAX_PENDING);
         assert_eq!(ids[0], "t1", "t0 was the oldest");
@@ -4252,7 +4363,7 @@ mod write_tests {
         let mut c = ResultCorrelator::default();
         for i in 0..3 * ResultCorrelator::MAX_PENDING {
             let id = format!("t{i}");
-            c.note_calls(&[write_call(&id)]);
+            c.note_calls(&mut [write_call(&id)]);
             let done = ToolResult {
                 tool_use_id: Arc::from(id.as_str()),
                 is_error: false,
@@ -4262,17 +4373,18 @@ mod write_tests {
                 content: None,
                 shown: Vec::new(),
                 printed: Vec::new(),
+                read: None,
             };
             assert_eq!(c.resolve(&mut [done]).len(), 1);
         }
-        c.note_calls(&[write_call("last")]);
+        c.note_calls(&mut [write_call("last")]);
         assert_eq!(pending_ids(c), vec!["last"]);
     }
 
     #[test]
     fn a_call_noted_twice_is_pending_once() {
         let mut c = ResultCorrelator::default();
-        c.note_calls(&[write_call("t1"), write_call("t1")]);
+        c.note_calls(&mut [write_call("t1"), write_call("t1")]);
         assert_eq!(pending_ids(c), vec!["t1"]);
     }
 

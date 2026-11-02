@@ -28,7 +28,7 @@ fn tool_read_file_path() {
     let call = map_tool_call(&cfg, "Read", &input, "a", "ts").unwrap();
     assert_eq!(call.read_depth, ReadDepth::FullBody);
     assert_eq!(call.file_path.unwrap().to_str().unwrap(), "/src/main.rs");
-    assert!(call.target_lines.is_none());
+    assert_eq!(call.target_lines, Some(1..2001), "Read returns 2000 lines");
 }
 
 #[test]
@@ -119,7 +119,7 @@ fn tool_grep_pattern_key() {
     let cfg = builtin();
     let input = serde_json::json!({ "pattern": "fn main" });
     let call = map_tool_call(&cfg, "Grep", &input, "a", "ts").unwrap();
-    assert_eq!(call.read_depth, ReadDepth::Overview);
+    assert_eq!(call.read_depth, ReadDepth::NameOnly);
     assert!(
         call.description.contains("fn main"),
         "description was: {}",
@@ -128,10 +128,10 @@ fn tool_grep_pattern_key() {
 }
 
 #[test]
-fn tool_grep_substring_pattern_fallback() {
+fn tool_search_for_pattern_substring_pattern() {
     let cfg = builtin();
     let input = serde_json::json!({ "substring_pattern": "struct Foo" });
-    let call = map_tool_call(&cfg, "Grep", &input, "a", "ts").unwrap();
+    let call = map_tool_call(&cfg, "mcp__serena__search_for_pattern", &input, "a", "ts").unwrap();
     assert!(
         call.description.contains("struct Foo"),
         "description was: {}",

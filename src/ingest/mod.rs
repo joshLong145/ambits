@@ -93,7 +93,7 @@ impl SelectorRead {
 }
 
 /// A parsed agent tool call event.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentToolCall {
     pub agent_id: Arc<str>,
     pub tool_name: Arc<str>,
@@ -140,6 +140,10 @@ pub struct AgentToolCall {
     /// The line-numbered searches a shell command ran (`grep -n`), whose
     /// printed lines the result credits (see `ToolFinished::printed`).
     pub searches: Vec<command_reads::Search>,
+    /// Its reads are credited when its result arrives, from what the result
+    /// says (`ToolFinished::read`), not here: set by the parser for a call
+    /// whose result it will pair with it.
+    pub credited_by_result: bool,
 }
 
 /// Point-in-time ledger snapshot captured at a compaction boundary.
@@ -226,6 +230,10 @@ pub struct ToolFinished {
     /// File lines a line-numbered search printed (`path:N:`), each a
     /// candidate the caller keeps only when it names a file it knows.
     pub printed: Vec<(PathBuf, u32)>,
+    /// For a call credited by its result, what it read as the result tells
+    /// it: the call narrowed to the lines returned. `None` when it read
+    /// nothing — it failed, or was rejected.
+    pub read: Option<Box<AgentToolCall>>,
 }
 
 /// A compaction event surfaced by the incremental tailer (no ledger snapshot

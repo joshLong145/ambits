@@ -1,14 +1,24 @@
 version = 1
 
 [[tool]]
-names        = ["Read", "mcp__acp__Read", "mcp__plugin_serena_serena__read_file"]
-path_keys    = ["file_path", "relative_path"]
+names        = ["Read", "mcp__acp__Read"]
+path_keys    = ["file_path"]
 pattern_keys = []
 depth        = { type = "fixed", value = "FullBody" }
 description  = "Read {file_path|short}"
 # Claude Code's Read starts at line 1 and returns 2000 lines unless told
-# otherwise, so a call naming only one of these still names a range.
+# otherwise, so a call naming neither still names a range. Its result says
+# which lines it returned, and that is what is credited when it arrives.
 target_lines = { offset_key = "offset", limit_key = "limit", default_limit = 2000 }
+
+[[tool]]
+names        = ["mcp__serena__read_file", "mcp__plugin_serena_serena__read_file"]
+path_keys    = ["relative_path"]
+pattern_keys = []
+depth        = { type = "fixed", value = "FullBody" }
+description  = "Read {relative_path|short}"
+# Serena counts lines from 0 and includes the last; either may be left out.
+target_lines = { first_key = "start_line", last_key = "end_line", zero_based = true }
 
 [[tool]]
 names        = ["Edit", "mcp__acp__Edit", "mcp__plugin_serena_serena__replace_content"]
@@ -33,8 +43,21 @@ path_required = false
 depth         = { type = "fixed", value = "NameOnly" }
 description   = "Glob {pattern}"
 
+# Claude Code's Grep shows code only in its `content` mode, as numbered
+# lines: the symbol on each is credited at name depth when the result
+# arrives. Its default mode lists file names and `count` counts, which show
+# none. No path key, so the file searched is not itself credited.
 [[tool]]
-names         = ["Grep", "mcp__serena__search_for_pattern",
+names         = ["Grep"]
+path_keys     = []
+pattern_keys  = ["pattern"]
+path_required = false
+depth         = { type = "fixed", value = "NameOnly" }
+description   = "Search \"{pattern}\""
+search_lines  = { path_key = "path", mode_key = "output_mode", mode = "content", default_mode = "files_with_matches", numbered_key = "-n" }
+
+[[tool]]
+names         = ["mcp__serena__search_for_pattern",
                  "mcp__plugin_serena_serena__search_for_pattern"]
 path_keys     = ["path", "relative_path"]
 pattern_keys  = ["pattern", "substring_pattern"]

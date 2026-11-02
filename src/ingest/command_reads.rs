@@ -1,6 +1,8 @@
 //! The file lines a shell command prints: `sed -n 10,40p a.rs`, `head -n 20
 //! a.rs`, `tail -n 5 a.rs`, `cat a.rs`, `nl a.rs`, alone or in a chain of
-//! `;`, `&&` and `||`, after any `cd`. A command it cannot read with
+//! `;`, `&&` and `||`, after any `cd`. Only what reaches the output counts:
+//! the last command of a pipeline, or one a `head` after it cuts short, and
+//! never one whose output is redirected away. A command it cannot read with
 //! certainty (a variable, a glob, a heredoc, a script it does not know)
 //! names nothing, so it earns no credit rather than a guessed one.
 
@@ -34,26 +36,67 @@ pub fn file_reads(command: &str) -> Vec<FileRead> {
     let mut out = Vec::new();
     let mut dir = PathBuf::new();
     for pipeline in tokens.split(|t| matches!(t, Token::Sep)) {
-        // Only a pipeline's first command reads files; the rest read its output.
-        let Some(first) = pipeline.split(|t| matches!(t, Token::Pipe)).next() else {
-            continue;
+        // A stage whose output is redirected away is `None`: it shows nothing.
+        let stages: Vec<Option<Vec<&str>>> = pipeline
+            .split(|t| matches!(t, Token::Pipe))
+            .map(|stage| stage.iter().map(Token::word).collect())
+            .collect();
+        let reads = match stages.as_slice() {
+            [Some(words)] => match words.as_slice() {
+                ["cd", to] => {
+                    dir = dir.join(to);
+                    continue;
+                }
+                ["cd", ..] => return out,
+                [program, args @ ..] => reads_of(program, args),
+                [] => continue,
+            },
+            // Only the last command's output is shown. One naming its own
+            // files prints them; a `head` reading its input shows the start
+            // of what the command before it printed.
+            [.., before, Some(last)] => match last.as_slice() {
+                [program, args @ ..] => {
+                    let direct = reads_of(program, args);
+                    if direct.is_empty() {
+                        before
+                            .as_deref()
+                            .and_then(|b| cut_short(b, program, args))
+                            .into_iter()
+                            .collect()
+                    } else {
+                        direct
+                    }
+                }
+                [] => Vec::new(),
+            },
+            _ => Vec::new(),
         };
-        let Some(words) = first.iter().map(Token::word).collect::<Option<Vec<&str>>>() else {
-            continue;
-        };
-        match words.as_slice() {
-            ["cd", to] => dir = dir.join(to),
-            ["cd", ..] => return out,
-            [program, args @ ..] => {
-                out.extend(reads_of(program, args).into_iter().map(|r| FileRead {
-                    path: dir.join(r.path),
-                    ..r
-                }))
-            }
-            [] => {}
-        }
+        out.extend(reads.into_iter().map(|r| FileRead {
+            path: dir.join(r.path),
+            ..r
+        }));
     }
     out
+}
+
+/// What `head` reading `before`'s output shows, when `before` printed lines
+/// of one file: the first `n` of them.
+fn cut_short(before: &[&str], program: &str, args: &[&str]) -> Option<FileRead> {
+    let [program_before, args_before @ ..] = before else {
+        return None;
+    };
+    let (n, _, files) = count(args).filter(|_| program == "head")?;
+    if !files.is_empty() {
+        return None;
+    }
+    let [read] = <[FileRead; 1]>::try_from(reads_of(program_before, args_before)).ok()?;
+    let lines = match read.lines {
+        Lines::Whole => Lines::Range(1..n.saturating_add(1)),
+        Lines::Range(r) => Lines::Range(r.start..r.end.min(r.start.saturating_add(n))),
+        // The last lines' start depends on the file's length.
+        Lines::Tail(_) => return None,
+    };
+    (n > 0).then_some(FileRead { lines, ..read })
 }
 
 fn reads_of(program: &str, args: &[&str]) -> Vec<FileRead> {
@@ -62,7 +105,7 @@ fn reads_of(program: &str, args: &[&str]) -> Vec<FileRead> {
             Some(found) => found,
             None => return Vec::new(),
         },
-        "head" | "tail" => match count(args) {
+        "head" | "tail" => match count(args).filter(|(_, _, files)| !files.is_empty()) {
             Some((n, from_start, files)) => {
                 let lines = match (program, from_start) {
                     ("head", _) => Lines::Range(1..n.saturating_add(1)),
@@ -106,8 +149,8 @@ fn reads_of(program: &str, args: &[&str]) -> Vec<FileRead> {
         .collect()
 }
 
-/// `sed -n 'A,Bp' FILE`, `sed -n 'Ap' FILE`, `sed -n 'A,$p' FILE`: one file,
-/// one print command.
+/// `sed -n 'A,Bp' FILE`, `sed -n 'Ap' FILE`, `sed -n 'A,$p' FILE`, `sed -n
+/// 'A,+Np' FILE` (A and the N lines after it): one file, one print command.
 fn sed<'a>(args: &[&'a str]) -> Option<(Lines, Vec<&'a str>)> {
     let mut quiet = false;
     let mut script = None;
@@ -128,6 +171,11 @@ fn sed<'a>(args: &[&'a str]) -> Option<(Lines, Vec<&'a str>)> {
     let body = script?.strip_suffix('p')?;
     let (from, to) = match body.split_once(',') {
         Some((a, "$")) => (a.parse::<u32>().ok()?, u32::MAX),
+        Some((a, b)) if b.starts_with('+') => {
+            let a: u32 = a.parse().ok()?;
+            let after: u32 = b[1..].parse().ok()?;
+            (a, a.checked_add(after)?.checked_add(1)?)
+        }
         Some((a, b)) => (a.parse().ok()?, b.parse::<u32>().ok()?.checked_add(1)?),
         None => {
             let a: u32 = body.parse().ok()?;
@@ -137,8 +185,9 @@ fn sed<'a>(args: &[&'a str]) -> Option<(Lines, Vec<&'a str>)> {
     (from >= 1 && from < to).then_some((Lines::Range(from..to), files))
 }
 
-/// `head`/`tail`'s line count and files: `-n N`, `-nN`, `-N`, `--lines=N`,
-/// `-n +K` (from line K, for `tail`); 10 when not given.
+/// `head`/`tail`'s line count and files, which may be none (it reads its
+/// input): `-n N`, `-nN`, `-N`, `--lines=N`, `-n +K` (from line K, for
+/// `tail`); 10 when not given.
 fn count<'a>(args: &[&'a str]) -> Option<(u32, bool, Vec<&'a str>)> {
     let mut n = None;
     let mut files = Vec::new();
@@ -166,7 +215,7 @@ fn count<'a>(args: &[&'a str]) -> Option<(u32, bool, Vec<&'a str>)> {
         Some(v) => v.strip_prefix('+').map_or((false, v), |rest| (true, rest)),
         None => (false, "10"),
     };
-    Some((digits.parse().ok()?, from_start, files)).filter(|(_, _, files)| !files.is_empty())
+    Some((digits.parse().ok()?, from_start, files))
 }
 
 /// A path that names one file as written: no variable, glob, `~` or stdin.
@@ -180,6 +229,10 @@ enum Token {
     /// `;`, `&&`, `||`, `&` or a newline: the next command runs on its own.
     Sep,
     Pipe,
+    /// The command's standard output goes to a file (`> f`, `>> f`, `&> f`,
+    /// `1> f`, `>&-`), so none of it is shown. Redirecting another
+    /// descriptor (`2> f`, `2>&1`) or into one that is shown (`>&2`) is not.
+    HiddenOutput,
 }
 
 impl Token {
@@ -192,7 +245,8 @@ impl Token {
 }
 
 /// Shell words and operators, quoting honoured, redirections dropped with
-/// their targets. `None` for a heredoc, a subshell or a command
+/// their targets — except that one hiding standard output leaves a
+/// [`Token::HiddenOutput`]. `None` for a heredoc, a subshell or a command
 /// substitution, whose text no simple reading can follow.
 fn tokenize(command: &str) -> Option<Vec<Token>> {
     let mut out = Vec::new();
@@ -256,32 +310,42 @@ fn tokenize(command: &str) -> Option<Vec<Token>> {
             }
             '<' if chars.peek() == Some(&'<') => return None,
             '(' | ')' => return None,
+            // `&> f` and `&>> f`: both outputs to the file.
+            '&' if chars.peek() == Some(&'>') => {
+                flush(&mut word, &mut in_word, &mut out);
+                chars.next();
+                if chars.peek() == Some(&'>') {
+                    chars.next();
+                }
+                redirect_target(&mut chars);
+                out.push(Token::HiddenOutput);
+            }
             '&' => {
                 flush(&mut word, &mut in_word, &mut out);
                 out.push(Token::Sep);
             }
             '<' | '>' => {
                 // `2>`: the descriptor is part of the redirection, not a word.
-                if in_word && !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()) {
-                    word.clear();
+                let fd = if in_word && !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit())
+                {
                     in_word = false;
-                }
+                    Some(std::mem::take(&mut word))
+                } else {
+                    None
+                };
                 flush(&mut word, &mut in_word, &mut out);
+                // `>&N` duplicates a descriptor rather than naming a file.
+                let mut dup = false;
+                while let Some(&next) = chars.peek().filter(|c| matches!(c, '>' | '&' | '|')) {
+                    dup |= next == '&';
+                    chars.next();
+                }
                 // A redirection's target is not a file the command printed.
-                while chars.peek().is_some_and(|c| matches!(c, '>' | '&' | '|')) {
-                    chars.next();
-                }
-                while chars
-                    .peek()
-                    .is_some_and(|c| c.is_whitespace() && *c != '\n')
-                {
-                    chars.next();
-                }
-                while chars
-                    .peek()
-                    .is_some_and(|c| !c.is_whitespace() && !matches!(c, ';' | '|' | '&'))
-                {
-                    chars.next();
+                let target = redirect_target(&mut chars);
+                let stdout = c == '>' && fd.as_deref().is_none_or(|fd| fd == "1");
+                let shown = dup && !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit());
+                if stdout && !shown {
+                    out.push(Token::HiddenOutput);
                 }
             }
             c if c.is_whitespace() => flush(&mut word, &mut in_word, &mut out),
@@ -293,6 +357,25 @@ fn tokenize(command: &str) -> Option<Vec<Token>> {
     }
     flush(&mut word, &mut in_word, &mut out);
     Some(out)
+}
+
+/// Skip a redirection's target, returning it.
+fn redirect_target(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    while chars
+        .peek()
+        .is_some_and(|c| c.is_whitespace() && *c != '\n')
+    {
+        chars.next();
+    }
+    let mut target = String::new();
+    while let Some(&c) = chars
+        .peek()
+        .filter(|c| !c.is_whitespace() && !matches!(c, ';' | '|' | '&'))
+    {
+        target.push(c);
+        chars.next();
+    }
+    target
 }
 
 /// A line-numbered search a command ran (`grep -n`, `rg -n`): its output
@@ -575,12 +658,67 @@ mod tests {
     }
 
     #[test]
-    fn only_a_pipelines_first_command_reads_files() {
+    fn only_what_a_pipeline_shows_is_read() {
         assert_eq!(
             reads("cat a.rs | head -n 3"),
-            [("a.rs".into(), Lines::Whole)]
+            [("a.rs".into(), Lines::Range(1..4))],
+            "head shows the first lines of what cat printed"
+        );
+        assert_eq!(
+            reads("sed -n 100,500p a.rs | head -20"),
+            [("a.rs".into(), Lines::Range(100..120))]
+        );
+        assert_eq!(
+            reads("sed -n 10,12p a.rs | head"),
+            [("a.rs".into(), Lines::Range(10..13))],
+            "head cannot show more than it was given"
+        );
+        assert!(
+            reads("cat a.rs | grep fn").is_empty(),
+            "grep shows only matches"
+        );
+        assert!(reads("cat a.rs | wc -l").is_empty());
+        assert!(
+            reads("tail -n 5 a.rs | head -2").is_empty(),
+            "where the tail starts is unknown"
+        );
+        assert!(
+            reads("cat a.rs b.rs | head").is_empty(),
+            "which file the lines are from is unknown"
         );
         assert!(reads("git show HEAD:a.rs | head -n 20").is_empty());
+        assert_eq!(
+            reads("git log | cat a.rs"),
+            [("a.rs".into(), Lines::Whole)],
+            "the last command prints its own files, not its input"
+        );
+    }
+
+    #[test]
+    fn output_redirected_away_is_not_read() {
+        assert!(reads("cat a.rs > copy.rs").is_empty());
+        assert!(reads("cat a.rs >> copy.rs").is_empty());
+        assert!(reads("cat a.rs 1>copy.rs").is_empty());
+        assert!(reads("cat a.rs &> /dev/null").is_empty());
+        assert!(reads("cat a.rs >/dev/null 2>&1").is_empty());
+        assert!(reads("cat a.rs | head -3 > top.rs").is_empty());
+        assert!(reads("head -3 a.rs > top.rs; cat b.rs").len() == 1);
+        for shown in [
+            "cat a.rs 2>/dev/null",
+            "cat a.rs 2>&1",
+            "cat a.rs >&2",
+            "cat < a.rs a.rs",
+        ] {
+            assert_eq!(reads(shown), [("a.rs".into(), Lines::Whole)], "{shown}");
+        }
+    }
+
+    #[test]
+    fn sed_prints_a_line_and_the_n_after_it() {
+        assert_eq!(
+            reads("sed -n '20,+5p' a.rs"),
+            [("a.rs".into(), Lines::Range(20..26))]
+        );
     }
 
     #[test]
@@ -662,7 +800,7 @@ mod tests {
         assert!(reads("cat \"$(ls)\"").is_empty());
         assert!(reads("cat > out.txt <<'EOF'\nx\nEOF").is_empty());
         assert_eq!(
-            reads("cat a.rs > copy.rs"),
+            reads("cat a.rs 2> err.txt"),
             [("a.rs".into(), Lines::Whole)],
             "a redirect target is not read"
         );

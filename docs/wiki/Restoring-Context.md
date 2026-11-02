@@ -1,8 +1,12 @@
 # Restoring Context
 
 Every read is tracked per symbol and per agent, at the depth the tool implies —
-a `Read` gives full body, a grep match gives overview, a glob gives name only
-(the full mapping is data; see [Configuration](Configuration#tool-mappings)).
+a `Read` gives full body, a grep match gives name only (the symbol its line
+sits in), a glob gives name only (the full mapping is data; see
+[Configuration](Configuration#tool-mappings)). A read is credited when its
+result arrives, for what the result says it returned: a failed or rejected
+call credits nothing, and a `Read` of a file longer than the 2,000 lines it
+returns credits only those lines.
 Edits are not reads: an agent that changed a symbol has not necessarily read
 it, so edits are recorded separately as [writes](Agent-Writes).
 `restore-context` reports that history:

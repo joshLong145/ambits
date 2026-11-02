@@ -1979,27 +1979,18 @@ impl App {
         });
     }
 
-    /// A tool call's result arrived: close its span in the trace.
+    /// A tool call's result arrived: close its span in the trace, and
+    /// credit what the result says the call read.
     pub fn process_tool_finished(&mut self, finished: &crate::ingest::ToolFinished) {
         self.trace.finish(finished);
-        if !finished.shown.is_empty() {
-            let read = apply_shown(
-                &self.project_tree,
-                finished,
-                &mut self.ledger,
-                &mut self.depth_cache,
-            );
-            self.trace.note_read(&finished.id, read);
-            self.rebuild_tree_rows();
-        }
-        if !finished.printed.is_empty() {
-            let read = apply_printed(
-                &self.project_tree,
-                &self.project_root,
-                finished,
-                &mut self.ledger,
-                &mut self.depth_cache,
-            );
+        let read = apply_finished(
+            &self.project_tree,
+            &self.project_root,
+            finished,
+            &mut self.ledger,
+            &mut self.depth_cache,
+        );
+        if !read.is_empty() {
             self.trace.note_read(&finished.id, read);
             self.rebuild_tree_rows();
         }
@@ -2231,12 +2222,14 @@ impl<'a> Credit<'a> {
 }
 
 /// Apply one tool call to the ledger, and say which symbols it read (as
-/// [`Credit::listed`] lists them).
+/// [`Credit::listed`] lists them). A call credited by its result
+/// (`credited_by_result`) reads nothing yet: [`apply_finished`] credits it.
 ///
-/// The single place that decides how a tool call becomes symbol reads. It had
-/// been open-coded at three call sites — the TUI, `coverage::run_report`, and
-/// `restore::replay_session_logs` — which is exactly how selector support came
-/// to work in the TUI and silently do nothing in the other two.
+/// With [`apply_finished`], the single place that decides how a tool call
+/// becomes symbol reads. It had been open-coded at three call sites — the
+/// TUI, `coverage::run_report`, and `restore::replay_session_logs` — which is
+/// exactly how selector support came to work in the TUI and silently do
+/// nothing in the other two.
 pub fn apply_tool_call(
     tree: &ProjectTree,
     project_root: &Path,
@@ -2260,12 +2253,48 @@ pub fn apply_tool_call(
         "tool call"
     );
 
-    // Only a read that saw something changes read state: a write is not a
-    // read (D9), and an Unseen read saw nothing.
-    if event.effect == crate::ingest::Effect::Write || !event.read_depth.is_seen() {
+    if event.credited_by_result {
         return Vec::new();
     }
     let mut credit = Credit::new(ledger, depth_cache, &event.agent_id);
+    credit_call(tree, project_root, event, &mut credit);
+    credit.listed()
+}
+
+/// Apply a call's result to the ledger: what the result says the call read
+/// (`read`), the symbols its output showed (`shown`) and the file lines it
+/// printed (`printed`). Says which symbols, as [`apply_tool_call`] does.
+pub fn apply_finished(
+    tree: &ProjectTree,
+    project_root: &Path,
+    finished: &crate::ingest::ToolFinished,
+    ledger: &mut ContextLedger,
+    depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
+) -> Vec<(String, ReadDepth)> {
+    if finished.read.is_none() && finished.shown.is_empty() && finished.printed.is_empty() {
+        return Vec::new();
+    }
+    let mut credit = Credit::new(ledger, depth_cache, &finished.agent_id);
+    if let Some(read) = &finished.read {
+        credit_call(tree, project_root, read, &mut credit);
+    }
+    credit_shown(tree, finished, &mut credit);
+    credit_printed(tree, project_root, finished, &mut credit);
+    credit.listed()
+}
+
+/// Credit what `event` read: the symbols it names, the file it read, and
+/// the file lines a shell command printed.
+fn credit_call(
+    tree: &ProjectTree,
+    project_root: &Path,
+    event: &AgentToolCall,
+    credit: &mut Credit<'_>,
+) {
+    // A write is not a read (D9).
+    if event.effect == crate::ingest::Effect::Write {
+        return;
+    }
 
     if !event.target_selectors.is_empty() {
         mark_selectors(
@@ -2274,7 +2303,7 @@ pub fn apply_tool_call(
                 .target_selectors
                 .iter()
                 .map(|s| (s.selector.as_str(), s.depth, s.whole)),
-            &mut credit,
+            credit,
         );
     }
 
@@ -2284,11 +2313,15 @@ pub fn apply_tool_call(
         .file_path
         .as_deref()
         .and_then(|p| crate::objects::project_file(p, project_root));
-    if let Some(file) = named.as_deref().and_then(|f| tree.file(f)) {
+    // An Unseen read saw nothing of the file — but a shell command's
+    // printed lines are credited whatever its own depth (`git status; cat
+    // a.rs` is matched as `git`).
+    let file = named.as_deref().and_then(|f| tree.file(f));
+    if let Some(file) = file.filter(|_| event.read_depth.is_seen()) {
         if event.target_symbol.is_some() || event.target_lines.is_some() {
-            mark_targeted_symbols(&file.symbols, event, &mut credit);
+            mark_targeted_symbols(&file.symbols, event, credit);
         } else {
-            mark_file_symbols(&file.symbols, event.read_depth, &mut credit, false);
+            mark_file_symbols(&file.symbols, event.read_depth, credit, false);
         }
     }
     for read in &event.file_reads {
@@ -2300,7 +2333,7 @@ pub fn apply_tool_call(
         use crate::ingest::command_reads::Lines;
         let lines = match &read.lines {
             Lines::Whole => {
-                mark_file_symbols(&file.symbols, ReadDepth::FullBody, &mut credit, false);
+                mark_file_symbols(&file.symbols, ReadDepth::FullBody, credit, false);
                 continue;
             }
             Lines::Range(r) => r.clone(),
@@ -2316,50 +2349,40 @@ pub fn apply_tool_call(
             read_depth: ReadDepth::FullBody,
             ..event.clone()
         };
-        mark_targeted_symbols(&file.symbols, &as_read, &mut credit);
+        mark_targeted_symbols(&file.symbols, &as_read, credit);
     }
-    credit.listed()
 }
 
 /// Credit the symbols a call's output showed (`ToolFinished::shown`: the
-/// matches an `ambits rg` printed), as the agent that made the call, and
-/// say which.
-pub fn apply_shown(
+/// matches an `ambits rg` printed).
+fn credit_shown(
     tree: &ProjectTree,
     finished: &crate::ingest::ToolFinished,
-    ledger: &mut ContextLedger,
-    depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
-) -> Vec<(String, ReadDepth)> {
-    if finished.shown.is_empty() {
-        return Vec::new();
-    }
-    let mut credit = Credit::new(ledger, depth_cache, &finished.agent_id);
+    credit: &mut Credit<'_>,
+) {
     mark_selectors(
         tree,
         finished.shown.iter().map(|(s, d)| (s.as_str(), *d, false)),
-        &mut credit,
+        credit,
     );
-    credit.listed()
 }
 
 /// Credit the innermost symbol on each file line a search printed
 /// (`ToolFinished::printed`) at `NameOnly`: a matching line, not the
 /// definition. Lines of files the tree does not hold are ignored, which is
 /// how a candidate split of an ambiguous `path:N:` line is told apart.
-pub fn apply_printed(
+fn credit_printed(
     tree: &ProjectTree,
     project_root: &Path,
     finished: &crate::ingest::ToolFinished,
-    ledger: &mut ContextLedger,
-    depth_cache: &mut crate::tracking::alignment::DepthOrdinalCache,
-) -> Vec<(String, ReadDepth)> {
+    credit: &mut Credit<'_>,
+) {
     fn innermost(symbols: &[SymbolNode], line: u32) -> Option<&SymbolNode> {
         let sym = symbols
             .iter()
             .find(|s| s.line_range.start <= line && line <= s.line_range.end)?;
         innermost(&sym.children, line).or(Some(sym))
     }
-    let mut credit = Credit::new(ledger, depth_cache, &finished.agent_id);
     for (path, line) in &finished.printed {
         let Some(file) =
             crate::objects::project_file(path, project_root).and_then(|f| tree.file(&f))
@@ -2370,7 +2393,6 @@ pub fn apply_printed(
             credit.record(sym, ReadDepth::NameOnly, false);
         }
     }
-    credit.listed()
 }
 
 /// Mark every symbol named by `selectors` (ids or content hashes), as read
@@ -3281,8 +3303,12 @@ mod tests {
             message: None,
             shown: shown.clone(),
             printed: Vec::new(),
+            read: None,
         };
-        assert_eq!(apply_shown(&tree, &search, &mut ledger, &mut cache), shown);
+        assert_eq!(
+            apply_finished(&tree, Path::new(""), &search, &mut ledger, &mut cache),
+            shown
+        );
         let whole = tool_call("Read", "mock/f.rs", ReadDepth::FullBody);
         let listed = apply_tool_call(&tree, Path::new(""), &whole, &mut ledger, &mut cache);
         assert_eq!(
@@ -3327,6 +3353,7 @@ mod tests {
             message: None,
             shown: Vec::new(),
             printed: Vec::new(),
+            read: None,
         });
         assert_eq!(
             app.agent_title("ab1"),
@@ -3386,6 +3413,7 @@ mod tests {
                 ("mock/f.rs::beta".into(), ReadDepth::NameOnly),
             ],
             printed: Vec::new(),
+            read: None,
         });
         assert_eq!(
             app.ledger.depth_of("mock/f.rs::alpha"),
@@ -4341,6 +4369,7 @@ mod tests {
             result_depth: None,
             file_reads: Vec::new(),
             searches: Vec::new(),
+            credited_by_result: false,
         };
         app.process_agent_event(event);
 
@@ -4862,6 +4891,7 @@ mod trace_view_tests {
                 child_agent: child.map(Arc::from),
                 shown: Vec::new(),
                 printed: Vec::new(),
+                read: None,
             });
         }
         // Read after its calls, as a tailer poll can deliver it; its time

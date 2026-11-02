@@ -98,6 +98,8 @@ pub struct ToolMapping {
     /// credited as reads of them (`sed -n`, `head`, `tail`, `cat`, `nl`).
     #[serde(default)]
     pub command_reads: Option<String>,
+    #[serde(default)]
+    pub search_lines: Option<SearchLinesSpec>,
     /// Name of a built-in stanza to inherit fields from.
     #[serde(default)]
     pub extends: Option<String>,
@@ -476,14 +478,110 @@ impl TargetSelectorSpec {
     }
 }
 
+/// The input keys naming the lines a call returns, in one of two shapes.
 #[derive(Debug, Clone, Deserialize)]
-pub struct TargetLinesSpec {
-    pub offset_key: String,
-    pub limit_key: String,
-    /// Lines the tool returns when the call gives an offset but no limit;
-    /// without it such a call names no range and credits the whole file.
+#[serde(untagged)]
+pub enum TargetLinesSpec {
+    /// A 1-based first line and a count: Claude Code's `Read`.
+    OffsetLimit {
+        offset_key: String,
+        limit_key: String,
+        /// Lines the tool returns when the call gives no limit; without it
+        /// such a call names no range and credits the whole file.
+        #[serde(default)]
+        default_limit: Option<u32>,
+    },
+    /// A first and an inclusive last line, either optional, counted from 0
+    /// when `zero_based`: Serena's `read_file`.
+    FirstLast {
+        first_key: String,
+        last_key: String,
+        #[serde(default)]
+        zero_based: bool,
+    },
+}
+
+impl TargetLinesSpec {
+    /// The lines the call asked for, 1-based and half-open; `None` for the
+    /// whole file. An offset alone reads the tool's default number of lines,
+    /// a limit alone starts at line 1.
+    pub fn lines(&self, input: &serde_json::Value) -> Option<std::ops::Range<u32>> {
+        let as_line = |key: &str| {
+            input
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+        };
+        match self {
+            TargetLinesSpec::OffsetLimit {
+                offset_key,
+                limit_key,
+                default_limit,
+            } => {
+                let (offset, limit) = (as_line(offset_key), as_line(limit_key));
+                let limit = limit.or(*default_limit)?;
+                let start = offset.unwrap_or(1).max(1);
+                Some(start..start.saturating_add(limit))
+            }
+            TargetLinesSpec::FirstLast {
+                first_key,
+                last_key,
+                zero_based,
+            } => {
+                let (first, last) = (as_line(first_key), as_line(last_key));
+                if first.is_none() && last.is_none() {
+                    return None;
+                }
+                let shift = u32::from(*zero_based);
+                let start = first.unwrap_or(0).saturating_add(shift).max(1);
+                let end = last.map_or(u32::MAX, |l| l.saturating_add(shift).saturating_add(1));
+                Some(start..end.max(start))
+            }
+        }
+    }
+}
+
+/// A search tool whose output prints numbered file lines — `path:N:text`,
+/// or `N:text` when it searched one file — credited as a shell `grep -n`'s
+/// are when its result arrives: Claude Code's `Grep` in `content` mode. Its
+/// other modes print file names or counts, which show no code, so earn
+/// nothing.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchLinesSpec {
+    /// Input key naming the file or directory searched, the working
+    /// directory when absent.
+    pub path_key: String,
+    /// Input key choosing what the output holds.
+    pub mode_key: String,
+    /// The mode in which it prints lines.
+    pub mode: String,
+    /// The mode when the call names none.
+    pub default_mode: String,
+    /// Input key that, set to `false`, leaves the line numbers out.
     #[serde(default)]
-    pub default_limit: Option<u32>,
+    pub numbered_key: Option<String>,
+}
+
+impl SearchLinesSpec {
+    /// The search this call ran, when its output names lines.
+    pub fn search(&self, input: &serde_json::Value) -> Option<super::command_reads::Search> {
+        let mode = input
+            .get(&self.mode_key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(&self.default_mode);
+        let numbered = self
+            .numbered_key
+            .as_ref()
+            .and_then(|k| input.get(k)?.as_bool())
+            .unwrap_or(true);
+        (mode == self.mode && numbered).then(|| super::command_reads::Search {
+            dir: std::path::PathBuf::new(),
+            file: input
+                .get(&self.path_key)
+                .and_then(serde_json::Value::as_str)
+                .map(std::path::PathBuf::from),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -764,6 +862,9 @@ impl ToolMappingConfig {
                     }
                     if stanza.result_selectors.is_none() {
                         stanza.result_selectors = base_stanza.result_selectors.clone();
+                    }
+                    if stanza.search_lines.is_none() {
+                        stanza.search_lines = base_stanza.search_lines.clone();
                     }
                 }
                 // base_name not found: skip silently
@@ -1171,7 +1272,7 @@ mod tests {
     #[test]
     fn builtin_config_parses() {
         let cfg = ToolMappingConfig::builtin().expect("built-in config must parse");
-        assert_eq!(cfg.tools.len(), 23);
+        assert_eq!(cfg.tools.len(), 25);
         assert!(!cfg.index.is_empty());
     }
 
@@ -1529,7 +1630,7 @@ description  = "Foo"
             root.path(),
             None,
         );
-        assert_eq!(cfg.tools.len(), 23, "should have 23 built-in tools");
+        assert_eq!(cfg.tools.len(), 25, "should have 25 built-in tools");
         assert!(
             matches!(warnings.as_slice(), [ConfigWarning::MissingOverride { path }] if path == "/nonexistent/tools.toml"),
             "{warnings:?}"
@@ -1804,7 +1905,8 @@ description  = "empty names"
         let idx = *cfg.index.get("Grep").unwrap();
         let mapping = &cfg.tools[idx];
         assert!(mapping.pattern_keys.contains(&"pattern".to_string()));
-        assert!(mapping
+        let idx = *cfg.index.get("mcp__serena__search_for_pattern").unwrap();
+        assert!(cfg.tools[idx]
             .pattern_keys
             .contains(&"substring_pattern".to_string()));
     }
