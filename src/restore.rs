@@ -724,7 +724,8 @@ pub fn rehydrate_ledger(
     // journaled hash still matches the node at the new address, and
     // `refresh_staleness` below correctly leaves it fresh.
     for ((symbol_id, agent), (hash, depth)) in &contents.agent_reads {
-        if ledger.rehydrate(resolve(symbol_id), *depth, *hash, agent.clone()) {
+        let at = contents.agent_read_time(symbol_id, agent);
+        if ledger.rehydrate(resolve(symbol_id), *depth, *hash, agent.clone(), at) {
             stats.inserted += 1;
         } else {
             stats.corrected += 1;
@@ -748,6 +749,7 @@ pub fn rehydrate_ledger(
             *depth,
             *hash,
             fallback_agent.to_string(),
+            None,
         ) {
             stats.inserted += 1;
         } else {

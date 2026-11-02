@@ -2171,6 +2171,9 @@ pub struct Credit<'a> {
     ledger: &'a mut ContextLedger,
     depth_cache: &'a mut crate::tracking::alignment::DepthOrdinalCache,
     agent: &'a str,
+    /// When the call read, in milliseconds since the Unix epoch, when its
+    /// log line says.
+    at: Option<u64>,
     /// Each credit, and whether it came with a parent read whole — implied,
     /// so not worth listing.
     read: Vec<(String, ReadDepth, bool)>,
@@ -2186,8 +2189,15 @@ impl<'a> Credit<'a> {
             ledger,
             depth_cache,
             agent,
+            at: None,
             read: Vec::new(),
         }
+    }
+
+    /// Credit reads made at `timestamp`, as a log line writes it.
+    pub fn at(mut self, timestamp: &str) -> Self {
+        self.at = crate::time::parse_rfc3339_millis(timestamp);
+        self
     }
 
     /// Credit `sym` at `depth`; `implied` when it comes with a parent read
@@ -2200,6 +2210,9 @@ impl<'a> Credit<'a> {
             self.agent.to_string(),
             sym.estimated_tokens as usize,
         );
+        if let Some(at) = self.at {
+            self.ledger.note_read_at(&sym.id, self.agent, at);
+        }
         self.depth_cache.record(&sym.id, self.agent, depth);
         self.read.push((sym.id.clone(), depth, implied));
     }
@@ -2256,7 +2269,7 @@ pub fn apply_tool_call(
     if event.credited_by_result {
         return Vec::new();
     }
-    let mut credit = Credit::new(ledger, depth_cache, &event.agent_id);
+    let mut credit = Credit::new(ledger, depth_cache, &event.agent_id).at(&event.timestamp_str);
     credit_call(tree, project_root, event, &mut credit);
     credit.listed()
 }
@@ -2274,7 +2287,7 @@ pub fn apply_finished(
     if finished.read.is_none() && finished.shown.is_empty() && finished.printed.is_empty() {
         return Vec::new();
     }
-    let mut credit = Credit::new(ledger, depth_cache, &finished.agent_id);
+    let mut credit = Credit::new(ledger, depth_cache, &finished.agent_id).at(&finished.timestamp);
     if let Some(read) = &finished.read {
         credit_call(tree, project_root, read, &mut credit);
     }
@@ -3229,6 +3242,57 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::new(project(vec![]), dir.path().to_path_buf());
         assert!(app.rehydrate_from_journal().is_none());
+    }
+
+    /// The replay stamps every read with today's hash, so an agent that read
+    /// `alpha` in full, saw it change and read it again by name replays as
+    /// having read it in full. The journal, written as it happened, knows the
+    /// later read was by name only, and wins — unless the log has a read from
+    /// after the journal's.
+    #[test]
+    fn a_journaled_read_replaces_older_replayed_ones() {
+        let at = |ts: &str| crate::time::parse_rfc3339_millis(ts).unwrap();
+        for (later, want) in [
+            (None, ReadDepth::NameOnly),
+            (Some("2025-01-01T00:00:09Z"), ReadDepth::FullBody),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let tree = project(vec![file(
+                "mock/f.rs",
+                vec![sym("mock/f.rs::alpha", "alpha")],
+            )]);
+            let hash = tree.files[0].symbols[0].content_hash;
+            let mut app = App::new(tree, dir.path().to_path_buf());
+            app.set_session_id(Some("sess".into()));
+
+            let read = |ts: &str, depth| AgentToolCall {
+                timestamp_str: ts.into(),
+                ..tool_call("Read", "mock/f.rs", depth)
+            };
+            app.process_agent_event(read("2025-01-01T00:00:00Z", ReadDepth::FullBody));
+            app.process_agent_event(read("2025-01-01T00:00:02Z", ReadDepth::NameOnly));
+            if let Some(ts) = later {
+                app.process_agent_event(read(ts, ReadDepth::FullBody));
+            }
+
+            let journal = crate::journal::journal_dir(dir.path());
+            std::fs::create_dir_all(&journal).unwrap();
+            let record = crate::journal::Record::Read {
+                symbol_id: "mock/f.rs::alpha".into(),
+                hash: crate::journal::encode_hash(&hash),
+                depth: crate::journal::DepthDto::NameOnly,
+                agent: Some("agent-1".into()),
+                at: Some(at("2025-01-01T00:00:03Z")),
+            };
+            std::fs::write(
+                journal.join("sess.ndjson"),
+                serde_json::to_string(&record).unwrap() + "\n",
+            )
+            .unwrap();
+
+            app.rehydrate_from_journal().expect("journal was found");
+            assert_eq!(app.ledger.depth_of("mock/f.rs::alpha"), want, "{later:?}");
+        }
     }
 
     /// Minimal journal writer, so this test exercises the real on-disk format

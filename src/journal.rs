@@ -817,6 +817,16 @@ pub fn append_shard(
 }
 
 impl JournalContents {
+    /// When `agent`'s journaled read of `symbol` was written, in milliseconds
+    /// since the Unix epoch; `None` for a record from before reads were
+    /// stamped.
+    pub fn agent_read_time(&self, symbol: &str, agent: &str) -> Option<u64> {
+        self.agent_read_times
+            .get(&(symbol.to_string(), agent.to_string()))
+            .copied()
+            .filter(|&t| t > 0)
+    }
+
     /// Whether `agent` already has `symbol` at `hash`, at `depth` or deeper:
     /// a read that would add nothing.
     pub fn knows_read(&self, symbol: &str, agent: &str, hash: &[u8; 32], depth: ReadDepth) -> bool {
