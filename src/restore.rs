@@ -801,6 +801,7 @@ mod tests {
                     hash: encode_hash(&[1; 32]),
                     depth: DepthDto::FullBody,
                     agent: agent.map(String::from),
+                    at: None,
                 };
                 serde_json::to_string(&read).unwrap()
             })

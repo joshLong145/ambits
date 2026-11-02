@@ -3248,6 +3248,7 @@ mod tests {
                         hash: encode_hash(hash),
                         depth: DepthDto::FullBody,
                         agent: Some((*agent).into()),
+                        at: None,
                     })
                     .unwrap(),
                 );

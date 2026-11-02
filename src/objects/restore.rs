@@ -85,6 +85,7 @@ impl CoverageRead {
             hash: journal::encode_hash(&self.hash),
             depth: self.depth.into(),
             agent: Some(self.agent.clone()),
+            at: None,
         }
     }
 }
