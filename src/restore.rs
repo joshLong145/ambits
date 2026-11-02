@@ -410,9 +410,16 @@ pub fn replay_session_logs(
                     depth_cache = crate::tracking::alignment::DepthOrdinalCache::new();
                 }
                 SessionEvent::Compacted { .. } => {}
-                // What a search printed (`ambits rg`) was seen.
+                // What the call read, as its result says, and what its
+                // output showed (`ambits rg`, `grep -n`).
                 SessionEvent::ToolFinished(f) => {
-                    crate::app::apply_shown(project_tree, &f, &mut ledger, &mut depth_cache);
+                    crate::app::apply_finished(
+                        project_tree,
+                        project_root,
+                        &f,
+                        &mut ledger,
+                        &mut depth_cache,
+                    );
                 }
                 // Writes grant no read credit (spec D9).
                 SessionEvent::Write(_) | SessionEvent::Prompt(_) => {}

@@ -650,6 +650,7 @@ mod tests {
             message: message.map(String::from),
             shown: Vec::new(),
             printed: Vec::new(),
+            read: None,
         });
     }
 

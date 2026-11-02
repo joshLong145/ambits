@@ -249,8 +249,8 @@ impl Trace {
         }
     }
 
-    /// Call `id` read these symbols — when it was made, or, for a search,
-    /// when its output arrived.
+    /// Call `id` read these symbols — when it was made, or, for a call
+    /// credited by its result (a read, a search), when its result arrived.
     pub fn note_read(&mut self, id: &str, read: Vec<(String, crate::tracking::ReadDepth)>) {
         if read.is_empty() {
             return;
@@ -505,6 +505,7 @@ mod tests {
             child_agent: child.map(Arc::from),
             shown: Vec::new(),
             printed: Vec::new(),
+            read: None,
         }
     }
 

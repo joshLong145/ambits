@@ -1,8 +1,12 @@
 # Restoring Context
 
 Every read is tracked per symbol and per agent, at the depth the tool implies —
-a `Read` gives full body, a grep match gives overview, a glob gives name only
-(the full mapping is data; see [Configuration](Configuration#tool-mappings)).
+a `Read` gives full body, a grep match gives name only (the symbol its line
+sits in), a glob gives name only (the full mapping is data; see
+[Configuration](Configuration#tool-mappings)). A read is credited when its
+result arrives, for what the result says it returned: a failed or rejected
+call credits nothing, and a `Read` of a file longer than the 2,000 lines it
+returns credits only those lines.
 Edits are not reads: an agent that changed a symbol has not necessarily read
 it, so edits are recorded separately as [writes](Agent-Writes).
 `restore-context` reports that history:
@@ -23,6 +27,9 @@ grouped:64-84, symbol_label:104-119, fit_names:126-141, …
 Entries are `name:first-last`. Line numbers come from a fresh scan at print
 time rather than from storage, so they stay correct in files edited since the
 read — the agent can read that range directly instead of pulling the file.
+An entry read less than in full says how far, `name:first-last [name]`,
+`[overview]` or `[signature]`: the agent saw it, not its body. A file's
+`tok` is the source it read in full, each symbol once.
 
 Only symbols that are **still unchanged** are reported: each journaled read
 carries the content hash it was read at, and a symbol whose source has changed

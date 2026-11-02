@@ -711,6 +711,7 @@ mod tests {
             child_agent: child.map(Arc::from),
             shown: Vec::new(),
             printed: Vec::new(),
+            read: None,
         };
         app.trace.start(
             &call("sess", "r1", "Read", "2026-09-27T10:00:00.000Z"),

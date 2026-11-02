@@ -420,6 +420,7 @@ pub(crate) mod test_render {
             result_depth: None,
             file_reads: Vec::new(),
             searches: Vec::new(),
+            credited_by_result: false,
         }
     }
 

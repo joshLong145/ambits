@@ -346,6 +346,7 @@ mod tests {
             child_agent: child.map(Arc::from),
             shown: Vec::new(),
             printed: Vec::new(),
+            read: None,
         }
     }
 
