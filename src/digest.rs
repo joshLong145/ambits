@@ -21,17 +21,18 @@
 //! *source* is; the digest emits its *name*. Budgeting on source size would
 //! under-fill by more than an order of magnitude.
 //!
-//! Files are emitted in descending order of the source tokens they represent,
-//! so when the budget runs out it has been spent on the files that save the
-//! most re-reading. Depth deliberately plays no part: any depth of read is
-//! worth restoring, so ranking by it would be inventing a preference the data
-//! does not support.
+//! Files are emitted in descending order of the source tokens read in full
+//! from them, so when the budget runs out it has been spent on the files that
+//! save the most re-reading. Every depth of read is listed — a name is worth
+//! knowing too — but one less than full is marked with how far it went, so
+//! the agent does not take a symbol it only saw named for one it read.
 
 use std::path::Path;
 
 use serde::Serialize;
 
 use crate::restore::{RestoreReport, RestoredSymbol};
+use crate::tracking::ReadDepth;
 
 /// Rough chars-per-token, matching the approximation used elsewhere in the
 /// codebase (`symbols::merkle::estimate_tokens`). Good enough for a budget;
@@ -56,8 +57,34 @@ pub trait DigestFormatter {
 struct FileGroup<'a> {
     path: &'a Path,
     symbols: Vec<&'a RestoredSymbol>,
-    /// Summed source tokens — how much re-reading this file would cost.
+    /// Source tokens read in full — how much re-reading this file would
+    /// cost (see [`full_tokens`]).
     source_tokens: u64,
+}
+
+/// The source tokens of `symbols` read in full, each counted once: a symbol
+/// inside another read in full is already part of its parent's tokens.
+fn full_tokens(symbols: &[&RestoredSymbol]) -> u64 {
+    let full: std::collections::HashSet<&str> = symbols
+        .iter()
+        .filter(|s| s.depth == ReadDepth::FullBody)
+        .map(|s| s.name_path.as_str())
+        .collect();
+    let inside_full = |name: &str| {
+        let mut name = name;
+        while let Some(cut) = name.rfind('/') {
+            name = &name[..cut];
+            if full.contains(name) {
+                return true;
+            }
+        }
+        false
+    };
+    symbols
+        .iter()
+        .filter(|s| s.depth == ReadDepth::FullBody && !inside_full(&s.name_path))
+        .map(|s| u64::from(s.estimated_tokens))
+        .sum()
 }
 
 /// Group restored symbols by file, heaviest first.
@@ -67,7 +94,7 @@ fn grouped(report: &RestoreReport) -> Vec<FileGroup<'_>> {
         .restored_by_file()
         .into_iter()
         .map(|(path, symbols)| {
-            let source_tokens = symbols.iter().map(|s| s.estimated_tokens as u64).sum();
+            let source_tokens = full_tokens(&symbols);
             FileGroup {
                 path,
                 symbols,
@@ -83,7 +110,8 @@ fn grouped(report: &RestoreReport) -> Vec<FileGroup<'_>> {
     groups
 }
 
-/// Render one symbol as `name:start-end`.
+/// Render one symbol as `name:start-end`, with `[name]`, `[overview]` or
+/// `[signature]` after one read less than in full.
 ///
 /// The line range comes from the tree node whose hash matched, so it describes
 /// the code as it is *now*, not as it was when read. That distinction is what
@@ -102,10 +130,13 @@ fn grouped(report: &RestoreReport) -> Vec<FileGroup<'_>> {
 /// file. Which half of the old id is shown depends on what actually changed —
 /// naming the old file is useless when the symbol never left it.
 fn symbol_label(sym: &RestoredSymbol) -> String {
-    let base = format!(
+    let mut base = format!(
         "{}:{}-{}",
         sym.name_path, sym.line_range.start, sym.line_range.end
     );
+    if sym.depth != ReadDepth::FullBody {
+        base.push_str(&format!(" [{}]", sym.depth));
+    }
     let Some(ref old_id) = sym.moved_from else {
         return base;
     };
@@ -162,7 +193,8 @@ impl DigestFormatter for MarkdownFormatter {
 
         out.push_str(
             "These symbols were read earlier in this session. Treat them as known —\n\
-             anything not listed here is not covered.\n\
+             anything not listed here is not covered. One marked `[name]`,\n\
+             `[overview]` or `[signature]` was seen only that far, not its body.\n\
              Each entry is `name:first-last`, current line numbers: read that range\n\
              directly rather than re-reading the whole file, or pass the id to\n\
              `ambits show` for the definition.\n\n",
@@ -433,7 +465,6 @@ impl DigestFormatter for JsonFormatter {
 mod tests {
     use super::*;
     use crate::restore::{OmissionReason, OmittedSymbol, RestoreOutcome, RestoreSource};
-    use crate::tracking::ReadDepth;
     use std::path::PathBuf;
 
     fn names_of<const N: usize>(names: [&str; N]) -> Vec<String> {
@@ -464,6 +495,43 @@ mod tests {
             session_id: Some("sess".into()),
             warnings: vec![],
         }
+    }
+
+    #[test]
+    fn a_symbol_read_less_than_in_full_says_how_far() {
+        let mut named = restored("a.rs", "named", 50);
+        named.depth = ReadDepth::NameOnly;
+        let r = report(
+            vec![restored("a.rs", "read", 10), named],
+            RestoreSource::Journal,
+        );
+        let out = MarkdownFormatter.format(&r, DEFAULT_MAX_TOKENS);
+        assert!(
+            out.contains("read:1-10,") || out.contains("read:1-10\n"),
+            "{out}"
+        );
+        assert!(out.contains("named:1-10 [name]"), "{out}");
+    }
+
+    #[test]
+    fn a_files_tokens_count_what_was_read_in_full_once() {
+        let mut sig = restored("a.rs", "Other", 500);
+        sig.depth = ReadDepth::Signature;
+        let r = report(
+            vec![
+                restored("a.rs", "App", 100),
+                restored("a.rs", "App/run", 60),
+                restored("a.rs", "App/run/inner", 20),
+                sig,
+                restored("a.rs", "Apple", 7),
+            ],
+            RestoreSource::Journal,
+        );
+        let out = MarkdownFormatter.format(&r, DEFAULT_MAX_TOKENS);
+        assert!(
+            out.contains("(~107 tok)"),
+            "App's children are in App's 100: {out}"
+        );
     }
 
     #[test]
