@@ -1271,20 +1271,36 @@ fn replay_log_file(
     let mut feed = LineFeed::for_file(path, project_root);
     let mut writes = ResultCorrelator::default();
     let mut events: Vec<SessionEvent> = Vec::new();
-    let mut offset = 0u64;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => offset += n as u64,
-        }
-        feed.feed(&line, mapper, &mut writes, &mut events);
-    }
+    let offset = feed_complete_lines(&mut reader, |line| {
+        feed.feed(line, mapper, &mut writes, &mut events)
+    });
     FileReplay {
         events,
         offset,
         awaiting: writes.into_pending(),
+    }
+}
+
+/// Hand each complete line of `reader` — one ending in `\n` — to `feed`, and
+/// return the bytes they took, which is where the next read should start.
+///
+/// A last line without its newline is still being written: fed now, its
+/// first half would fail to parse and be dropped, and the rest, read next
+/// time, would too. It is left for the next read instead. Lines are taken as
+/// bytes, so one that is not UTF-8 is read lossily rather than stopping the
+/// read at it for good.
+fn feed_complete_lines(reader: &mut impl BufRead, mut feed: impl FnMut(&str)) -> u64 {
+    let mut consumed = 0u64;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(n) if n > 0 && line.ends_with(b"\n") => {
+                consumed += n as u64;
+                feed(&String::from_utf8_lossy(&line));
+            }
+            _ => return consumed,
+        }
     }
 }
 
@@ -2054,23 +2070,22 @@ impl LogTailer {
                 .feeds
                 .entry(path.clone())
                 .or_insert_with(|| LineFeed::for_file(path, self.project_root.as_deref()));
+            let mut read = 0;
             if let Ok(file) = fs::File::open(path) {
                 use std::io::{Seek, SeekFrom};
                 let mut reader = BufReader::new(file);
                 if reader.seek(SeekFrom::Start(pos)).is_ok() {
-                    let mut line = String::new();
-                    loop {
-                        line.clear();
-                        match reader.read_line(&mut line) {
-                            Ok(0) | Err(_) => break,
-                            Ok(_) => feed.feed(&line, &*self.mapper, &mut self.writes, &mut events),
-                        }
-                    }
+                    read = feed_complete_lines(&mut reader, |line| {
+                        feed.feed(line, &*self.mapper, &mut self.writes, &mut events)
+                    });
                 }
             }
+            // Past what was fed, not to the length stat'd above: lines
+            // appended since are read to the end and must not be read again,
+            // and a line still being written must be read once it is whole.
             // Insert rather than `get_mut`: an absent key must start tracking
             // from here, not silently keep re-reading from 0.
-            self.positions.insert(self.files[i].clone(), current_len);
+            self.positions.insert(self.files[i].clone(), pos + read);
         }
 
         let mut output = TailerOutput {
@@ -3278,6 +3293,112 @@ mod tests {
         assert!(output.session_cleared);
         assert_eq!(output.events.len(), 1);
         assert_eq!(output.events[0].read_depth, ReadDepth::FullBody);
+    }
+
+    fn append_raw(path: &Path, bytes: &[u8]) {
+        use std::io::Write as _;
+        let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(bytes).unwrap();
+    }
+
+    /// A line caught half-written is read once it is whole, not dropped.
+    #[test]
+    fn tailer_reads_a_line_caught_half_written_once_it_is_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("session.jsonl");
+        fs::write(&log, "").unwrap();
+        let config: Arc<dyn ToolCallMapper> =
+            Arc::new(ToolMappingConfig::builtin().expect("builtin config"));
+        let mut tailer = LogTailer::new(vec![log.clone()], config);
+
+        let line = jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/src/main.rs"}"#);
+        let (head, rest) = line.split_at(line.len() / 2);
+        append_raw(&log, head.as_bytes());
+        assert!(tailer.read_new_events().events.is_empty(), "not whole yet");
+        append_raw(&log, format!("{rest}\n").as_bytes());
+        assert_eq!(tailer.read_new_events().events.len(), 1);
+        assert!(tailer.read_new_events().events.is_empty(), "and read once");
+    }
+
+    /// A replay stops before a half-written last line, so the tailer that
+    /// takes over reads it whole.
+    #[test]
+    fn a_line_half_written_at_the_handoff_is_read_by_the_tailer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("session.jsonl");
+        let first = jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/src/a.rs"}"#);
+        let second = jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/src/b.rs"}"#);
+        let (head, rest) = second.split_at(second.len() / 2);
+        fs::write(&log, format!("{first}\n{head}")).unwrap();
+        let config: Arc<dyn ToolCallMapper> =
+            Arc::new(ToolMappingConfig::builtin().expect("builtin config"));
+
+        let replay = replay_log_file(&log, &*config, None);
+        assert_eq!(replay.offset, first.len() as u64 + 1);
+        let mut tailer = LogTailer::resume(
+            Handoff {
+                files: vec![(log.clone(), replay.offset)],
+                awaiting: replay.awaiting,
+                project_root: None,
+            },
+            config,
+        );
+        append_raw(&log, format!("{rest}\n").as_bytes());
+        let events = tailer.read_new_events().events;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].file_path.as_deref(), Some(Path::new("/src/b.rs")));
+    }
+
+    /// Lines appended while a poll reads are read once: by this poll or
+    /// the next, never both, and never cut in two.
+    #[test]
+    fn tailer_reads_each_line_once_while_the_log_grows() {
+        const LINES: usize = 20_000;
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("session.jsonl");
+        fs::write(&log, "").unwrap();
+        let config: Arc<dyn ToolCallMapper> =
+            Arc::new(ToolMappingConfig::builtin().expect("builtin config"));
+        let mut tailer = LogTailer::new(vec![log.clone()], config);
+
+        let line = jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/src/main.rs"}"#);
+        let writer = {
+            let log = log.clone();
+            std::thread::spawn(move || {
+                use std::io::Write as _;
+                let mut f = fs::OpenOptions::new().append(true).open(&log).unwrap();
+                for _ in 0..LINES {
+                    // Two writes, so a poll can land between the halves.
+                    let (head, rest) = line.split_at(line.len() / 2);
+                    f.write_all(head.as_bytes()).unwrap();
+                    f.write_all(format!("{rest}\n").as_bytes()).unwrap();
+                }
+            })
+        };
+        let mut seen = 0;
+        while !writer.is_finished() {
+            seen += tailer.read_new_events().events.len();
+        }
+        writer.join().unwrap();
+        seen += tailer.read_new_events().events.len();
+        assert_eq!(seen, LINES);
+    }
+
+    /// A line that is not UTF-8 is passed over, not a wall the tailer can
+    /// never read past.
+    #[test]
+    fn tailer_reads_past_a_line_that_is_not_utf8() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("session.jsonl");
+        fs::write(&log, "").unwrap();
+        let config: Arc<dyn ToolCallMapper> =
+            Arc::new(ToolMappingConfig::builtin().expect("builtin config"));
+        let mut tailer = LogTailer::new(vec![log.clone()], config);
+
+        append_raw(&log, b"{\"type\":\"user\",\"x\":\"\xff\xfe\"}\n");
+        let line = jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/src/main.rs"}"#);
+        append_raw(&log, format!("{line}\n").as_bytes());
+        assert_eq!(tailer.read_new_events().events.len(), 1);
     }
 
     // -----------------------------------------------------------------------
