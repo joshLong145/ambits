@@ -19,8 +19,16 @@
 //!
 //! ```text
 //! {"kind":"header","schema_version":2,...}
-//! {"kind":"read","sym":"src/app.rs::App/record","h":"b3:1a2b…","d":"full_body","a":"agent-3f9c"}
+//! {"kind":"read","sym":"src/app.rs::App/record","h":"b3:1a2b…","d":"full_body","a":"agent-3f9c","t":1793600000000}
 //! ```
+//!
+//! `t` is when the record was appended. A session's reads can span several
+//! files — the primary, and shards that `restore` and `pull` append to — so
+//! when two files disagree about a symbol, `t` says which read is newer (see
+//! `fold`). A clock that runs backwards can only make an older read win,
+//! and every read was of the code as it was when it was appended, so the
+//! cost is a symbol reported as changed, never one reported as known that
+//! is not.
 //!
 //! ## Written by diffing the ledger
 //!
@@ -29,8 +37,9 @@
 //! `(hash, depth)` differs from what has already been journaled. That yields
 //! exactly one record per read-set change, with no plumbing through the
 //! recursive symbol-marking hot path. It is sound only because
-//! `ContextLedger::record` refreshes `content_hash_at_read` on *every* read —
-//! see its docs; it did not always.
+//! `ContextLedger::record` refreshes the reading agent's hash on *every*
+//! read — see its docs; it did not always — and keeps each agent's own, so a
+//! record never credits one agent with a version another read.
 //!
 //! ## Agent attribution and portability
 //!
@@ -56,7 +65,12 @@
 //! record across two syscalls and interleave it with another process's append.
 //! Nothing is buffered in memory, so there is no flush to lose and no `Drop`
 //! guard to write: a crash costs at most the reads since the last `sync`, which
-//! only ever *under*-reports coverage. Under-reporting is the safe direction —
+//! only ever *under*-reports coverage. A crash mid-write leaves a line cut
+//! off; the next writer ends it before appending, so it costs that record
+//! alone, and the fold drops it without complaint. Nothing is fsynced, for
+//! the same reason: what a power loss takes is re-appended by the next sync,
+//! restore or pull, which only append what the journal does not already
+//! hold. Under-reporting is the safe direction —
 //! the agent re-reads something it already knew.
 //!
 //! ## One writer
@@ -300,6 +314,16 @@ pub enum Record {
         /// read still counts — it just cannot be filtered by agent.
         #[serde(rename = "a", default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
+        /// When the record was appended, in milliseconds since the Unix
+        /// epoch; stamped by the writer, so callers leave it `None`.
+        ///
+        /// Orders reads across a session's files: within one file, its line
+        /// order already does (see `fold_lines`). Absent from records
+        /// written before it existed, which then count as older than any
+        /// that carry it. Additive, so not a schema change: a build that
+        /// predates it ignores it.
+        #[serde(rename = "t", default, skip_serializing_if = "Option::is_none")]
+        at: Option<u64>,
     },
     /// An agent write (v3). One per `(session, op)`; the highest `av` wins.
     Write(Box<crate::writes::WriteRecord>),
@@ -403,6 +427,11 @@ pub struct JournalContents {
     /// Per-`(symbol, agent)` view, for restoring agent-filtered coverage.
     /// Empty for v1 journals, which carried no attribution.
     pub agent_reads: HashMap<AgentReadKey, ([u8; 32], ReadDepth)>,
+    /// When each entry of `reads` and `agent_reads` was last decided, as a
+    /// record's `t`: what [`merge_shard`] orders another file's records
+    /// against. `0` for records written before `t` existed.
+    read_times: HashMap<String, u64>,
+    agent_read_times: HashMap<AgentReadKey, u64>,
     /// Agent writes by `op`, keeping the record with the highest `av`
     /// (spec §2.6). Empty before v3.
     pub writes: std::collections::BTreeMap<String, crate::writes::WriteRecord>,
@@ -422,33 +451,48 @@ pub struct JournalContents {
     pub warnings: Vec<String>,
 }
 
-/// Merge one record into whichever view is accumulating it.
+/// Merge one record, appended at `t`, into whichever view is accumulating
+/// it.
 ///
 /// Both views fold identically, and having written the rule twice it is worth
-/// stating once: a record carrying a *new* hash supersedes what came before,
-/// because earlier depths describe a version of the symbol that no longer
-/// exists; a record carrying the *same* hash contributes its depth to the
-/// maximum, which is how the ledger aggregates across agents.
-fn fold(
-    slot: std::collections::hash_map::Entry<'_, impl std::hash::Hash + Eq, ([u8; 32], ReadDepth)>,
-    hash: [u8; 32],
-    depth: ReadDepth,
+/// stating once: a record carrying the *same* hash contributes its depth to
+/// the maximum, which is how the ledger aggregates across agents; one
+/// carrying a *new* hash supersedes what came before, because earlier depths
+/// describe a version of the symbol that no longer exists — provided it is
+/// not older than what it would replace. Within a file `t` never decreases
+/// (see [`fold_lines`]), so there it is line order; across files it is what
+/// keeps a file read later from replacing a newer read with an older one.
+/// Equal times keep the later file's, as before `t` existed.
+fn fold<K: std::hash::Hash + Eq + Clone>(
+    view: &mut HashMap<K, ([u8; 32], ReadDepth)>,
+    times: &mut HashMap<K, u64>,
+    key: K,
+    (hash, depth): ([u8; 32], ReadDepth),
+    t: u64,
 ) {
-    slot.and_modify(|cur| {
-        if cur.0 == hash {
-            cur.1 = cur.1.max(depth);
-        } else {
-            *cur = (hash, depth);
+    let time = times.entry(key.clone()).or_insert(t);
+    match view.entry(key) {
+        std::collections::hash_map::Entry::Occupied(mut slot) => {
+            let current = slot.get_mut();
+            if current.0 == hash {
+                current.1 = current.1.max(depth);
+                *time = (*time).max(t);
+            } else if t >= *time {
+                *current = (hash, depth);
+                *time = t;
+            }
         }
-    })
-    .or_insert((hash, depth));
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert((hash, depth));
+        }
+    }
 }
 
 /// Read and fold a journal file.
 ///
-/// Corruption is never fatal: a partial *final* line is dropped silently (the
-/// writer was interrupted mid-append, which is expected), while a bad
-/// *interior* line warns and is skipped. Losing one record costs one symbol's
+/// Corruption is never fatal: a line cut off mid-record is dropped silently
+/// (the writer was interrupted mid-append, which is expected), while any
+/// other bad line warns and is skipped. Losing one record costs one symbol's
 /// coverage; refusing to read the file costs all of it.
 pub fn read_journal(path: &Path) -> JournalContents {
     match std::fs::read_to_string(path) {
@@ -483,6 +527,10 @@ enum Records {
 /// readable range discards the whole shard.
 fn fold_lines(path: &Path, content: &str, records: Records) -> JournalContents {
     let mut out = JournalContents::default();
+    // The latest `t` seen so far. A record without one — written by a build
+    // that predates it — is no older than the line before it: one writer
+    // appends to a file at a time, so a file's line order is its time order.
+    let mut latest = 0u64;
 
     let lines: Vec<&str> = content.lines().collect();
     let last_index = lines.len().saturating_sub(1);
@@ -500,7 +548,10 @@ fn fold_lines(path: &Path, content: &str, records: Records) -> JournalContents {
         let record: Record = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(e) => {
-                if !(i == last_index && final_line_may_be_torn) {
+                // A line cut off mid-record is a write interrupted before
+                // its newline: the last line, or one the next writer ended
+                // (see `Journal::write_all`).
+                if !(e.is_eof() || i == last_index && final_line_may_be_torn) {
                     out.warnings
                         .push(format!("{}:{}: {e}", path.display(), i + 1));
                 }
@@ -532,12 +583,26 @@ fn fold_lines(path: &Path, content: &str, records: Records) -> JournalContents {
                 hash,
                 depth,
                 agent,
+                at,
             } => match decode_hash(&hash) {
                 Some(h) => {
-                    let depth: ReadDepth = depth.into();
-                    fold(out.reads.entry(symbol_id.clone()), h, depth);
+                    latest = latest.max(at.unwrap_or(0));
+                    let read = (h, depth.into());
+                    fold(
+                        &mut out.reads,
+                        &mut out.read_times,
+                        symbol_id.clone(),
+                        read,
+                        latest,
+                    );
                     if let Some(agent) = agent {
-                        fold(out.agent_reads.entry((symbol_id, agent)), h, depth);
+                        fold(
+                            &mut out.agent_reads,
+                            &mut out.agent_read_times,
+                            (symbol_id, agent),
+                            read,
+                            latest,
+                        );
                     }
                 }
                 None => out.warnings.push(format!(
@@ -621,9 +686,11 @@ pub fn session_shard_paths(dir: &Path, session_id: &str) -> Vec<PathBuf> {
 /// Read and fold every shard of `session_id`'s journal into one merged view.
 ///
 /// Shards fold together with the same rule [`fold`] uses for lines within a
-/// single file: a record carrying a *new* hash supersedes what came before
-/// (the content moved on since an earlier shard's read), and one carrying the
-/// *same* hash contributes its depth to the maximum. Which shard's header
+/// single file: a record carrying a *new* hash supersedes an older one (the
+/// content moved on since), and one carrying the *same* hash contributes its
+/// depth to the maximum. "Older" is by `t`, so the order shards are read in
+/// decides only between records written in the same millisecond, or before
+/// `t` existed. Which shard's header
 /// survives depends on iteration order, not correctness — any valid header
 /// describes the same session's environment.
 pub fn read_journal_session(dir: &Path, session_id: &str) -> JournalContents {
@@ -666,11 +733,19 @@ pub fn merge_shard(out: &mut JournalContents, shard: JournalContents) {
     if shard.header.is_some() {
         out.header = shard.header;
     }
-    for (id, (hash, depth)) in shard.reads {
-        fold(out.reads.entry(id), hash, depth);
+    for (id, read) in shard.reads {
+        let t = shard.read_times.get(&id).copied().unwrap_or(0);
+        fold(&mut out.reads, &mut out.read_times, id, read, t);
     }
-    for (key, (hash, depth)) in shard.agent_reads {
-        fold(out.agent_reads.entry(key), hash, depth);
+    for (key, read) in shard.agent_reads {
+        let t = shard.agent_read_times.get(&key).copied().unwrap_or(0);
+        fold(
+            &mut out.agent_reads,
+            &mut out.agent_read_times,
+            key,
+            read,
+            t,
+        );
     }
     for record in shard.writes.into_values() {
         fold_write(&mut out.writes, record);
@@ -705,6 +780,10 @@ pub struct Journal {
     written_ops: HashMap<String, u32>,
     interval: Duration,
     last_sync: Instant,
+    /// Whether the file ends partway through a line — a write interrupted
+    /// before its newline — so the next write must end that line first, or
+    /// the torn text and the new record would read back as one corrupt line.
+    torn: bool,
     /// Set when writing fails. Journaling then stops for the rest of the run
     /// rather than erroring on every tick — a broken cache must never take the
     /// TUI down with it.
@@ -726,13 +805,13 @@ pub fn append_shard(
         return Ok(());
     }
     let mut journal = Journal::open_shard(project_root, session, shard, Duration::ZERO, manifest);
-    for record in records {
-        if !journal.append(record) {
-            color_eyre::eyre::bail!(
-                "cannot write the {shard} shard {}",
-                journal.path().display()
-            );
-        }
+    // One write for the batch, rather than one per record, so another
+    // writer of the shard cannot land between its records.
+    if !(journal.error.is_none() && journal.write_all(records)) {
+        color_eyre::eyre::bail!(
+            "cannot write the {shard} shard {}",
+            journal.path().display()
+        );
     }
     Ok(())
 }
@@ -810,6 +889,7 @@ impl Journal {
             written_ops: HashMap::new(),
             interval,
             last_sync: Instant::now(),
+            torn: false,
             error: None,
             warnings: Vec::new(),
         };
@@ -862,6 +942,7 @@ impl Journal {
                 ));
             }
         }
+        journal.torn = ends_mid_line(&path);
         journal.file = Some(file);
 
         // Append a fresh header when the file has none, or when its header
@@ -949,13 +1030,12 @@ impl Journal {
     /// Append a record for every ledger entry whose read-state has changed
     /// since it was last journaled. Returns how many were written.
     ///
-    /// Skips unseen and stale entries: we only ever journal reads we currently
+    /// Skips unseen and stale reads: we only ever journal reads we currently
     /// believe describe the file as it is on disk.
     ///
-    /// One record per `(symbol, agent)` whose depth or hash moved. The content
-    /// hash is a property of the symbol, not of the reader, so every agent's
-    /// record for a symbol carries the same hash — what differs is how deeply
-    /// each one read it.
+    /// One record per `(symbol, agent)` whose depth or hash moved, each with
+    /// the hash that agent read: two agents can have read two versions of a
+    /// symbol, and only the one that read the current version knows it.
     pub fn sync(&mut self, ledger: &ContextLedger) -> usize {
         self.last_sync = Instant::now();
         if self.error.is_some() {
@@ -964,14 +1044,11 @@ impl Journal {
 
         let mut pending: Vec<(String, String, [u8; 32], ReadDepth)> = Vec::new();
         for (id, entry) in &ledger.entries {
-            if !entry.depth.is_seen() || entry.stale {
-                continue;
-            }
-            for (agent, depth) in &entry.agent_depths {
-                if !depth.is_seen() {
+            for (agent, read) in &entry.agent_reads {
+                if !read.depth.is_seen() || read.stale {
                     continue;
                 }
-                let current = (entry.content_hash_at_read, *depth);
+                let current = (read.hash_at_read, read.depth);
                 let key = (id.clone(), agent.clone());
                 if self.journaled.get(&key) != Some(&current) {
                     pending.push((id.clone(), agent.clone(), current.0, current.1));
@@ -990,6 +1067,7 @@ impl Journal {
                 hash: encode_hash(&hash),
                 depth: depth.into(),
                 agent: Some(agent.clone()),
+                at: None,
             };
             if !self.write(&record) {
                 break;
@@ -1011,19 +1089,27 @@ impl Journal {
     }
 
     fn write(&mut self, record: &Record) -> bool {
+        self.write_all(std::slice::from_ref(record))
+    }
+
+    /// Append `records` with a single `write_all`: a `BufWriter` could split
+    /// a record across syscalls and interleave it with another process's
+    /// append. Ends a torn last line first, in the same write.
+    fn write_all(&mut self, records: &[Record]) -> bool {
         let Some(file) = self.file.as_mut() else {
             return false;
         };
-        let mut buf = match serde_json::to_vec(record) {
-            Ok(b) => b,
-            Err(e) => {
+        let mut buf = Vec::new();
+        if self.torn {
+            buf.push(b'\n');
+        }
+        for record in records {
+            if let Err(e) = serde_json::to_writer(&mut buf, &stamped(record)) {
                 self.error = Some(e.to_string());
                 return false;
             }
-        };
-        buf.push(b'\n');
-        // One write_all per record: a BufWriter could split a record across
-        // syscalls and interleave it with another process's append.
+            buf.push(b'\n');
+        }
         if let Err(e) = file.write_all(&buf) {
             let msg = format!("{}: {e}", self.path.display());
             self.warnings.push(msg.clone());
@@ -1031,8 +1117,44 @@ impl Journal {
             self.file = None;
             return false;
         }
+        self.torn = false;
         true
     }
+}
+
+/// Whether `path` ends partway through a line. A missing or empty file does
+/// not; an unreadable one is taken not to, since `read_journal` would have
+/// warned about it already.
+fn ends_mid_line(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut last = [0u8; 1];
+    file.seek(SeekFrom::End(-1)).is_ok() && file.read_exact(&mut last).is_ok() && last[0] != b'\n'
+}
+
+/// `record`, with a read's `t` set to now when it has none.
+fn stamped(record: &Record) -> std::borrow::Cow<'_, Record> {
+    match record {
+        Record::Read { at: None, .. } => {
+            let mut read = record.clone();
+            if let Record::Read { at, .. } = &mut read {
+                *at = Some(now_millis());
+            }
+            std::borrow::Cow::Owned(read)
+        }
+        _ => std::borrow::Cow::Borrowed(record),
+    }
+}
+
+/// Milliseconds since the Unix epoch, for a read record's `t`; `0` when the
+/// clock reads before the epoch, which then orders as a record without one.
+fn now_millis() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Best-effort ISO-8601-ish UTC timestamp.
@@ -1453,6 +1575,29 @@ mod tests {
         assert_eq!(contents.reads["a.rs::x"], (h2, ReadDepth::FullBody));
     }
 
+    /// Agent B read the old version; agent A then read the new one. Only A's
+    /// read describes the symbol as it is, so only A's is journaled again —
+    /// B must not be recorded as having read a version it never saw.
+    #[test]
+    fn a_read_by_one_agent_is_not_journaled_for_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = ContextLedger::new();
+        let h1 = content_hash("v1");
+        let h2 = content_hash("v2");
+        ledger.record("a.rs::x".into(), ReadDepth::FullBody, h1, "b".into(), 5);
+
+        let mut j = journal_in(dir.path());
+        assert_eq!(j.sync(&ledger), 1);
+
+        ledger.record("a.rs::x".into(), ReadDepth::Overview, h2, "a".into(), 5);
+        assert_eq!(j.sync(&ledger), 1, "only a's read is new");
+
+        let contents = read_journal(j.path());
+        let key = |agent: &str| ("a.rs::x".to_string(), agent.to_string());
+        assert_eq!(contents.agent_reads[&key("b")], (h1, ReadDepth::FullBody));
+        assert_eq!(contents.agent_reads[&key("a")], (h2, ReadDepth::Overview));
+    }
+
     #[test]
     fn stale_and_unseen_entries_are_not_journaled() {
         let dir = tempfile::tempdir().unwrap();
@@ -1530,6 +1675,7 @@ mod tests {
             hash: encode_hash(&[1u8; 32]),
             depth: DepthDto::FullBody,
             agent: Some("agent-1".into()),
+            at: None,
         })
         .unwrap();
         std::fs::write(&path, format!("not json\n{good}\n")).unwrap();
@@ -1555,6 +1701,7 @@ mod tests {
             hash: encode_hash(&[1u8; 32]),
             depth: DepthDto::FullBody,
             agent: Some("agent-1".into()),
+            at: None,
         })
         .unwrap();
         std::fs::write(&path, format!("{header}\n{read}\n")).unwrap();
@@ -1663,6 +1810,7 @@ mod write_record_tests {
             hash: "b3:00".into(),
             depth: DepthDto::FullBody,
             agent: None,
+            at: None,
         };
         assert!(serde_json::to_string(&read)
             .unwrap()
@@ -1811,6 +1959,7 @@ mod write_record_tests {
             hash: encode_hash(&[0; 32]),
             depth: DepthDto::FullBody,
             agent: Some("ag".into()),
+            at: None,
         };
         std::fs::write(
             &path,
@@ -1826,5 +1975,342 @@ mod write_record_tests {
         let contents = read_journal(&path);
         assert_eq!(contents.reads.len(), 1);
         assert_eq!(contents.header.map(|h| h.0), Some(SUPPORTED_SCHEMA_VERSION));
+    }
+}
+
+/// How reads from several of a session's files, or several versions of
+/// ambits, order (F3).
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    /// One read of `a.rs::x` by `agent`, at hash `[seed; 32]`, appended at `t`.
+    fn read(agent: &str, seed: u8, depth: DepthDto, t: Option<u64>) -> String {
+        serde_json::to_string(&Record::Read {
+            symbol_id: "a.rs::x".into(),
+            hash: encode_hash(&[seed; 32]),
+            depth,
+            agent: Some(agent.into()),
+            at: t,
+        })
+        .unwrap()
+    }
+
+    /// Write `session`'s file `<session><suffix>.ndjson` holding `lines`.
+    fn shard(root: &Path, suffix: &str, lines: &[String]) {
+        let dir = journal_dir(root);
+        std::fs::create_dir_all(&dir).unwrap();
+        let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(dir.join(format!("sess{suffix}.ndjson")), text).unwrap();
+    }
+
+    fn session(root: &Path) -> JournalContents {
+        let contents = read_journal_session(&journal_dir(root), "sess");
+        assert!(contents.warnings.is_empty(), "{:?}", contents.warnings);
+        contents
+    }
+
+    /// F3: a pull brought in agent a's read of the first version; a then read
+    /// the second, in the primary file. The pull shard is read after the
+    /// primary, but the primary's read is newer and must win.
+    #[test]
+    fn a_newer_read_in_the_primary_outranks_an_older_one_pulled_in() {
+        let dir = tempfile::tempdir().unwrap();
+        shard(dir.path(), "", &[read("a", 2, DepthDto::FullBody, Some(2))]);
+        shard(
+            dir.path(),
+            ".pull",
+            &[read("a", 1, DepthDto::FullBody, Some(1))],
+        );
+
+        let contents = session(dir.path());
+        assert_eq!(contents.reads["a.rs::x"].0, [2; 32]);
+        assert!(contents.knows_read("a.rs::x", "a", &[2; 32], ReadDepth::FullBody));
+        assert!(!contents.knows_read("a.rs::x", "a", &[1; 32], ReadDepth::NameOnly));
+    }
+
+    #[test]
+    fn a_newer_read_pulled_in_outranks_an_older_one_in_the_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        shard(dir.path(), "", &[read("a", 1, DepthDto::FullBody, Some(1))]);
+        shard(
+            dir.path(),
+            ".pull",
+            &[read("a", 2, DepthDto::Overview, Some(2))],
+        );
+
+        let contents = session(dir.path());
+        assert_eq!(contents.reads["a.rs::x"], ([2; 32], ReadDepth::Overview));
+    }
+
+    /// An older ambits appended a read after a newer one stamped its own.
+    /// One writer appends to a file at a time, so the later line is the
+    /// later read, `t` or not.
+    #[test]
+    fn within_a_file_a_later_line_without_a_time_is_still_later() {
+        let dir = tempfile::tempdir().unwrap();
+        shard(
+            dir.path(),
+            "",
+            &[
+                read("a", 1, DepthDto::FullBody, Some(5)),
+                read("a", 2, DepthDto::Overview, None),
+            ],
+        );
+        // And it carries the time of the line before it across files: an
+        // older read in another file does not replace it.
+        shard(
+            dir.path(),
+            ".pull",
+            &[read("a", 3, DepthDto::FullBody, Some(4))],
+        );
+
+        let contents = session(dir.path());
+        assert_eq!(contents.reads["a.rs::x"], ([2; 32], ReadDepth::Overview));
+    }
+
+    /// Journals written before `t` fold exactly as they always did: the file
+    /// read last wins a disagreement.
+    #[test]
+    fn without_times_the_file_read_last_wins_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        shard(dir.path(), "", &[read("a", 1, DepthDto::FullBody, None)]);
+        shard(
+            dir.path(),
+            ".pull",
+            &[read("a", 2, DepthDto::Overview, None)],
+        );
+        assert_eq!(session(dir.path()).reads["a.rs::x"].0, [2; 32]);
+    }
+
+    /// A record with a time is newer than one without.
+    #[test]
+    fn a_timed_read_outranks_one_from_before_times() {
+        let dir = tempfile::tempdir().unwrap();
+        shard(dir.path(), "", &[read("a", 1, DepthDto::FullBody, Some(1))]);
+        shard(
+            dir.path(),
+            ".pull",
+            &[read("a", 2, DepthDto::FullBody, None)],
+        );
+        assert_eq!(session(dir.path()).reads["a.rs::x"].0, [1; 32]);
+    }
+
+    #[test]
+    fn equal_times_fall_back_to_the_file_read_last() {
+        let dir = tempfile::tempdir().unwrap();
+        shard(dir.path(), "", &[read("a", 1, DepthDto::FullBody, Some(7))]);
+        shard(
+            dir.path(),
+            ".pull",
+            &[read("a", 2, DepthDto::FullBody, Some(7))],
+        );
+        assert_eq!(session(dir.path()).reads["a.rs::x"].0, [2; 32]);
+    }
+
+    /// The same version in two files: the deeper read counts, and the later
+    /// time, so a third file's read between the two does not replace it.
+    #[test]
+    fn the_same_version_in_two_files_keeps_the_deepest_read_and_latest_time() {
+        let dir = tempfile::tempdir().unwrap();
+        shard(dir.path(), "", &[read("a", 1, DepthDto::FullBody, Some(1))]);
+        shard(
+            dir.path(),
+            ".pull",
+            &[read("a", 1, DepthDto::NameOnly, Some(9))],
+        );
+        shard(
+            dir.path(),
+            ".restore",
+            &[read("a", 2, DepthDto::FullBody, Some(5))],
+        );
+
+        let contents = session(dir.path());
+        assert_eq!(contents.reads["a.rs::x"], ([1; 32], ReadDepth::FullBody));
+        let key = ("a.rs::x".to_string(), "a".to_string());
+        assert_eq!(contents.agent_reads[&key], ([1; 32], ReadDepth::FullBody));
+    }
+
+    /// Each agent's view orders on its own; the symbol's is the newest read
+    /// by anyone.
+    #[test]
+    fn each_agents_read_and_the_symbols_order_by_time() {
+        let dir = tempfile::tempdir().unwrap();
+        shard(
+            dir.path(),
+            "",
+            &[
+                read("b", 1, DepthDto::Overview, Some(1)),
+                read("a", 2, DepthDto::FullBody, Some(3)),
+            ],
+        );
+        shard(
+            dir.path(),
+            ".pull",
+            &[read("b", 3, DepthDto::FullBody, Some(2))],
+        );
+
+        let contents = session(dir.path());
+        let key = |a: &str| ("a.rs::x".to_string(), a.to_string());
+        assert_eq!(contents.agent_reads[&key("a")].0, [2; 32]);
+        assert_eq!(
+            contents.agent_reads[&key("b")].0,
+            [3; 32],
+            "b's pulled read is newer"
+        );
+        assert_eq!(
+            contents.reads["a.rs::x"].0, [2; 32],
+            "a's read is the newest"
+        );
+    }
+
+    /// Every read a writer appends carries the time it was appended.
+    #[test]
+    fn writers_stamp_each_read_with_the_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = now_millis();
+        let mut ledger = ContextLedger::new();
+        ledger.record(
+            "a.rs::x".into(),
+            ReadDepth::FullBody,
+            [1; 32],
+            "a".into(),
+            1,
+        );
+        let mut journal =
+            Journal::open(dir.path(), "sess", Duration::ZERO, || EnvironmentManifest {
+                project_root: "/p".into(),
+                tree_fingerprint: "b3:00".into(),
+                ambit_version: "test".into(),
+                backend: "tree-sitter".into(),
+                parsers: vec![],
+                tool_config_version: None,
+                filter: None,
+                os: "test".into(),
+                arch: "test".into(),
+                host: "test".into(),
+            });
+        assert_eq!(journal.sync(&ledger), 1);
+        drop(journal);
+
+        let text = std::fs::read_to_string(journal_dir(dir.path()).join("sess.ndjson")).unwrap();
+        let t = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Record>(l).ok())
+            .find_map(|r| match r {
+                Record::Read { at, .. } => at,
+                _ => None,
+            })
+            .expect("the read carries t");
+        assert!((before..=now_millis()).contains(&t));
+    }
+
+    /// A build that predates `t` still reads a record carrying it — the
+    /// reason it needs no schema version.
+    #[test]
+    fn a_read_without_its_time_field_still_parses() {
+        let line = read("a", 1, DepthDto::FullBody, Some(1));
+        let mut value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        value.as_object_mut().unwrap().remove("t");
+        assert!(serde_json::from_value::<Record>(value).is_ok());
+        assert!(
+            line.starts_with(r#"{"kind":"read""#),
+            "the read prefix scan still works"
+        );
+    }
+}
+
+/// A write interrupted before its newline must not take the next record
+/// down with it (F4).
+#[cfg(test)]
+mod torn_tests {
+    use super::*;
+
+    fn manifest() -> EnvironmentManifest {
+        EnvironmentManifest {
+            project_root: "/p".into(),
+            tree_fingerprint: "b3:00".into(),
+            ambit_version: "test".into(),
+            backend: "tree-sitter".into(),
+            parsers: vec![],
+            tool_config_version: None,
+            filter: None,
+            os: "test".into(),
+            arch: "test".into(),
+            host: "test".into(),
+        }
+    }
+
+    fn ledger(symbol: &str) -> ContextLedger {
+        let mut ledger = ContextLedger::new();
+        ledger.record(symbol.into(), ReadDepth::FullBody, [1; 32], "a".into(), 1);
+        ledger
+    }
+
+    /// Cut the file at `path` short, partway through its last record.
+    fn tear(path: &Path) {
+        let mut text = std::fs::read_to_string(path).unwrap();
+        text.truncate(text.trim_end().len() - 10);
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn the_record_after_a_torn_line_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path(), "sess", Duration::ZERO, manifest);
+        journal.sync(&ledger("a.rs::x"));
+        let path = journal.path().to_path_buf();
+        drop(journal);
+        tear(&path);
+
+        let mut journal = Journal::open(dir.path(), "sess", Duration::ZERO, manifest);
+        assert_eq!(journal.sync(&ledger("a.rs::y")), 1);
+        drop(journal);
+
+        let contents = read_journal(&path);
+        assert!(
+            contents.reads.contains_key("a.rs::y"),
+            "the new record survives"
+        );
+        assert!(contents.warnings.is_empty(), "{:?}", contents.warnings);
+    }
+
+    #[test]
+    fn a_shard_batch_after_a_torn_line_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = |symbol: &str| Record::Read {
+            symbol_id: symbol.into(),
+            hash: encode_hash(&[1; 32]),
+            depth: DepthDto::FullBody,
+            agent: Some("a".into()),
+            at: None,
+        };
+        append_shard(dir.path(), "sess", "pull", &[read("a.rs::x")], manifest).unwrap();
+        let path = journal_dir(dir.path()).join("sess.pull.ndjson");
+        tear(&path);
+
+        append_shard(
+            dir.path(),
+            "sess",
+            "pull",
+            &[read("a.rs::y"), read("a.rs::z")],
+            manifest,
+        )
+        .unwrap();
+
+        let contents = read_journal(&path);
+        assert!(contents.reads.contains_key("a.rs::y"));
+        assert!(contents.reads.contains_key("a.rs::z"));
+        assert!(contents.warnings.is_empty(), "{:?}", contents.warnings);
+    }
+
+    /// A line that is not a cut-off record is still reported.
+    #[test]
+    fn a_line_that_is_not_json_still_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.ndjson");
+        std::fs::write(&path, "{\"kind\":\"read\"\nnot json\n").unwrap();
+        let contents = read_journal(&path);
+        assert_eq!(contents.warnings.len(), 1, "{:?}", contents.warnings);
     }
 }

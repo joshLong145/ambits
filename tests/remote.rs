@@ -64,6 +64,7 @@ impl Clone {
             hash: ambits::journal::encode_hash(&sym.content_hash),
             depth: ambits::journal::DepthDto::FullBody,
             agent: Some(agent.into()),
+            at: None,
         };
         append_journal(&self.root, session, &[record]);
     }
@@ -290,6 +291,54 @@ fn a_stale_remote_read_becomes_history_once() {
     )
     .unwrap();
     assert_eq!(shard.matches(r#""of":"read""#).count(), 1);
+}
+
+/// F3: B pulls A's read of `alpha`, then changes `alpha` and reads it again.
+/// The pull shard is read after B's own journal, but B's read is the newer
+/// one: the session, and the snapshot B takes, know `alpha` as it is now.
+#[test]
+fn a_read_after_a_pull_outranks_the_pulled_read() {
+    let (_dir, _remote, a, b) = pair();
+    a.read("alpha", "agent-1");
+    a.snap();
+    a.push(false).unwrap();
+    assert!(matches!(b.pull(), PullOutcome::Merged { reads: 1, .. }));
+
+    std::fs::write(b.root.join("src/a.rs"), "fn alpha() { 1; }\nfn beta() {}\n").unwrap();
+    let tree = b.registry.scan_project(&b.root, None).unwrap();
+    let (_, alpha) = tree
+        .walk()
+        .into_iter()
+        .find(|(_, s)| &*s.name == "alpha")
+        .unwrap();
+    let mut ledger = ambits::tracking::ContextLedger::new();
+    ledger.record(
+        alpha.id.clone(),
+        ambits::tracking::ReadDepth::FullBody,
+        alpha.content_hash,
+        "agent-1".into(),
+        1,
+    );
+    let mut journal =
+        ambits::journal::Journal::open(&b.root, SESSION, std::time::Duration::ZERO, || {
+            ambits::journal::EnvironmentManifest::capture(&tree, "tree-sitter", None)
+        });
+    assert_eq!(journal.sync(&ledger), 1);
+    drop(journal);
+
+    let contents = ambits::journal::read_journal_session(&b.root.join(".ambits/coverage"), SESSION);
+    assert_eq!(contents.reads[&alpha.id].0, alpha.content_hash);
+
+    let snap = Snapshot::load(&b.store(), created(b.snap())).unwrap();
+    let coverage = b
+        .store()
+        .get(&snap.coverage, ambits::objects::Kind::Coverage)
+        .unwrap();
+    let hash = ambits::journal::encode_hash(&alpha.content_hash);
+    assert_eq!(
+        coverage["reads"],
+        serde_json::json!([[alpha.id, hash, "full_body", "agent-1"]]),
+    );
 }
 
 /// A push that cannot take the remote's lock moves nothing — no dangling

@@ -7,6 +7,16 @@ While the [TUI](TUI) runs it maintains an append-only NDJSON record at
 including the content hash the symbol had at the time. This is what lets
 `restore-context` answer after the fact, and it survives restarts.
 
+A session's journal can be several files: `ambits restore` and `ambits pull`
+write their own, `<session>.restore.ndjson` and `<session>.pull.ndjson`. Each
+read is stamped with when it was written (`"t"`, milliseconds since the Unix
+epoch), so when two files disagree about a symbol the newer read wins
+whichever file it is in. Reads written before ambits stamped them count as
+older than any that are; within one file, a later line is a later read. If
+the clock is wrong, the worst case is that an older read wins: what it says
+was read no longer matches the code, so the symbol shows as changed — never
+as known when it is not.
+
 A search or `show` writes no journal itself. Where no TUI runs, such as an
 agent harness on a CI runner or in a container, `cache sync` builds the same
 journal after the fact: it replays the session's logs exactly as the TUI does

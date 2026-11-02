@@ -50,6 +50,7 @@ impl Project {
                 hash: ambits::journal::encode_hash(&sym.content_hash),
                 depth: ambits::journal::DepthDto::FullBody,
                 agent: Some("agent-1".into()),
+                at: None,
             })
             .collect();
         records.push(ambits::journal::Record::Write(Box::new(
@@ -240,6 +241,7 @@ fn reads_of_a_since_changed_dirty_file_are_unverifiable() {
         hash: ambits::journal::encode_hash(&gamma.content_hash),
         depth: ambits::journal::DepthDto::FullBody,
         agent: Some("agent-1".into()),
+        at: None,
     };
     std::fs::write(
         p.root.join(format!(".ambits/coverage/{SOURCE}.ndjson")),

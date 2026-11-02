@@ -108,20 +108,29 @@ fn symbol_facts(app: &App, row: &ambits::app::TreeRow) -> Vec<Line<'static>> {
         .get(&row.symbol_id)
         .filter(|_| depth.is_seen())
     {
-        let mut by: Vec<(String, ReadDepth)> = entry
-            .agent_depths
+        let mut by: Vec<(String, ReadDepth, bool)> = entry
+            .agent_reads
             .iter()
-            .filter(|(_, d)| d.is_seen())
-            .map(|(a, d)| (app.agent_title(a), *d))
+            .filter(|(_, r)| r.depth.is_seen())
+            .map(|(a, r)| (app.agent_title(a), r.depth, r.stale))
             .collect();
         by.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let who: Vec<String> = by
             .iter()
-            .map(|(a, d)| {
-                if *d == depth {
+            .map(|(a, d, stale)| {
+                // An agent that read a version others have since replaced
+                // does not know the current one, however deeply it read.
+                let mut notes = Vec::new();
+                if *d != depth {
+                    notes.push(depth_word(*d));
+                }
+                if *stale && !entry.stale {
+                    notes.push("an earlier version");
+                }
+                if notes.is_empty() {
                     a.clone()
                 } else {
-                    format!("{a} ({})", depth_word(*d))
+                    format!("{a} ({})", notes.join(", "))
                 }
             })
             .collect();

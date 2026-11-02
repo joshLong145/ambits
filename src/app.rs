@@ -740,7 +740,7 @@ impl App {
                 coverage_seen: seen,
                 coverage_total: total,
                 coverage_full: full,
-                stale_count: count_stale(&file.symbols, &self.ledger),
+                stale_count: count_stale(&file.symbols, &self.ledger, agent_filter),
                 write: file_writes.as_ref().and_then(|w| w.file_mark()),
             });
 
@@ -2429,15 +2429,29 @@ fn mark_selectors<'s>(
     }
 }
 
-/// How many of `symbols`, at any depth, were read and have changed since.
-fn count_stale(symbols: &[SymbolNode], ledger: &ContextLedger) -> usize {
+/// How many of `symbols`, at any depth, were read and have changed since —
+/// by `agent_filter` when given, else by every agent.
+fn count_stale(
+    symbols: &[SymbolNode],
+    ledger: &ContextLedger,
+    agent_filter: Option<&str>,
+) -> usize {
     symbols
         .iter()
         .map(|s| {
-            usize::from(ledger.is_stale(&s.id) && ledger.depth_of(&s.id).is_seen())
-                + count_stale(&s.children, ledger)
+            usize::from(is_stale(ledger, &s.id, agent_filter))
+                + count_stale(&s.children, ledger, agent_filter)
         })
         .sum()
+}
+
+/// Whether `symbol_id` was read and has changed since: by `agent_filter`
+/// when given, else by every agent that read it.
+fn is_stale(ledger: &ContextLedger, symbol_id: &str, agent_filter: Option<&str>) -> bool {
+    match agent_filter {
+        Some(agent_id) => ledger.is_stale_for_agent(symbol_id, agent_id),
+        None => ledger.is_stale(symbol_id) && ledger.depth_of(symbol_id).is_seen(),
+    }
 }
 
 /// What every symbol row of one file is built from.
@@ -2471,7 +2485,7 @@ fn flatten_symbol(sym: &SymbolNode, depth: usize, cx: &RowContext<'_>, rows: &mu
                 seen,
                 total,
                 full,
-                count_stale(&sym.children, ledger),
+                count_stale(&sym.children, ledger, agent_filter),
             )
         } else {
             (None, 0, 0, 0, 0)
@@ -2488,7 +2502,7 @@ fn flatten_symbol(sym: &SymbolNode, depth: usize, cx: &RowContext<'_>, rows: &mu
         line_range: format!("L{}-{}", sym.line_range.start, sym.line_range.end),
         token_count: sym.estimated_tokens as usize,
         read_depth,
-        stale: ledger.is_stale(&sym.id),
+        stale: is_stale(ledger, &sym.id, agent_filter),
         restored: ledger.is_restored(&sym.id),
         coverage_status,
         coverage_seen,
@@ -3234,6 +3248,7 @@ mod tests {
                         hash: encode_hash(hash),
                         depth: DepthDto::FullBody,
                         agent: Some((*agent).into()),
+                        at: None,
                     })
                     .unwrap(),
                 );
@@ -3827,13 +3842,9 @@ mod tests {
             .entries
             .values()
             .filter(|e| {
-                listed.iter().any(|(id, _)| {
-                    e.agent_depths
-                        .get(id)
-                        .copied()
-                        .unwrap_or(ReadDepth::Unseen)
-                        .is_seen()
-                })
+                listed
+                    .iter()
+                    .any(|(id, _)| e.agent_reads.get(id).is_some_and(|r| r.depth.is_seen()))
             })
             .count();
         assert_eq!(

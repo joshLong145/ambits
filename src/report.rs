@@ -425,10 +425,10 @@ pub fn build(inputs: Inputs<'_>) -> Result<Report> {
                 .entries
                 .get(id)
                 .map(|e| {
-                    e.agent_depths
+                    e.agent_reads
                         .iter()
-                        .filter(|(_, d)| d.is_seen())
-                        .map(|(a, d)| (a.clone(), DepthDto::from(*d)))
+                        .filter(|(_, r)| r.depth.is_seen())
+                        .map(|(a, r)| (a.clone(), DepthDto::from(r.depth)))
                         .collect()
                 })
                 .unwrap_or_default()

@@ -279,6 +279,7 @@ mod tests {
                     hash: encode_hash(&[i as u8; 32]),
                     depth: DepthDto::FullBody,
                     agent: Some("ag".into()),
+                    at: None,
                 })
                 .unwrap(),
             );
@@ -300,6 +301,7 @@ mod tests {
                     hash: encode_hash(&[(100 + i) as u8; 32]),
                     depth: DepthDto::FullBody,
                     agent: Some("cli".into()),
+                    at: None,
                 })
                 .unwrap(),
             );
