@@ -1037,6 +1037,7 @@ mod tests {
             "agent_a".into(),
             10,
         );
+        ledger.mark_stale_if_changed("s1", [2; 32]);
         ledger.record(
             "s1".into(),
             ReadDepth::FullBody,

@@ -158,14 +158,14 @@ impl ContextLedger {
     ///
     /// Each agent's read is tracked independently — agent A can have
     /// `FullBody` while agent B has `Overview` for the same symbol. Re-reading
-    /// the same content only ever deepens an agent's read; reading changed
-    /// content replaces it, because what the agent saw of the old version
-    /// says nothing about the new one. The journal's fold applies the same
-    /// rule.
+    /// the same content only ever deepens an agent's read; reading content
+    /// that changed since — the agent's read is stale — replaces it, because
+    /// what the agent saw of the old version says nothing about the new one.
+    /// The journal's fold applies the same rule.
     ///
-    /// `content_hash` is the symbol's content now, so the read also settles
-    /// every other agent's staleness: theirs is stale exactly when they read
-    /// another version.
+    /// Only the reader's own staleness is settled: another agent's is the
+    /// tree's to decide ([`Self::mark_stale_if_changed`]), not a hash this
+    /// read happened to see — one id can name several symbols.
     ///
     /// Provenance (`stale`, `timestamp`, `agent_id`, `token_count`) is
     /// refreshed on *every* read, not just on a depth upgrade: a re-read at an
@@ -202,12 +202,17 @@ impl ContextLedger {
                 stale: false,
             });
         let from = read.depth;
-        if read.hash_at_read != content_hash {
+        // Changed content is what made the agent's read stale. A different
+        // hash on a read that is not stale is another symbol with the same
+        // id (two `impl Foo` in one file), whose content says nothing about
+        // whether this one changed.
+        if read.stale && read.hash_at_read != content_hash {
             read.depth = depth;
         } else {
             read.depth = read.depth.max(depth);
         }
         read.hash_at_read = content_hash;
+        read.stale = false;
         log::debug!(
             target: "ambits::symbol_update",
             symbol_id = symbol_id.as_str(),
@@ -216,9 +221,6 @@ impl ContextLedger {
             to:? = read.depth;
             "recorded"
         );
-        for read in entry.agent_reads.values_mut() {
-            read.stale = read.hash_at_read != content_hash;
-        }
         entry.settle();
 
         // A read always re-establishes provenance: we have just seen this
@@ -567,6 +569,7 @@ mod tests {
         let h2 = hash("v2");
 
         ledger.record("s1".into(), ReadDepth::FullBody, h1, "ag".into(), 10);
+        ledger.mark_stale_if_changed("s1", h2);
         ledger.record("s1".into(), ReadDepth::NameOnly, h2, "ag".into(), 10);
 
         assert_eq!(ledger.depth_of("s1"), ReadDepth::NameOnly);
@@ -726,6 +729,7 @@ mod tests {
         let h2 = hash("v2");
 
         ledger.record("s1".into(), ReadDepth::FullBody, h1, "a".into(), 10);
+        ledger.mark_stale_if_changed("s1", h2);
         ledger.record("s1".into(), ReadDepth::Overview, h2, "b".into(), 10);
         assert!(ledger.is_stale_for_agent("s1", "a"));
 
@@ -735,6 +739,30 @@ mod tests {
         assert!(ledger.is_stale_for_agent("s1", "b"));
         assert_eq!(ledger.depth_of("s1"), ReadDepth::FullBody);
         assert!(!ledger.is_stale("s1"));
+    }
+
+    /// Two `impl Foo` in one file share an id, so reads of it alternate
+    /// between their hashes with nothing changed. A full read must survive a
+    /// later name-only one, and no agent turns stale.
+    #[test]
+    fn symbols_sharing_an_id_are_not_changed_content() {
+        let mut ledger = ContextLedger::new();
+        let (first, second) = (hash("impl Foo { a }"), hash("impl Foo { b }"));
+
+        // A whole-file read by b credits both, then a reads the first alone.
+        ledger.record("f::Foo".into(), ReadDepth::FullBody, first, "b".into(), 1);
+        ledger.record("f::Foo".into(), ReadDepth::FullBody, second, "b".into(), 1);
+        ledger.record("f::Foo".into(), ReadDepth::FullBody, first, "a".into(), 1);
+        // A grep hit in the second, by b.
+        ledger.record("f::Foo".into(), ReadDepth::NameOnly, second, "b".into(), 1);
+
+        assert_eq!(
+            ledger.depth_of_for_agent("f::Foo", "b"),
+            ReadDepth::FullBody
+        );
+        assert!(!ledger.is_stale_for_agent("f::Foo", "a"));
+        assert!(!ledger.is_stale_for_agent("f::Foo", "b"));
+        assert!(!ledger.is_stale("f::Foo"));
     }
 
     /// An agent that never read a symbol is not stale for it.
