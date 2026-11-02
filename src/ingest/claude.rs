@@ -16,27 +16,66 @@ use crate::tracking::ReadDepth;
 use serde_json::Value;
 
 /// Derive the Claude Code log directory for a given project path.
-/// Probes two slug variants to stay resilient across Claude Code versions:
-///   1. Primary: replace '/' and '.' with '-' (observed current behavior)
-///   2. Fallback: replace only '/' — older builds may not replace dots
+/// Probes the current slug first, then older ones for logs written by
+/// earlier Claude Code versions.
 pub fn log_dir_for_project(project_path: &Path) -> Option<PathBuf> {
     let canonical = project_path.canonicalize().ok()?;
     let home = dirs_home()?;
     let base = home.join(".claude").join("projects");
 
-    let slug_primary = canonical.to_string_lossy().replace(['/', '.'], "-");
-    let dir_primary = base.join(&slug_primary);
-    if dir_primary.is_dir() {
-        return Some(dir_primary);
-    }
+    let path = canonical.to_string_lossy();
+    [
+        project_slug(&path),
+        path.replace(['/', '.'], "-"),
+        path.replace('/', "-"),
+    ]
+    .into_iter()
+    .map(|slug| base.join(slug))
+    .find(|dir| dir.is_dir())
+}
 
-    let slug_fallback = canonical.to_string_lossy().replace('/', "-");
-    let dir_fallback = base.join(&slug_fallback);
-    if dir_fallback.is_dir() {
-        return Some(dir_fallback);
-    }
+/// Longest slug Claude Code uses as is; longer ones are cut and suffixed with
+/// a hash of the whole path.
+const MAX_SLUG_LEN: usize = 200;
 
-    None
+/// The directory name Claude Code gives a project's logs: every UTF-16 code
+/// unit of the path that is not an ASCII letter or digit becomes `-`, and a
+/// slug over 200 units is cut to 200 and suffixed with `-` and the base-36
+/// absolute value of the path's 32-bit string hash (`(h << 5) - h + unit`).
+fn project_slug(path: &str) -> String {
+    let units: Vec<u16> = path.encode_utf16().collect();
+    let slug: String = units
+        .iter()
+        .map(|&u| match u8::try_from(u) {
+            Ok(b) if b.is_ascii_alphanumeric() => char::from(b),
+            _ => '-',
+        })
+        .collect();
+    if slug.len() <= MAX_SLUG_LEN {
+        return slug;
+    }
+    let hash = units.iter().fold(0i32, |h, &u| {
+        h.wrapping_shl(5).wrapping_sub(h).wrapping_add(i32::from(u))
+    });
+    format!(
+        "{}-{}",
+        &slug[..MAX_SLUG_LEN],
+        base36(i64::from(hash).unsigned_abs())
+    )
+}
+
+fn base36(mut n: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = Vec::new();
+    loop {
+        out.push(DIGITS[(n % 36) as usize]);
+        n /= 36;
+        if n == 0 {
+            break;
+        }
+    }
+    out.reverse();
+    String::from_utf8(out).expect("base-36 digits are ASCII")
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -333,12 +372,14 @@ pub fn extract_agent_label(path: &Path) -> String {
         return fallback;
     }
 
-    // Truncate to a short label: first line, max 50 chars.
+    // Truncate to a short label: first line, max 50 chars. Counted in
+    // chars, not bytes, so a multi-byte prompt is never cut mid-character.
     let first_line_content = content.lines().next().unwrap_or(content);
-    if first_line_content.len() <= 50 {
-        first_line_content.to_string()
-    } else {
-        format!("{}...", &first_line_content[..47])
+    match first_line_content.char_indices().nth(47) {
+        Some((cut, _)) if first_line_content.chars().count() > 50 => {
+            format!("{}...", &first_line_content[..cut])
+        }
+        _ => first_line_content.to_string(),
     }
 }
 
@@ -2835,6 +2876,55 @@ mod tests {
 
         let label = extract_agent_label(&log);
         assert_eq!(label, "Explore the parser module");
+    }
+
+    #[test]
+    fn extract_label_truncates_a_multibyte_prompt_on_a_char_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("agent-abc1234.jsonl");
+        // Three-byte chars put byte 47 inside the 16th char.
+        let long_prompt = "日".repeat(60);
+        let content = format!(
+            r#"{{"agentId":"abc1234","type":"user","message":{{"role":"user","content":"{long_prompt}"}},"sessionId":"sess-1","timestamp":"2025-01-01T00:00:00Z"}}"#
+        );
+        fs::write(&log, content).unwrap();
+
+        let label = extract_agent_label(&log);
+        assert_eq!(label, format!("{}...", "日".repeat(47)));
+    }
+
+    #[test]
+    fn extract_label_keeps_a_multibyte_prompt_of_fifty_chars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("agent-abc1234.jsonl");
+        let prompt = "é".repeat(50);
+        let content = format!(
+            r#"{{"agentId":"abc1234","type":"user","message":{{"role":"user","content":"{prompt}"}},"sessionId":"sess-1","timestamp":"2025-01-01T00:00:00Z"}}"#
+        );
+        fs::write(&log, content).unwrap();
+
+        assert_eq!(extract_agent_label(&log), prompt);
+    }
+
+    // Expected slugs come from running Claude Code 2.1.304's own slug
+    // function under node.
+    #[test]
+    fn project_slug_replaces_every_char_but_ascii_letters_and_digits() {
+        assert_eq!(
+            project_slug("/Users/me/my_project v2/ambit"),
+            "-Users-me-my-project-v2-ambit"
+        );
+        // One `-` per UTF-16 code unit: the emoji is a surrogate pair.
+        assert_eq!(project_slug("/home/é/日本/😀x"), "-home--------x");
+    }
+
+    #[test]
+    fn project_slug_cuts_a_long_path_and_appends_its_hash() {
+        let path = format!("/srv/{}proj", "long_dir/".repeat(30));
+        assert_eq!(
+            project_slug(&path),
+            format!("-srv-{}long-d-32dl1g", "long-dir-".repeat(21))
+        );
     }
 
     #[test]
