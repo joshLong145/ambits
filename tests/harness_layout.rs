@@ -1202,6 +1202,32 @@ fn a_serena_read_that_answers_with_an_error_credits_nothing() {
     assert!(credited(&l).0.is_empty());
 }
 
+/// A file is read whatever it says, even when it quotes a failure.
+#[test]
+fn a_read_of_a_file_that_quotes_a_failure_is_credited() {
+    let text = "fn alpha() { let _x = \"<tool_use_error>\"; }";
+    let l = only_call(
+        "Read",
+        |file| json!({"file_path": file}),
+        &format!("1\t{text}"),
+        json!({"type": "text", "file": {"filePath": "a.rs", "content": text, "numLines": 1, "startLine": 1, "totalLines": 3}}),
+        false,
+    );
+    assert_eq!(credited(&l).0, [("alpha".into(), "full_body".into())]);
+}
+
+#[test]
+fn a_serena_read_of_a_file_that_starts_with_error_is_credited() {
+    let l = only_call(
+        "mcp__plugin_serena_serena__read_file",
+        |_| json!({"relative_path": "src/a.rs"}),
+        "Errors are values.\nfn alpha() { let _x = 1; }",
+        Value::Null,
+        false,
+    );
+    assert!(!credited(&l).0.is_empty());
+}
+
 #[test]
 fn a_file_piped_through_a_filter_credits_nothing() {
     for command in [

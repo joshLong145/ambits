@@ -585,15 +585,19 @@ fn reads_code(call: &AgentToolCall) -> bool {
 /// `toolUseResult.file`), which a file shorter than the range asked for, or
 /// one too large to read whole, makes fewer than the call asked for.
 fn read_from_result(call: &AgentToolCall, result: &ToolResult) -> Option<AgentToolCall> {
+    let returned = result.detail.as_ref().and_then(|d| d.get("file"));
     // A tool reading a named file and failing may say so only in its text:
     // Serena answers `Error: ...`, or that the answer was too long to give.
+    // Claude Code's `Read` says what it returned instead, and its text is
+    // then the file itself, which may say anything.
     let failed_in_text = || {
-        call.file_path.is_some()
+        returned.is_none()
+            && call.file_path.is_some()
             && result
                 .content
                 .as_ref()
                 .and_then(content_text)
-                .is_some_and(|t| reads_as_failure(&t) || t.starts_with("The answer is too long"))
+                .is_some_and(|t| answered_with_failure(&t))
     };
     if result.is_error || failed_in_text() {
         return None;
@@ -692,13 +696,32 @@ fn result_failed(block: &Value, detail: Option<&Value>, single: bool) -> bool {
         || (single && detail.and_then(Value::as_str).is_some_and(reads_as_failure))
 }
 
-/// Claude Code's failure text: it starts `Error`, is wrapped in
-/// `<tool_use_error>`, or is its message for a call the user rejected.
+/// Claude Code's failure text in a line's `toolUseResult`: it starts
+/// `Error`, is wrapped in `<tool_use_error>`, or is its message for a call
+/// the user rejected.
 fn reads_as_failure(text: &str) -> bool {
     let text = text.trim_start();
     text.starts_with("Error")
         || text.contains("<tool_use_error>")
         || text.starts_with("The user doesn't want to proceed")
+}
+
+/// Whether a tool's whole answer is a failure rather than what it read: Claude
+/// Code's `<tool_use_error>` or its message for a call the user rejected, or
+/// an MCP server's error (`Error: ...`) or refusal to answer at length.
+/// Matched at the start only: a file that merely mentions these is still a
+/// file.
+fn answered_with_failure(text: &str) -> bool {
+    let text = text.trim_start();
+    [
+        "<tool_use_error>",
+        "The user doesn't want to proceed",
+        "Error:",
+        "Error executing tool",
+        "The answer is too long",
+    ]
+    .iter()
+    .any(|failure| text.starts_with(failure))
 }
 
 /// Every `tool_result` block on a `type:"user"` line.
