@@ -188,9 +188,13 @@ pub fn count_symbols(
         }
         // A drifted symbol still counts as "seen" — the agent did look at it —
         // but not as "full": whatever it read no longer describes the current
-        // body. Staleness is a property of the content, so it applies
-        // regardless of `agent_filter`.
-        if depth == ReadDepth::FullBody && !ledger.is_stale(&sym.id) {
+        // body. Each agent's read drifts on its own: one that read an earlier
+        // version is stale even after another has read the current one.
+        let stale = match agent_filter {
+            Some(agent_id) => ledger.is_stale_for_agent(&sym.id, agent_id),
+            None => ledger.is_stale(&sym.id),
+        };
+        if depth == ReadDepth::FullBody && !stale {
             full += 1;
         }
 
@@ -1017,6 +1021,33 @@ mod tests {
         // Unknown agent: nothing seen.
         let (total, seen, full) = count_symbols(&syms, &ledger, Some("agent_c"));
         assert_eq!((total, seen, full), (2, 0, 0));
+    }
+
+    /// Agent A read the old version in full; agent B read the new one in
+    /// full. Filtered to A, the symbol is seen but not fully known.
+    #[test]
+    fn count_symbols_counts_an_agents_earlier_version_as_not_full() {
+        let mut ledger = ContextLedger::new();
+        let syms = vec![sym("s1", "s1")];
+
+        ledger.record(
+            "s1".into(),
+            ReadDepth::FullBody,
+            [1; 32],
+            "agent_a".into(),
+            10,
+        );
+        ledger.record(
+            "s1".into(),
+            ReadDepth::FullBody,
+            [2; 32],
+            "agent_b".into(),
+            10,
+        );
+
+        assert_eq!(count_symbols(&syms, &ledger, None), (1, 1, 1));
+        assert_eq!(count_symbols(&syms, &ledger, Some("agent_a")), (1, 1, 0));
+        assert_eq!(count_symbols(&syms, &ledger, Some("agent_b")), (1, 1, 1));
     }
 
     #[test]

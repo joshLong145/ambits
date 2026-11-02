@@ -60,6 +60,13 @@ In the [TUI](TUI): `Tab` to the Stats panel, `j`/`k` to move, `Enter` to
 filter — tree, activity feed and depth breakdown all follow. `a` cycles agents
 from any panel.
 
+Each agent's read keeps the version of the symbol it saw. When agent A read a
+function in full, it then changed, and agent B read the new version by name,
+B knows the function as it is now and A does not: filtered to A it is marked
+changed `!`, and unfiltered it counts as read by name only, not in full. The
+[read journal](Configuration#the-read-journal) records each agent's version
+the same way.
+
 `d` opens the **alignment view**, which scores each pair of agents file by
 file — useful for spotting sub-agents that duplicated each other's exploration.
 

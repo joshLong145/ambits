@@ -29,8 +29,9 @@
 //! `(hash, depth)` differs from what has already been journaled. That yields
 //! exactly one record per read-set change, with no plumbing through the
 //! recursive symbol-marking hot path. It is sound only because
-//! `ContextLedger::record` refreshes `content_hash_at_read` on *every* read —
-//! see its docs; it did not always.
+//! `ContextLedger::record` refreshes the reading agent's hash on *every*
+//! read — see its docs; it did not always — and keeps each agent's own, so a
+//! record never credits one agent with a version another read.
 //!
 //! ## Agent attribution and portability
 //!
@@ -949,13 +950,12 @@ impl Journal {
     /// Append a record for every ledger entry whose read-state has changed
     /// since it was last journaled. Returns how many were written.
     ///
-    /// Skips unseen and stale entries: we only ever journal reads we currently
+    /// Skips unseen and stale reads: we only ever journal reads we currently
     /// believe describe the file as it is on disk.
     ///
-    /// One record per `(symbol, agent)` whose depth or hash moved. The content
-    /// hash is a property of the symbol, not of the reader, so every agent's
-    /// record for a symbol carries the same hash — what differs is how deeply
-    /// each one read it.
+    /// One record per `(symbol, agent)` whose depth or hash moved, each with
+    /// the hash that agent read: two agents can have read two versions of a
+    /// symbol, and only the one that read the current version knows it.
     pub fn sync(&mut self, ledger: &ContextLedger) -> usize {
         self.last_sync = Instant::now();
         if self.error.is_some() {
@@ -964,14 +964,11 @@ impl Journal {
 
         let mut pending: Vec<(String, String, [u8; 32], ReadDepth)> = Vec::new();
         for (id, entry) in &ledger.entries {
-            if !entry.depth.is_seen() || entry.stale {
-                continue;
-            }
-            for (agent, depth) in &entry.agent_depths {
-                if !depth.is_seen() {
+            for (agent, read) in &entry.agent_reads {
+                if !read.depth.is_seen() || read.stale {
                     continue;
                 }
-                let current = (entry.content_hash_at_read, *depth);
+                let current = (read.hash_at_read, read.depth);
                 let key = (id.clone(), agent.clone());
                 if self.journaled.get(&key) != Some(&current) {
                     pending.push((id.clone(), agent.clone(), current.0, current.1));
@@ -1451,6 +1448,29 @@ mod tests {
         // Last write wins on read-back.
         let contents = read_journal(j.path());
         assert_eq!(contents.reads["a.rs::x"], (h2, ReadDepth::FullBody));
+    }
+
+    /// Agent B read the old version; agent A then read the new one. Only A's
+    /// read describes the symbol as it is, so only A's is journaled again —
+    /// B must not be recorded as having read a version it never saw.
+    #[test]
+    fn a_read_by_one_agent_is_not_journaled_for_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = ContextLedger::new();
+        let h1 = content_hash("v1");
+        let h2 = content_hash("v2");
+        ledger.record("a.rs::x".into(), ReadDepth::FullBody, h1, "b".into(), 5);
+
+        let mut j = journal_in(dir.path());
+        assert_eq!(j.sync(&ledger), 1);
+
+        ledger.record("a.rs::x".into(), ReadDepth::Overview, h2, "a".into(), 5);
+        assert_eq!(j.sync(&ledger), 1, "only a's read is new");
+
+        let contents = read_journal(j.path());
+        let key = |agent: &str| ("a.rs::x".to_string(), agent.to_string());
+        assert_eq!(contents.agent_reads[&key("b")], (h1, ReadDepth::FullBody));
+        assert_eq!(contents.agent_reads[&key("a")], (h2, ReadDepth::Overview));
     }
 
     #[test]

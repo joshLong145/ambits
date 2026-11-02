@@ -759,35 +759,27 @@ pub fn rehydrate_ledger(
     stats
 }
 
-/// Re-derive `stale` for every ledger entry by comparing its recorded
-/// hash-at-read against the current tree. Returns how many are stale.
+/// Re-derive staleness for every agent's read in the ledger by comparing the
+/// hash it was read at against the current tree. Returns how many entries
+/// are stale for every agent that read them.
 ///
-/// Unlike `tracking::check_staleness` this needs no previous tree — the
-/// entry's own `content_hash_at_read` is the earlier side of the comparison.
-/// That makes it usable at startup, where no earlier tree exists.
+/// Unlike `tracking::check_staleness` this needs no previous tree — each
+/// read's own hash is the earlier side of the comparison. That makes it
+/// usable at startup, where no earlier tree exists.
 pub fn refresh_staleness(ledger: &mut crate::tracking::ContextLedger, tree: &ProjectTree) -> usize {
     let index = index_tree(tree);
 
     // One id can name several symbols (`struct Foo` and `impl Foo` collide), so
-    // an entry is only stale when *none* of its candidates match — the same
+    // a read is only stale when *none* of its candidates match — the same
     // rule `classify` applies.
-    let stale: Vec<String> = ledger
-        .entries
-        .iter()
-        .filter(|(_, entry)| entry.depth.is_seen())
-        .filter(|(id, entry)| {
-            !index.get(id.as_str()).is_some_and(|syms| {
-                syms.iter()
-                    .any(|s| s.content_hash == entry.content_hash_at_read)
-            })
-        })
-        .map(|(id, _)| id.clone())
-        .collect();
-
-    for id in &stale {
-        ledger.mark_stale(id);
+    let ids: Vec<String> = ledger.entries.keys().cloned().collect();
+    for id in &ids {
+        let candidates = index.get(id.as_str());
+        ledger.mark_stale_unless(id, |hash| {
+            candidates.is_some_and(|syms| syms.iter().any(|s| s.content_hash == *hash))
+        });
     }
-    stale.len()
+    ledger.total_stale()
 }
 
 #[cfg(test)]
@@ -1365,7 +1357,7 @@ mod tests {
         );
     }
 
-    /// The aggregate depth is a max over `agent_depths`, so a rehydrated entry
+    /// The aggregate depth is a max over the agents' reads, so a rehydrated entry
     /// with no agent recorded would be silently downgraded by the next real
     /// read. Seeding the agent is what prevents that.
     #[test]
@@ -1387,6 +1379,34 @@ mod tests {
 
         assert_eq!(ledger.depth_of("a.rs::x"), ReadDepth::FullBody);
         assert_eq!(ledger.provenance_of("a.rs::x"), Some(Provenance::Live));
+    }
+
+    /// Two agents read two versions of a symbol, and the second is on disk.
+    /// The startup reload must say the second agent knows it and the first
+    /// does not — whatever order the journal's map hands them over in.
+    #[test]
+    fn rehydrate_keeps_each_agents_version() {
+        let tree = project(vec![file("a.rs", vec![sym("a.rs::x", "current")])]);
+        let current = tree.files[0].symbols[0].content_hash;
+        let earlier = content_hash("earlier");
+
+        for agents in [["a", "b"], ["b", "a"]] {
+            let reads: Vec<_> = agents
+                .iter()
+                .map(|&agent| {
+                    let hash = if agent == "a" { earlier } else { current };
+                    ("a.rs::x", agent, hash, ReadDepth::FullBody)
+                })
+                .collect();
+            let mut ledger = ContextLedger::new();
+            let stats = rehydrate_ledger(&mut ledger, &journal_of(&reads), "sess", &tree);
+
+            assert!(ledger.is_stale_for_agent("a.rs::x", "a"), "{agents:?}");
+            assert!(!ledger.is_stale_for_agent("a.rs::x", "b"), "{agents:?}");
+            assert!(!ledger.is_stale("a.rs::x"), "{agents:?}");
+            assert_eq!(ledger.entries["a.rs::x"].content_hash_at_read, current);
+            assert_eq!(stats.drifted, 0, "{agents:?}");
+        }
     }
 
     /// v1 journals carry no attribution. Their reads must still land, under

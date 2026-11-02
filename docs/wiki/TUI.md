@@ -92,7 +92,7 @@ Each symbol row starts with three columns, one state each:
 | | `◑` | Overview (a symbol listing, Serena's pattern search) |
 | | `◔` | Name only (a glob, a listing, a grep match, a `callers` or `show --no-body` result) |
 | | `·` | Unseen |
-| Freshness | `!` | Changed since it was read: what the agent knows is out of date |
+| Freshness | `!` | Changed since it was read: what the agent knows is out of date. With an agent filter, since that agent read it; without one, since any agent last read it |
 | | `◌` | Read before a compaction: no longer in the agent's context |
 | Write | `✎` green | Written this session, and the agent's version is still there |
 | | `✎` amber / red | Changed since, or gone |
@@ -126,6 +126,10 @@ The selected row in words:
  › 09-27 14:02 read, wrote  "lets fix the blockers…"
    09-27 15:20 read         "lets now move on to ui-7"
 ```
+
+**read** names who read the symbol, with how deeply when that differs, and
+`an earlier version` for an agent whose read predates the current content
+while another agent has read it since.
 
 A file shows its coverage, how many read symbols changed since, its latest
 write and its size. **traces** lists the prompts whose calls read or wrote
