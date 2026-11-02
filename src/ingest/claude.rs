@@ -1329,9 +1329,11 @@ fn replay_log_file(
 /// Hand each complete line of `reader` — one ending in `\n` — to `feed`, and
 /// return the bytes they took, which is where the next read should start.
 ///
-/// A last line without its newline is still being written: fed now, its
+/// A last line without its newline may still be being written: fed now, its
 /// first half would fail to parse and be dropped, and the rest, read next
-/// time, would too. It is left for the next read instead. Lines are taken as
+/// time, would too. It is left for the next read instead — unless it is
+/// already a whole JSON value, which a line cut short never is: a log whose
+/// writer never ended its last line still has that line read. Lines are taken as
 /// bytes, so one that is not UTF-8 is read lossily rather than stopping the
 /// read at it for good.
 fn feed_complete_lines(reader: &mut impl BufRead, mut feed: impl FnMut(&str)) -> u64 {
@@ -1343,6 +1345,11 @@ fn feed_complete_lines(reader: &mut impl BufRead, mut feed: impl FnMut(&str)) ->
             Ok(n) if n > 0 && line.ends_with(b"\n") => {
                 consumed += n as u64;
                 feed(&String::from_utf8_lossy(&line));
+            }
+            Ok(n) if n > 0 && serde_json::from_slice::<serde::de::IgnoredAny>(&line).is_ok() => {
+                consumed += n as u64;
+                feed(&String::from_utf8_lossy(&line));
+                return consumed;
             }
             _ => return consumed,
         }
@@ -3408,6 +3415,34 @@ mod tests {
         assert!(tailer.read_new_events().events.is_empty(), "not whole yet");
         append_raw(&log, format!("{rest}\n").as_bytes());
         assert_eq!(tailer.read_new_events().events.len(), 1);
+        assert!(tailer.read_new_events().events.is_empty(), "and read once");
+    }
+
+    /// A log whose writer never ended its last line still has it read, by a
+    /// replay and by a tailer — once, even when the newline comes later.
+    #[test]
+    fn a_whole_last_line_without_a_newline_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("session.jsonl");
+        let first = jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/src/a.rs"}"#);
+        let last = jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/src/b.rs"}"#);
+        fs::write(&log, format!("{first}\n{last}")).unwrap();
+        let config: Arc<dyn ToolCallMapper> =
+            Arc::new(ToolMappingConfig::builtin().expect("builtin config"));
+
+        let replay = replay_log_file(&log, &*config, None);
+        assert_eq!(
+            replay.offset,
+            fs::metadata(&log).unwrap().len(),
+            "the replay read the last line"
+        );
+
+        let tailed = tmp.path().join("tailed.jsonl");
+        fs::write(&tailed, "").unwrap();
+        let mut tailer = LogTailer::new(vec![tailed.clone()], config);
+        append_raw(&tailed, format!("{first}\n{last}").as_bytes());
+        assert_eq!(tailer.read_new_events().events.len(), 2);
+        append_raw(&tailed, b"\n");
         assert!(tailer.read_new_events().events.is_empty(), "and read once");
     }
 
