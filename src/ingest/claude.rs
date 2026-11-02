@@ -15,23 +15,34 @@ use super::{
 use crate::tracking::ReadDepth;
 use serde_json::Value;
 
-/// Derive the Claude Code log directory for a given project path.
-/// Probes the current slug first, then older ones for logs written by
-/// earlier Claude Code versions.
+/// Derive the Claude Code log directory for a given project path: the first
+/// of [`log_dirs_for_project`].
 pub fn log_dir_for_project(project_path: &Path) -> Option<PathBuf> {
-    let canonical = project_path.canonicalize().ok()?;
-    let home = dirs_home()?;
+    log_dirs_for_project(project_path).into_iter().next()
+}
+
+/// Every Claude Code log directory a project's sessions may be in: the
+/// current slug's first, then older ones, for sessions written by earlier
+/// Claude Code versions — after an upgrade a project can have both.
+pub fn log_dirs_for_project(project_path: &Path) -> Vec<PathBuf> {
+    let (Ok(canonical), Some(home)) = (project_path.canonicalize(), dirs_home()) else {
+        return Vec::new();
+    };
     let base = home.join(".claude").join("projects");
 
     let path = canonical.to_string_lossy();
-    [
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for slug in [
         project_slug(&path),
         path.replace(['/', '.'], "-"),
         path.replace('/', "-"),
-    ]
-    .into_iter()
-    .map(|slug| base.join(slug))
-    .find(|dir| dir.is_dir())
+    ] {
+        let dir = base.join(slug);
+        if dir.is_dir() && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
 }
 
 /// Longest slug Claude Code uses as is; longer ones are cut and suffixed with
@@ -2173,6 +2184,9 @@ impl SessionIngester for ClaudeIngester {
     fn log_dir_for_project(&self, project_path: &Path) -> Option<PathBuf> {
         log_dir_for_project(project_path)
     }
+    fn log_dirs_for_project(&self, project_path: &Path) -> Vec<PathBuf> {
+        log_dirs_for_project(project_path)
+    }
     fn find_latest_session(&self, log_dir: &Path) -> Option<String> {
         find_latest_session(log_dir)
     }
@@ -3076,6 +3090,49 @@ mod tests {
         );
         // One `-` per UTF-16 code unit: the emoji is a surrogate pair.
         assert_eq!(project_slug("/home/é/日本/😀x"), "-home--------x");
+    }
+
+    /// A project with logs under both the current slug and an older one:
+    /// a session named from before the upgrade is found in the older; the
+    /// latest is looked for in the current.
+    #[test]
+    fn a_named_session_is_found_in_whichever_log_dir_holds_it() {
+        struct Dirs(Vec<PathBuf>);
+        impl crate::ingest::SessionIngester for Dirs {
+            fn log_dir_for_project(&self, _: &Path) -> Option<PathBuf> {
+                self.0.first().cloned()
+            }
+            fn log_dirs_for_project(&self, _: &Path) -> Vec<PathBuf> {
+                self.0.clone()
+            }
+            fn find_latest_session(&self, log_dir: &Path) -> Option<String> {
+                find_latest_session(log_dir)
+            }
+            fn session_log_files(&self, log_dir: &Path, session_id: &str) -> Vec<PathBuf> {
+                session_log_files(log_dir, session_id)
+            }
+            fn parse_log_file(&self, _: &Path) -> Vec<crate::ingest::SessionEvent> {
+                Vec::new()
+            }
+            fn new_tailer(&self, _: Vec<PathBuf>) -> Box<dyn crate::ingest::EventTailer> {
+                unimplemented!("not tailed")
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (current, older) = (root.path().join("current"), root.path().join("older"));
+        let old_session = "11111111-1111-4111-8111-111111111111";
+        let new_session = "22222222-2222-4222-8222-222222222222";
+        for (dir, session) in [(&current, new_session), (&older, old_session)] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(format!("{session}.jsonl")), "{}\n").unwrap();
+        }
+        let dirs = Dirs(vec![current.clone(), older.clone()]);
+        let holding = |s| crate::ingest::SessionIngester::log_dir_holding(&dirs, root.path(), s);
+
+        assert_eq!(holding(Some(old_session)), Some(older));
+        assert_eq!(holding(Some(new_session)), Some(current.clone()));
+        assert_eq!(holding(None), Some(current.clone()));
+        assert_eq!(holding(Some("unknown")), Some(current));
     }
 
     #[test]

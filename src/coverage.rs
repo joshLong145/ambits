@@ -544,7 +544,7 @@ pub fn run_report(
     // 1. Resolve log directory.
     let log_dir = log_dir_opt
         .clone()
-        .or_else(|| ingester.log_dir_for_project(project_path));
+        .or_else(|| ingester.log_dir_holding(project_path, session_opt.as_deref()));
 
     // 2. Find session (auto-detect if not provided).
     let session_id = session_opt.clone().or_else(|| {
