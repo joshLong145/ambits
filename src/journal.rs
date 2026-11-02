@@ -65,7 +65,12 @@
 //! record across two syscalls and interleave it with another process's append.
 //! Nothing is buffered in memory, so there is no flush to lose and no `Drop`
 //! guard to write: a crash costs at most the reads since the last `sync`, which
-//! only ever *under*-reports coverage. Under-reporting is the safe direction —
+//! only ever *under*-reports coverage. A crash mid-write leaves a line cut
+//! off; the next writer ends it before appending, so it costs that record
+//! alone, and the fold drops it without complaint. Nothing is fsynced, for
+//! the same reason: what a power loss takes is re-appended by the next sync,
+//! restore or pull, which only append what the journal does not already
+//! hold. Under-reporting is the safe direction —
 //! the agent re-reads something it already knew.
 //!
 //! ## One writer
@@ -485,9 +490,9 @@ fn fold<K: std::hash::Hash + Eq + Clone>(
 
 /// Read and fold a journal file.
 ///
-/// Corruption is never fatal: a partial *final* line is dropped silently (the
-/// writer was interrupted mid-append, which is expected), while a bad
-/// *interior* line warns and is skipped. Losing one record costs one symbol's
+/// Corruption is never fatal: a line cut off mid-record is dropped silently
+/// (the writer was interrupted mid-append, which is expected), while any
+/// other bad line warns and is skipped. Losing one record costs one symbol's
 /// coverage; refusing to read the file costs all of it.
 pub fn read_journal(path: &Path) -> JournalContents {
     match std::fs::read_to_string(path) {
@@ -543,7 +548,10 @@ fn fold_lines(path: &Path, content: &str, records: Records) -> JournalContents {
         let record: Record = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(e) => {
-                if !(i == last_index && final_line_may_be_torn) {
+                // A line cut off mid-record is a write interrupted before
+                // its newline: the last line, or one the next writer ended
+                // (see `Journal::write_all`).
+                if !(e.is_eof() || i == last_index && final_line_may_be_torn) {
                     out.warnings
                         .push(format!("{}:{}: {e}", path.display(), i + 1));
                 }
@@ -772,6 +780,10 @@ pub struct Journal {
     written_ops: HashMap<String, u32>,
     interval: Duration,
     last_sync: Instant,
+    /// Whether the file ends partway through a line — a write interrupted
+    /// before its newline — so the next write must end that line first, or
+    /// the torn text and the new record would read back as one corrupt line.
+    torn: bool,
     /// Set when writing fails. Journaling then stops for the rest of the run
     /// rather than erroring on every tick — a broken cache must never take the
     /// TUI down with it.
@@ -793,13 +805,13 @@ pub fn append_shard(
         return Ok(());
     }
     let mut journal = Journal::open_shard(project_root, session, shard, Duration::ZERO, manifest);
-    for record in records {
-        if !journal.append(record) {
-            color_eyre::eyre::bail!(
-                "cannot write the {shard} shard {}",
-                journal.path().display()
-            );
-        }
+    // One write for the batch, rather than one per record, so another
+    // writer of the shard cannot land between its records.
+    if !(journal.error.is_none() && journal.write_all(records)) {
+        color_eyre::eyre::bail!(
+            "cannot write the {shard} shard {}",
+            journal.path().display()
+        );
     }
     Ok(())
 }
@@ -877,6 +889,7 @@ impl Journal {
             written_ops: HashMap::new(),
             interval,
             last_sync: Instant::now(),
+            torn: false,
             error: None,
             warnings: Vec::new(),
         };
@@ -929,6 +942,7 @@ impl Journal {
                 ));
             }
         }
+        journal.torn = ends_mid_line(&path);
         journal.file = Some(file);
 
         // Append a fresh header when the file has none, or when its header
@@ -1075,19 +1089,27 @@ impl Journal {
     }
 
     fn write(&mut self, record: &Record) -> bool {
+        self.write_all(std::slice::from_ref(record))
+    }
+
+    /// Append `records` with a single `write_all`: a `BufWriter` could split
+    /// a record across syscalls and interleave it with another process's
+    /// append. Ends a torn last line first, in the same write.
+    fn write_all(&mut self, records: &[Record]) -> bool {
         let Some(file) = self.file.as_mut() else {
             return false;
         };
-        let mut buf = match serde_json::to_vec(&stamped(record)) {
-            Ok(b) => b,
-            Err(e) => {
+        let mut buf = Vec::new();
+        if self.torn {
+            buf.push(b'\n');
+        }
+        for record in records {
+            if let Err(e) = serde_json::to_writer(&mut buf, &stamped(record)) {
                 self.error = Some(e.to_string());
                 return false;
             }
-        };
-        buf.push(b'\n');
-        // One write_all per record: a BufWriter could split a record across
-        // syscalls and interleave it with another process's append.
+            buf.push(b'\n');
+        }
         if let Err(e) = file.write_all(&buf) {
             let msg = format!("{}: {e}", self.path.display());
             self.warnings.push(msg.clone());
@@ -1095,8 +1117,21 @@ impl Journal {
             self.file = None;
             return false;
         }
+        self.torn = false;
         true
     }
+}
+
+/// Whether `path` ends partway through a line. A missing or empty file does
+/// not; an unreadable one is taken not to, since `read_journal` would have
+/// warned about it already.
+fn ends_mid_line(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut last = [0u8; 1];
+    file.seek(SeekFrom::End(-1)).is_ok() && file.read_exact(&mut last).is_ok() && last[0] != b'\n'
 }
 
 /// `record`, with a read's `t` set to now when it has none.
@@ -2182,5 +2217,100 @@ mod order_tests {
             line.starts_with(r#"{"kind":"read""#),
             "the read prefix scan still works"
         );
+    }
+}
+
+/// A write interrupted before its newline must not take the next record
+/// down with it (F4).
+#[cfg(test)]
+mod torn_tests {
+    use super::*;
+
+    fn manifest() -> EnvironmentManifest {
+        EnvironmentManifest {
+            project_root: "/p".into(),
+            tree_fingerprint: "b3:00".into(),
+            ambit_version: "test".into(),
+            backend: "tree-sitter".into(),
+            parsers: vec![],
+            tool_config_version: None,
+            filter: None,
+            os: "test".into(),
+            arch: "test".into(),
+            host: "test".into(),
+        }
+    }
+
+    fn ledger(symbol: &str) -> ContextLedger {
+        let mut ledger = ContextLedger::new();
+        ledger.record(symbol.into(), ReadDepth::FullBody, [1; 32], "a".into(), 1);
+        ledger
+    }
+
+    /// Cut the file at `path` short, partway through its last record.
+    fn tear(path: &Path) {
+        let mut text = std::fs::read_to_string(path).unwrap();
+        text.truncate(text.trim_end().len() - 10);
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn the_record_after_a_torn_line_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path(), "sess", Duration::ZERO, manifest);
+        journal.sync(&ledger("a.rs::x"));
+        let path = journal.path().to_path_buf();
+        drop(journal);
+        tear(&path);
+
+        let mut journal = Journal::open(dir.path(), "sess", Duration::ZERO, manifest);
+        assert_eq!(journal.sync(&ledger("a.rs::y")), 1);
+        drop(journal);
+
+        let contents = read_journal(&path);
+        assert!(
+            contents.reads.contains_key("a.rs::y"),
+            "the new record survives"
+        );
+        assert!(contents.warnings.is_empty(), "{:?}", contents.warnings);
+    }
+
+    #[test]
+    fn a_shard_batch_after_a_torn_line_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = |symbol: &str| Record::Read {
+            symbol_id: symbol.into(),
+            hash: encode_hash(&[1; 32]),
+            depth: DepthDto::FullBody,
+            agent: Some("a".into()),
+            at: None,
+        };
+        append_shard(dir.path(), "sess", "pull", &[read("a.rs::x")], manifest).unwrap();
+        let path = journal_dir(dir.path()).join("sess.pull.ndjson");
+        tear(&path);
+
+        append_shard(
+            dir.path(),
+            "sess",
+            "pull",
+            &[read("a.rs::y"), read("a.rs::z")],
+            manifest,
+        )
+        .unwrap();
+
+        let contents = read_journal(&path);
+        assert!(contents.reads.contains_key("a.rs::y"));
+        assert!(contents.reads.contains_key("a.rs::z"));
+        assert!(contents.warnings.is_empty(), "{:?}", contents.warnings);
+    }
+
+    /// A line that is not a cut-off record is still reported.
+    #[test]
+    fn a_line_that_is_not_json_still_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.ndjson");
+        std::fs::write(&path, "{\"kind\":\"read\"\nnot json\n").unwrap();
+        let contents = read_journal(&path);
+        assert_eq!(contents.warnings.len(), 1, "{:?}", contents.warnings);
     }
 }
