@@ -592,7 +592,8 @@ fn reads_code(call: &AgentToolCall) -> bool {
 }
 
 /// What a read call read, as its result tells it: nothing when it failed or
-/// was rejected; for a `Read`, the lines its result says it returned (its
+/// was rejected, though a shell command that exited non-zero still printed
+/// what it read; for a `Read`, the lines its result says it returned (its
 /// `toolUseResult.file`), which a file shorter than the range asked for, or
 /// one too large to read whole, makes fewer than the call asked for.
 fn read_from_result(call: &AgentToolCall, result: &ToolResult) -> Option<AgentToolCall> {
@@ -610,7 +611,21 @@ fn read_from_result(call: &AgentToolCall, result: &ToolResult) -> Option<AgentTo
                 .and_then(content_text)
                 .is_some_and(|t| answered_with_failure(&t))
     };
-    if result.is_error || failed_in_text() {
+    // A shell call whose commands, or one of them, exit non-zero is an
+    // error too, but its output still reached the agent, which read it:
+    // only one that showed nothing, or never ran (rejected, blocked), read
+    // nothing.
+    let shown = || {
+        result
+            .content
+            .as_ref()
+            .and_then(content_text)
+            .and_then(|t| t.strip_prefix("Exit code ").map(str::to_owned))
+            // `Exit code 1` and nothing after it: whatever failed, nothing
+            // was shown (`false && sed -n 3p a.rs`).
+            .is_some_and(|rest| rest.trim_start_matches(|c: char| c.is_ascii_digit()).trim() != "")
+    };
+    if (result.is_error && !shown()) || failed_in_text() {
         return None;
     }
     let mut read = AgentToolCall {

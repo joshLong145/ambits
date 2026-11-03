@@ -1202,29 +1202,47 @@ fn a_serena_read_that_answers_with_an_error_credits_nothing() {
     assert!(credited(&l).0.is_empty());
 }
 
-/// A command that exits with an error is not credited, even for what it
-/// printed before failing: its output is not what the command was run for.
+/// A command that exits non-zero still printed what it read: here `grep`
+/// finds nothing, after `sed` printed line 3.
 #[test]
-fn a_shell_read_whose_command_fails_credits_nothing() {
-    for (content, detail) in [
-        (
-            "Exit code 1\nfn beta() {}",
-            "Error: Exit code 1\nfn beta() {}",
-        ),
-        (
-            "The user doesn't want to proceed with this tool use.",
-            "Error: The user doesn't want to proceed with this tool use.",
-        ),
-    ] {
-        let l = only_call(
-            "Bash",
-            |file| json!({"command": format!("sed -n 3p {file} && grep -n zzz {file}")}),
-            content,
-            json!(detail),
-            true,
-        );
-        assert!(credited(&l).0.is_empty(), "{content}");
-    }
+fn a_shell_read_that_exits_non_zero_is_credited() {
+    let l = only_call(
+        "Bash",
+        |file| json!({"command": format!("sed -n 3p {file} && grep -n zzz {file}")}),
+        "Exit code 1\nfn beta() {}",
+        json!("Error: Exit code 1\nfn beta() {}"),
+        true,
+    );
+    assert_eq!(credited(&l).0, [("beta".into(), "full_body".into())]);
+}
+
+/// One whose failure showed nothing (`false && sed -n 3p a.rs`: sed never
+/// ran) read nothing.
+#[test]
+fn a_failed_shell_command_that_showed_nothing_credits_nothing() {
+    let l = only_call(
+        "Bash",
+        |file| json!({"command": format!("false && sed -n 3p {file}")}),
+        "Exit code 1",
+        json!("Error: Exit code 1"),
+        true,
+    );
+    assert!(credited(&l).0.is_empty());
+}
+
+/// One the user rejected never ran.
+#[test]
+fn a_rejected_shell_read_credits_nothing() {
+    let rejected =
+        "The user doesn't want to proceed with this tool use. The tool use was rejected.";
+    let l = only_call(
+        "Bash",
+        |file| json!({"command": format!("sed -n 3p {file}")}),
+        rejected,
+        json!(format!("Error: {rejected}")),
+        true,
+    );
+    assert!(credited(&l).0.is_empty());
 }
 
 /// A file is read whatever it says, even when it quotes a failure.
