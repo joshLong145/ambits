@@ -67,6 +67,10 @@ pub struct AgentRead {
     pub hash_at_read: [u8; 32],
     /// Whether the symbol has changed since this agent read it.
     pub stale: bool,
+    /// When the agent last read it, in milliseconds since the Unix epoch, as
+    /// its session log tells: what [`ContextLedger::rehydrate`] weighs a
+    /// journaled read against. `None` when no log said.
+    pub read_at: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -158,14 +162,14 @@ impl ContextLedger {
     ///
     /// Each agent's read is tracked independently — agent A can have
     /// `FullBody` while agent B has `Overview` for the same symbol. Re-reading
-    /// the same content only ever deepens an agent's read; reading changed
-    /// content replaces it, because what the agent saw of the old version
-    /// says nothing about the new one. The journal's fold applies the same
-    /// rule.
+    /// the same content only ever deepens an agent's read; reading content
+    /// that changed since — the agent's read is stale — replaces it, because
+    /// what the agent saw of the old version says nothing about the new one.
+    /// The journal's fold applies the same rule.
     ///
-    /// `content_hash` is the symbol's content now, so the read also settles
-    /// every other agent's staleness: theirs is stale exactly when they read
-    /// another version.
+    /// Only the reader's own staleness is settled: another agent's is the
+    /// tree's to decide ([`Self::mark_stale_if_changed`]), not a hash this
+    /// read happened to see — one id can name several symbols.
     ///
     /// Provenance (`stale`, `timestamp`, `agent_id`, `token_count`) is
     /// refreshed on *every* read, not just on a depth upgrade: a re-read at an
@@ -200,14 +204,20 @@ impl ContextLedger {
                 depth: ReadDepth::Unseen,
                 hash_at_read: content_hash,
                 stale: false,
+                read_at: None,
             });
         let from = read.depth;
-        if read.hash_at_read != content_hash {
+        // Changed content is what made the agent's read stale. A different
+        // hash on a read that is not stale is another symbol with the same
+        // id (two `impl Foo` in one file), whose content says nothing about
+        // whether this one changed.
+        if read.stale && read.hash_at_read != content_hash {
             read.depth = depth;
         } else {
             read.depth = read.depth.max(depth);
         }
         read.hash_at_read = content_hash;
+        read.stale = false;
         log::debug!(
             target: "ambits::symbol_update",
             symbol_id = symbol_id.as_str(),
@@ -216,9 +226,6 @@ impl ContextLedger {
             to:? = read.depth;
             "recorded"
         );
-        for read in entry.agent_reads.values_mut() {
-            read.stale = read.hash_at_read != content_hash;
-        }
         entry.settle();
 
         // A read always re-establishes provenance: we have just seen this
@@ -271,11 +278,25 @@ impl ContextLedger {
         self.mark_stale_unless(symbol_id, |_| false);
     }
 
-    /// Install a read recovered from the durable journal.
+    /// Note that `agent_id` read `symbol_id` at `at` (milliseconds since the
+    /// Unix epoch), as its session log tells.
+    pub fn note_read_at(&mut self, symbol_id: &str, agent_id: &str, at: u64) {
+        if let Some(read) = self
+            .entries
+            .get_mut(symbol_id)
+            .and_then(|e| e.agent_reads.get_mut(agent_id))
+        {
+            read.read_at = Some(read.read_at.map_or(at, |was| was.max(at)));
+        }
+    }
+
+    /// Install a read recovered from the durable journal, journaled at
+    /// `journaled_at` (milliseconds since the Unix epoch, when the journal
+    /// says).
     ///
-    /// Cold-start only: this must run before any live ingestion, because it
-    /// treats the journal as authoritative over whatever is already in the
-    /// entry.
+    /// Cold-start only: this must run after the log replay and before any
+    /// live ingestion, because it treats the journal as authoritative over
+    /// whatever is already in the entry.
     ///
     /// The point of the overwrite is `hash_at_read`. Replaying a session log
     /// can only stamp the hash a symbol has *now*, which makes the later drift
@@ -283,9 +304,16 @@ impl ContextLedger {
     /// holds the hash the symbol actually had when `agent_id` read it, so
     /// installing it is what makes drift detectable at all.
     ///
-    /// Depth is merged upgrade-only per agent, so a rehydrated entry can never
-    /// lose depth to a later read. Staleness is deliberately *not* decided
-    /// here — the caller runs one comparison pass against the tree afterwards.
+    /// For the same reason the replay cannot tell a read of an earlier
+    /// version from one of this: an agent that read a function in full, saw
+    /// it change and read it again by name replays as having read it in full.
+    /// So when the journal's read is no older than the agent's last replayed
+    /// one, the journal's depth replaces the replay's, as it did when the
+    /// reads were live. A read the log has from after the journal's — made
+    /// while nothing journaled it — only deepens it.
+    ///
+    /// Staleness is deliberately *not* decided here — the caller runs one
+    /// comparison pass against the tree afterwards.
     ///
     /// Returns `true` when this created a new entry, i.e. the journal knew
     /// about a read the session log could not account for.
@@ -295,6 +323,7 @@ impl ContextLedger {
         depth: ReadDepth,
         hash_at_read: [u8; 32],
         agent_id: String,
+        journaled_at: Option<u64>,
     ) -> bool {
         let inserted = !self.entries.contains_key(&symbol_id);
         let entry = self.entries.entry(symbol_id.clone()).or_insert_with(|| {
@@ -312,8 +341,10 @@ impl ContextLedger {
             depth: ReadDepth::Unseen,
             hash_at_read,
             stale: false,
+            read_at: None,
         });
-        read.depth = read.depth.max(depth);
+        let newer = journaled_at.is_some_and(|t| read.read_at.is_none_or(|replayed| replayed <= t));
+        read.depth = if newer { depth } else { read.depth.max(depth) };
         read.hash_at_read = hash_at_read;
         entry.settle();
 
@@ -567,6 +598,7 @@ mod tests {
         let h2 = hash("v2");
 
         ledger.record("s1".into(), ReadDepth::FullBody, h1, "ag".into(), 10);
+        ledger.mark_stale_if_changed("s1", h2);
         ledger.record("s1".into(), ReadDepth::NameOnly, h2, "ag".into(), 10);
 
         assert_eq!(ledger.depth_of("s1"), ReadDepth::NameOnly);
@@ -726,6 +758,7 @@ mod tests {
         let h2 = hash("v2");
 
         ledger.record("s1".into(), ReadDepth::FullBody, h1, "a".into(), 10);
+        ledger.mark_stale_if_changed("s1", h2);
         ledger.record("s1".into(), ReadDepth::Overview, h2, "b".into(), 10);
         assert!(ledger.is_stale_for_agent("s1", "a"));
 
@@ -735,6 +768,55 @@ mod tests {
         assert!(ledger.is_stale_for_agent("s1", "b"));
         assert_eq!(ledger.depth_of("s1"), ReadDepth::FullBody);
         assert!(!ledger.is_stale("s1"));
+    }
+
+    /// Two `impl Foo` in one file share an id, so reads of it alternate
+    /// between their hashes with nothing changed. A full read must survive a
+    /// later name-only one, and no agent turns stale.
+    #[test]
+    fn symbols_sharing_an_id_are_not_changed_content() {
+        let mut ledger = ContextLedger::new();
+        let (first, second) = (hash("impl Foo { a }"), hash("impl Foo { b }"));
+
+        // A whole-file read by b credits both, then a reads the first alone.
+        ledger.record("f::Foo".into(), ReadDepth::FullBody, first, "b".into(), 1);
+        ledger.record("f::Foo".into(), ReadDepth::FullBody, second, "b".into(), 1);
+        ledger.record("f::Foo".into(), ReadDepth::FullBody, first, "a".into(), 1);
+        // A grep hit in the second, by b.
+        ledger.record("f::Foo".into(), ReadDepth::NameOnly, second, "b".into(), 1);
+
+        assert_eq!(
+            ledger.depth_of_for_agent("f::Foo", "b"),
+            ReadDepth::FullBody
+        );
+        assert!(!ledger.is_stale_for_agent("f::Foo", "a"));
+        assert!(!ledger.is_stale_for_agent("f::Foo", "b"));
+        assert!(!ledger.is_stale("f::Foo"));
+    }
+
+    /// A journaled read replaces replayed ones it is no older than, and a
+    /// record from before reads were stamped only deepens them, as before.
+    #[test]
+    fn rehydrate_weighs_the_journal_against_when_the_replay_read() {
+        let h = hash("v");
+        let replayed = |at: u64| {
+            let mut ledger = ContextLedger::new();
+            ledger.record("s1".into(), ReadDepth::FullBody, h, "a".into(), 1);
+            ledger.note_read_at("s1", "a", at);
+            ledger
+        };
+
+        let mut ledger = replayed(10);
+        ledger.rehydrate("s1".into(), ReadDepth::NameOnly, h, "a".into(), Some(10));
+        assert_eq!(ledger.depth_of("s1"), ReadDepth::NameOnly);
+
+        let mut ledger = replayed(11);
+        ledger.rehydrate("s1".into(), ReadDepth::NameOnly, h, "a".into(), Some(10));
+        assert_eq!(ledger.depth_of("s1"), ReadDepth::FullBody);
+
+        let mut ledger = replayed(10);
+        ledger.rehydrate("s1".into(), ReadDepth::NameOnly, h, "a".into(), None);
+        assert_eq!(ledger.depth_of("s1"), ReadDepth::FullBody);
     }
 
     /// An agent that never read a symbol is not stale for it.

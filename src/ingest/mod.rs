@@ -309,6 +309,24 @@ pub enum Caller {
 pub trait SessionIngester: Send + Sync {
     /// Derive the log directory from a project root path.
     fn log_dir_for_project(&self, project_path: &Path) -> Option<PathBuf>;
+    /// Every log directory a project's sessions may be in, the current one
+    /// first.
+    fn log_dirs_for_project(&self, project_path: &Path) -> Vec<PathBuf> {
+        self.log_dir_for_project(project_path).into_iter().collect()
+    }
+    /// The log directory to read: of [`Self::log_dirs_for_project`], the one
+    /// holding `session` when one is named — an older one, for a session
+    /// from before an upgrade moved the project's logs — else the current.
+    fn log_dir_holding(&self, project_path: &Path, session: Option<&str>) -> Option<PathBuf> {
+        let dirs = self.log_dirs_for_project(project_path);
+        session
+            .and_then(|sid| {
+                dirs.iter()
+                    .find(|d| !self.session_log_files(d, sid).is_empty())
+                    .cloned()
+            })
+            .or_else(|| dirs.into_iter().next())
+    }
     /// Find the ID of the most recently active session in `log_dir`.
     fn find_latest_session(&self, log_dir: &Path) -> Option<String>;
     /// List all log files belonging to `session_id` within `log_dir`.

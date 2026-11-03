@@ -15,23 +15,34 @@ use super::{
 use crate::tracking::ReadDepth;
 use serde_json::Value;
 
-/// Derive the Claude Code log directory for a given project path.
-/// Probes the current slug first, then older ones for logs written by
-/// earlier Claude Code versions.
+/// Derive the Claude Code log directory for a given project path: the first
+/// of [`log_dirs_for_project`].
 pub fn log_dir_for_project(project_path: &Path) -> Option<PathBuf> {
-    let canonical = project_path.canonicalize().ok()?;
-    let home = dirs_home()?;
+    log_dirs_for_project(project_path).into_iter().next()
+}
+
+/// Every Claude Code log directory a project's sessions may be in: the
+/// current slug's first, then older ones, for sessions written by earlier
+/// Claude Code versions — after an upgrade a project can have both.
+pub fn log_dirs_for_project(project_path: &Path) -> Vec<PathBuf> {
+    let (Ok(canonical), Some(home)) = (project_path.canonicalize(), dirs_home()) else {
+        return Vec::new();
+    };
     let base = home.join(".claude").join("projects");
 
     let path = canonical.to_string_lossy();
-    [
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for slug in [
         project_slug(&path),
         path.replace(['/', '.'], "-"),
         path.replace('/', "-"),
-    ]
-    .into_iter()
-    .map(|slug| base.join(slug))
-    .find(|dir| dir.is_dir())
+    ] {
+        let dir = base.join(slug);
+        if dir.is_dir() && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
 }
 
 /// Longest slug Claude Code uses as is; longer ones are cut and suffixed with
@@ -581,21 +592,40 @@ fn reads_code(call: &AgentToolCall) -> bool {
 }
 
 /// What a read call read, as its result tells it: nothing when it failed or
-/// was rejected; for a `Read`, the lines its result says it returned (its
+/// was rejected, though a shell command that exited non-zero still printed
+/// what it read; for a `Read`, the lines its result says it returned (its
 /// `toolUseResult.file`), which a file shorter than the range asked for, or
 /// one too large to read whole, makes fewer than the call asked for.
 fn read_from_result(call: &AgentToolCall, result: &ToolResult) -> Option<AgentToolCall> {
+    let returned = result.detail.as_ref().and_then(|d| d.get("file"));
     // A tool reading a named file and failing may say so only in its text:
     // Serena answers `Error: ...`, or that the answer was too long to give.
+    // Claude Code's `Read` says what it returned instead, and its text is
+    // then the file itself, which may say anything.
     let failed_in_text = || {
-        call.file_path.is_some()
+        returned.is_none()
+            && call.file_path.is_some()
             && result
                 .content
                 .as_ref()
                 .and_then(content_text)
-                .is_some_and(|t| reads_as_failure(&t) || t.starts_with("The answer is too long"))
+                .is_some_and(|t| answered_with_failure(&t))
     };
-    if result.is_error || failed_in_text() {
+    // A shell call whose commands, or one of them, exit non-zero is an
+    // error too, but its output still reached the agent, which read it:
+    // only one that showed nothing, or never ran (rejected, blocked), read
+    // nothing.
+    let shown = || {
+        result
+            .content
+            .as_ref()
+            .and_then(content_text)
+            .and_then(|t| t.strip_prefix("Exit code ").map(str::to_owned))
+            // `Exit code 1` and nothing after it: whatever failed, nothing
+            // was shown (`false && sed -n 3p a.rs`).
+            .is_some_and(|rest| rest.trim_start_matches(|c: char| c.is_ascii_digit()).trim() != "")
+    };
+    if (result.is_error && !shown()) || failed_in_text() {
         return None;
     }
     let mut read = AgentToolCall {
@@ -692,13 +722,32 @@ fn result_failed(block: &Value, detail: Option<&Value>, single: bool) -> bool {
         || (single && detail.and_then(Value::as_str).is_some_and(reads_as_failure))
 }
 
-/// Claude Code's failure text: it starts `Error`, is wrapped in
-/// `<tool_use_error>`, or is its message for a call the user rejected.
+/// Claude Code's failure text in a line's `toolUseResult`: it starts
+/// `Error`, is wrapped in `<tool_use_error>`, or is its message for a call
+/// the user rejected.
 fn reads_as_failure(text: &str) -> bool {
     let text = text.trim_start();
     text.starts_with("Error")
         || text.contains("<tool_use_error>")
         || text.starts_with("The user doesn't want to proceed")
+}
+
+/// Whether a tool's whole answer is a failure rather than what it read: Claude
+/// Code's `<tool_use_error>` or its message for a call the user rejected, or
+/// an MCP server's error (`Error: ...`) or refusal to answer at length.
+/// Matched at the start only: a file that merely mentions these is still a
+/// file.
+fn answered_with_failure(text: &str) -> bool {
+    let text = text.trim_start();
+    [
+        "<tool_use_error>",
+        "The user doesn't want to proceed",
+        "Error:",
+        "Error executing tool",
+        "The answer is too long",
+    ]
+    .iter()
+    .any(|failure| text.starts_with(failure))
 }
 
 /// Every `tool_result` block on a `type:"user"` line.
@@ -1284,9 +1333,11 @@ fn replay_log_file(
 /// Hand each complete line of `reader` — one ending in `\n` — to `feed`, and
 /// return the bytes they took, which is where the next read should start.
 ///
-/// A last line without its newline is still being written: fed now, its
+/// A last line without its newline may still be being written: fed now, its
 /// first half would fail to parse and be dropped, and the rest, read next
-/// time, would too. It is left for the next read instead. Lines are taken as
+/// time, would too. It is left for the next read instead — unless it is
+/// already a whole JSON value, which a line cut short never is: a log whose
+/// writer never ended its last line still has that line read. Lines are taken as
 /// bytes, so one that is not UTF-8 is read lossily rather than stopping the
 /// read at it for good.
 fn feed_complete_lines(reader: &mut impl BufRead, mut feed: impl FnMut(&str)) -> u64 {
@@ -1298,6 +1349,11 @@ fn feed_complete_lines(reader: &mut impl BufRead, mut feed: impl FnMut(&str)) ->
             Ok(n) if n > 0 && line.ends_with(b"\n") => {
                 consumed += n as u64;
                 feed(&String::from_utf8_lossy(&line));
+            }
+            Ok(n) if n > 0 && serde_json::from_slice::<serde::de::IgnoredAny>(&line).is_ok() => {
+                consumed += n as u64;
+                feed(&String::from_utf8_lossy(&line));
+                return consumed;
             }
             _ => return consumed,
         }
@@ -2138,6 +2194,9 @@ impl ClaudeIngester {
 impl SessionIngester for ClaudeIngester {
     fn log_dir_for_project(&self, project_path: &Path) -> Option<PathBuf> {
         log_dir_for_project(project_path)
+    }
+    fn log_dirs_for_project(&self, project_path: &Path) -> Vec<PathBuf> {
+        log_dirs_for_project(project_path)
     }
     fn find_latest_session(&self, log_dir: &Path) -> Option<String> {
         find_latest_session(log_dir)
@@ -3044,6 +3103,49 @@ mod tests {
         assert_eq!(project_slug("/home/é/日本/😀x"), "-home--------x");
     }
 
+    /// A project with logs under both the current slug and an older one:
+    /// a session named from before the upgrade is found in the older; the
+    /// latest is looked for in the current.
+    #[test]
+    fn a_named_session_is_found_in_whichever_log_dir_holds_it() {
+        struct Dirs(Vec<PathBuf>);
+        impl crate::ingest::SessionIngester for Dirs {
+            fn log_dir_for_project(&self, _: &Path) -> Option<PathBuf> {
+                self.0.first().cloned()
+            }
+            fn log_dirs_for_project(&self, _: &Path) -> Vec<PathBuf> {
+                self.0.clone()
+            }
+            fn find_latest_session(&self, log_dir: &Path) -> Option<String> {
+                find_latest_session(log_dir)
+            }
+            fn session_log_files(&self, log_dir: &Path, session_id: &str) -> Vec<PathBuf> {
+                session_log_files(log_dir, session_id)
+            }
+            fn parse_log_file(&self, _: &Path) -> Vec<crate::ingest::SessionEvent> {
+                Vec::new()
+            }
+            fn new_tailer(&self, _: Vec<PathBuf>) -> Box<dyn crate::ingest::EventTailer> {
+                unimplemented!("not tailed")
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (current, older) = (root.path().join("current"), root.path().join("older"));
+        let old_session = "11111111-1111-4111-8111-111111111111";
+        let new_session = "22222222-2222-4222-8222-222222222222";
+        for (dir, session) in [(&current, new_session), (&older, old_session)] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(format!("{session}.jsonl")), "{}\n").unwrap();
+        }
+        let dirs = Dirs(vec![current.clone(), older.clone()]);
+        let holding = |s| crate::ingest::SessionIngester::log_dir_holding(&dirs, root.path(), s);
+
+        assert_eq!(holding(Some(old_session)), Some(older));
+        assert_eq!(holding(Some(new_session)), Some(current.clone()));
+        assert_eq!(holding(None), Some(current.clone()));
+        assert_eq!(holding(Some("unknown")), Some(current));
+    }
+
     #[test]
     fn project_slug_cuts_a_long_path_and_appends_its_hash() {
         let path = format!("/srv/{}proj", "long_dir/".repeat(30));
@@ -3317,6 +3419,34 @@ mod tests {
         assert!(tailer.read_new_events().events.is_empty(), "not whole yet");
         append_raw(&log, format!("{rest}\n").as_bytes());
         assert_eq!(tailer.read_new_events().events.len(), 1);
+        assert!(tailer.read_new_events().events.is_empty(), "and read once");
+    }
+
+    /// A log whose writer never ended its last line still has it read, by a
+    /// replay and by a tailer — once, even when the newline comes later.
+    #[test]
+    fn a_whole_last_line_without_a_newline_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("session.jsonl");
+        let first = jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/src/a.rs"}"#);
+        let last = jsonl_assistant("mcp__acp__Read", r#"{"file_path":"/src/b.rs"}"#);
+        fs::write(&log, format!("{first}\n{last}")).unwrap();
+        let config: Arc<dyn ToolCallMapper> =
+            Arc::new(ToolMappingConfig::builtin().expect("builtin config"));
+
+        let replay = replay_log_file(&log, &*config, None);
+        assert_eq!(
+            replay.offset,
+            fs::metadata(&log).unwrap().len(),
+            "the replay read the last line"
+        );
+
+        let tailed = tmp.path().join("tailed.jsonl");
+        fs::write(&tailed, "").unwrap();
+        let mut tailer = LogTailer::new(vec![tailed.clone()], config);
+        append_raw(&tailed, format!("{first}\n{last}").as_bytes());
+        assert_eq!(tailer.read_new_events().events.len(), 2);
+        append_raw(&tailed, b"\n");
         assert!(tailer.read_new_events().events.is_empty(), "and read once");
     }
 

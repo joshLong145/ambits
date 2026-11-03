@@ -27,9 +27,13 @@ grouped:64-84, symbol_label:104-119, fit_names:126-141, …
 Entries are `name:first-last`. Line numbers come from a fresh scan at print
 time rather than from storage, so they stay correct in files edited since the
 read — the agent can read that range directly instead of pulling the file.
-An entry read less than in full says how far, `name:first-last [name]`,
-`[overview]` or `[signature]`: the agent saw it, not its body. A file's
-`tok` is the source it read in full, each symbol once.
+An entry read less than in full says how far, `name:first-last [overview]`
+or `[signature]`: the agent saw it, not its body. A symbol seen only by name
+(a search hit, a listing) is counted rather than listed — `· +12 seen by name
+only` after a file's entries, and a closing line for files seen no other
+way — so names do not use up the budget files read in full need. A file's
+`tok` is the source it read in full, each symbol once. `--format json` lists
+every symbol with its `depth`.
 
 Only symbols that are **still unchanged** are reported: each journaled read
 carries the content hash it was read at, and a symbol whose source has changed

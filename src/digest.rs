@@ -23,9 +23,11 @@
 //!
 //! Files are emitted in descending order of the source tokens read in full
 //! from them, so when the budget runs out it has been spent on the files that
-//! save the most re-reading. Every depth of read is listed — a name is worth
-//! knowing too — but one less than full is marked with how far it went, so
-//! the agent does not take a symbol it only saw named for one it read.
+//! save the most re-reading. A symbol read less than in full is marked with
+//! how far it went, so the agent does not take one it only glimpsed for one
+//! it read. One seen only by name — a search hit, a listing — is counted
+//! rather than listed: a name is cheap to see again, and listing every one
+//! spent the budget that files read in full needed.
 
 use std::path::Path;
 
@@ -193,8 +195,9 @@ impl DigestFormatter for MarkdownFormatter {
 
         out.push_str(
             "These symbols were read earlier in this session. Treat them as known —\n\
-             anything not listed here is not covered. One marked `[name]`,\n\
-             `[overview]` or `[signature]` was seen only that far, not its body.\n\
+             anything not listed here is not covered. One marked `[overview]` or\n\
+             `[signature]` was seen only that far, not its body; those seen only\n\
+             by name are counted, not listed.\n\
              Each entry is `name:first-last`, current line numbers: read that range\n\
              directly rather than re-reading the whole file, or pass the id to\n\
              `ambits show` for the definition.\n\n",
@@ -206,9 +209,20 @@ impl DigestFormatter for MarkdownFormatter {
         }
 
         let groups = grouped(report);
-        let mut emitted = 0usize;
+        let (mut emitted, mut omitted) = (0usize, 0usize);
+        let (mut by_name, mut by_name_files) = (0usize, 0usize);
+        let mut full = false;
 
         for group in &groups {
+            let (named, read): (Vec<&RestoredSymbol>, Vec<&RestoredSymbol>) = group
+                .symbols
+                .iter()
+                .partition(|s| s.depth == ReadDepth::NameOnly);
+            if read.is_empty() {
+                by_name += named.len();
+                by_name_files += 1;
+                continue;
+            }
             let header = format!(
                 "### {} — {} symbol{} (~{} tok)\n",
                 group.path.display(),
@@ -219,11 +233,13 @@ impl DigestFormatter for MarkdownFormatter {
 
             // Always emit at least one file: a digest that fits perfectly but
             // says nothing is worse than one that overruns slightly.
-            if emitted > 0 && out.len() + header.len() > budget_chars {
-                break;
+            if full || (emitted > 0 && out.len() + header.len() > budget_chars) {
+                full = true;
+                omitted += 1;
+                continue;
             }
 
-            let names: Vec<String> = group.symbols.iter().map(|s| symbol_label(s)).collect();
+            let names: Vec<String> = read.iter().map(|s| symbol_label(s)).collect();
             let room = budget_chars.saturating_sub(out.len() + header.len());
             let (listed, hidden) = fit_names(&names, room);
 
@@ -232,22 +248,29 @@ impl DigestFormatter for MarkdownFormatter {
             if hidden > 0 {
                 out.push_str(&format!(" … (+{hidden} more)"));
             }
+            if !named.is_empty() {
+                out.push_str(&format!(" · +{} seen by name only", named.len()));
+            }
             out.push_str("\n\n");
             emitted += 1;
 
             // A file whose symbol list had to be trimmed has already consumed
             // the remaining budget; anything after it would be a lie about
             // fitting.
-            if hidden > 0 {
-                break;
-            }
+            full = hidden > 0;
         }
 
-        if emitted < groups.len() {
+        if omitted > 0 {
             out.push_str(&format!(
-                "_{} more file{} omitted to stay within the {max_tokens}-token budget._\n\n",
-                groups.len() - emitted,
-                if groups.len() - emitted == 1 { "" } else { "s" },
+                "_{omitted} more file{} omitted to stay within the {max_tokens}-token budget._\n\n",
+                if omitted == 1 { "" } else { "s" },
+            ));
+        }
+        if by_name > 0 {
+            out.push_str(&format!(
+                "_{by_name} symbol{} in {by_name_files} other file{} seen by name only._\n\n",
+                if by_name == 1 { "" } else { "s" },
+                if by_name_files == 1 { "" } else { "s" },
             ));
         }
 
@@ -501,16 +524,40 @@ mod tests {
     fn a_symbol_read_less_than_in_full_says_how_far() {
         let mut named = restored("a.rs", "named", 50);
         named.depth = ReadDepth::NameOnly;
+        let mut overview = restored("a.rs", "glimpsed", 50);
+        overview.depth = ReadDepth::Overview;
         let r = report(
-            vec![restored("a.rs", "read", 10), named],
+            vec![restored("a.rs", "read", 10), named, overview],
             RestoreSource::Journal,
         );
         let out = MarkdownFormatter.format(&r, DEFAULT_MAX_TOKENS);
+        assert!(out.contains("read:1-10"), "{out}");
+        assert!(out.contains("glimpsed:1-10 [overview]"), "{out}");
+        assert!(!out.contains("named:"), "{out}");
+        assert!(out.contains("+1 seen by name only"), "{out}");
+    }
+
+    /// Names seen in passing must not crowd out a file read in full.
+    #[test]
+    fn names_seen_in_passing_leave_room_for_files_read_in_full() {
+        let named = |file: &str, name: String| RestoredSymbol {
+            depth: ReadDepth::NameOnly,
+            ..restored(file, &name, 5)
+        };
+        // Sorted by file, as a restore report is.
+        let mut symbols = vec![restored("big.rs", "Big", 1000)];
+        symbols.extend((0..400).map(|i| named("big.rs", format!("a_rather_long_symbol_name_{i}"))));
+        symbols.extend((0..400).map(|i| named("seen.rs", format!("hit_{i}"))));
+        symbols.push(restored("small.rs", "small", 10));
+        let out = MarkdownFormatter.format(&report(symbols, RestoreSource::Journal), 300);
+
+        assert!(out.contains("### small.rs"), "{out}");
+        assert!(out.contains("+400 seen by name only"), "{out}");
         assert!(
-            out.contains("read:1-10,") || out.contains("read:1-10\n"),
+            out.contains("_400 symbols in 1 other file seen by name only._"),
             "{out}"
         );
-        assert!(out.contains("named:1-10 [name]"), "{out}");
+        assert!(!out.contains("omitted"), "{out}");
     }
 
     #[test]

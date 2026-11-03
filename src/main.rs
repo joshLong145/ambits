@@ -1592,10 +1592,14 @@ fn run() -> Result<()> {
     // dispatches before it: neither depends on the symbol tree, and both read
     // the CLI values rather than consuming them so `--coverage` below still
     // resolves its own.
+    let named = cli
+        .session
+        .clone()
+        .or_else(|| std::env::var("CLAUDE_CODE_SESSION_ID").ok());
     let log_dir = cli
         .log_dir
         .clone()
-        .or_else(|| ingester.log_dir_for_project(&project_path));
+        .or_else(|| ingester.log_dir_holding(&project_path, named.as_deref()));
 
     // Run from a Claude Code session, the session is the one running us —
     // named by the environment — when it is this project's; else the latest.

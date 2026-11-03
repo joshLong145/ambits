@@ -1,7 +1,8 @@
 //! The file lines a shell command prints: `sed -n 10,40p a.rs`, `head -n 20
 //! a.rs`, `tail -n 5 a.rs`, `cat a.rs`, `nl a.rs`, alone or in a chain of
 //! `;`, `&&` and `||`, after any `cd`. Only what reaches the output counts:
-//! the last command of a pipeline, or one a `head` after it cuts short, and
+//! the last command of a pipeline, or a file the first printed that the rest
+//! only cut down (`head`, `sed -n A,Bp`) or passed on (`cat`, `nl`), and
 //! never one whose output is redirected away. A command it cannot read with
 //! certainty (a variable, a glob, a heredoc, a script it does not know)
 //! names nothing, so it earns no credit rather than a guessed one.
@@ -51,25 +52,7 @@ pub fn file_reads(command: &str) -> Vec<FileRead> {
                 [program, args @ ..] => reads_of(program, args),
                 [] => continue,
             },
-            // Only the last command's output is shown. One naming its own
-            // files prints them; a `head` reading its input shows the start
-            // of what the command before it printed.
-            [.., before, Some(last)] => match last.as_slice() {
-                [program, args @ ..] => {
-                    let direct = reads_of(program, args);
-                    if direct.is_empty() {
-                        before
-                            .as_deref()
-                            .and_then(|b| cut_short(b, program, args))
-                            .into_iter()
-                            .collect()
-                    } else {
-                        direct
-                    }
-                }
-                [] => Vec::new(),
-            },
-            _ => Vec::new(),
+            stages => shown_by_pipeline(stages),
         };
         out.extend(reads.into_iter().map(|r| FileRead {
             path: dir.join(r.path),
@@ -79,31 +62,82 @@ pub fn file_reads(command: &str) -> Vec<FileRead> {
     out
 }
 
-/// What `head` reading `before`'s output shows, when `before` printed lines
-/// of one file: the first `n` of them.
-fn cut_short(before: &[&str], program: &str, args: &[&str]) -> Option<FileRead> {
-    let [program_before, args_before @ ..] = before else {
-        return None;
-    };
-    let (n, _, files) = count(args).filter(|_| program == "head")?;
-    if !files.is_empty() {
-        return None;
+/// What a pipeline of several commands shows. Only the last command's output
+/// is: one naming its own files prints them; otherwise it shows what the
+/// commands after the first leave of the one file the first printed. Any
+/// command whose output cannot be traced back to lines of that file — a
+/// filter, a redirect — leaves nothing.
+fn shown_by_pipeline(stages: &[Option<Vec<&str>>]) -> Vec<FileRead> {
+    if let Some(Some([program, args @ ..])) = stages.last().map(Option::as_deref) {
+        let direct = reads_of(program, args);
+        if !direct.is_empty() {
+            return direct;
+        }
     }
-    let [read] = <[FileRead; 1]>::try_from(reads_of(program_before, args_before)).ok()?;
+    let [Some(first), rest @ ..] = stages else {
+        return Vec::new();
+    };
+    let [program, args @ ..] = first.as_slice() else {
+        return Vec::new();
+    };
+    let Ok([mut read]) = <[FileRead; 1]>::try_from(reads_of(program, args)) else {
+        return Vec::new();
+    };
+    for stage in rest {
+        let Some([program, args @ ..]) = stage.as_deref() else {
+            return Vec::new();
+        };
+        match narrow(read, program, args) {
+            Some(narrowed) => read = narrowed,
+            None => return Vec::new(),
+        }
+    }
+    vec![read]
+}
+
+/// What `program`, reading `read`'s lines as its input, shows of them:
+/// `head` the first N, `sed -n` a range of them, `cat` and `nl` all of
+/// them. `None` for anything else, and for lines counted from the end of a
+/// file whose length is unknown here.
+fn narrow(read: FileRead, program: &str, args: &[&str]) -> Option<FileRead> {
+    let (from, to) = match program {
+        "head" => match count(args)? {
+            (n, _, files) if files.is_empty() && n > 0 => (1, n.saturating_add(1)),
+            _ => return None,
+        },
+        "sed" => match sed(args)? {
+            (Lines::Range(r), files) if files.is_empty() => (r.start, r.end),
+            _ => return None,
+        },
+        "cat" | "nl" if args.iter().all(|a| plain_flag(program, a)) => return Some(read),
+        _ => return None,
+    };
     let lines = match read.lines {
-        Lines::Whole => Lines::Range(1..n.saturating_add(1)),
-        Lines::Range(r) => Lines::Range(r.start..r.end.min(r.start.saturating_add(n))),
-        // The last lines' start depends on the file's length.
+        Lines::Whole => Lines::Range(from..to),
+        Lines::Range(r) => {
+            let start = r.start.saturating_add(from - 1);
+            let end = r.end.min(r.start.saturating_add(to - 1));
+            if start >= end {
+                return None;
+            }
+            Lines::Range(start..end)
+        }
         Lines::Tail(_) => return None,
     };
-    (n > 0).then_some(FileRead { lines, ..read })
+    Some(FileRead { lines, ..read })
+}
+
+/// A flag of `cat` that changes how lines look, not which are shown; `nl`'s
+/// all take a value, so none is followed.
+fn plain_flag(program: &str, arg: &str) -> bool {
+    program == "cat" && ["-n", "-b", "-A", "-v", "-e", "-t", "-s", "-E", "-T"].contains(&arg)
 }
 
 fn reads_of(program: &str, args: &[&str]) -> Vec<FileRead> {
     let (lines, files) = match program {
         "sed" => match sed(args) {
-            Some(found) => found,
-            None => return Vec::new(),
+            Some(found) if found.1.len() == 1 => found,
+            _ => return Vec::new(),
         },
         "head" | "tail" => match count(args).filter(|(_, _, files)| !files.is_empty()) {
             Some((n, from_start, files)) => {
@@ -117,15 +151,9 @@ fn reads_of(program: &str, args: &[&str]) -> Vec<FileRead> {
             None => return Vec::new(),
         },
         "cat" | "nl" => {
-            // Flags that take no value; `nl`'s all take one, so none is followed.
-            let plain: &[&str] = if program == "cat" {
-                &["-n", "-b", "-A", "-v", "-e", "-t", "-s", "-E", "-T"]
-            } else {
-                &[]
-            };
             if args
                 .iter()
-                .any(|a| a.starts_with('-') && !plain.contains(a))
+                .any(|a| a.starts_with('-') && !plain_flag(program, a))
             {
                 return Vec::new();
             }
@@ -150,7 +178,8 @@ fn reads_of(program: &str, args: &[&str]) -> Vec<FileRead> {
 }
 
 /// `sed -n 'A,Bp' FILE`, `sed -n 'Ap' FILE`, `sed -n 'A,$p' FILE`, `sed -n
-/// 'A,+Np' FILE` (A and the N lines after it): one file, one print command.
+/// 'A,+Np' FILE` (A and the N lines after it): one print command, and the
+/// files it reads, if any — none when it reads its input.
 fn sed<'a>(args: &[&'a str]) -> Option<(Lines, Vec<&'a str>)> {
     let mut quiet = false;
     let mut script = None;
@@ -165,7 +194,7 @@ fn sed<'a>(args: &[&'a str]) -> Option<(Lines, Vec<&'a str>)> {
             _ => files.push(a),
         }
     }
-    if !quiet || files.len() != 1 {
+    if !quiet || files.len() > 1 {
         return None;
     }
     let body = script?.strip_suffix('p')?;
@@ -692,6 +721,37 @@ mod tests {
             [("a.rs".into(), Lines::Whole)],
             "the last command prints its own files, not its input"
         );
+    }
+
+    /// A command that only cuts its input down, or passes it on, leaves
+    /// lines traceable to the file the first command printed.
+    #[test]
+    fn what_later_commands_cut_down_or_pass_on_is_read() {
+        assert_eq!(
+            reads("cat a.rs | sed -n 1,200p"),
+            [("a.rs".into(), Lines::Range(1..201))]
+        );
+        assert_eq!(
+            reads("sed -n 100,500p a.rs | sed -n 3,5p"),
+            [("a.rs".into(), Lines::Range(102..105))],
+            "sed counts the lines it is given"
+        );
+        assert_eq!(
+            reads("sed -n 10,12p a.rs | sed -n 2,9p"),
+            [("a.rs".into(), Lines::Range(11..13))],
+            "and cannot show more than it was given"
+        );
+        assert!(reads("sed -n 10,12p a.rs | sed -n 5,9p").is_empty());
+        assert_eq!(
+            reads("sed -n 125,135p a.rs | cat -A | head -4"),
+            [("a.rs".into(), Lines::Range(125..129))]
+        );
+        assert_eq!(reads("cat a.rs | nl"), [("a.rs".into(), Lines::Whole)]);
+        assert!(
+            reads("sed -n 1,330p a.rs | grep -v '^///'").is_empty(),
+            "which lines grep -v dropped is unknown"
+        );
+        assert!(reads("cat a.rs | sed 's/a/b/'").is_empty());
     }
 
     #[test]

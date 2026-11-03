@@ -37,7 +37,7 @@ collects them in one place.
 | `-p`, `--project <PATH>` | Project root. Defaults to the nearest enclosing directory with `.git` or `.ambits`, else the current directory |
 | `-s`, `--session <ID>` | Session to track (auto-detects the latest) |
 | `-a`, `--agent <ID>` | Filter coverage to one agent (prefix match). For `rg`, `grep` and `show`, whose read depths to report — by default, the agent running the command ([Reading by Symbol](Reading-by-Symbol#whose-reads)) |
-| `--log-dir <DIR>` | Claude Code log directory (auto-derived) |
+| `--log-dir <DIR>` | Claude Code log directory (auto-derived: a session named with `-s` is looked for under the project's current and older Claude Code folder names) |
 | `--dump` | Print the symbol tree to stdout instead of launching the TUI |
 | `--depth <N>` | With `--dump`, levels of children to show (default `0`; hidden children marked `+N`) |
 | `--full` | With `--dump`, the whole tree regardless of `--depth` |
