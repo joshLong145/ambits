@@ -37,7 +37,7 @@
 //!
 //! ## Prefilter first, parse second
 //!
-//! Every other command scans the project up front: walk, then parse every file,
+//! Most other commands scan the project up front: walk, then parse every file,
 //! then answer. For a search that is backwards. Most files do not match, and a
 //! file that does not match need never be parsed — so the pipeline is walk,
 //! read, reject on the raw bytes, and only then parse the survivors for
@@ -714,9 +714,9 @@ fn attribute(hits: &mut [Hit], symbols: &FileSymbols, coverage: Option<&Coverage
 
 /// Search every file the walk yields.
 ///
-/// Files are searched in parallel and the results sorted afterwards: threads
-/// finish out of order, and ripgrep's own nondeterminism under `-j` is a thing
-/// callers work around rather than want.
+/// Files are searched in parallel and the results sorted by path afterwards: a
+/// walk's order depends on the filesystem, and ripgrep's own nondeterminism
+/// under `-j` is a thing callers work around rather than want.
 pub fn search(
     matcher: &Matcher,
     registry: &ParserRegistry,

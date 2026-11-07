@@ -337,7 +337,10 @@ impl ParserRegistry {
         )
         .into_iter()
         .filter(|(abs, _)| self.parser_for(abs).is_some())
-        .filter(|(_, rel)| !matches!(scope, Some(ScanScope::Paths(accepts)) if !accepts(rel)))
+        .filter(|(_, rel)| match scope {
+            Some(ScanScope::Paths(accepts)) => accepts(rel),
+            _ => true,
+        })
         .collect();
 
         // Every consumer expects files in path order, and `par_map` keeps the
