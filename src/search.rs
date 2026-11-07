@@ -46,7 +46,9 @@
 //! machinery ripgrep relies on.
 
 use std::io::Write;
+use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use color_eyre::eyre::{Result, WrapErr};
 use regex::bytes::{Regex, RegexBuilder};
@@ -344,24 +346,33 @@ pub struct Hit {
     /// Absolute byte offset of the match start, which is what attribution
     /// searches.
     pub byte: u32,
-    /// The whole line, or every line the match spans under `-U`.
-    pub text: Vec<u8>,
+    /// The whole line, or every line the match spans under `-U`. Shared by
+    /// the hits on one line: a minified bundle is a single line holding
+    /// thousands of matches, and a copy each is the line's size times theirs.
+    pub text: Arc<[u8]>,
     /// The match, relative to `text`.
     pub span: (usize, usize),
     pub symbol: Option<SymbolHit>,
 }
 
-impl FileHits {
-    /// Distinct lines with at least one match, which is what `-c` reports.
-    ///
-    /// Hits are per match, not per line, so this is not `hits.len()`: a line
-    /// holding two matches is one matching line.
-    pub fn matched_lines(&self) -> usize {
-        self.hits
-            .iter()
-            .map(|h| h.line)
-            .collect::<std::collections::HashSet<_>>()
-            .len()
+/// What a file's matches add up to, which is all the modes that print no
+/// source report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tally {
+    /// Distinct lines with at least one match, which is what `-c` reports: a
+    /// line holding two matches is one matching line.
+    pub lines: usize,
+    /// Every match.
+    pub matches: usize,
+}
+
+impl Tally {
+    /// `hits` is in file order, so a line's matches are adjacent.
+    fn of(hits: &[Hit]) -> Self {
+        Self {
+            lines: hits.chunk_by(|a, b| a.line == b.line).count(),
+            matches: hits.len(),
+        }
     }
 }
 
@@ -370,9 +381,9 @@ impl FileHits {
 pub struct FileHits {
     /// Project-relative.
     pub path: PathBuf,
+    /// Empty in the modes that print no source, which have only the `tally`.
     pub hits: Vec<Hit>,
-    /// Matches before `-m` truncated them.
-    pub total: usize,
+    pub tally: Tally,
     /// `-A`/`-B`/`-C` lines, by 1-based line number, never overlapping `hits`.
     /// Captured during the search because that is the only point at which the
     /// file's bytes are in hand.
@@ -391,78 +402,161 @@ fn is_binary(buf: &[u8]) -> bool {
     buf.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0)
 }
 
-/// Every match in one already-read buffer, before attribution.
-fn hits_in(matcher: &Matcher, buf: &[u8], max_count: Option<usize>) -> (Vec<Hit>, usize) {
-    let mut hits = Vec::new();
-    let mut total = 0usize;
+/// One match, located in the buffer it was found in.
+struct Found {
+    /// 1-based line of the match start.
+    line: u32,
+    /// The whole line, or every line the match spans under `-U`.
+    text: Range<usize>,
+    /// The match, relative to `text`.
+    span: (usize, usize),
+}
 
+/// Call `visit` with each match in `buf`, in file order, until it breaks: the
+/// one definition of a match, whether it ends up a [`Hit`] or a [`Tally`].
+fn each_match(matcher: &Matcher, buf: &[u8], mut visit: impl FnMut(Found) -> ControlFlow<()>) {
     if matcher.multiline {
-        // One pass over the whole buffer: the match may cross line boundaries,
-        // so lines are derived from the match rather than the other way around.
-        for m in matcher.re.find_iter(buf) {
-            total += 1;
-            if max_count.is_some_and(|c| hits.len() >= c) {
-                continue;
-            }
-            let line_start = buf[..m.start()]
-                .iter()
-                .rposition(|&b| b == b'\n')
-                .map_or(0, |i| i + 1);
-            let line_end = buf[m.end()..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .map_or(buf.len(), |i| m.end() + i);
-            hits.push(Hit {
-                line: buf[..m.start()].iter().filter(|&&b| b == b'\n').count() as u32 + 1,
-                column: (m.start() - line_start) as u32 + 1,
-                byte: m.start() as u32,
-                text: buf[line_start..line_end].to_vec(),
-                span: (m.start() - line_start, m.end() - line_start),
-                symbol: None,
-            });
-        }
-        return (hits, total);
+        each_multiline_match(matcher, buf, visit);
+        return;
     }
 
     let mut offset = 0usize;
     for (i, raw) in buf.split_inclusive(|&b| b == b'\n').enumerate() {
         let line_no = i as u32 + 1;
         let line = strip_newline(raw);
+        let found = |span| Found {
+            line: line_no,
+            text: offset..offset + line.len(),
+            span,
+        };
 
         if matcher.invert {
-            if !matcher.re.is_match(line) {
-                total += 1;
-                if !max_count.is_some_and(|c| hits.len() >= c) {
-                    hits.push(Hit {
-                        line: line_no,
-                        column: 1,
-                        byte: offset as u32,
-                        text: line.to_vec(),
-                        span: (0, 0),
-                        symbol: None,
-                    });
-                }
+            if !matcher.re.is_match(line) && visit(found((0, 0))).is_break() {
+                return;
             }
         } else {
             for m in matcher.re.find_iter(line) {
-                total += 1;
-                if max_count.is_some_and(|c| hits.len() >= c) {
-                    continue;
+                if visit(found((m.start(), m.end()))).is_break() {
+                    return;
                 }
-                hits.push(Hit {
-                    line: line_no,
-                    column: m.start() as u32 + 1,
-                    byte: (offset + m.start()) as u32,
-                    text: line.to_vec(),
-                    span: (m.start(), m.end()),
-                    symbol: None,
-                });
             }
         }
         offset += raw.len();
     }
+}
 
-    (hits, total)
+/// [`each_match`] under `-U`. One pass over the whole buffer: the match may
+/// cross line boundaries, so lines are derived from the match rather than the
+/// other way around. Matches arrive in order, so the position carries from one
+/// to the next instead of being measured from the top of the file for each.
+fn each_multiline_match(
+    matcher: &Matcher,
+    buf: &[u8],
+    mut visit: impl FnMut(Found) -> ControlFlow<()>,
+) {
+    let mut line = 1u32;
+    let mut line_start = 0usize;
+    let mut counted = 0usize;
+    let mut line_end = None;
+
+    for m in matcher.re.find_iter(buf) {
+        for (i, _) in buf[counted..m.start()]
+            .iter()
+            .enumerate()
+            .filter(|(_, &b)| b == b'\n')
+        {
+            line += 1;
+            line_start = counted + i + 1;
+        }
+        counted = m.start();
+
+        // No newline lies between the last match's end and `line_end`, so a
+        // match ending inside that gap ends the same line.
+        let end = match line_end {
+            Some(end) if m.end() <= end => end,
+            _ => buf[m.end()..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(buf.len(), |i| m.end() + i),
+        };
+        line_end = Some(end);
+
+        let found = Found {
+            line,
+            text: line_start..end,
+            span: (m.start() - line_start, m.end() - line_start),
+        };
+        if visit(found).is_break() {
+            return;
+        }
+    }
+}
+
+/// Every match in one already-read buffer, up to `max_count`, before
+/// attribution.
+fn hits_in(matcher: &Matcher, buf: &[u8], max_count: Option<usize>) -> Vec<Hit> {
+    let mut hits = Vec::new();
+    let mut shared: Option<(Range<usize>, Arc<[u8]>)> = None;
+
+    each_match(matcher, buf, |found| {
+        if max_count.is_some_and(|c| hits.len() >= c) {
+            return ControlFlow::Break(());
+        }
+        let text = match &shared {
+            Some((range, text)) if *range == found.text => Arc::clone(text),
+            _ => {
+                let text: Arc<[u8]> = Arc::from(&buf[found.text.clone()]);
+                shared = Some((found.text.clone(), Arc::clone(&text)));
+                text
+            }
+        };
+        hits.push(Hit {
+            line: found.line,
+            column: found.span.0 as u32 + 1,
+            byte: (found.text.start + found.span.0) as u32,
+            text,
+            span: found.span,
+            symbol: None,
+        });
+        ControlFlow::Continue(())
+    });
+
+    hits
+}
+
+/// [`hits_in`] reduced to its [`Tally`], without holding a single match.
+fn tally_in(matcher: &Matcher, buf: &[u8], max_count: Option<usize>) -> Tally {
+    let mut tally = Tally::default();
+    let mut last_line = 0u32;
+
+    each_match(matcher, buf, |found| {
+        if max_count.is_some_and(|c| tally.matches >= c) {
+            return ControlFlow::Break(());
+        }
+        tally.matches += 1;
+        if found.line != last_line {
+            tally.lines += 1;
+            last_line = found.line;
+        }
+        ControlFlow::Continue(())
+    });
+
+    tally
+}
+
+/// How many matches in a file answer what `opts` asks of it. `-l`, `-L` and
+/// `-q` want to know only whether there is one, though `--json` still reports
+/// the file's stats.
+fn matches_wanted(opts: &Options) -> Option<usize> {
+    let any_will_do = matches!(
+        opts.mode,
+        OutputMode::FilesWithMatches | OutputMode::FilesWithoutMatch | OutputMode::Quiet
+    );
+    if any_will_do && !opts.json {
+        Some(opts.max_count.map_or(1, |c| c.min(1)))
+    } else {
+        opts.max_count
+    }
 }
 
 /// A line without its terminator, CRLF included.
@@ -496,16 +590,26 @@ pub fn search_file(
         return None;
     }
 
-    let (mut hits, total) = hits_in(matcher, &buf, opts.max_count);
+    if !opts.mode.shows_source() {
+        let tally = tally_in(matcher, &buf, matches_wanted(opts));
+        return (tally.matches > 0).then(|| FileHits {
+            path: rel.to_path_buf(),
+            hits: Vec::new(),
+            tally,
+            context: Vec::new(),
+        });
+    }
+
+    let mut hits = hits_in(matcher, &buf, opts.max_count);
     if hits.is_empty() {
         return None;
     }
 
-    // Attribution is the only reason to parse, so the modes that show no source
-    // skip it outright — as does a file whose bytes are not valid UTF-8, since
-    // the parsers take `&str` and a lossy rewrite would move every offset after
-    // the first bad byte.
-    if opts.mode.shows_source() && !opts.no_symbol {
+    // Attribution is the only reason to parse, so `--no-symbol` skips it — as
+    // does a file whose bytes are not valid UTF-8, since the parsers take
+    // `&str` and a lossy rewrite would move every offset after the first bad
+    // byte.
+    if !opts.no_symbol {
         if let (Some(parser), Ok(source)) = (registry.parser_for(abs), std::str::from_utf8(&buf)) {
             if let Ok(symbols) = parser.parse_file(rel, source) {
                 attribute(&mut hits, &symbols, coverage);
@@ -517,8 +621,8 @@ pub fn search_file(
 
     Some(FileHits {
         path: rel.to_path_buf(),
+        tally: Tally::of(&hits),
         hits,
-        total,
         context,
     })
 }
@@ -653,6 +757,7 @@ pub fn apply_head_limit(files: &mut Vec<FileHits>, head_limit: usize) -> usize {
         if file.hits.len() > room {
             withheld += file.hits.len() - room;
             file.hits.truncate(room);
+            file.tally = Tally::of(&file.hits);
         }
         kept += file.hits.len();
     }
@@ -1018,7 +1123,7 @@ fn print_json(
             }
         }
 
-        matched_lines += file.matched_lines();
+        matched_lines += file.tally.lines;
         writeln!(
             w,
             "{}",
@@ -1027,7 +1132,7 @@ fn print_json(
                 "data": {
                     "path": {"text": path},
                     "binary_offset": serde_json::Value::Null,
-                    "stats": {"matched_lines": file.matched_lines(), "matches": file.hits.len()},
+                    "stats": {"matched_lines": file.tally.lines, "matches": file.tally.matches},
                 }
             })
         )?;
@@ -1179,12 +1284,12 @@ fn print_results(
         // matches is one line and two matches.
         OutputMode::Count => {
             for file in files {
-                writeln!(w, "{}:{}", file.path.display(), file.matched_lines())?;
+                writeln!(w, "{}:{}", file.path.display(), file.tally.lines)?;
             }
         }
         OutputMode::CountMatches => {
             for file in files {
-                writeln!(w, "{}:{}", file.path.display(), file.hits.len())?;
+                writeln!(w, "{}:{}", file.path.display(), file.tally.matches)?;
             }
         }
         OutputMode::Quiet => unreachable!("run returns before printing"),
@@ -1253,11 +1358,20 @@ mod tests {
 
     fn hits(src: &str, opts: &Options) -> Vec<Hit> {
         let matcher = Matcher::new(opts).expect("pattern must compile");
-        hits_in(&matcher, src.as_bytes(), opts.max_count).0
+        hits_in(&matcher, src.as_bytes(), opts.max_count)
     }
 
     fn lines_of(hits: &[Hit]) -> Vec<u32> {
         hits.iter().map(|h| h.line).collect()
+    }
+
+    pub(super) fn file_hits(path: &str, hits: Vec<Hit>) -> FileHits {
+        FileHits {
+            path: PathBuf::from(path),
+            tally: Tally::of(&hits),
+            hits,
+            context: Vec::new(),
+        }
     }
 
     /// The headline change: the pattern searches file *content*, not symbol
@@ -1338,28 +1452,120 @@ mod tests {
         );
     }
 
+    /// Lines are carried from match to match rather than measured from the
+    /// top of the file, which has to land on the same place for each.
+    #[test]
+    fn multiline_locates_every_match_in_a_file() {
+        let src = "one x\ntwo\nx three x\n\nx\nfour";
+        let mut opts = Options::new(vec!["x".into()]);
+        opts.multiline = true;
+        let found = hits(src, &opts);
+        assert_eq!(lines_of(&found), vec![1, 3, 3, 5]);
+        assert_eq!(
+            found.iter().map(|h| h.column).collect::<Vec<_>>(),
+            vec![5, 1, 9, 1]
+        );
+        assert_eq!(
+            found.iter().map(|h| h.byte).collect::<Vec<_>>(),
+            vec![4, 10, 18, 21]
+        );
+        let text = |h: &Hit| String::from_utf8_lossy(&h.text).into_owned();
+        assert_eq!(text(&found[0]), "one x");
+        assert_eq!(text(&found[1]), "x three x");
+        assert_eq!(text(&found[3]), "x");
+    }
+
+    /// A match ending on its newline takes in the line after it, and the
+    /// next match starts there: same text only where the bounds agree.
+    #[test]
+    fn multiline_text_follows_each_matches_own_lines() {
+        let mut opts = Options::new(vec!["a\\n|b".into()]);
+        opts.multiline = true;
+        let found = hits("a\nb b\nc\n", &opts);
+        let texts: Vec<_> = found
+            .iter()
+            .map(|h| String::from_utf8_lossy(&h.text).into_owned())
+            .collect();
+        assert_eq!(texts, vec!["a\nb b", "b b", "b b"]);
+        assert_eq!(found[1].span, (0, 1));
+        assert_eq!(found[2].span, (2, 3));
+    }
+
+    /// The bug this sharing fixes: a copy of the line per match took a
+    /// 1.4 MB generated line with 124k matches past 60 GB.
+    #[test]
+    fn the_matches_on_a_line_share_its_text() {
+        let line = "e".repeat(10_000);
+        let mut opts = Options::new(vec!["e".into()]);
+        for multiline in [false, true] {
+            opts.multiline = multiline;
+            let found = hits(&line, &opts);
+            assert_eq!(found.len(), 10_000);
+            assert!(
+                found.iter().all(|h| Arc::ptr_eq(&h.text, &found[0].text)),
+                "multiline: {multiline}"
+            );
+        }
+    }
+
+    /// `-c` and friends never build a hit, so the two paths must agree on
+    /// what the hits would have been.
+    #[test]
+    fn a_tally_counts_what_the_hits_would_hold() {
+        let src = "fn a() { fn b() {} }\n\nlet c;\nfn d() {}";
+        for (pattern, invert, multiline, max_count) in [
+            ("fn", false, false, None),
+            ("fn", false, false, Some(2)),
+            ("fn", false, false, Some(0)),
+            ("fn", true, false, None),
+            ("fn", true, false, Some(1)),
+            ("fn", false, true, None),
+            ("fn", false, true, Some(1)),
+            ("\\}\\n", false, true, None),
+            ("x*", false, false, None),
+            ("nothing", false, false, None),
+        ] {
+            let mut opts = Options::new(vec![pattern.into()]);
+            opts.invert_match = invert;
+            opts.multiline = multiline;
+            let matcher = Matcher::new(&opts).unwrap();
+            assert_eq!(
+                tally_in(&matcher, src.as_bytes(), max_count),
+                Tally::of(&hits_in(&matcher, src.as_bytes(), max_count)),
+                "{pattern} invert={invert} multiline={multiline} max={max_count:?}"
+            );
+        }
+    }
+
+    /// `-l` stops at a file's first match, but `--json` reports its stats.
+    #[test]
+    fn only_a_listing_stops_at_the_first_match() {
+        let mut opts = Options::new(vec!["fn".into()]);
+        for (mode, json, max_count, wanted) in [
+            (OutputMode::FilesWithMatches, false, None, Some(1)),
+            (OutputMode::FilesWithoutMatch, false, Some(5), Some(1)),
+            (OutputMode::Quiet, false, Some(0), Some(0)),
+            (OutputMode::FilesWithMatches, true, None, None),
+            (OutputMode::Count, false, None, None),
+            (OutputMode::CountMatches, false, Some(5), Some(5)),
+        ] {
+            opts.mode = mode;
+            opts.json = json;
+            opts.max_count = max_count;
+            assert_eq!(matches_wanted(&opts), wanted, "{mode:?} json={json}");
+        }
+    }
+
     #[test]
     fn max_count_caps_per_file_and_head_limit_caps_globally() {
         let mut opts = Options::new(vec!["fn".into()]);
         opts.max_count = Some(1);
         let matcher = Matcher::new(&opts).unwrap();
-        let (kept, total) = hits_in(&matcher, SRC.as_bytes(), opts.max_count);
-        assert_eq!(kept.len(), 1);
-        assert_eq!(total, 2, "the total still counts what -m withheld");
+        assert_eq!(hits_in(&matcher, SRC.as_bytes(), opts.max_count).len(), 1);
 
         let mut files = vec![
-            FileHits {
-                path: PathBuf::from("a.rs"),
-                hits: hits(SRC, &Options::new(vec!["fn".into()])),
-                total: 2,
-                context: Vec::new(),
-            },
-            FileHits {
-                path: PathBuf::from("b.rs"),
-                hits: hits(SRC, &Options::new(vec!["fn".into()])),
-                total: 2,
-                context: Vec::new(),
-            },
+            file_hits("a.rs", hits(SRC, &Options::new(vec!["fn".into()]))),
+            file_hits("b.rs", hits(SRC, &Options::new(vec!["fn".into()]))),
         ];
         assert_eq!(apply_head_limit(&mut files, 3), 1);
         assert_eq!(files.iter().map(|f| f.hits.len()).sum::<usize>(), 3);
@@ -1395,7 +1601,7 @@ mod tests {
             line: 1,
             column: 1,
             byte,
-            text: b"x".to_vec(),
+            text: Arc::from(&b"x"[..]),
             span: (0, 1),
             symbol: None,
         }
@@ -1427,7 +1633,7 @@ mod tests {
             line: 3,
             column: 1,
             byte: 36,
-            text: b"    fn method() {}\n".to_vec(),
+            text: Arc::from(&b"    fn method() {}\n"[..]),
             span: (0, 13),
             symbol: None,
         }];
@@ -1437,7 +1643,7 @@ mod tests {
             line: 3,
             column: 1,
             byte: 36,
-            text: b"    \n".to_vec(),
+            text: Arc::from(&b"    \n"[..]),
             span: (0, 2),
             symbol: None,
         }];
@@ -1522,12 +1728,7 @@ mod tests {
     fn one_file(path: &str, opts: &Options) -> Vec<FileHits> {
         let mut found = hits(SRC, opts);
         attribute(&mut found, &thing(), None);
-        vec![FileHits {
-            path: PathBuf::from(path),
-            hits: found,
-            total: 2,
-            context: Vec::new(),
-        }]
+        vec![file_hits(path, found)]
     }
 
     fn rendered(files: &[FileHits], opts: &Options, journal: bool) -> String {
@@ -1573,12 +1774,7 @@ mod tests {
             "fixture: two matches on line 1"
         );
 
-        let files = vec![FileHits {
-            path: PathBuf::from("a.rs"),
-            hits: found,
-            total: 3,
-            context: Vec::new(),
-        }];
+        let files = vec![file_hits("a.rs", found)];
         let out = rendered(&files, &opts, false);
         let rows: Vec<&str> = out.lines().collect();
         assert_eq!(rows.len(), 2, "one row per line, not per match: {rows:?}");
@@ -1595,12 +1791,7 @@ mod tests {
         let two_on_one_line = "fn alpha() { fn nested() {} }\nfn beta() {}\n";
         let mut opts = Options::new(vec!["fn".into()]);
         opts.heading = Some(true);
-        let files = vec![FileHits {
-            path: PathBuf::from("a.rs"),
-            hits: hits(two_on_one_line, &opts),
-            total: 3,
-            context: Vec::new(),
-        }];
+        let files = vec![file_hits("a.rs", hits(two_on_one_line, &opts))];
         let out = rendered(&files, &opts, false);
         let match_rows = out
             .lines()
@@ -1652,12 +1843,7 @@ mod tests {
         let mut opts = Options::new(vec!["fn".into()]);
         opts.json = true;
         opts.vimgrep = true;
-        let files = vec![FileHits {
-            path: PathBuf::from("a.rs"),
-            hits: hits(two_on_one_line, &opts),
-            total: 3,
-            context: Vec::new(),
-        }];
+        let files = vec![file_hits("a.rs", hits(two_on_one_line, &opts))];
         let mut buf = Vec::new();
         print_json(&mut buf, &files, &opts, None, 0).unwrap();
         let events: Vec<serde_json::Value> = String::from_utf8(buf)
@@ -1708,12 +1894,7 @@ mod tests {
         let two_on_one_line = "fn alpha() { fn nested() {} }\nfn beta() {}\n";
         let mut opts = Options::new(vec!["fn".into()]);
         opts.json = true;
-        let files = vec![FileHits {
-            path: PathBuf::from("a.rs"),
-            hits: hits(two_on_one_line, &opts),
-            total: 3,
-            context: Vec::new(),
-        }];
+        let files = vec![file_hits("a.rs", hits(two_on_one_line, &opts))];
         let mut buf = Vec::new();
         print_json(&mut buf, &files, &opts, None, 0).unwrap();
         let events: Vec<serde_json::Value> = String::from_utf8(buf)
@@ -1861,14 +2042,12 @@ mod tests {
     #[test]
     fn counting_distinguishes_lines_from_matches() {
         let opts = Options::new(vec!["fn".into()]);
-        let file = FileHits {
-            path: PathBuf::from("a.rs"),
-            hits: hits("fn alpha() { fn nested() {} }\nfn beta() {}\n", &opts),
-            total: 3,
-            context: Vec::new(),
-        };
+        let file = file_hits(
+            "a.rs",
+            hits("fn alpha() { fn nested() {} }\nfn beta() {}\n", &opts),
+        );
         assert_eq!(file.hits.len(), 3, "three matches");
-        assert_eq!(file.matched_lines(), 2, "on two lines");
+        assert_eq!(file.tally.lines, 2, "on two lines");
     }
 
     /// The withheld count is reported to the caller so it can go to stderr;
@@ -1891,6 +2070,7 @@ mod tests {
 /// right regardless of who, if anyone, consumes `Outcome.shown`.
 #[cfg(test)]
 mod shown_symbols_tests {
+    use super::tests::file_hits;
     use super::*;
 
     fn symbol(id: &str, hash: u8) -> SymbolHit {
@@ -1910,19 +2090,14 @@ mod shown_symbols_tests {
             line: 1,
             column: 1,
             byte: 0,
-            text: b"x".to_vec(),
+            text: Arc::from(&b"x"[..]),
             span: (0, 1),
             symbol,
         }
     }
 
     fn file_with(path: &str, symbols: Vec<Option<SymbolHit>>) -> FileHits {
-        FileHits {
-            path: PathBuf::from(path),
-            hits: symbols.into_iter().map(hit_with).collect(),
-            total: 1,
-            context: Vec::new(),
-        }
+        file_hits(path, symbols.into_iter().map(hit_with).collect())
     }
 
     /// The credit rule: modes that print no source put nothing in front of the
@@ -1976,24 +2151,23 @@ mod shown_symbols_tests {
 
 #[cfg(test)]
 mod head_limit_tests {
+    use super::tests::file_hits;
     use super::*;
 
     fn file_of(path: &str, hits: usize) -> FileHits {
-        FileHits {
-            path: PathBuf::from(path),
-            hits: (0..hits)
+        file_hits(
+            path,
+            (0..hits)
                 .map(|i| Hit {
                     line: i as u32 + 1,
                     column: 1,
                     byte: i as u32,
-                    text: b"x".to_vec(),
+                    text: Arc::from(&b"x"[..]),
                     span: (0, 1),
                     symbol: None,
                 })
                 .collect(),
-            total: hits,
-            context: Vec::new(),
-        }
+        )
     }
 
     /// `--head-limit` caps what is printed. Applying it to `-l` would drop
@@ -2095,7 +2269,7 @@ mod prefilter_tests {
         let matcher = Matcher::new(&opts).unwrap();
 
         let found = search_file(&matcher, &registry(), &abs, &rel, &opts, None).unwrap();
-        assert_eq!(found.hits.len(), 1, "it matched, it just was not parsed");
+        assert_eq!(found.tally.matches, 1, "it matched, it just was not parsed");
     }
 
     /// The whole-file prefilter used to run `re` — compiled multi-line only
@@ -2110,8 +2284,8 @@ mod prefilter_tests {
             probe("first line has nothing to do with it\nneedle shows up here\n");
         let mut opts = Options::new(vec!["^needle".into()]);
         // This suite's registry explodes on parse; attribution is not what
-        // this test is about, so skip it the same way the tests above do.
-        opts.mode = OutputMode::FilesWithMatches;
+        // this test is about, so skip it.
+        opts.no_symbol = true;
         let matcher = Matcher::new(&opts).unwrap();
 
         let found = search_file(&matcher, &registry(), &abs, &rel, &opts, None)
@@ -2125,7 +2299,7 @@ mod prefilter_tests {
     fn an_end_anchored_pattern_still_finds_a_match_past_the_first_line() {
         let (_dir, abs, rel) = probe("first line\nthis one ends with needle\n");
         let mut opts = Options::new(vec!["needle$".into()]);
-        opts.mode = OutputMode::FilesWithMatches;
+        opts.no_symbol = true;
         let matcher = Matcher::new(&opts).unwrap();
 
         let found = search_file(&matcher, &registry(), &abs, &rel, &opts, None)
