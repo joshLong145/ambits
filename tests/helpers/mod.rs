@@ -85,10 +85,7 @@ pub fn file(path: &str, symbols: Vec<SymbolNode>) -> FileSymbols {
 
 /// Create a ProjectTree from files.
 pub fn project(files: Vec<FileSymbols>) -> ProjectTree {
-    ProjectTree {
-        root: PathBuf::from("/test/project"),
-        files,
-    }
+    ProjectTree::new(PathBuf::from("/test/project"), files)
 }
 
 /// Create a basic AgentToolCall.

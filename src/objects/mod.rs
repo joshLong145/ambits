@@ -117,7 +117,13 @@ pub fn b3(hash: &[u8; 32]) -> String {
 /// NFC-normalized (§5.2), so the same file named from Windows or with a
 /// decomposed accent is the same path.
 pub fn normalize_path(path: &str) -> String {
-    path.replace('\\', "/").nfc().collect()
+    let path = path.replace('\\', "/");
+    // ASCII is already NFC, and nearly every path is ASCII.
+    if path.is_ascii() {
+        path
+    } else {
+        path.nfc().collect()
+    }
 }
 
 /// The project file a tool call's `path` names, in the one form every

@@ -45,13 +45,7 @@ fn writes_flow_from_the_log_to_the_journal_without_file_contents() {
     let log = root.join("sess.jsonl");
     std::fs::write(&log, log_lines(&root).join("\n") + "\n").unwrap();
 
-    let mut app = App::new(
-        ProjectTree {
-            root: root.clone(),
-            files: vec![],
-        },
-        root.clone(),
-    );
+    let mut app = App::new(ProjectTree::new(root.clone(), vec![]), root.clone());
     app.set_session_id(Some("sess".into()));
     app.enable_journal("tree-sitter", std::time::Duration::ZERO);
 

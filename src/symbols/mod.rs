@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub mod merkle;
 
@@ -231,16 +231,54 @@ pub fn nested_in(name_path: &str, ancestor: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct ProjectTree {
     pub root: PathBuf,
+    /// Add and remove files with [`ProjectTree::insert_file`] and
+    /// [`ProjectTree::remove_file`], which keep `by_path` true of them.
     pub files: Vec<FileSymbols>,
+    /// Each file's position by normalized path, built on the first lookup: a
+    /// session's replay asks once per read, and a monorepo has a lot of files
+    /// to compare each time.
+    by_path: OnceLock<HashMap<String, usize>>,
 }
 
 impl ProjectTree {
+    pub fn new(root: PathBuf, files: Vec<FileSymbols>) -> Self {
+        Self {
+            root,
+            files,
+            by_path: OnceLock::new(),
+        }
+    }
+
     /// The file whose project-relative path is `rel`, as records name files
-    /// (normalized, `/`-separated).
+    /// (normalized, `/`-separated). The first, should two normalize alike.
     pub fn file(&self, rel: &str) -> Option<&FileSymbols> {
-        self.files
-            .iter()
-            .find(|f| crate::objects::normalize_path(&f.file_path.to_string_lossy()) == rel)
+        let by_path = self.by_path.get_or_init(|| {
+            let mut by_path = HashMap::with_capacity(self.files.len());
+            for (at, file) in self.files.iter().enumerate() {
+                by_path
+                    .entry(crate::objects::normalize_path(
+                        &file.file_path.to_string_lossy(),
+                    ))
+                    .or_insert(at);
+            }
+            by_path
+        });
+        self.files.get(*by_path.get(rel)?)
+    }
+
+    /// Add a file, keeping the tree in path order.
+    pub fn insert_file(&mut self, file: FileSymbols) {
+        self.files.push(file);
+        self.files.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+        self.by_path = OnceLock::new();
+    }
+
+    /// Drop the file at `path`, reporting whether there was one.
+    pub fn remove_file(&mut self, path: &Path) -> bool {
+        let before = self.files.len();
+        self.files.retain(|f| f.file_path != path);
+        self.by_path = OnceLock::new();
+        self.files.len() != before
     }
 
     /// Every symbol in the tree, depth-first, paired with its owning file.
@@ -276,7 +314,8 @@ impl ProjectTree {
 #[cfg(test)]
 mod tests {
     use crate::helpers::{file, sym_with_bytes, sym_with_children};
-    use crate::symbols::{nested_in, split_id, FileSymbols};
+    use crate::symbols::{nested_in, split_id, FileSymbols, ProjectTree};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn ids_split_at_the_first_separator() {
@@ -291,6 +330,71 @@ mod tests {
                 && nested_in("App", "App")
                 && !nested_in("Application", "App")
         );
+    }
+
+    fn tree(paths: &[&str]) -> ProjectTree {
+        ProjectTree::new(
+            PathBuf::from("/p"),
+            paths.iter().map(|p| file(p, Vec::new())).collect(),
+        )
+    }
+
+    fn found(tree: &ProjectTree, rel: &str) -> Option<PathBuf> {
+        tree.file(rel).map(|f| f.file_path.clone())
+    }
+
+    /// `a-b.rs` sorts before `a/b.rs` as text and after it as a path, which
+    /// is what a binary search over either order would trip on.
+    #[test]
+    fn a_file_is_found_by_its_whole_path() {
+        let tree = tree(&["a-b.rs", "a/b.rs", "a/c.rs", "a.rs"]);
+        for path in ["a-b.rs", "a/b.rs", "a/c.rs", "a.rs"] {
+            assert_eq!(found(&tree, path), Some(PathBuf::from(path)));
+        }
+        assert_eq!(found(&tree, "b.rs"), None, "a suffix names nothing");
+        assert_eq!(found(&tree, "a"), None);
+        assert_eq!(found(&tree, ""), None);
+    }
+
+    /// Records name files normalized; the tree holds them as the disk does.
+    #[test]
+    fn a_file_is_found_by_its_normalized_path() {
+        let tree = tree(&["src/cafe\u{301}.rs", "win\\dows.rs"]);
+        assert_eq!(
+            found(&tree, "src/caf\u{e9}.rs"),
+            Some(PathBuf::from("src/cafe\u{301}.rs"))
+        );
+        assert!(found(&tree, "win/dows.rs").is_some());
+        assert_eq!(
+            found(&tree, "src/cafe\u{301}.rs"),
+            None,
+            "a lookup takes the normalized form, as it always has"
+        );
+    }
+
+    #[test]
+    fn the_first_of_two_files_normalizing_alike_wins() {
+        let mut tree = tree(&["src/caf\u{e9}.rs", "src/cafe\u{301}.rs"]);
+        tree.files[0].total_lines = 7;
+        assert_eq!(tree.file("src/caf\u{e9}.rs").unwrap().total_lines, 7);
+    }
+
+    /// A lookup builds the index, so a change after one has to be seen by the
+    /// next.
+    #[test]
+    fn lookups_follow_files_added_and_removed() {
+        let mut tree = tree(&["b.rs", "d.rs"]);
+        assert_eq!(found(&tree, "d.rs"), Some(PathBuf::from("d.rs")));
+
+        tree.insert_file(file("a.rs", Vec::new()));
+        assert_eq!(found(&tree, "a.rs"), Some(PathBuf::from("a.rs")));
+        assert_eq!(found(&tree, "d.rs"), Some(PathBuf::from("d.rs")));
+        assert_eq!(tree.files[0].file_path, Path::new("a.rs"), "in path order");
+
+        assert!(tree.remove_file(Path::new("b.rs")));
+        assert!(!tree.remove_file(Path::new("b.rs")));
+        assert_eq!(found(&tree, "b.rs"), None);
+        assert_eq!(found(&tree, "d.rs"), Some(PathBuf::from("d.rs")));
     }
 
     /// `sym_with_children` leaves the parent spanning 0..100, so the child's

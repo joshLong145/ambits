@@ -90,10 +90,7 @@ fn typescript_parse_and_coverage(bencher: divan::Bencher, size: &&str) {
 
         // 3. Build project tree from the single file
         use std::path::PathBuf;
-        let project = ProjectTree {
-            root: PathBuf::from("/bench"),
-            files: vec![file_syms],
-        };
+        let project = ProjectTree::new(PathBuf::from("/bench"), vec![file_syms]);
 
         // 4. Generate coverage report
         divan::black_box(CoverageReport::from_project(&project, &ledger, None))

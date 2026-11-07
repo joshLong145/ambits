@@ -369,14 +369,14 @@ mod tests {
     }
 
     fn test_app() -> App {
-        let tree = ProjectTree {
-            root: PathBuf::from("/test"),
-            files: vec![FileSymbols {
+        let tree = ProjectTree::new(
+            PathBuf::from("/test"),
+            vec![FileSymbols {
                 file_path: "mock/a.rs".into(),
                 symbols: vec![sym("a1", "alpha")],
                 total_lines: 50,
             }],
-        };
+        );
         App::new(tree, PathBuf::from("/test"))
     }
 

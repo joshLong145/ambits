@@ -72,10 +72,7 @@ fn file(path: &str, symbols: Vec<SymbolNode>) -> FileSymbols {
 }
 
 fn project(files: Vec<FileSymbols>) -> ProjectTree {
-    ProjectTree {
-        root: PathBuf::from("/test/project"),
-        files,
-    }
+    ProjectTree::new(PathBuf::from("/test/project"), files)
 }
 
 fn jsonl_read(file_path: &str) -> String {
@@ -449,10 +446,10 @@ fn journal_records_symbols_read_through_app() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
 
-    let tree = ProjectTree {
-        root: root.clone(),
-        files: vec![file("a.rs", vec![sym("a.rs::x", "x"), sym("a.rs::y", "y")])],
-    };
+    let tree = ProjectTree::new(
+        root.clone(),
+        vec![file("a.rs", vec![sym("a.rs::x", "x"), sym("a.rs::y", "y")])],
+    );
     let mut app = App::new(tree, root.clone());
     app.set_session_id(Some("sess-1".into()));
     app.enable_journal("tree-sitter", std::time::Duration::from_millis(0));
@@ -505,10 +502,7 @@ fn journal_survives_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
 
-    let tree = ProjectTree {
-        root: root.clone(),
-        files: vec![file("a.rs", vec![sym("a.rs::x", "x")])],
-    };
+    let tree = ProjectTree::new(root.clone(), vec![file("a.rs", vec![sym("a.rs::x", "x")])]);
     let mut app = App::new(tree, root.clone());
     app.set_session_id(Some("sess-2".into()));
     app.enable_journal("tree-sitter", std::time::Duration::from_millis(0));
@@ -581,14 +575,14 @@ fn journal_round_trips_to_the_ledgers_seen_set() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
 
-    let tree = ProjectTree {
-        root: root.clone(),
-        files: vec![
+    let tree = ProjectTree::new(
+        root.clone(),
+        vec![
             file("a.rs", vec![sym("a.rs::x", "x"), sym("a.rs::y", "y")]),
             file("b.rs", vec![sym("b.rs::z", "z")]),
             file("untouched.rs", vec![sym("untouched.rs::q", "q")]),
         ],
-    };
+    );
 
     let mut app = App::new(tree.clone(), root.clone());
     app.set_session_id(Some("rt".into()));
@@ -635,13 +629,13 @@ fn edited_symbols_are_withheld_but_neighbours_survive() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
 
-    let tree = ProjectTree {
-        root: root.clone(),
-        files: vec![file(
+    let tree = ProjectTree::new(
+        root.clone(),
+        vec![file(
             "a.rs",
             vec![sym("a.rs::kept", "kept"), sym("a.rs::edited", "edited")],
         )],
-    };
+    );
 
     let mut app = App::new(tree.clone(), root.clone());
     app.set_session_id(Some("drift".into()));
@@ -673,10 +667,10 @@ fn deleted_symbols_are_reported_as_removed() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
 
-    let tree = ProjectTree {
-        root: root.clone(),
-        files: vec![file("a.rs", vec![sym("a.rs::doomed", "doomed")])],
-    };
+    let tree = ProjectTree::new(
+        root.clone(),
+        vec![file("a.rs", vec![sym("a.rs::doomed", "doomed")])],
+    );
 
     let mut app = App::new(tree.clone(), root.clone());
     app.set_session_id(Some("gone".into()));
@@ -684,10 +678,7 @@ fn deleted_symbols_are_reported_as_removed() {
     app.process_agent_event(read_call(&root, "a.rs"));
     app.sync_journal();
 
-    let rescanned = ProjectTree {
-        root: root.clone(),
-        files: vec![file("a.rs", vec![])],
-    };
+    let rescanned = ProjectTree::new(root.clone(), vec![file("a.rs", vec![])]);
 
     let path = root
         .join(ambits::journal::JOURNAL_SUBDIR)

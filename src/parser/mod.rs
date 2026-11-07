@@ -371,10 +371,7 @@ impl ParserRegistry {
         // than cosmetic: every consumer expects files in path order.
         files.sort_by(|a, b| a.file_path.cmp(&b.file_path));
 
-        Ok(ProjectTree {
-            root: root.to_path_buf(),
-            files,
-        })
+        Ok(ProjectTree::new(root.to_path_buf(), files))
     }
 }
 

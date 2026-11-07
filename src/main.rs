@@ -2020,19 +2020,22 @@ fn run() -> Result<()> {
             &*ingester,
         );
         attach_journal(&mut app, journal_settings(cli.serena, Some(0)));
-        for (write_session, event) in recovered_writes(
+        let writes = recovered_writes(
             &mut app,
             log_dir.as_deref(),
             &session,
             &project_path,
             &*ingester,
-        ) {
-            if let Some(record) =
-                ambits::writes::build_record(&event, &project_path, &registry, !cli.serena)
-            {
-                app.record_write(&write_session, record);
+        );
+        app.with_rows_held(|app| {
+            for (write_session, event) in writes {
+                if let Some(record) =
+                    ambits::writes::build_record(&event, &project_path, &registry, !cli.serena)
+                {
+                    app.record_write(&write_session, record);
+                }
             }
-        }
+        });
         app.sync_journal();
         let journal = app.journal.as_ref().ok_or_else(|| {
             color_eyre::eyre::eyre!("no journal was opened for session {session}")
@@ -2449,10 +2452,16 @@ fn run_tui(
         )
     })?;
 
+    // The event that ended a run of queued writes, still to be handled.
+    let mut next = None;
     loop {
         terminal.draw(|f| ui::render(f, app))?;
 
-        match rx.recv_timeout(Duration::from_millis(50)) {
+        let event = match next.take() {
+            Some(event) => Ok(event),
+            None => rx.recv_timeout(Duration::from_millis(50)),
+        };
+        match event {
             Ok(AppEvent::Key(key)) => app.handle_key(key),
             Ok(AppEvent::Mouse(mouse)) => app.handle_mouse(mouse),
             Ok(AppEvent::FileChanged(path)) => {
@@ -2464,7 +2473,9 @@ fn run_tui(
             Ok(AppEvent::Tick) => {
                 session.handle_tick(log_dir, app, serena_mode, project_path);
             }
-            Ok(AppEvent::WriteRecorded { session, record }) => app.record_write(&session, *record),
+            Ok(AppEvent::WriteRecorded { session, record }) => {
+                next = tui::record_queued_writes(app, &rx, &session, *record);
+            }
             Ok(AppEvent::CommitsFound(commits)) => app.trace.set_commits(&commits),
             Ok(AppEvent::ContentLoaded { key, content }) => app.set_call_content(key, content),
             Err(flume::RecvTimeoutError::Timeout) => {}
@@ -2546,23 +2557,25 @@ fn suspend_for_editor(
     // clicks were meant for the editor, not the TUI. Other event kinds
     // (file-watch, tick) are still real state changes and get applied
     // normally so nothing goes stale across the suspension.
-    while let Ok(ev) = rx.try_recv() {
-        match ev {
-            AppEvent::Key(_) | AppEvent::Mouse(_) => {}
-            AppEvent::FileChanged(p) => {
-                tui::TuiSession::handle_file_changed(p, project_path, registry, app);
+    app.with_rows_held(|app| {
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                AppEvent::Key(_) | AppEvent::Mouse(_) => {}
+                AppEvent::FileChanged(p) => {
+                    tui::TuiSession::handle_file_changed(p, project_path, registry, app);
+                }
+                AppEvent::FileRemoved(p) => {
+                    tui::TuiSession::handle_file_removed(p, project_path, app);
+                }
+                AppEvent::Tick => {
+                    session.handle_tick(log_dir, app, serena_mode, project_path);
+                }
+                AppEvent::WriteRecorded { session, record } => app.record_write(&session, *record),
+                AppEvent::CommitsFound(commits) => app.trace.set_commits(&commits),
+                AppEvent::ContentLoaded { key, content } => app.set_call_content(key, content),
             }
-            AppEvent::FileRemoved(p) => {
-                tui::TuiSession::handle_file_removed(p, project_path, app);
-            }
-            AppEvent::Tick => {
-                session.handle_tick(log_dir, app, serena_mode, project_path);
-            }
-            AppEvent::WriteRecorded { session, record } => app.record_write(&session, *record),
-            AppEvent::CommitsFound(commits) => app.trace.set_commits(&commits),
-            AppEvent::ContentLoaded { key, content } => app.set_call_content(key, content),
         }
-    }
+    });
 
     Ok(())
 }
