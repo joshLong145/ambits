@@ -240,6 +240,17 @@ pub fn walk_files(root: &Path, opts: &WalkOptions<'_>) -> Vec<(PathBuf, PathBuf)
     out
 }
 
+/// The files a command needs parsed, when that is not all of them. The answer
+/// must be the one a full scan gives: narrowing skips work, never symbols the
+/// command could have reported.
+#[derive(Clone, Copy)]
+pub enum ScanScope<'a> {
+    /// Files at paths this accepts, decided before reading any.
+    Paths(&'a (dyn Fn(&Path) -> bool + Sync)),
+    /// Files whose text holds one of these.
+    Mentioning(&'a [String]),
+}
+
 /// Registry of all available language parsers.
 pub struct ParserRegistry {
     parsers: Vec<Box<dyn LanguageParser>>,
@@ -286,6 +297,27 @@ impl ParserRegistry {
     /// satisfy the filter are skipped *before* I/O — excluded files are not
     /// read from disk or parsed.
     pub fn scan_project(&self, root: &Path, filter: Option<&PathFilter>) -> Result<ProjectTree> {
+        self.scan(root, filter, None)
+    }
+
+    /// [`Self::scan_project`] for only the files `scope` allows. The walk is
+    /// the same one, so ignored and filtered files stay out just as they do
+    /// there.
+    pub fn scan_scoped(
+        &self,
+        root: &Path,
+        filter: Option<&PathFilter>,
+        scope: ScanScope<'_>,
+    ) -> Result<ProjectTree> {
+        self.scan(root, filter, Some(scope))
+    }
+
+    fn scan(
+        &self,
+        root: &Path,
+        filter: Option<&PathFilter>,
+        scope: Option<ScanScope<'_>>,
+    ) -> Result<ProjectTree> {
         // Walk first, parse second. Measured on this repo, walking the tree is
         // effectively free — restricting the parse to a single file costs the
         // same as parsing none — while parsing every file is ~95ms of the
@@ -305,6 +337,7 @@ impl ParserRegistry {
         )
         .into_iter()
         .filter(|(abs, _)| self.parser_for(abs).is_some())
+        .filter(|(_, rel)| !matches!(scope, Some(ScanScope::Paths(accepts)) if !accepts(rel)))
         .collect();
 
         // Every consumer expects files in path order, and `par_map` keeps the
@@ -314,7 +347,7 @@ impl ParserRegistry {
 
         // A read failure stays fatal, as it was when this ran serially — a
         // project we cannot read is not a project with fewer symbols.
-        let parsed = par_map(&targets, |(abs, rel)| self.parse_target(abs, rel));
+        let parsed = par_map(&targets, |(abs, rel)| self.parse_target(abs, rel, scope));
         let files = parsed
             .into_iter()
             .collect::<Result<Vec<_>>>()?
@@ -325,14 +358,25 @@ impl ParserRegistry {
         Ok(ProjectTree::new(root.to_path_buf(), files))
     }
 
-    /// Read and parse one file the walk found. `None` for one its parser
-    /// gave up on, which is warned about rather than fatal.
-    fn parse_target(&self, abs: &Path, rel: &Path) -> Result<Option<FileSymbols>> {
+    /// Read and parse one file the walk found. `None` for one `scope` rules
+    /// out by its text, or its parser gave up on, which is warned about
+    /// rather than fatal.
+    fn parse_target(
+        &self,
+        abs: &Path,
+        rel: &Path,
+        scope: Option<ScanScope<'_>>,
+    ) -> Result<Option<FileSymbols>> {
         let Some(parser) = self.parser_for(abs) else {
             return Ok(None);
         };
         let source =
             fs::read_to_string(abs).wrap_err_with(|| format!("reading {}", abs.display()))?;
+        if let Some(ScanScope::Mentioning(names)) = scope {
+            if !names.iter().any(|n| source.contains(n.as_str())) {
+                return Ok(None);
+            }
+        }
         match parser.parse_file(rel, &source) {
             Ok(file_symbols) => {
                 log::debug!(

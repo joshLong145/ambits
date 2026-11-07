@@ -30,7 +30,7 @@ use ambits::app::App;
 use ambits::filter::PathFilter;
 use ambits::ingest::tool_config::ToolMappingConfig;
 use ambits::ingest::{SessionIngester, ToolCallMapper};
-use ambits::parser::ParserRegistry;
+use ambits::parser::{ParserRegistry, ScanScope};
 use events::AppEvent;
 
 #[derive(ClapParser, Debug)]
@@ -1843,8 +1843,25 @@ fn run() -> Result<()> {
         }
     }
 
-    let project_tree = ambits::logging::timed("scan", || {
-        scan_tree(cli.serena, &registry, &project_path, filter.as_ref())
+    // `show` of ids and `callers` answer from a few files, so they need only
+    // those parsed. `--dump` and `--coverage` run ahead of either and report
+    // on the whole project; Serena's cache has no walk to narrow.
+    let narrowable = !(cli.serena || cli.dump || cli.coverage);
+    let id_paths = match &command {
+        Some(Commands::Show { selector, .. }) if narrowable => {
+            ambits::lookup::IdPaths::of(selector)
+        }
+        _ => None,
+    };
+    let may_hold = |rel: &Path| id_paths.as_ref().is_some_and(|ids| ids.may_hold(rel));
+    let scope = match &command {
+        _ if id_paths.is_some() => Some(ScanScope::Paths(&may_hold)),
+        Some(Commands::Callers { name, .. }) if narrowable => Some(ScanScope::Mentioning(name)),
+        _ => None,
+    };
+    let project_tree = ambits::logging::timed("scan", || match scope {
+        Some(scope) => registry.scan_scoped(&project_path, filter.as_ref(), scope),
+        None => scan_tree(cli.serena, &registry, &project_path, filter.as_ref()),
     })?;
 
     if let Some(Commands::Restore { reference, into }) = &command {

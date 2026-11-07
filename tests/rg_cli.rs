@@ -506,3 +506,48 @@ fn matches_past_the_limit_are_counted_and_the_rest_keep_their_symbols() {
         out.stderr
     );
 }
+
+/// `--dump` runs ahead of `show` and reports the project, so `show`'s narrowing
+/// must not reach it.
+#[test]
+fn dump_still_sees_the_whole_project_when_show_is_named() {
+    let dir = fixture();
+    let out = run(dir.path(), &["--dump", "show", "src/lib.rs::needle"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.contains("src/util.rs"), "{}", out.stdout);
+}
+
+/// A hash can name a symbol anywhere, so it sends the whole query down the
+/// full scan and the id beside it answers as usual.
+#[test]
+fn show_resolves_a_hash_and_an_id_together() {
+    let dir = fixture();
+    let by_id = run(dir.path(), &["show", "src/util.rs::unrelated"]);
+    let shown: serde_json::Value = serde_json::from_str(&by_id.stdout).unwrap();
+    let hash = shown["results"][0]["matches"][0]["content_hash"]
+        .as_str()
+        .unwrap();
+
+    let out = run(dir.path(), &["show", hash, "src/lib.rs::needle"]);
+    let shown: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(
+        shown["results"][0]["matches"][0]["id"],
+        "src/util.rs::unrelated"
+    );
+    assert_eq!(
+        shown["results"][1]["matches"][0]["id"],
+        "src/lib.rs::needle"
+    );
+}
+
+/// `show` of an id reads only the files it names, so a source file elsewhere
+/// that cannot be read no longer costs it the answer.
+#[test]
+fn show_of_an_id_is_not_stopped_by_an_unreadable_file_elsewhere() {
+    let dir = fixture();
+    std::fs::write(dir.path().join("src/latin1.rs"), [0x66, 0xE9, 0x0A]).unwrap();
+
+    let out = run(dir.path(), &["show", "src/lib.rs::needle"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.contains("pub fn needle"), "{}", out.stdout);
+}

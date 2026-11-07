@@ -132,6 +132,41 @@ struct ResultDto<'a> {
     suggestions: Vec<&'a str>,
 }
 
+/// The paths in a `show` query: everything [`find`] and [`suggest`] will look
+/// at, so a tree of just these files answers it as the whole project would.
+pub struct IdPaths(Vec<String>);
+
+impl IdPaths {
+    /// `None` unless every query is an id: a hash can name a symbol anywhere.
+    pub fn of(queries: &[String]) -> Option<Self> {
+        queries
+            .iter()
+            .map(|query| match parse_selector(query) {
+                Selector::Id(id) => Some(crate::symbols::split_id(&id).0.to_string()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(Self)
+    }
+
+    /// Whether the file at `rel` could answer one of the ids: [`find`] takes
+    /// its normalized path whole, and [`suggest`] reads it out of each symbol's
+    /// id, where it ends at the first `::`.
+    pub fn may_hold(&self, rel: &Path) -> bool {
+        let rel = rel.to_string_lossy();
+        let normalized = crate::objects::normalize_path(&rel);
+        let in_ids = rel.split("::").next().unwrap_or(&rel);
+        self.0
+            .iter()
+            .any(|path| normalized == *path || names_file(in_ids, path))
+    }
+}
+
+/// Whether `path`, as written in an id, names `file` or ends it.
+fn names_file(file: &str, path: &str) -> bool {
+    file == path || file.ends_with(&format!("/{path}"))
+}
+
 /// The symbols each of `selectors` names in `tree`, in their order, each
 /// with its file: by id — the file the id names, walked once however many
 /// ids name it — or by content-hash prefix, every symbol's hash spelled out
@@ -221,11 +256,10 @@ fn suggest<'a>(all: &[(&Path, &'a SymbolNode)], id: &str) -> Vec<&'a str> {
     let Some(last) = want.last() else {
         return Vec::new();
     };
-    let in_file = |file: &str| file == path || file.ends_with(&format!("/{path}"));
     let (mut ends, mut shares) = (Vec::new(), Vec::new());
     for (_, sym) in all {
         let (file, name) = crate::symbols::split_id(&sym.id);
-        if !in_file(file) {
+        if !names_file(file, path) {
             continue;
         }
         let segments: Vec<String> = name.split('/').map(loosely).collect();
@@ -672,5 +706,88 @@ mod tests {
         let v = show(dir.path(), &tree, &["a.rs::two", "a.rs::one"], false);
         assert_eq!(v["results"][0]["query"], "a.rs::two");
         assert_eq!(v["results"][1]["query"], "a.rs::one");
+    }
+
+    fn queries(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    /// A hash can name a symbol in any file, so one among the ids needs
+    /// everything parsed, as does a query that is neither.
+    #[test]
+    fn only_ids_narrow_a_scan() {
+        assert!(IdPaths::of(&queries(&["a.rs::f", "b/c.rs::g"])).is_some());
+        assert!(IdPaths::of(&queries(&["a.rs::f", "abcdef0123456789"])).is_none());
+        assert!(IdPaths::of(&queries(&["abcdef0123456789"])).is_none());
+        assert!(IdPaths::of(&queries(&["a.rs::f", "nope"])).is_none());
+    }
+
+    #[test]
+    fn an_id_may_be_answered_by_its_file_or_a_longer_path_ending_with_it() {
+        let ids = IdPaths::of(&queries(&["common/a.rs::f", "caf\u{e9}.rs::g"])).unwrap();
+        assert!(ids.may_hold(Path::new("common/a.rs")));
+        assert!(ids.may_hold(Path::new("src/common/a.rs")));
+        assert!(!ids.may_hold(Path::new("uncommon/a.rs")));
+        assert!(!ids.may_hold(Path::new("common/a.rs.bak")));
+        assert!(!ids.may_hold(Path::new("Common/a.rs")));
+        assert!(ids.may_hold(Path::new("cafe\u{301}.rs")), "by its NFC form");
+    }
+
+    /// The whole of the narrowing's promise: for every shape of query, a tree
+    /// of the files the ids can name answers as the full tree does.
+    #[test]
+    fn a_narrowed_scan_shows_what_a_full_scan_shows() {
+        use crate::parser::{ParserRegistry, ScanScope};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src/deep")).unwrap();
+        std::fs::create_dir_all(root.join("skipped")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join(".gitignore"), "/target\n").unwrap();
+        let source = "pub struct Row<'a> { x: &'a u8 }\nimpl<'a> Row<'a> { pub fn new() {} }\n";
+        for file in [
+            "src/a.rs",
+            "src/deep/a.rs",
+            "src/b.rs",
+            "skipped/a.rs",
+            "target/a.rs",
+        ] {
+            std::fs::write(root.join(file), source).unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("src/b.rs"), root.join("src/link.rs")).unwrap();
+
+        let registry = ParserRegistry::new();
+        let filter = crate::filter::PathFilter::literal("src");
+        for filter in [None, Some(&filter)] {
+            let full = registry.scan_project(root, filter).unwrap();
+            for ids in [
+                &["src/a.rs::Row"][..],
+                &["src/a.rs::Nope"],
+                &["a.rs::new"],
+                &["a.rs::Row/new"],
+                &["deep/a.rs::row/NEW"],
+                &["SRC/a.rs::Row"],
+                &["src/b.rs::Row", "src/deep/a.rs::Row"],
+                &["src/link.rs::Row"],
+                &["target/a.rs::Row"],
+                &["skipped/a.rs::Row"],
+                &["nowhere.rs::Row"],
+                &["::Row"],
+            ] {
+                let ids = queries(ids);
+                let paths = IdPaths::of(&ids).unwrap();
+                let may_hold = |rel: &Path| paths.may_hold(rel);
+                let narrowed = registry
+                    .scan_scoped(root, filter, ScanScope::Paths(&may_hold))
+                    .unwrap();
+                let shown = |tree| {
+                    serde_json::to_string(&resolve(root, tree, &ids, true, None, None)).unwrap()
+                };
+                assert_eq!(shown(&narrowed), shown(&full), "{ids:?}");
+            }
+        }
     }
 }
