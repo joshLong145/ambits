@@ -1170,21 +1170,26 @@ fn execute(
     filter: Option<&PathFilter>,
     coverage: Option<&ambits::restore::CoverageIndex>,
 ) -> Result<ambits::search::Outcome> {
+    use ambits::logging::timed;
     use ambits::parser::{walk_files, WalkOptions};
 
-    let targets = walk_files(
-        project_path,
-        &WalkOptions {
-            filter,
-            overrides: request.overrides,
-            types: request.types,
-            hidden: request.hidden,
-            no_ignore: request.no_ignore,
-            roots: request.roots,
-        },
-    );
+    let targets = timed("walk", || {
+        walk_files(
+            project_path,
+            &WalkOptions {
+                filter,
+                overrides: request.overrides,
+                types: request.types,
+                hidden: request.hidden,
+                no_ignore: request.no_ignore,
+                roots: request.roots,
+            },
+        )
+    });
 
-    ambits::search::run(registry, &targets, &request.options, coverage)
+    timed("search", || {
+        ambits::search::run(registry, &targets, &request.options, coverage)
+    })
 }
 
 /// A CLI flag given in days, as a duration.
@@ -1838,7 +1843,9 @@ fn run() -> Result<()> {
         }
     }
 
-    let project_tree = scan_tree(cli.serena, &registry, &project_path, filter.as_ref())?;
+    let project_tree = ambits::logging::timed("scan", || {
+        scan_tree(cli.serena, &registry, &project_path, filter.as_ref())
+    })?;
 
     if let Some(Commands::Restore { reference, into }) = &command {
         report_warnings(&config_warnings);
@@ -2216,7 +2223,9 @@ fn replayed_app(
     let mut handoff = ingest::Handoff::default();
     if let (Some(log_dir), Some(session_id)) = (log_dir, session_id) {
         let log_files = ingester.session_log_files(log_dir, session_id);
-        handoff = tui::replay_session(&mut app, ingester, log_files, project_path);
+        handoff = ambits::logging::timed("replay", || {
+            tui::replay_session(&mut app, ingester, log_files, project_path)
+        });
     }
     (app, handoff)
 }
@@ -2293,7 +2302,7 @@ fn journal_settings(serena: bool, flush_interval_ms: Option<u64>) -> ambits::app
 /// which keeps relaunching idempotent.
 fn attach_journal(app: &mut App, settings: ambits::app::JournalSettings) {
     app.set_journal_settings(Some(settings));
-    let attach = app.attach_journal();
+    let attach = ambits::logging::timed("journal", || app.attach_journal());
     if let Some(stats) = attach.rehydrated {
         if stats.drifted > 0 || stats.inserted > 0 || stats.moved > 0 {
             ambits::try_eprintln!(
@@ -2428,15 +2437,17 @@ fn run_tui(
     events::spawn_key_reader(tx.clone());
     events::spawn_tick_timer(tx.clone(), Duration::from_millis(250));
 
-    let mut session = tui::TuiSession::new(
-        project_path,
-        log_dir,
-        starting,
-        registry.supported_extensions(),
-        Arc::clone(ingester),
-        serena_mode,
-        &tx,
-    )?;
+    let mut session = ambits::logging::timed("watchers", || {
+        tui::TuiSession::new(
+            project_path,
+            log_dir,
+            starting,
+            registry.supported_extensions(),
+            Arc::clone(ingester),
+            serena_mode,
+            &tx,
+        )
+    })?;
 
     loop {
         terminal.draw(|f| ui::render(f, app))?;

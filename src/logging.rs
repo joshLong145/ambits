@@ -20,6 +20,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
+use std::time::Instant;
 
 use log::kv::{Error as KvError, Key, Value, VisitSource, VisitValue};
 
@@ -57,6 +58,20 @@ pub fn init(log_output_dir: Option<&Path>, session_id: Option<&str>) {
         .format(format_json_line)
         .target(env_logger::Target::Pipe(Box::new(file)))
         .try_init();
+}
+
+/// Run `work`, logging how long it took under `ambits::timing`: where a slow
+/// start went, for anyone holding a `--log-output` log. Free when no logger is
+/// installed, as with every other record here.
+pub fn timed<T>(phase: &str, work: impl FnOnce() -> T) -> T {
+    let start = Instant::now();
+    let out = work();
+    log::info!(
+        target: "ambits::timing",
+        phase, ms = start.elapsed().as_millis() as u64;
+        "phase finished"
+    );
+    out
 }
 
 /// Render one `log::Record` as a single JSON object per line.
