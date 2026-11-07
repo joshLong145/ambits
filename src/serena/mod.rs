@@ -52,10 +52,7 @@ pub fn scan_project_serena(
 
     all_files.sort_by(|a, b| a.file_path.cmp(&b.file_path));
 
-    Ok(ProjectTree {
-        root: project_root.to_path_buf(),
-        files: all_files,
-    })
+    Ok(ProjectTree::new(project_root.to_path_buf(), all_files))
 }
 
 /// Find all Serena cache pickle files for a project.

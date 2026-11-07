@@ -332,14 +332,14 @@ mod tests {
             children: Vec::new(),
             estimated_tokens: 12,
         };
-        let tree = ProjectTree {
-            root: PathBuf::from("/test"),
-            files: vec![FileSymbols {
+        let tree = ProjectTree::new(
+            PathBuf::from("/test"),
+            vec![FileSymbols {
                 file_path: "mock/a.rs".into(),
                 symbols: vec![alpha],
                 total_lines: 3,
             }],
-        };
+        );
         let mut app = App::new(tree, PathBuf::from("/test"));
         app.set_session_id(Some("sess".into()));
         app.set_expanded("mock/a.rs", RowKind::File, true);

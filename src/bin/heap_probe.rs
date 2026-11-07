@@ -71,10 +71,7 @@ fn make_monorepo_tree(n_files: usize, symbols_per_file: usize) -> ProjectTree {
             }
         })
         .collect();
-    ProjectTree {
-        root: PathBuf::from("/bench/monorepo"),
-        files,
-    }
+    ProjectTree::new(PathBuf::from("/bench/monorepo"), files)
 }
 
 fn build_file_symbols(file_path: &str, n: usize) -> Vec<SymbolNode> {

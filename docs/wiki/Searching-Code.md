@@ -140,8 +140,17 @@ from its heading to the next of the same or a higher level; `rg '^#{1,3} '
 
 ## The pipeline runs backwards
 
-Every other command scans the project first: walk, parse every file, then
+Most other commands scan the project first: walk, parse every file, then
 answer. A search inverts that — walk, read, reject on the raw bytes, and parse
 only the files that matched. A pattern that matches nothing parses nothing; on
 this repository a typical search completes in well under 10 ms, where a
 symbol-index search would pay for a full parse every time.
+
+`--head-limit` goes further. Every file is counted, so the withheld total is
+exact, but only the files the limit reaches are searched for real and parsed,
+so a pattern matching most of a monorepo costs about what a rare one does.
+Every match printed still names its symbol.
+
+`show` of symbol ids and `callers` narrow the same way, parsing only the files
+that can answer: the ones an id names, or the ones mentioning a callee. A hash
+selector, which can name a symbol anywhere, needs the full scan.

@@ -695,10 +695,7 @@ mod tests {
 
     fn app() -> App {
         let mut app = App::new(
-            ProjectTree {
-                root: PathBuf::from("/test"),
-                files: vec![],
-            },
+            ProjectTree::new(PathBuf::from("/test"), vec![]),
             PathBuf::from("/test"),
         );
         app.set_session_id(Some("sess".into()));
@@ -861,10 +858,7 @@ mod tests {
     #[test]
     fn an_empty_trace_says_so() {
         let mut app = App::new(
-            ProjectTree {
-                root: PathBuf::from("/test"),
-                files: vec![],
-            },
+            ProjectTree::new(PathBuf::from("/test"), vec![]),
             PathBuf::from("/test"),
         );
         app.trace_view.open = true;

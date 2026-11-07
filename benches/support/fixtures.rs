@@ -1020,10 +1020,7 @@ pub fn make_project(n_files: usize, symbols_per_file: usize) -> ProjectTree {
     let files = (0..n_files)
         .map(|i| make_file(&format!("src/module_{i}.rs"), symbols_per_file))
         .collect();
-    ProjectTree {
-        root: PathBuf::from("/bench/project"),
-        files,
-    }
+    ProjectTree::new(PathBuf::from("/bench/project"), files)
 }
 
 /// Build a synthetic monorepo `ProjectTree` for project-scale benchmarks.
@@ -1051,10 +1048,7 @@ pub fn make_monorepo_tree(n_files: usize, symbols_per_file: usize) -> ProjectTre
             }
         })
         .collect();
-    ProjectTree {
-        root: PathBuf::from("/bench/monorepo"),
-        files,
-    }
+    ProjectTree::new(PathBuf::from("/bench/monorepo"), files)
 }
 
 fn build_file_symbols(file_path: &str, n: usize) -> Vec<SymbolNode> {

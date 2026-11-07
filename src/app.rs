@@ -177,6 +177,8 @@ pub struct App {
     // Tree view state.
     pub tree_rows: Vec<TreeRow>,
     pub selected_index: usize,
+    /// Set inside [`App::with_rows_held`], where rebuilding `tree_rows` waits.
+    rows_held: bool,
     /// Private: every change must rebuild `tree_rows`, so it goes through
     /// [`App::set_expanded`].
     expansion: Expansion,
@@ -303,6 +305,7 @@ impl App {
             ledger: ContextLedger::new(),
             should_quit: false,
             tree_rows: Vec::new(),
+            rows_held: false,
             selected_index: 0,
             expansion: Expansion::default(),
             activity: Vec::new(),
@@ -670,8 +673,25 @@ impl App {
         self.rebuild_tree_rows();
     }
 
+    /// Run `work` with row rebuilds held back, then rebuild once.
+    ///
+    /// For applying events in bulk, a session's replay or a backlog of
+    /// writes. A rebuild visits every symbol in the project and nothing reads
+    /// the rows until the next frame, so one per event costs a large repo
+    /// minutes of startup to draw nothing. Nests: the outermost rebuilds.
+    pub fn with_rows_held<T>(&mut self, work: impl FnOnce(&mut Self) -> T) -> T {
+        let outer = std::mem::replace(&mut self.rows_held, true);
+        let out = work(self);
+        self.rows_held = outer;
+        self.rebuild_tree_rows();
+        out
+    }
+
     /// Rebuild the flattened tree rows from the project tree + expansion state.
     pub fn rebuild_tree_rows(&mut self) {
+        if self.rows_held {
+            return;
+        }
         let mut rows = Vec::new();
         let agent_filter = self.agent_filter.as_deref();
 
@@ -3968,6 +3988,23 @@ mod tests {
         app.activity_scroll_offset = 5;
         app.handle_mouse(scroll_up);
         assert_eq!(app.activity_scroll_offset, 5); // unchanged
+    }
+
+    #[test]
+    fn rows_wait_for_the_outermost_hold() {
+        let mut app = test_app(vec![file("a.rs", Vec::new())]);
+        let before = app.tree_rows.len();
+
+        app.with_rows_held(|app| {
+            app.with_rows_held(|app| app.project_tree.insert_file(file("b.rs", Vec::new())));
+            app.rebuild_tree_rows();
+            assert_eq!(app.tree_rows.len(), before, "still held");
+        });
+        assert_eq!(app.tree_rows.len(), before + 1, "rebuilt once released");
+
+        app.project_tree.insert_file(file("c.rs", Vec::new()));
+        app.rebuild_tree_rows();
+        assert_eq!(app.tree_rows.len(), before + 2, "and no longer held");
     }
 
     #[test]

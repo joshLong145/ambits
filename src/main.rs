@@ -30,7 +30,7 @@ use ambits::app::App;
 use ambits::filter::PathFilter;
 use ambits::ingest::tool_config::ToolMappingConfig;
 use ambits::ingest::{SessionIngester, ToolCallMapper};
-use ambits::parser::ParserRegistry;
+use ambits::parser::{ParserRegistry, ScanScope};
 use events::AppEvent;
 
 #[derive(ClapParser, Debug)]
@@ -1170,21 +1170,26 @@ fn execute(
     filter: Option<&PathFilter>,
     coverage: Option<&ambits::restore::CoverageIndex>,
 ) -> Result<ambits::search::Outcome> {
+    use ambits::logging::timed;
     use ambits::parser::{walk_files, WalkOptions};
 
-    let targets = walk_files(
-        project_path,
-        &WalkOptions {
-            filter,
-            overrides: request.overrides,
-            types: request.types,
-            hidden: request.hidden,
-            no_ignore: request.no_ignore,
-            roots: request.roots,
-        },
-    );
+    let targets = timed("walk", || {
+        walk_files(
+            project_path,
+            &WalkOptions {
+                filter,
+                overrides: request.overrides,
+                types: request.types,
+                hidden: request.hidden,
+                no_ignore: request.no_ignore,
+                roots: request.roots,
+            },
+        )
+    });
 
-    ambits::search::run(registry, &targets, &request.options, coverage)
+    timed("search", || {
+        ambits::search::run(registry, &targets, &request.options, coverage)
+    })
 }
 
 /// A CLI flag given in days, as a duration.
@@ -1838,7 +1843,26 @@ fn run() -> Result<()> {
         }
     }
 
-    let project_tree = scan_tree(cli.serena, &registry, &project_path, filter.as_ref())?;
+    // `show` of ids and `callers` answer from a few files, so they need only
+    // those parsed. `--dump` and `--coverage` run ahead of either and report
+    // on the whole project; Serena's cache has no walk to narrow.
+    let narrowable = !(cli.serena || cli.dump || cli.coverage);
+    let id_paths = match &command {
+        Some(Commands::Show { selector, .. }) if narrowable => {
+            ambits::lookup::IdPaths::of(selector)
+        }
+        _ => None,
+    };
+    let may_hold = |rel: &Path| id_paths.as_ref().is_some_and(|ids| ids.may_hold(rel));
+    let scope = match &command {
+        _ if id_paths.is_some() => Some(ScanScope::Paths(&may_hold)),
+        Some(Commands::Callers { name, .. }) if narrowable => Some(ScanScope::Mentioning(name)),
+        _ => None,
+    };
+    let project_tree = ambits::logging::timed("scan", || match scope {
+        Some(scope) => registry.scan_scoped(&project_path, filter.as_ref(), scope),
+        None => scan_tree(cli.serena, &registry, &project_path, filter.as_ref()),
+    })?;
 
     if let Some(Commands::Restore { reference, into }) = &command {
         report_warnings(&config_warnings);
@@ -2013,19 +2037,22 @@ fn run() -> Result<()> {
             &*ingester,
         );
         attach_journal(&mut app, journal_settings(cli.serena, Some(0)));
-        for (write_session, event) in recovered_writes(
+        let writes = recovered_writes(
             &mut app,
             log_dir.as_deref(),
             &session,
             &project_path,
             &*ingester,
-        ) {
-            if let Some(record) =
-                ambits::writes::build_record(&event, &project_path, &registry, !cli.serena)
-            {
-                app.record_write(&write_session, record);
+        );
+        app.with_rows_held(|app| {
+            for (write_session, event) in writes {
+                if let Some(record) =
+                    ambits::writes::build_record(&event, &project_path, &registry, !cli.serena)
+                {
+                    app.record_write(&write_session, record);
+                }
             }
-        }
+        });
         app.sync_journal();
         let journal = app.journal.as_ref().ok_or_else(|| {
             color_eyre::eyre::eyre!("no journal was opened for session {session}")
@@ -2216,7 +2243,9 @@ fn replayed_app(
     let mut handoff = ingest::Handoff::default();
     if let (Some(log_dir), Some(session_id)) = (log_dir, session_id) {
         let log_files = ingester.session_log_files(log_dir, session_id);
-        handoff = tui::replay_session(&mut app, ingester, log_files, project_path);
+        handoff = ambits::logging::timed("replay", || {
+            tui::replay_session(&mut app, ingester, log_files, project_path)
+        });
     }
     (app, handoff)
 }
@@ -2293,7 +2322,7 @@ fn journal_settings(serena: bool, flush_interval_ms: Option<u64>) -> ambits::app
 /// which keeps relaunching idempotent.
 fn attach_journal(app: &mut App, settings: ambits::app::JournalSettings) {
     app.set_journal_settings(Some(settings));
-    let attach = app.attach_journal();
+    let attach = ambits::logging::timed("journal", || app.attach_journal());
     if let Some(stats) = attach.rehydrated {
         if stats.drifted > 0 || stats.inserted > 0 || stats.moved > 0 {
             ambits::try_eprintln!(
@@ -2428,20 +2457,28 @@ fn run_tui(
     events::spawn_key_reader(tx.clone());
     events::spawn_tick_timer(tx.clone(), Duration::from_millis(250));
 
-    let mut session = tui::TuiSession::new(
-        project_path,
-        log_dir,
-        starting,
-        registry.supported_extensions(),
-        Arc::clone(ingester),
-        serena_mode,
-        &tx,
-    )?;
+    let mut session = ambits::logging::timed("watchers", || {
+        tui::TuiSession::new(
+            project_path,
+            log_dir,
+            starting,
+            registry.supported_extensions(),
+            Arc::clone(ingester),
+            serena_mode,
+            &tx,
+        )
+    })?;
 
+    // The event that ended a run of queued writes, still to be handled.
+    let mut next = None;
     loop {
         terminal.draw(|f| ui::render(f, app))?;
 
-        match rx.recv_timeout(Duration::from_millis(50)) {
+        let event = match next.take() {
+            Some(event) => Ok(event),
+            None => rx.recv_timeout(Duration::from_millis(50)),
+        };
+        match event {
             Ok(AppEvent::Key(key)) => app.handle_key(key),
             Ok(AppEvent::Mouse(mouse)) => app.handle_mouse(mouse),
             Ok(AppEvent::FileChanged(path)) => {
@@ -2453,7 +2490,9 @@ fn run_tui(
             Ok(AppEvent::Tick) => {
                 session.handle_tick(log_dir, app, serena_mode, project_path);
             }
-            Ok(AppEvent::WriteRecorded { session, record }) => app.record_write(&session, *record),
+            Ok(AppEvent::WriteRecorded { session, record }) => {
+                next = tui::record_queued_writes(app, &rx, &session, *record);
+            }
             Ok(AppEvent::CommitsFound(commits)) => app.trace.set_commits(&commits),
             Ok(AppEvent::ContentLoaded { key, content }) => app.set_call_content(key, content),
             Err(flume::RecvTimeoutError::Timeout) => {}
@@ -2535,23 +2574,25 @@ fn suspend_for_editor(
     // clicks were meant for the editor, not the TUI. Other event kinds
     // (file-watch, tick) are still real state changes and get applied
     // normally so nothing goes stale across the suspension.
-    while let Ok(ev) = rx.try_recv() {
-        match ev {
-            AppEvent::Key(_) | AppEvent::Mouse(_) => {}
-            AppEvent::FileChanged(p) => {
-                tui::TuiSession::handle_file_changed(p, project_path, registry, app);
+    app.with_rows_held(|app| {
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                AppEvent::Key(_) | AppEvent::Mouse(_) => {}
+                AppEvent::FileChanged(p) => {
+                    tui::TuiSession::handle_file_changed(p, project_path, registry, app);
+                }
+                AppEvent::FileRemoved(p) => {
+                    tui::TuiSession::handle_file_removed(p, project_path, app);
+                }
+                AppEvent::Tick => {
+                    session.handle_tick(log_dir, app, serena_mode, project_path);
+                }
+                AppEvent::WriteRecorded { session, record } => app.record_write(&session, *record),
+                AppEvent::CommitsFound(commits) => app.trace.set_commits(&commits),
+                AppEvent::ContentLoaded { key, content } => app.set_call_content(key, content),
             }
-            AppEvent::FileRemoved(p) => {
-                tui::TuiSession::handle_file_removed(p, project_path, app);
-            }
-            AppEvent::Tick => {
-                session.handle_tick(log_dir, app, serena_mode, project_path);
-            }
-            AppEvent::WriteRecorded { session, record } => app.record_write(&session, *record),
-            AppEvent::CommitsFound(commits) => app.trace.set_commits(&commits),
-            AppEvent::ContentLoaded { key, content } => app.set_call_content(key, content),
         }
-    }
+    });
 
     Ok(())
 }

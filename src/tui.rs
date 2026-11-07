@@ -134,6 +134,26 @@ fn spawn_write_attributor(
     write_tx
 }
 
+/// One logged event, applied as a replay applies it.
+fn apply_replayed(app: &mut App, event: ambits::ingest::SessionEvent) {
+    use ambits::ingest::SessionEvent;
+    match event {
+        SessionEvent::ToolCall(tc) => app.process_agent_event(tc),
+        SessionEvent::Compacted {
+            summary,
+            timestamp,
+            agent_id,
+            metadata,
+        } => {
+            app.process_compaction(summary, timestamp, agent_id, metadata);
+        }
+        SessionEvent::SessionCleared => app.reset_session(),
+        SessionEvent::Write(w) => app.queue_write(w),
+        SessionEvent::ToolFinished(f) => app.process_tool_finished(&f),
+        SessionEvent::Prompt(p) => app.process_prompt(&p),
+    }
+}
+
 /// Replay a session's logs into `app` — every tool call, compaction, clear
 /// and write already on disk — and return where its tailer continues.
 ///
@@ -144,34 +164,44 @@ pub fn replay_session(
     files: Vec<PathBuf>,
     project_root: &Path,
 ) -> ambits::ingest::Handoff {
-    use ambits::ingest::SessionEvent;
     let mut handoff = ambits::ingest::Handoff {
         project_root: Some(project_root.to_path_buf()),
         ..Default::default()
     };
-    for file in files {
-        let replay = ingester.replay_log_file(&file, project_root);
-        for event in replay.events {
-            match event {
-                SessionEvent::ToolCall(tc) => app.process_agent_event(tc),
-                SessionEvent::Compacted {
-                    summary,
-                    timestamp,
-                    agent_id,
-                    metadata,
-                } => {
-                    app.process_compaction(summary, timestamp, agent_id, metadata);
+    app.with_rows_held(|app| {
+        for file in files {
+            let replay = ingester.replay_log_file(&file, project_root);
+            for event in replay.events {
+                apply_replayed(app, event);
+            }
+            handoff.files.push((file, replay.offset));
+            handoff.awaiting.extend(replay.awaiting);
+        }
+    });
+    handoff
+}
+
+/// Record a write and each one queued behind it, rebuilding the rows once: the
+/// attribution worker sends a session's writes one at a time, right as the TUI
+/// opens. Returns the event that ended the run, for the caller to handle.
+pub fn record_queued_writes(
+    app: &mut App,
+    rx: &flume::Receiver<AppEvent>,
+    session: &str,
+    record: ambits::writes::WriteRecord,
+) -> Option<AppEvent> {
+    app.with_rows_held(|app| {
+        app.record_write(session, record);
+        loop {
+            match rx.try_recv() {
+                Ok(AppEvent::WriteRecorded { session, record }) => {
+                    app.record_write(&session, *record);
                 }
-                SessionEvent::SessionCleared => app.reset_session(),
-                SessionEvent::Write(w) => app.queue_write(w),
-                SessionEvent::ToolFinished(f) => app.process_tool_finished(&f),
-                SessionEvent::Prompt(p) => app.process_prompt(&p),
+                Ok(other) => return Some(other),
+                Err(_) => return None,
             }
         }
-        handoff.files.push((file, replay.offset));
-        handoff.awaiting.extend(replay.awaiting);
-    }
-    handoff
+    })
 }
 
 /// The session the TUI starts on, as replayed before it opened.
@@ -489,10 +519,7 @@ impl TuiSession {
                             );
                             *existing = new_file;
                         } else {
-                            app.project_tree.files.push(new_file);
-                            app.project_tree
-                                .files
-                                .sort_by(|a, b| a.file_path.cmp(&b.file_path));
+                            app.project_tree.insert_file(new_file);
                         }
                         app.rebuild_tree_rows();
                     }
@@ -511,13 +538,7 @@ impl TuiSession {
         let Ok(rel) = path.strip_prefix(project_path) else {
             return;
         };
-        let rel_str = rel.to_string_lossy().to_string();
-        let before = app.project_tree.files.len();
-        app.project_tree
-            .files
-            .retain(|f| f.file_path.to_string_lossy() != rel_str);
-
-        if app.project_tree.files.len() != before {
+        if app.project_tree.remove_file(rel) {
             app.rebuild_tree_rows();
         }
     }
@@ -560,6 +581,8 @@ mod tests {
         latest: Mutex<Option<String>>,
         /// Writes the next tailer yields on its first poll.
         tailed_writes: Mutex<Vec<ambits::ingest::WriteEvent>>,
+        /// What the next session's one log file replays.
+        logged: Mutex<Vec<SessionEvent>>,
     }
 
     impl MockIngester {
@@ -567,6 +590,7 @@ mod tests {
             Arc::new(Self {
                 latest: Mutex::new(Some(latest.to_string())),
                 tailed_writes: Mutex::new(Vec::new()),
+                logged: Mutex::new(Vec::new()),
             })
         }
 
@@ -582,11 +606,14 @@ mod tests {
         fn find_latest_session(&self, _log_dir: &Path) -> Option<String> {
             self.latest.lock().unwrap().clone()
         }
-        fn session_log_files(&self, _log_dir: &Path, _session_id: &str) -> Vec<PathBuf> {
-            Vec::new()
+        fn session_log_files(&self, log_dir: &Path, session_id: &str) -> Vec<PathBuf> {
+            if self.logged.lock().unwrap().is_empty() {
+                return Vec::new();
+            }
+            vec![log_dir.join(format!("{session_id}.jsonl"))]
         }
         fn parse_log_file(&self, _path: &Path) -> Vec<SessionEvent> {
-            Vec::new()
+            std::mem::take(&mut *self.logged.lock().unwrap())
         }
         fn new_tailer(&self, _files: Vec<PathBuf>) -> Box<dyn EventTailer> {
             Box::new(MockTailer {
@@ -618,10 +645,7 @@ mod tests {
     }
 
     fn empty_app(root: &Path, session_id: &str) -> App {
-        let tree = ProjectTree {
-            root: root.to_path_buf(),
-            files: Vec::new(),
-        };
+        let tree = ProjectTree::new(root.to_path_buf(), Vec::new());
         let mut app = App::new(tree, root.to_path_buf());
         app.set_session_id(Some(session_id.to_string()));
         app
@@ -969,6 +993,126 @@ mod tests {
         save(dir.path(), &mut app, "beta.rs", "pub fn beta() {}\n");
 
         assert!(row(&app, "beta.rs").unwrap().is_expanded);
+    }
+
+    /// `alpha.rs` read, a `/clear`, `beta.rs` read, then a compaction.
+    fn log_of_every_kind(dir: &Path) -> PathBuf {
+        let read = |id: &str, file: &str| {
+            let path = dir.join(file).display().to_string();
+            [
+                serde_json::json!({"type": "assistant", "sessionId": "s", "timestamp": "2026-11-07T10:00:00Z",
+                    "message": {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": id, "name": "Read", "input": {"file_path": path}}]}}),
+                serde_json::json!({"type": "user", "sessionId": "s", "timestamp": "2026-11-07T10:00:01Z",
+                    "toolUseResult": {"type": "text", "file": {"filePath": path, "content": "", "numLines": 1, "startLine": 1, "totalLines": 1}},
+                    "message": {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": id, "content": "1"}]}}),
+            ]
+        };
+        let clear = serde_json::json!({"type": "user", "sessionId": "s", "timestamp": "2026-11-07T10:00:02Z",
+            "message": {"role": "user", "content": "<command-name>/clear</command-name>"}});
+        let compacted = serde_json::json!({"type": "user", "sessionId": "s", "timestamp": "2026-11-07T10:00:05Z",
+            "isCompactSummary": true, "message": {"role": "user", "content": "Summary."}});
+        let lines: Vec<String> = read("toolu_a", "alpha.rs")
+            .into_iter()
+            .chain([clear])
+            .chain(read("toolu_b", "beta.rs"))
+            .chain([compacted])
+            .map(|line| line.to_string())
+            .collect();
+        let log = dir.join("session.log.jsonl");
+        fs::write(&log, lines.join("\n") + "\n").unwrap();
+        log
+    }
+
+    fn parsed(log: &Path) -> Vec<SessionEvent> {
+        let config = ambits::ingest::tool_config::ToolMappingConfig::builtin().unwrap();
+        ambits::ingest::claude::parse_log_file(log, &config)
+    }
+
+    fn rows_of(app: &App) -> Vec<String> {
+        app.tree_rows.iter().map(|r| format!("{r:?}")).collect()
+    }
+
+    /// Holding rebuilds back moves when the rows are built, never what they
+    /// say, across every kind of event that rebuilds them.
+    #[test]
+    fn replayed_rows_are_the_ones_each_event_would_have_built() {
+        let (dir, mut held) = scanned_project();
+        let mut eager = App::new(held.project_tree.clone(), dir.path().to_path_buf());
+        let log = log_of_every_kind(dir.path());
+        let events = || parsed(&log);
+
+        let ingester = MockIngester::new("s");
+        *ingester.logged.lock().unwrap() = events();
+        replay_session(&mut held, &*ingester, vec![log.clone()], dir.path());
+        for event in events() {
+            apply_replayed(&mut eager, event);
+        }
+
+        assert_eq!(rows_of(&held), rows_of(&eager));
+        assert_eq!(row(&held, "alpha.rs").unwrap().coverage_seen, 0, "cleared");
+        assert_eq!(row(&held, "beta.rs").unwrap().coverage_seen, 1);
+    }
+
+    #[test]
+    fn a_session_switch_leaves_the_rows_on_the_new_session() {
+        let (dir, mut app) = scanned_project();
+        let logs = tempfile::tempdir().unwrap();
+        let ingester = MockIngester::new("old-session");
+        let (mut session, _rx) = session_with(
+            dir.path(),
+            logs.path(),
+            &["old-session"],
+            "old-session",
+            Arc::clone(&ingester),
+        );
+        let log = log_of_every_kind(dir.path());
+
+        touch_session(logs.path(), "new-session");
+        ingester.set_latest("new-session");
+        *ingester.logged.lock().unwrap() = parsed(&log);
+        session.handle_tick(
+            &Some(logs.path().to_path_buf()),
+            &mut app,
+            false,
+            dir.path(),
+        );
+
+        assert_eq!(session.current_session_id.as_deref(), Some("new-session"));
+        assert_eq!(row(&app, "beta.rs").unwrap().coverage_seen, 1);
+    }
+
+    /// The worker's backlog lands as one run; whatever arrives behind it is
+    /// handed back rather than lost.
+    #[test]
+    fn queued_writes_are_recorded_together_and_the_next_event_is_kept() {
+        let project = tempfile::tempdir().unwrap();
+        let mut app = empty_app(project.path(), "s1");
+        let record = || {
+            ambits::writes::build_record(
+                &new_file_write(project.path()),
+                project.path(),
+                &ambits::parser::ParserRegistry::new(),
+                true,
+            )
+            .unwrap()
+        };
+        let (tx, rx) = flume::unbounded();
+        let queued = || AppEvent::WriteRecorded {
+            session: Arc::from("s1"),
+            record: Box::new(record()),
+        };
+        tx.send(queued()).unwrap();
+        tx.send(AppEvent::Tick).unwrap();
+        tx.send(queued()).unwrap();
+
+        let next = record_queued_writes(&mut app, &rx, "s1", record());
+        assert!(matches!(next, Some(AppEvent::Tick)));
+        assert_eq!(rx.len(), 1, "nothing past that event was taken");
+        assert!(!app.writes.is_empty());
+
+        assert!(record_queued_writes(&mut app, &flume::unbounded().1, "s1", record()).is_none());
     }
 
     /// Writes queued from any source are attributed off the render thread

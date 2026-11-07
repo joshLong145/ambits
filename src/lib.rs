@@ -25,6 +25,7 @@ pub mod logging;
 pub mod lookup;
 pub mod objects;
 pub mod output;
+pub mod parallel;
 pub mod parser;
 pub mod remote;
 pub mod report;

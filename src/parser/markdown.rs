@@ -7,9 +7,8 @@
 //! trading completeness for a parser this small is the whole point.
 //!
 //! A [`tree_sitter::Language`] is still required to satisfy [`LanguageParser`]
-//! — `callers::call_sites_filtered` calls `language()`/`tags_query()`
-//! unconditionally on any file the registry claims, to build a reference-
-//! finding query — so `tree-sitter-md`'s grammar is used to answer that, with
+//! — `callers` calls `language()`/`tags_query()` unconditionally on any file
+//! the registry claims, to build a reference-finding query — so `tree-sitter-md`'s grammar is used to answer that, with
 //! an empty `tags_query()` since Markdown has no calls to find.
 //!
 //! ## Heading body ranges
@@ -94,8 +93,8 @@ impl LanguageParser for MarkdownParser {
     }
 
     fn tags_query(&self) -> &'static str {
-        // Markdown has no "calls" to extract. `call_sites_filtered` degrades
-        // an empty query to "no call sites" rather than erroring.
+        // Markdown has no "calls" to extract. `callers` degrades an empty
+        // query to "no call sites" rather than erroring.
         ""
     }
 

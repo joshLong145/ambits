@@ -267,9 +267,9 @@ mod tests {
     }
 
     fn test_app() -> App {
-        let tree = ProjectTree {
-            root: PathBuf::from("/test"),
-            files: vec![
+        let tree = ProjectTree::new(
+            PathBuf::from("/test"),
+            vec![
                 FileSymbols {
                     file_path: "mock/a.rs".into(),
                     symbols: vec![sym("a1", "alpha"), sym("a2", "beta")],
@@ -281,7 +281,7 @@ mod tests {
                     total_lines: 30,
                 },
             ],
-        };
+        );
         App::new(tree, PathBuf::from("/test"))
     }
 
@@ -328,9 +328,9 @@ mod tests {
     /// version is there; the file's counts its writes.
     #[test]
     fn render_marks_written_rows() {
-        let tree = ProjectTree {
-            root: PathBuf::from("/test"),
-            files: vec![FileSymbols {
+        let tree = ProjectTree::new(
+            PathBuf::from("/test"),
+            vec![FileSymbols {
                 file_path: "mock/w.rs".into(),
                 symbols: vec![
                     sym("mock/w.rs::alpha", "alpha"),
@@ -338,7 +338,7 @@ mod tests {
                 ],
                 total_lines: 5,
             }],
-        };
+        );
         let mut app = App::new(tree, PathBuf::from("/test"));
         app.set_session_id(Some("sess".into()));
         app.set_expanded("mock/w.rs", ambits::expansion::RowKind::File, true);
@@ -447,14 +447,14 @@ mod tests {
     fn app_with_a_read_child() -> App {
         let mut parent = sym("p", "Parent");
         parent.children = vec![sym("p/a", "a"), sym("p/b", "b")];
-        let tree = ProjectTree {
-            root: PathBuf::from("/test"),
-            files: vec![FileSymbols {
+        let tree = ProjectTree::new(
+            PathBuf::from("/test"),
+            vec![FileSymbols {
                 file_path: "mock/p.rs".into(),
                 symbols: vec![parent],
                 total_lines: 20,
             }],
-        };
+        );
         let mut app = App::new(tree, PathBuf::from("/test"));
         app.set_expanded("mock/p.rs", ambits::expansion::RowKind::File, true);
         app.set_expanded("p", ambits::expansion::RowKind::Symbol, false);
