@@ -71,6 +71,47 @@ impl LanguageParser for TypescriptParser {
         tree_sitter_typescript::TAGS_QUERY
     }
 
+    /// The shipped query has no call patterns at all: this grammar's tags
+    /// extend the JavaScript ones, which the crate does not include, so no
+    /// `.ts` file ever reported a call site.
+    ///
+    /// These report what Python's query reports: a callee named in the syntax,
+    /// bare or as a member, so `a['b']()` and `(a.b)()` stay out. A non-null
+    /// assertion does not change that: `a.b!()` is the same call as `a.b()`
+    /// to anyone reading it.
+    ///
+    /// `new Foo()` is a call to `Foo`, as Java's supplement has it, and as
+    /// `Foo()` already is in Python. The shipped query tags it only as
+    /// `@reference.class`, which does not count, so it is not reported twice.
+    fn tags_supplement(&self) -> &'static str {
+        r#"
+        (call_expression
+            function: [
+                (identifier) @name
+                (member_expression
+                    property: [
+                        (property_identifier)
+                        (private_property_identifier)
+                    ] @name)
+                (non_null_expression
+                    (identifier) @name)
+                (non_null_expression
+                    (member_expression
+                        property: [
+                            (property_identifier)
+                            (private_property_identifier)
+                        ] @name))
+            ]) @reference.call
+
+        (new_expression
+            constructor: [
+                (identifier) @name
+                (member_expression
+                    property: (property_identifier) @name)
+            ]) @reference.call
+        "#
+    }
+
     fn parse_file(&self, path: &Path, source: &str) -> color_eyre::Result<FileSymbols> {
         let mut parser = Parser::new();
         let language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT;

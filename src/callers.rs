@@ -3,9 +3,11 @@
 //! ## What this can and cannot know
 //!
 //! Reference sites come from the grammar's own `tags.scm`, which every
-//! tree-sitter crate we depend on ships. Those queries already define
+//! tree-sitter crate we depend on ships. Most of those queries already define
 //! `@reference.call` over call expressions, method calls, and macro
-//! invocations, so nothing here authors per-language rules.
+//! invocations, so nothing here authors per-language rules. Each parser adds
+//! what its query leaves out through [`LanguageParser::tags_supplement`];
+//! for TypeScript, that is every call.
 //!
 //! What the grammar gives is *syntax*, not resolution. A call to `walk()` is
 //! visibly a call to something named `walk`; which `walk` it binds to needs
@@ -555,6 +557,228 @@ fn caller() {
         assert_eq!(hit.1, 3, "the call is on line 3 of the original file");
     }
 
+    /// Callee names in TypeScript `src`, in source order.
+    fn ts_calls(src: &str) -> Vec<String> {
+        call_sites(&registry(), Path::new("a.ts"), src)
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect()
+    }
+
+    /// The shipped TypeScript query has no call patterns, so without the
+    /// supplement every one of these came back empty.
+    #[test]
+    fn typescript_bare_and_member_calls_are_found() {
+        let src = r#"
+bare();
+a.member();
+this.own();
+a?.optional();
+a.maybe?.();
+super.inherited();
+a.b.deep();
+"#;
+        assert_eq!(
+            ts_calls(src),
+            [
+                "bare",
+                "member",
+                "own",
+                "optional",
+                "maybe",
+                "inherited",
+                "deep"
+            ]
+        );
+    }
+
+    /// A chain is one call per link, each reported at its own name, so a
+    /// fluent chain over several lines lands on the line that makes each call.
+    #[test]
+    fn each_link_of_a_typescript_call_chain_is_a_call() {
+        let found = call_sites(
+            &registry(),
+            Path::new("a.ts"),
+            "a\n  .first()\n  .second();\n",
+        );
+        let links: Vec<(&str, u32)> = found.iter().map(|(n, l, _)| (n.as_str(), *l)).collect();
+        assert_eq!(links, [("first", 2), ("second", 3)]);
+    }
+
+    /// `target<T>()` and `target!()` wrap the callee differently in the
+    /// grammar, but a reader sees the same call to the same name.
+    #[test]
+    fn type_syntax_around_a_typescript_callee_does_not_hide_the_call() {
+        let src = r#"
+generic<T>();
+a.genericMember<T>();
+asserted!();
+a.assertedMember!();
+a!.onAsserted();
+(a as any).onCast();
+"#;
+        assert_eq!(
+            ts_calls(src),
+            [
+                "generic",
+                "genericMember",
+                "asserted",
+                "assertedMember",
+                "onAsserted",
+                "onCast"
+            ]
+        );
+    }
+
+    /// The name is reported as written, `#` included, because that is also
+    /// the name of the symbol it calls.
+    #[test]
+    fn a_typescript_private_method_call_keeps_its_hash() {
+        assert_eq!(ts_calls("class K { m() { this.#p(); } }"), ["#p"]);
+    }
+
+    /// Calls are expressions, so they turn up well outside function bodies.
+    /// `@decorated()` is a call but a bare `@decorated` is not, as in Python.
+    #[test]
+    fn typescript_calls_are_found_wherever_an_expression_can_go() {
+        let src = r#"
+const arrow = () => inArrow();
+class K {
+    field = inField();
+    @decorated() method(arg = inDefault()) {}
+    @notCalled other() {}
+}
+@ns.decoratedClass() class D {}
+const text = `before ${inTemplate()} after`;
+"#;
+        assert_eq!(
+            ts_calls(src),
+            [
+                "inArrow",
+                "inField",
+                "decorated",
+                "inDefault",
+                "decoratedClass",
+                "inTemplate"
+            ]
+        );
+    }
+
+    /// A tagged template is a call without parentheses: `tag` runs, and the
+    /// grammar says so with a `call_expression`.
+    #[test]
+    fn a_typescript_tagged_template_is_a_call() {
+        assert_eq!(ts_calls("tag`text ${inside()}`;"), ["tag", "inside"]);
+    }
+
+    /// A constructor call is a call to the class, as it is in Java and Python.
+    /// The shipped query's `@reference.class` pattern matches the same node,
+    /// and must not make it a second site.
+    #[test]
+    fn typescript_new_is_a_call_to_the_class() {
+        assert_eq!(
+            ts_calls("new Foo(); new ns.Bar(); new Generic<T>(); new Bare;"),
+            ["Foo", "Bar", "Generic", "Bare"]
+        );
+        assert_eq!(
+            ts_calls("new Foo(arg()).method();"),
+            ["Foo", "arg", "method"]
+        );
+    }
+
+    /// No name in the syntax, so nothing to report. A string key could be read
+    /// as one, but Python and Rust leave `a['b']()` out too, and `a[key]()`
+    /// could not be reported at all. The object is still ordinary code.
+    #[test]
+    fn a_typescript_callee_named_only_at_runtime_is_not_reported() {
+        assert_eq!(
+            ts_calls("a['computed'](); a[key](); (a.wrapped)(); (0, indirect)();"),
+            Vec::<String>::new()
+        );
+        assert_eq!(ts_calls("object()['computed']();"), ["object"]);
+    }
+
+    /// `super` and `import` are keywords in callee position, not names.
+    #[test]
+    fn typescript_super_and_import_calls_are_not_reported() {
+        let src = "class K extends B { constructor() { super(); import('x'); } }";
+        assert_eq!(ts_calls(src), Vec::<String>::new());
+    }
+
+    /// What a text search for `dispose(` drowns in: every one of these has the
+    /// shape of a call and is not one.
+    #[test]
+    fn typescript_declarations_comments_and_strings_are_not_call_sites() {
+        let src = r#"
+declare function target(): void;
+function target(): void {}
+interface I { target(): void; }
+abstract class A { abstract target(): void; target() {} }
+type T = ReturnType<typeof target>;
+// target()
+/* target() */
+const text = "target()" + `target()`;
+"#;
+        assert_eq!(ts_calls(src), Vec::<String>::new());
+    }
+
+    /// One call is one site. Each call expression has a single callee, so the
+    /// alternatives in the supplement cannot both match it, and two calls on
+    /// a line stay two because a site is keyed by its byte as well.
+    #[test]
+    fn each_typescript_call_is_reported_once() {
+        let found = call_sites(
+            &registry(),
+            Path::new("a.ts"),
+            "a.target(); a.target!(); a?.target();",
+        );
+        let bytes: Vec<u32> = found.iter().map(|(_, _, byte)| *byte).collect();
+        assert_eq!(bytes, [2, 14, 28]);
+    }
+
+    /// The enclosing symbol is what the output leads with. Object literals and
+    /// callbacks have no symbol of their own, so they fall through to whatever
+    /// holds them, and a method's decorator sits beside it in the class body.
+    #[test]
+    fn typescript_calls_are_attributed_to_the_innermost_symbol() {
+        let src = r#"
+target();
+function plain() { target(); }
+const arrow = () => { target(); };
+class K {
+    field = target();
+    handler = () => { target(); };
+    method() { [1].map(() => target()); }
+    @target() decorated() {}
+}
+namespace N { export function nested() { target(); } }
+const table = { entry() { target(); } };
+describe('suite', () => { target(); });
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ts"), src).unwrap();
+        let registry = registry();
+        let tree = registry.scan_project(dir.path(), None).unwrap();
+
+        let found = find_callers(dir.path(), &tree, &registry, &["target".to_string()]);
+        let callers: Vec<Option<&str>> = found.iter().map(|s| s.caller.as_deref()).collect();
+        assert_eq!(
+            callers,
+            [
+                None,
+                Some("a.ts::plain"),
+                Some("a.ts::arrow"),
+                Some("a.ts::K/field"),
+                Some("a.ts::K/handler"),
+                Some("a.ts::K/method"),
+                Some("a.ts::K"),
+                Some("a.ts::N/nested"),
+                None,
+                None,
+            ]
+        );
+    }
+
     #[test]
     fn an_unparseable_language_yields_no_sites_rather_than_failing() {
         assert!(call_sites(&registry(), Path::new("a.txt"), "helper()").is_empty());
@@ -590,6 +814,9 @@ fn caller() {
         let found = find_callers(dir.path(), &narrowed, &registry, &names);
         assert_eq!(found, find_callers(dir.path(), &full, &registry, &names));
         let in_file = |name: &str| found.iter().filter(|s| s.file == Path::new(name)).count();
-        assert_eq!((in_file("a.rs"), in_file("d.py")), (2, 1));
+        assert_eq!(
+            (in_file("a.rs"), in_file("d.py"), in_file("e.ts")),
+            (2, 1, 2)
+        );
     }
 }

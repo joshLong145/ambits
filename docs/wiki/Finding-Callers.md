@@ -10,10 +10,11 @@ centered_rect — 2 call sites in 2 callers
   src/ui/compaction.rs::render  (src/ui/compaction.rs:15)
 ```
 
-Call sites come from the grammar's own tags query, so a mention in a comment or
-inside a string literal is never reported — the answer is a call node or it is
-not there. Each site is attributed to the innermost symbol containing it, and
-that id goes straight into [`show`](Reading-by-Symbol).
+Call sites come from the grammar's own tags query, plus patterns of ours where
+that falls short, so a mention in a comment or inside a string literal is never
+reported — the answer is a call node or it is not there. Each site is attributed
+to the innermost symbol containing it, and that id goes straight into
+[`show`](Reading-by-Symbol).
 
 Several names can be passed at once. `--format json` gives, per name, the
 counts and a `sites` list of `{file, line, caller}`, where `caller` is the
@@ -33,6 +34,25 @@ codebase are unique, so most answers are exact — but `callers new` returns
 every call to anything named `new` (618 sites in 390 callers on this
 repository). `--format json` sets `name_matched_only: true` so a consumer
 cannot mistake this for a resolved call graph.
+
+## What counts as a call
+
+A call is reported when its callee has a name in the syntax. In TypeScript that
+covers `foo()`, `a.b()`, `this.b()`, `a?.b()`, each link of `a.b().c()`,
+`foo<T>()`, `a.b!()`, `this.#b()` (as `#b`), a decorator written `@foo()`, a
+tagged template, and `new Foo()` as a call to `Foo`, as in Java and Python,
+wherever the call appears.
+
+These are not reported, in TypeScript or in the languages with an equivalent: a
+computed `a['b']()`, a parenthesized `(a.b)()`, and a bare decorator `@foo`. Nor
+are TypeScript's `super()` and `import()`.
+
+Of the JavaScript family only `.ts` files are parsed. `.tsx`, `.mts`, `.js` and
+`.jsx` are not, so calls in them are not reported.
+
+A callback or object literal has no symbol of its own, so a call inside one
+belongs to the symbol around it, or to `<file scope>` if there is none. Test
+suites written as `suite('…', () => { … })` report mostly `<file scope>`.
 
 ## Cost
 
