@@ -456,3 +456,98 @@ fn an_empty_pattern_file_alone_is_no_pattern_given() {
     assert_eq!(out.code, 2);
     assert!(out.stderr.contains("no pattern given"), "{:?}", out.stderr);
 }
+
+/// A generated file is one line holding a match every few bytes. A copy of the
+/// line per match would need 100 GB here, so simply finishing is the assertion
+/// on memory: every mode has to hold that line once, or not at all.
+#[test]
+fn a_giant_line_of_matches_finishes_in_every_mode() {
+    let dir = fixture();
+    let line = "e ".repeat(250_000);
+    std::fs::write(dir.path().join("src/data.ts"), format!("{line}\n")).unwrap();
+
+    let matches = 250_000.to_string();
+    for (args, want) in [
+        (&["rg", "-n", "e", "src/data.ts"][..], "src/data.ts:1:1:"),
+        (&["rg", "-U", "-n", "e", "src/data.ts"], "src/data.ts:1:1:"),
+        (&["rg", "-o", "e", "src/data.ts"], "src/data.ts:1:1:"),
+        (
+            &["rg", "--json", "e", "src/data.ts"],
+            "\"type\":\"summary\"",
+        ),
+        (&["rg", "-c", "e", "src/data.ts"], "src/data.ts:1"),
+        (
+            &["rg", "--count-matches", "e", "src/data.ts"],
+            matches.as_str(),
+        ),
+        (&["rg", "-l", "e", "src/data.ts"], "src/data.ts"),
+    ] {
+        let out = run(dir.path(), args);
+        assert_eq!(out.code, 0, "{args:?}: {}", out.stderr);
+        assert!(out.stdout.contains(want), "{args:?}: {:.200}", out.stdout);
+    }
+    assert_eq!(run(dir.path(), &["rg", "-q", "e", "src/data.ts"]).code, 0);
+}
+
+/// What the limit keeps is still attributed, and what it cuts is still counted.
+#[test]
+fn matches_past_the_limit_are_counted_and_the_rest_keep_their_symbols() {
+    let dir = fixture();
+    let out = run(dir.path(), &["rg", "-n", "--head-limit", "2", "needle"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(
+        out.stdout.trim(),
+        "docs/notes.md:1:5:[preamble] the needle is documented here\n\
+         src/lib.rs:1:8:[needle] pub fn needle() -> u32 {"
+    );
+    assert!(
+        out.stderr.contains("1 more matches withheld"),
+        "{}",
+        out.stderr
+    );
+}
+
+/// `--dump` runs ahead of `show` and reports the project, so `show`'s narrowing
+/// must not reach it.
+#[test]
+fn dump_still_sees_the_whole_project_when_show_is_named() {
+    let dir = fixture();
+    let out = run(dir.path(), &["--dump", "show", "src/lib.rs::needle"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.contains("src/util.rs"), "{}", out.stdout);
+}
+
+/// A hash can name a symbol anywhere, so it sends the whole query down the
+/// full scan and the id beside it answers as usual.
+#[test]
+fn show_resolves_a_hash_and_an_id_together() {
+    let dir = fixture();
+    let by_id = run(dir.path(), &["show", "src/util.rs::unrelated"]);
+    let shown: serde_json::Value = serde_json::from_str(&by_id.stdout).unwrap();
+    let hash = shown["results"][0]["matches"][0]["content_hash"]
+        .as_str()
+        .unwrap();
+
+    let out = run(dir.path(), &["show", hash, "src/lib.rs::needle"]);
+    let shown: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(
+        shown["results"][0]["matches"][0]["id"],
+        "src/util.rs::unrelated"
+    );
+    assert_eq!(
+        shown["results"][1]["matches"][0]["id"],
+        "src/lib.rs::needle"
+    );
+}
+
+/// `show` of an id reads only the files it names, so a source file elsewhere
+/// that cannot be read no longer costs it the answer.
+#[test]
+fn show_of_an_id_is_not_stopped_by_an_unreadable_file_elsewhere() {
+    let dir = fixture();
+    std::fs::write(dir.path().join("src/latin1.rs"), [0x66, 0xE9, 0x0A]).unwrap();
+
+    let out = run(dir.path(), &["show", "src/lib.rs::needle"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.contains("pub fn needle"), "{}", out.stdout);
+}

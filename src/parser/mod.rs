@@ -7,9 +7,10 @@ pub mod typescript;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, WrapErr};
 
 use crate::filter::PathFilter;
+use crate::parallel::par_map;
 use crate::symbols::{FileSymbols, ProjectTree, SymbolCategory};
 
 /// What a grammar node maps to in the symbol tree.
@@ -239,6 +240,17 @@ pub fn walk_files(root: &Path, opts: &WalkOptions<'_>) -> Vec<(PathBuf, PathBuf)
     out
 }
 
+/// The files a command needs parsed, when that is not all of them. The answer
+/// must be the one a full scan gives: narrowing skips work, never symbols the
+/// command could have reported.
+#[derive(Clone, Copy)]
+pub enum ScanScope<'a> {
+    /// Files at paths this accepts, decided before reading any.
+    Paths(&'a (dyn Fn(&Path) -> bool + Sync)),
+    /// Files whose text holds one of these.
+    Mentioning(&'a [String]),
+}
+
 /// Registry of all available language parsers.
 pub struct ParserRegistry {
     parsers: Vec<Box<dyn LanguageParser>>,
@@ -285,6 +297,27 @@ impl ParserRegistry {
     /// satisfy the filter are skipped *before* I/O — excluded files are not
     /// read from disk or parsed.
     pub fn scan_project(&self, root: &Path, filter: Option<&PathFilter>) -> Result<ProjectTree> {
+        self.scan(root, filter, None)
+    }
+
+    /// [`Self::scan_project`] for only the files `scope` allows. The walk is
+    /// the same one, so ignored and filtered files stay out just as they do
+    /// there.
+    pub fn scan_scoped(
+        &self,
+        root: &Path,
+        filter: Option<&PathFilter>,
+        scope: ScanScope<'_>,
+    ) -> Result<ProjectTree> {
+        self.scan(root, filter, Some(scope))
+    }
+
+    fn scan(
+        &self,
+        root: &Path,
+        filter: Option<&PathFilter>,
+        scope: Option<ScanScope<'_>>,
+    ) -> Result<ProjectTree> {
         // Walk first, parse second. Measured on this repo, walking the tree is
         // effectively free — restricting the parse to a single file costs the
         // same as parsing none — while parsing every file is ~95ms of the
@@ -295,7 +328,7 @@ impl ParserRegistry {
         // The extension test stays here rather than in the walk: a scan wants
         // only files it can parse, but a content search wants every text file
         // in scope and attributes symbols to the subset that parses.
-        let targets: Vec<(PathBuf, PathBuf)> = walk_files(
+        let mut targets: Vec<(PathBuf, PathBuf)> = walk_files(
             root,
             &WalkOptions {
                 filter,
@@ -304,82 +337,118 @@ impl ParserRegistry {
         )
         .into_iter()
         .filter(|(abs, _)| self.parser_for(abs).is_some())
+        .filter(|(_, rel)| match scope {
+            Some(ScanScope::Paths(accepts)) => accepts(rel),
+            _ => true,
+        })
         .collect();
 
-        let mut files: Vec<FileSymbols> = Vec::with_capacity(targets.len());
-        if !targets.is_empty() {
-            let threads = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .min(targets.len());
-            let chunk = targets.len().div_ceil(threads);
+        // Every consumer expects files in path order, and `par_map` keeps the
+        // order it is given. It also makes the failure below the same one
+        // every run, however the threads finish.
+        targets.sort_by(|a, b| a.1.cmp(&b.1));
 
-            // A read failure stays fatal, as it was when this ran serially —
-            // a project we cannot read is not a project with fewer symbols.
-            let results: Vec<Result<Vec<FileSymbols>>> = std::thread::scope(|scope| {
-                let handles: Vec<_> = targets
-                    .chunks(chunk)
-                    .map(|batch| {
-                        scope.spawn(move || {
-                            let mut out = Vec::with_capacity(batch.len());
-                            for (abs, rel) in batch {
-                                let Some(parser) = self.parser_for(abs) else {
-                                    continue;
-                                };
-                                let source = fs::read_to_string(abs)?;
-                                match parser.parse_file(rel, &source) {
-                                    Ok(file_symbols) => {
-                                        log::debug!(
-                                            target: "ambits::parsing",
-                                            path:? = rel,
-                                            symbol_count = file_symbols.symbols.len() as u64;
-                                            "parsed"
-                                        );
-                                        out.push(file_symbols);
-                                    }
-                                    Err(e) => {
-                                        log::warn!(
-                                            target: "ambits::parsing",
-                                            path:? = abs,
-                                            error = e.to_string();
-                                            "failed to parse"
-                                        );
-                                        crate::try_eprintln!(
-                                            "Warning: failed to parse {}: {}",
-                                            abs.display(),
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                            Ok(out)
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap_or_else(|_| Ok(Vec::new())))
-                    .collect()
-            });
+        // A read failure stays fatal, as it was when this ran serially — a
+        // project we cannot read is not a project with fewer symbols.
+        let parsed = par_map(&targets, |(abs, rel)| self.parse_target(abs, rel, scope));
+        let files = parsed
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
 
-            for batch in results {
-                files.extend(batch?);
+        Ok(ProjectTree::new(root.to_path_buf(), files))
+    }
+
+    /// Read and parse one file the walk found. `None` for one `scope` rules
+    /// out by its text, or its parser gave up on, which is warned about
+    /// rather than fatal.
+    fn parse_target(
+        &self,
+        abs: &Path,
+        rel: &Path,
+        scope: Option<ScanScope<'_>>,
+    ) -> Result<Option<FileSymbols>> {
+        let Some(parser) = self.parser_for(abs) else {
+            return Ok(None);
+        };
+        let source =
+            fs::read_to_string(abs).wrap_err_with(|| format!("reading {}", abs.display()))?;
+        if let Some(ScanScope::Mentioning(names)) = scope {
+            if !names.iter().any(|n| source.contains(n.as_str())) {
+                return Ok(None);
             }
         }
-
-        // Threads finish out of order, so the sort is now load-bearing rather
-        // than cosmetic: every consumer expects files in path order.
-        files.sort_by(|a, b| a.file_path.cmp(&b.file_path));
-
-        Ok(ProjectTree {
-            root: root.to_path_buf(),
-            files,
-        })
+        match parser.parse_file(rel, &source) {
+            Ok(file_symbols) => {
+                log::debug!(
+                    target: "ambits::parsing",
+                    path:? = rel,
+                    symbol_count = file_symbols.symbols.len() as u64;
+                    "parsed"
+                );
+                Ok(Some(file_symbols))
+            }
+            Err(e) => {
+                log::warn!(
+                    target: "ambits::parsing",
+                    path:? = abs,
+                    error = e.to_string();
+                    "failed to parse"
+                );
+                crate::try_eprintln!("Warning: failed to parse {}: {}", abs.display(), e);
+                Ok(None)
+            }
+        }
     }
 }
 
 impl Default for ParserRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    /// Two unreadable files, one failure: the same one each run, whichever
+    /// thread got there first, and naming the file.
+    #[test]
+    fn a_scan_fails_on_the_first_unreadable_file_in_path_order() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "c.rs", "e.rs"] {
+            fs::write(dir.path().join(name), "fn f() {}\n").unwrap();
+        }
+        // Not UTF-8, as a Latin-1 source file is not.
+        for name in ["b.rs", "d.rs"] {
+            fs::write(dir.path().join(name), [0x66, 0xE9, 0x0A]).unwrap();
+        }
+
+        let registry = ParserRegistry::new();
+        for _ in 0..20 {
+            let error = registry.scan_project(dir.path(), None).unwrap_err();
+            assert!(format!("{error}").ends_with("b.rs"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_scan_returns_files_in_path_order() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("a")).unwrap();
+        for name in ["z.rs", "a-b.rs", "a/b.rs", "m.rs"] {
+            fs::write(dir.path().join(name), "fn f() {}\n").unwrap();
+        }
+
+        let tree = ParserRegistry::new()
+            .scan_project(dir.path(), None)
+            .unwrap();
+        let paths: Vec<_> = tree.files.iter().map(|f| f.file_path.clone()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted);
+        assert_eq!(paths.len(), 4);
     }
 }

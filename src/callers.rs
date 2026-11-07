@@ -35,17 +35,23 @@
 //! vastly outnumber definitions, and every other command — `find`, `show`, the
 //! TUI — would carry that weight without using it. Re-reading the files costs
 //! this one command a fraction of a second and costs the rest nothing.
+//!
+//! Nor does it need every file parsed to start with. A file that never mentions
+//! a name cannot call it, so the scan behind this command skips those
+//! ([`crate::parser::ScanScope::Mentioning`]) as [`find_callers`] does.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Result, WrapErr};
 use serde::Serialize;
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Parser, Query, QueryCursor};
+use tree_sitter::{Language, Parser, Query, QueryCursor};
 
-use crate::parser::ParserRegistry;
+use crate::parallel::par_map;
+use crate::parser::{LanguageParser, ParserRegistry};
 use crate::symbols::ProjectTree;
 
 /// Bumped on any breaking change to the emitted shape.
@@ -68,13 +74,35 @@ pub struct CallSite {
     pub caller: Option<String>,
 }
 
+/// A language's call query. Compiled once per language: it is hundreds of
+/// patterns, and compiling it costs more than running it over a typical file.
+struct CallQuery {
+    language: Language,
+    query: Query,
+}
+
+impl CallQuery {
+    /// `None` when the grammar has no usable tags query: a language we cannot
+    /// introspect should narrow the answer, not abort the command.
+    fn of(parser: &dyn LanguageParser) -> Option<Self> {
+        let language = parser.language();
+        // Supplemented rather than replaced: the shipped query is a good base
+        // and stays maintained upstream, but it is written for tagging rather
+        // than for exhaustive reference finding.
+        let source = format!("{}\n{}", parser.tags_query(), parser.tags_supplement());
+        let query = Query::new(&language, &source).ok()?;
+        Some(Self { language, query })
+    }
+}
+
 /// Extract every `@reference.call` capture from one already-read source file.
 ///
-/// Returns nothing rather than failing when the grammar has no usable tags
-/// query: a language we cannot introspect should narrow the answer, not abort
-/// the command.
+/// Returns nothing rather than failing for a language with no call query.
 pub fn call_sites(registry: &ParserRegistry, path: &Path, source: &str) -> Vec<(String, u32, u32)> {
-    call_sites_filtered(registry, path, source, None)
+    registry
+        .parser_for(path)
+        .and_then(CallQuery::of)
+        .map_or_else(Vec::new, |query| sites_in(&query, source, None))
 }
 
 /// As [`call_sites`], but skipping macro bodies that cannot contain any of
@@ -83,31 +111,14 @@ pub fn call_sites(registry: &ParserRegistry, path: &Path, source: &str) -> Vec<(
 /// Re-parsing macro token trees is the bulk of this module's cost — Rust code
 /// is dense with `println!`, `format!` and `assert_eq!` — and a body whose
 /// text lacks the name outright cannot hold a call to it.
-pub fn call_sites_filtered(
-    registry: &ParserRegistry,
-    path: &Path,
+fn sites_in(
+    call_query: &CallQuery,
     source: &str,
     wanted: Option<&[String]>,
 ) -> Vec<(String, u32, u32)> {
-    let Some(parser_impl) = registry.parser_for(path) else {
-        return Vec::new();
-    };
-    let language = parser_impl.language();
-
-    // Supplemented rather than replaced: the shipped query is a good base and
-    // stays maintained upstream, but it is written for tagging rather than for
-    // exhaustive reference finding.
-    let source_query = format!(
-        "{}\n{}",
-        parser_impl.tags_query(),
-        parser_impl.tags_supplement()
-    );
-    let Ok(query) = Query::new(&language, &source_query) else {
-        return Vec::new();
-    };
-
+    let query = &call_query.query;
     let mut parser = Parser::new();
-    if parser.set_language(&language).is_err() {
+    if parser.set_language(&call_query.language).is_err() {
         return Vec::new();
     }
     let Some(tree) = parser.parse(source, None) else {
@@ -116,7 +127,7 @@ pub fn call_sites_filtered(
 
     let src = source.as_bytes();
     let mut out = Vec::new();
-    collect(&query, tree.root_node(), src, 0, 0, &mut out);
+    collect(query, tree.root_node(), src, 0, 0, &mut out);
 
     // Descend into macro bodies. tree-sitter does not parse them — a macro's
     // arguments arrive as an unparsed `token_tree` — so a call written inside
@@ -147,7 +158,7 @@ pub fn call_sites_filtered(
             continue;
         };
         collect(
-            &query,
+            query,
             sub.root_node(),
             text.as_bytes(),
             start_byte,
@@ -258,34 +269,43 @@ pub fn find_callers(
     names: &[String],
 ) -> Vec<CallSite> {
     let wanted: HashMap<&str, ()> = names.iter().map(|n| (n.as_str(), ())).collect();
-    let mut out = Vec::new();
 
+    let mut queries: HashMap<&OsStr, Option<CallQuery>> = HashMap::new();
     for file in &tree.files {
+        if let Some(extension) = file.file_path.extension() {
+            queries
+                .entry(extension)
+                .or_insert_with(|| registry.parser_for(&file.file_path).and_then(CallQuery::of));
+        }
+    }
+
+    let per_file = par_map(&tree.files, |file| {
+        let query = file
+            .file_path
+            .extension()
+            .and_then(|extension| queries.get(extension)?.as_ref())?;
         let full = project_root.join(&file.file_path);
-        let Ok(source) = std::fs::read_to_string(&full) else {
-            continue;
-        };
+        let source = std::fs::read_to_string(&full).ok()?;
         // A name that appears nowhere in the file's text cannot be called from
         // it, so the parse and the macro re-parses below can be skipped
         // outright. Sound because every call site contains the callee as a
         // substring, and worth it because most files mention most names never.
         if !names.iter().any(|n| source.contains(n.as_str())) {
-            continue;
+            return None;
         }
-        for (callee, line, byte) in
-            call_sites_filtered(registry, &file.file_path, &source, Some(names))
-        {
-            if !wanted.contains_key(callee.as_str()) {
-                continue;
-            }
-            out.push(CallSite {
+        let sites: Vec<CallSite> = sites_in(query, &source, Some(names))
+            .into_iter()
+            .filter(|(callee, _, _)| wanted.contains_key(callee.as_str()))
+            .map(|(callee, line, byte)| CallSite {
                 callee,
                 file: file.file_path.clone(),
                 line,
                 caller: file.enclosing(byte).map(|s| s.id.clone()),
-            });
-        }
-    }
+            })
+            .collect();
+        Some(sites)
+    });
+    let mut out: Vec<CallSite> = per_file.into_iter().flatten().flatten().collect();
 
     out.sort_by(|a, b| {
         a.callee
@@ -538,5 +558,38 @@ fn caller() {
     #[test]
     fn an_unparseable_language_yields_no_sites_rather_than_failing() {
         assert!(call_sites(&registry(), Path::new("a.txt"), "helper()").is_empty());
+    }
+
+    /// Files that never mention a name are left out of the scan, which must
+    /// change nothing: not the sites, the callers they sit in, or their order.
+    #[test]
+    fn a_scan_of_the_mentioning_files_finds_the_same_callers() {
+        use crate::parser::ScanScope;
+
+        let dir = tempfile::tempdir().unwrap();
+        let files = [
+            ("a.rs", "fn a() { target(); println!(\"{}\", target()); }\n"),
+            ("b.rs", "fn b() {}\n"),
+            ("c.rs", "// target is only mentioned here\nfn c() {}\n"),
+            ("d.py", "def d():\n    target()\n"),
+            ("e.ts", "function e() { target(); other(); }\n"),
+            ("f.md", "# target\n"),
+        ];
+        for (name, source) in files {
+            std::fs::write(dir.path().join(name), source).unwrap();
+        }
+
+        let registry = registry();
+        let names = vec!["target".to_string(), "other".to_string()];
+        let full = registry.scan_project(dir.path(), None).unwrap();
+        let narrowed = registry
+            .scan_scoped(dir.path(), None, ScanScope::Mentioning(&names))
+            .unwrap();
+
+        assert!(narrowed.files.len() < full.files.len());
+        let found = find_callers(dir.path(), &narrowed, &registry, &names);
+        assert_eq!(found, find_callers(dir.path(), &full, &registry, &names));
+        let in_file = |name: &str| found.iter().filter(|s| s.file == Path::new(name)).count();
+        assert_eq!((in_file("a.rs"), in_file("d.py")), (2, 1));
     }
 }

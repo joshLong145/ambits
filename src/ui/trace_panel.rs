@@ -658,10 +658,7 @@ mod tests {
     /// of b.rs; the trace list open.
     fn app() -> App {
         let mut app = App::new(
-            ProjectTree {
-                root: PathBuf::from("/test"),
-                files: vec![],
-            },
+            ProjectTree::new(PathBuf::from("/test"), vec![]),
             PathBuf::from("/test"),
         );
         app.set_session_id(Some("sess".into()));
@@ -950,14 +947,14 @@ mod tests {
             estimated_tokens: 5,
         };
         let run = node("src/a.rs::App/run", "run", 3..5, vec![]);
-        let tree = ProjectTree {
-            root: PathBuf::from("/test"),
-            files: vec![FileSymbols {
+        let tree = ProjectTree::new(
+            PathBuf::from("/test"),
+            vec![FileSymbols {
                 file_path: "src/a.rs".into(),
                 symbols: vec![node("src/a.rs::App", "App", 1..6, vec![run])],
                 total_lines: 6,
             }],
-        };
+        );
         let mut app = App::new(tree, PathBuf::from("/test"));
         app.set_session_id(Some("sess".into()));
         app.process_prompt(&Prompt {

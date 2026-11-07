@@ -250,8 +250,9 @@ ambits -p . --log-output ./logs
 ```
 
 Writes one structured JSON-lines log per session to `<dir>/<session>.log`:
-session-log ingest, tool/depth resolution, symbol updates, parsing, and one
-activity line per tool call. It is file-only, never stderr, because stray
+session-log ingest, tool/depth resolution, symbol updates, parsing, one
+activity line per tool call, and how long each startup phase took (target
+`ambits::timing`, with `phase` and `ms`). It is file-only, never stderr, because stray
 output would corrupt the TUI; with no `--log-output` no logger is installed at
 all.
 
