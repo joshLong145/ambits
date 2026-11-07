@@ -44,6 +44,14 @@
 //! attribution. Against this repo a typical query parses 7 files instead of 40.
 //! The regex crate's own literal prefilters do the rejecting, which is the same
 //! machinery ripgrep relies on.
+//!
+//! ## Count first, attribute second
+//!
+//! `--head-limit` keeps a prefix of the sorted matches and reports how many it
+//! withheld. A broad pattern matches most of a monorepo, and only the prefix
+//! is ever printed, so everything else is counted and never held or parsed:
+//! [`search_within_limit`] counts every file, then runs the real search over
+//! the files the limit reaches. Every match printed still carries its symbol.
 
 use std::io::Write;
 use std::ops::{ControlFlow, Range};
@@ -53,6 +61,7 @@ use std::sync::Arc;
 use color_eyre::eyre::{Result, WrapErr};
 use regex::bytes::{Regex, RegexBuilder};
 
+use crate::parallel::par_map;
 use crate::parser::ParserRegistry;
 use crate::restore::CoverageIndex;
 use crate::symbols::FileSymbols;
@@ -571,12 +580,17 @@ fn strip_newline(raw: &[u8]) -> &[u8] {
     line
 }
 
+/// A file's bytes, if it could hold a match: `None` for one that is unreadable,
+/// binary, or rejected by the prefilter — outcomes a caller treats identically,
+/// and none of which is an error: one unreadable file should narrow the answer,
+/// not fail the command.
+fn searchable(matcher: &Matcher, abs: &Path) -> Option<Vec<u8>> {
+    let buf = std::fs::read(abs).ok()?;
+    (!is_binary(&buf) && matcher.worth_searching(&buf)).then_some(buf)
+}
+
 /// Search one file, parsing it only if it matched and only if attribution is
-/// wanted.
-///
-/// Returns `None` for a file that is unreadable, binary, or has no match —
-/// three outcomes a caller treats identically, and none of which is an error:
-/// one unreadable file should narrow the answer, not fail the command.
+/// wanted. `None` for a file with no match, as for one not [`searchable`].
 pub fn search_file(
     matcher: &Matcher,
     registry: &ParserRegistry,
@@ -585,10 +599,7 @@ pub fn search_file(
     opts: &Options,
     coverage: Option<&CoverageIndex>,
 ) -> Option<FileHits> {
-    let buf = std::fs::read(abs).ok()?;
-    if is_binary(&buf) || !matcher.worth_searching(&buf) {
-        return None;
-    }
+    let buf = searchable(matcher, abs)?;
 
     if !opts.mode.shows_source() {
         let tally = tally_in(matcher, &buf, matches_wanted(opts));
@@ -612,7 +623,13 @@ pub fn search_file(
     if !opts.no_symbol {
         if let (Some(parser), Ok(source)) = (registry.parser_for(abs), std::str::from_utf8(&buf)) {
             if let Ok(symbols) = parser.parse_file(rel, source) {
-                attribute(&mut hits, &symbols, coverage);
+                // No file prints more than the limit, so past it no one will
+                // ever see a symbol.
+                let printable = match opts.head_limit {
+                    0 => hits.len(),
+                    limit => limit.min(hits.len()),
+                };
+                attribute(&mut hits[..printable], &symbols, coverage);
             }
         }
     }
@@ -707,39 +724,55 @@ pub fn search(
     opts: &Options,
     coverage: Option<&CoverageIndex>,
 ) -> Vec<FileHits> {
-    if targets.is_empty() {
-        return Vec::new();
-    }
-
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(targets.len());
-    let chunk = targets.len().div_ceil(threads);
-
-    let mut out: Vec<FileHits> = std::thread::scope(|scope| {
-        let handles: Vec<_> = targets
-            .chunks(chunk)
-            .map(|batch| {
-                scope.spawn(move || {
-                    batch
-                        .iter()
-                        .filter_map(|(abs, rel)| {
-                            search_file(matcher, registry, abs, rel, opts, coverage)
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .filter_map(|h| h.join().ok())
-            .flatten()
-            .collect()
-    });
+    let mut out: Vec<FileHits> = par_map(targets, |(abs, rel)| {
+        search_file(matcher, registry, abs, rel, opts, coverage)
+    })
+    .into_iter()
+    .flatten()
+    .collect();
 
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
+}
+
+/// [`search`] for the files the head limit reaches, and how many matches the
+/// files past them hold, counted rather than kept.
+///
+/// The last file reached is searched whole, as any other: [`apply_head_limit`]
+/// truncates it, and its context lines come from all its matches.
+///
+/// A file changing between the count and the search is reported as the search
+/// found it, so a tree being edited can print short of the limit, and never
+/// past it, with `withheld` still counting what the rest held when counted.
+fn search_within_limit(
+    matcher: &Matcher,
+    registry: &ParserRegistry,
+    targets: &[(PathBuf, PathBuf)],
+    opts: &Options,
+    coverage: Option<&CoverageIndex>,
+) -> (Vec<FileHits>, usize) {
+    let mut counted: Vec<_> = par_map(targets, |target| {
+        let matches = searchable(matcher, &target.0)
+            .map_or(0, |buf| tally_in(matcher, &buf, opts.max_count).matches);
+        (target, matches)
+    });
+    counted.retain(|(_, matches)| *matches > 0);
+    // Matches print in path order, so that is the order the limit reaches them.
+    counted.sort_by(|(a, _), (b, _)| a.1.cmp(&b.1));
+
+    let mut reached = 0usize;
+    let mut beyond = 0usize;
+    let mut within = Vec::new();
+    for (target, matches) in counted {
+        if reached < opts.head_limit {
+            reached += matches;
+            within.push(target.clone());
+        } else {
+            beyond += matches;
+        }
+    }
+
+    (search(matcher, registry, &within, opts, coverage), beyond)
 }
 
 /// Drop everything past `head_limit` matches, reporting how many were dropped.
@@ -1205,15 +1238,21 @@ pub fn run(
     coverage: Option<&CoverageIndex>,
 ) -> Result<Outcome> {
     let matcher = Matcher::new(opts)?;
-    let mut files = search(&matcher, registry, targets, opts, coverage);
-    let matched = !files.is_empty();
 
     // `--head-limit` caps what is *printed*, so it applies only where matches
     // are printed. Letting it truncate `-l` or `-c` would silently drop files
     // from a listing and cap a count at the limit — answers that look complete
     // and are not.
-    let withheld = if opts.mode.shows_source() {
-        apply_head_limit(&mut files, opts.head_limit)
+    let limited = opts.mode.shows_source() && opts.head_limit > 0;
+    let (mut files, beyond) = if limited {
+        search_within_limit(&matcher, registry, targets, opts, coverage)
+    } else {
+        (search(&matcher, registry, targets, opts, coverage), 0)
+    };
+    let matched = !files.is_empty() || beyond > 0;
+
+    let withheld = if limited {
+        apply_head_limit(&mut files, opts.head_limit) + beyond
     } else {
         0
     };
@@ -2198,6 +2237,135 @@ mod head_limit_tests {
 /// The invariant the whole pipeline rests on: a file that cannot match is never
 /// parsed. Pinned with a parser that panics rather than by timing, which would
 /// be both flaky and unable to tell "fast" from "skipped".
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    /// `a.rs` to `d.rs` holding 1, 3, 0 and 2 matches, plus a binary file,
+    /// listed out of path order as a walk may.
+    fn corpus() -> (tempfile::TempDir, Vec<(PathBuf, PathBuf)>) {
+        let dir = tempfile::tempdir().unwrap();
+        let files: [(&str, &[u8]); 5] = [
+            ("d.rs", b"fn d() {}\nlet x;\nfn e() {}\n"),
+            ("b.rs", b"fn a() { fn b() {} }\n\nlet y;\nfn c() {}\n"),
+            ("a.rs", b"let z;\nfn f() {}\nlet w;\n"),
+            ("c.rs", b"let v;\n"),
+            ("e.bin", b"fn \0 fn\n"),
+        ];
+        let targets = files
+            .iter()
+            .map(|(name, bytes)| {
+                std::fs::write(dir.path().join(name), bytes).unwrap();
+                (dir.path().join(name), PathBuf::from(name))
+            })
+            .collect();
+        (dir, targets)
+    }
+
+    /// Every file searched and then truncated, as it was before counting.
+    fn search_everything(targets: &[(PathBuf, PathBuf)], opts: &Options) -> (Vec<FileHits>, usize) {
+        let matcher = Matcher::new(opts).unwrap();
+        let mut files = search(&matcher, &ParserRegistry::new(), targets, opts, None);
+        let withheld = apply_head_limit(&mut files, opts.head_limit);
+        (files, withheld)
+    }
+
+    fn search_counted(targets: &[(PathBuf, PathBuf)], opts: &Options) -> (Vec<FileHits>, usize) {
+        let matcher = Matcher::new(opts).unwrap();
+        let registry = ParserRegistry::new();
+        let (mut files, beyond) = search_within_limit(&matcher, &registry, targets, opts, None);
+        let withheld = apply_head_limit(&mut files, opts.head_limit) + beyond;
+        (files, withheld)
+    }
+
+    fn output(files: &[FileHits], opts: &Options, withheld: usize) -> String {
+        let mut out = Vec::new();
+        print_results(&mut out, files, &[], opts, None, withheld).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// The limit landing inside a file, on its last match, on its first and
+    /// past everything, under each flag that changes what a match is or what
+    /// surrounds it.
+    #[test]
+    fn counting_first_prints_what_searching_everything_printed() {
+        let (_dir, targets) = corpus();
+        type Flag = fn(&mut Options);
+        let flags: [(&str, Flag); 8] = [
+            ("plain", |_| {}),
+            ("-m 1", |o| o.max_count = Some(1)),
+            ("-v", |o| o.invert_match = true),
+            ("-U", |o| o.multiline = true),
+            ("-C 1", |o| {
+                o.before_context = 1;
+                o.after_context = 1;
+            }),
+            ("-o", |o| o.only_matching = true),
+            ("--json", |o| o.json = true),
+            ("--vimgrep", |o| o.vimgrep = true),
+        ];
+        for (name, flag) in flags {
+            for limit in [1, 2, 3, 4, 5, 6, 7, 100] {
+                let mut opts = Options::new(vec!["fn".into()]);
+                opts.head_limit = limit;
+                opts.heading = Some(false);
+                flag(&mut opts);
+
+                let (want, want_withheld) = search_everything(&targets, &opts);
+                let (got, got_withheld) = search_counted(&targets, &opts);
+                assert_eq!(got_withheld, want_withheld, "{name} limit {limit}");
+                assert_eq!(
+                    output(&got, &opts, got_withheld),
+                    output(&want, &opts, want_withheld),
+                    "{name} limit {limit}"
+                );
+            }
+        }
+    }
+
+    /// Only the files the limit reaches get read a second time, let alone
+    /// parsed: the rest are a number.
+    #[test]
+    fn files_past_the_limit_are_counted_and_not_searched() {
+        let (_dir, targets) = corpus();
+        let mut opts = Options::new(vec!["fn".into()]);
+        opts.head_limit = 2;
+        let matcher = Matcher::new(&opts).unwrap();
+
+        let (files, beyond) =
+            search_within_limit(&matcher, &ParserRegistry::new(), &targets, &opts, None);
+        let paths: Vec<_> = files.iter().map(|f| f.path.as_path()).collect();
+        assert_eq!(paths, [Path::new("a.rs"), Path::new("b.rs")]);
+        assert_eq!(beyond, 2, "d.rs");
+        assert_eq!(files[1].hits.len(), 3, "the last file reached stays whole");
+    }
+
+    /// Each match printed names its symbol; only those past the limit go
+    /// without, and those are never seen.
+    #[test]
+    fn every_printable_match_is_attributed() {
+        let (_dir, targets) = corpus();
+        let mut opts = Options::new(vec!["fn".into()]);
+        opts.head_limit = 2;
+        let (files, _) = search_counted(&targets, &opts);
+        let printed: Vec<_> = files.iter().flat_map(|f| &f.hits).collect();
+        assert_eq!(printed.len(), 2);
+        assert!(printed.iter().all(|h| h.symbol.is_some()), "{printed:?}");
+    }
+
+    /// One unreadable file narrows the answer, as it does without a limit.
+    #[test]
+    fn a_file_that_cannot_be_read_counts_for_nothing() {
+        let (dir, mut targets) = corpus();
+        targets.push((dir.path().join("gone.rs"), PathBuf::from("gone.rs")));
+        let mut opts = Options::new(vec!["fn".into()]);
+        opts.head_limit = 1;
+        let (files, withheld) = search_counted(&targets, &opts);
+        assert_eq!(files.len(), 1);
+        assert_eq!(withheld, 5, "the 3 in b.rs and the 2 in d.rs");
+    }
+}
+
 #[cfg(test)]
 mod prefilter_tests {
     use super::*;

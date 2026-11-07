@@ -456,3 +456,53 @@ fn an_empty_pattern_file_alone_is_no_pattern_given() {
     assert_eq!(out.code, 2);
     assert!(out.stderr.contains("no pattern given"), "{:?}", out.stderr);
 }
+
+/// A generated file is one line holding a match every few bytes. A copy of the
+/// line per match would need 100 GB here, so simply finishing is the assertion
+/// on memory: every mode has to hold that line once, or not at all.
+#[test]
+fn a_giant_line_of_matches_finishes_in_every_mode() {
+    let dir = fixture();
+    let line = "e ".repeat(250_000);
+    std::fs::write(dir.path().join("src/data.ts"), format!("{line}\n")).unwrap();
+
+    let matches = 250_000.to_string();
+    for (args, want) in [
+        (&["rg", "-n", "e", "src/data.ts"][..], "src/data.ts:1:1:"),
+        (&["rg", "-U", "-n", "e", "src/data.ts"], "src/data.ts:1:1:"),
+        (&["rg", "-o", "e", "src/data.ts"], "src/data.ts:1:1:"),
+        (
+            &["rg", "--json", "e", "src/data.ts"],
+            "\"type\":\"summary\"",
+        ),
+        (&["rg", "-c", "e", "src/data.ts"], "src/data.ts:1"),
+        (
+            &["rg", "--count-matches", "e", "src/data.ts"],
+            matches.as_str(),
+        ),
+        (&["rg", "-l", "e", "src/data.ts"], "src/data.ts"),
+    ] {
+        let out = run(dir.path(), args);
+        assert_eq!(out.code, 0, "{args:?}: {}", out.stderr);
+        assert!(out.stdout.contains(want), "{args:?}: {:.200}", out.stdout);
+    }
+    assert_eq!(run(dir.path(), &["rg", "-q", "e", "src/data.ts"]).code, 0);
+}
+
+/// What the limit keeps is still attributed, and what it cuts is still counted.
+#[test]
+fn matches_past_the_limit_are_counted_and_the_rest_keep_their_symbols() {
+    let dir = fixture();
+    let out = run(dir.path(), &["rg", "-n", "--head-limit", "2", "needle"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(
+        out.stdout.trim(),
+        "docs/notes.md:1:5:[preamble] the needle is documented here\n\
+         src/lib.rs:1:8:[needle] pub fn needle() -> u32 {"
+    );
+    assert!(
+        out.stderr.contains("1 more matches withheld"),
+        "{}",
+        out.stderr
+    );
+}
