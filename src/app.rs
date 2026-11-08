@@ -2021,6 +2021,12 @@ impl App {
         self.trace.prompt(prompt);
     }
 
+    /// A line of a model response. Only the trace shows responses, so the
+    /// tree's rows are left as they are.
+    pub fn process_inference(&mut self, block: &crate::ingest::InferenceBlock) {
+        self.trace.inference(block);
+    }
+
     /// Queue a write for attribution, tagged with the current session (see
     /// `pending_writes`). Without a session there is no journal to put it in.
     pub fn queue_write(&mut self, event: crate::ingest::WriteEvent) {

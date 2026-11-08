@@ -180,6 +180,8 @@ pub struct TraceSummary {
     pub agents: usize,
     /// Commits made while it ran.
     pub commits: usize,
+    /// Its model responses, summed up.
+    pub inference: super::InferenceTotals,
 }
 
 /// The traces, in time order; under `filter`, those in which that agent
@@ -218,6 +220,7 @@ pub fn traces(trace: &Trace, filter: Option<&str>) -> Vec<TraceSummary> {
                             && (spans[node.span].start..=node.end).contains(&x.t)
                     })
                     .count(),
+                inference: super::InferenceTotals::of(trace, &all),
             })
         })
         .collect()

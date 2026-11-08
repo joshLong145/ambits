@@ -151,7 +151,7 @@ fn apply_replayed(app: &mut App, event: ambits::ingest::SessionEvent) {
         SessionEvent::Write(w) => app.queue_write(w),
         SessionEvent::ToolFinished(f) => app.process_tool_finished(&f),
         SessionEvent::Prompt(p) => app.process_prompt(&p),
-        SessionEvent::Inference(_) => {}
+        SessionEvent::Inference(block) => app.process_inference(&block),
     }
 }
 
@@ -387,6 +387,9 @@ impl TuiSession {
             }
             for prompt in &output.prompts {
                 app.process_prompt(prompt);
+            }
+            for block in &output.inferences {
+                app.process_inference(block);
             }
             for compaction in output.compactions {
                 app.process_compaction(

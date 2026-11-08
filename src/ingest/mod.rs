@@ -260,6 +260,23 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// Each count at the larger of the two: a response's output count grows
+    /// from line to line while it streams, and the last line knows most.
+    pub fn most(self, other: Usage) -> Usage {
+        let max = |a: Option<u64>, b: Option<u64>| a.max(b);
+        Usage {
+            input: max(self.input, other.input),
+            output: max(self.output, other.output),
+            thinking: max(self.thinking, other.thinking),
+            cache_read: max(self.cache_read, other.cache_read),
+            cache_write: max(self.cache_write, other.cache_write),
+            cache_write_5m: max(self.cache_write_5m, other.cache_write_5m),
+            cache_write_1h: max(self.cache_write_1h, other.cache_write_1h),
+            web_searches: max(self.web_searches, other.web_searches),
+            web_fetches: max(self.web_fetches, other.web_fetches),
+        }
+    }
+
     /// Everything the model was given: uncached input plus what was read
     /// from and written to the cache. How full its context was.
     pub fn context(&self) -> Option<u64> {

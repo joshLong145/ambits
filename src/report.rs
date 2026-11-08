@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::Arc;
 
 use color_eyre::eyre::Result;
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,8 @@ pub struct Report {
     pub truncated: Vec<&'static str>,
     pub agents: Vec<Agent>,
     pub spans: Vec<SpanDto>,
+    /// The model responses, beside the spans they sit among.
+    pub inferences: Vec<InferenceDto>,
     pub instants: Vec<InstantDto>,
     pub files: Vec<FileDto>,
     pub writes: Vec<WriteDto>,
@@ -149,6 +152,7 @@ pub struct Totals {
     pub symbols_written: usize,
     pub writes: usize,
     pub spans: usize,
+    pub inferences: usize,
     pub agents: usize,
 }
 
@@ -196,6 +200,48 @@ pub struct SpanDto {
     pub args: Vec<ArgDto>,
     /// What it wrote, read or returned, as the log recorded it.
     pub content: Option<ContentDto>,
+}
+
+/// A model response: what it was, how it ended, and what it cost. Never the
+/// text it wrote.
+#[derive(Debug, Serialize)]
+pub struct InferenceDto {
+    /// Its message id.
+    pub id: String,
+    /// The span it sits under (a `SpanDto::i`): its prompt or delegation.
+    pub parent: Option<usize>,
+    pub agent: String,
+    /// When the request was sent, as far as the log tells.
+    pub start_ms: u64,
+    /// When its first block was written.
+    pub first_block_ms: u64,
+    pub end_ms: u64,
+    pub model: Option<String>,
+    /// The model asked for, when the log names it.
+    pub requested_model: Option<String>,
+    pub stop_reason: Option<String>,
+    /// The API error it reports, when it is one.
+    pub error: Option<String>,
+    /// Claude Code wrote it, not a model: its usage is not counted.
+    pub synthetic: bool,
+    /// No line said how it stopped: `output_tokens` is only where the
+    /// stream began.
+    pub usage_partial: bool,
+    /// Uncached input; `context_tokens` adds what was read from and
+    /// written to the cache.
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub thinking_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub context_tokens: Option<u64>,
+    pub max_tokens: Option<u64>,
+    pub effort: Option<String>,
+    pub speed: Option<String>,
+    pub service_tier: Option<String>,
+    pub thinking_ms: Option<u64>,
+    /// The calls it made (`SpanDto::i`), in order.
+    pub calls: Vec<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -347,6 +393,7 @@ pub fn build(inputs: Inputs<'_>) -> Result<Report> {
     } = inputs;
 
     let spans = spans(trace, &details, project_root);
+    let inferences = inferences(trace);
     let numbering = trace.numbering();
     let span_of_op: HashMap<&str, usize> = trace
         .spans()
@@ -414,6 +461,7 @@ pub fn build(inputs: Inputs<'_>) -> Result<Report> {
     let mut totals = Totals {
         files: tree.files.len(),
         spans: spans.len(),
+        inferences: inferences.len(),
         writes: write_dtos.len(),
         ..Totals::default()
     };
@@ -507,6 +555,7 @@ pub fn build(inputs: Inputs<'_>) -> Result<Report> {
         truncated: Vec::new(),
         agents: agent_list,
         spans,
+        inferences,
         instants: trace.instants().iter().map(instant).collect(),
         files,
         writes: write_dtos,
@@ -528,11 +577,8 @@ fn arg_value(key: &str, value: &str, project_root: &Path) -> String {
     )
 }
 
-fn spans(
-    trace: &Trace,
-    details: &HashMap<String, CallDetail>,
-    project_root: &Path,
-) -> Vec<SpanDto> {
+/// Each span's parent in the trace's tree, and its effective end.
+fn parents(trace: &Trace) -> (HashMap<usize, usize>, HashMap<usize, u64>) {
     let mut parent: HashMap<usize, usize> = HashMap::new();
     let mut end: HashMap<usize, u64> = HashMap::new();
     fn walk(node: &Node, parent: &mut HashMap<usize, usize>, end: &mut HashMap<usize, u64>) {
@@ -545,6 +591,67 @@ fn spans(
     for root in trace.tree() {
         walk(&root, &mut parent, &mut end);
     }
+    (parent, end)
+}
+
+fn inferences(trace: &Trace) -> Vec<InferenceDto> {
+    let (parent, _) = parents(trace);
+    let numbering = trace.numbering();
+    let call_number: HashMap<&str, usize> = trace
+        .spans()
+        .iter()
+        .zip(&numbering)
+        .filter_map(|(s, n)| Some((s.id.as_deref()?, (*n)?)))
+        .collect();
+    let text = |v: &Option<Arc<str>>| v.as_deref().map(str::to_string);
+    trace
+        .spans()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| Some((i, s, s.inference.as_deref()?)))
+        .map(|(i, s, inf)| {
+            let (meta, usage) = (&inf.meta, &inf.usage);
+            let counted = |n: Option<u64>| n.filter(|_| inf.counts());
+            InferenceDto {
+                id: s.id.as_deref().unwrap_or_default().to_string(),
+                parent: parent.get(&i).and_then(|&p| numbering[p]),
+                agent: s.agent.to_string(),
+                start_ms: s.start,
+                first_block_ms: inf.first_block,
+                end_ms: s.end.unwrap_or(s.start),
+                model: text(&meta.model),
+                requested_model: text(&meta.requested_model),
+                stop_reason: text(&inf.stop_reason),
+                error: meta.error.clone(),
+                synthetic: meta.synthetic,
+                usage_partial: inf.usage_partial(),
+                input_tokens: counted(usage.input),
+                output_tokens: counted(usage.output),
+                thinking_tokens: counted(usage.thinking),
+                cache_read_tokens: counted(usage.cache_read),
+                cache_write_tokens: counted(usage.cache_write),
+                context_tokens: counted(usage.context()),
+                max_tokens: meta.max_tokens,
+                effort: text(&meta.effort),
+                speed: text(&meta.speed),
+                service_tier: text(&meta.service_tier),
+                thinking_ms: meta.thinking_ms,
+                calls: inf
+                    .calls
+                    .iter()
+                    .filter_map(|c| call_number.get(&**c).copied())
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+fn spans(
+    trace: &Trace,
+    details: &HashMap<String, CallDetail>,
+    project_root: &Path,
+) -> Vec<SpanDto> {
+    let (parent, end) = parents(trace);
     // Spans are numbered without the model responses, which are listed on
     // their own.
     let numbering = trace.numbering();
@@ -666,13 +773,14 @@ fn instant(i: &crate::trace::Instant) -> InstantDto {
 /// the text reads returned; every other call's output; every span's list
 /// of symbols read (its
 /// `read_count` stays); every call's arguments; the attributes of every
-/// phase and marker; every write's diff; the spans that neither read, wrote
+/// phase and marker; the model responses; every write's diff; the spans
+/// that neither read, wrote
 /// nor delegated. Writes, totals, phase times and the remaining spans are
 /// never cut, so a report can still exceed the limit; the caller sees
 /// `truncated`.
 pub fn fit(report: &mut Report, max_bytes: usize) -> Result<()> {
     type Cut = fn(&mut Report);
-    let cuts: [(&'static str, Cut); 8] = [
+    let cuts: [(&'static str, Cut); 9] = [
         ("unwritten_file_symbols", |r| {
             r.files
                 .iter_mut()
@@ -706,6 +814,7 @@ pub fn fit(report: &mut Report, max_bytes: usize) -> Result<()> {
                 p.markers.iter_mut().for_each(|m| m.attrs.clear());
             }
         }),
+        ("inferences", |r| r.inferences.clear()),
         ("diffs", |r| {
             r.spans.iter_mut().for_each(|s| s.content = None)
         }),

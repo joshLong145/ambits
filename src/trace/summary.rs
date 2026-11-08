@@ -147,6 +147,8 @@ pub struct TraceDetail {
     pub failed: Vec<usize>,
     /// Commits made while it ran (instant indices), in time order.
     pub commits: Vec<usize>,
+    /// Its model responses, summed up.
+    pub inference: super::InferenceTotals,
 }
 
 /// The trace rooted at span `root`, summed up; `None` for a span that is
@@ -241,6 +243,7 @@ pub fn detail(trace: &Trace, index: &TraceIndex, root: usize) -> Option<TraceDet
         agents,
         failed,
         commits,
+        inference: super::InferenceTotals::of(trace, &node.spans()),
     })
 }
 
