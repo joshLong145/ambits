@@ -197,6 +197,101 @@ pub enum SessionEvent {
     /// The user asked something: the start of a turn, whose tool calls
     /// the trace nests under it.
     Prompt(Prompt),
+    /// One log line of a model response. A response is written as several
+    /// lines, one per content block, so the trace merges them by message id.
+    Inference(InferenceBlock),
+}
+
+/// One assistant log line's share of a model response: the response's
+/// metadata, which every line repeats, and the blocks this line holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferenceBlock {
+    /// `message.id`, shared by every line of the response.
+    pub message_id: Arc<str>,
+    pub agent_id: Arc<str>,
+    pub timestamp: String,
+    /// When the request was sent, in milliseconds since the epoch, as far as
+    /// the log tells: its `api-request` line, else the last line before the
+    /// response that was not written with it. `None` when nothing says.
+    pub requested_at: Option<u64>,
+    /// `stop_reason`, on the line that has one. A subagent's lines often
+    /// never do: their usage is then a count from the start of the stream.
+    pub stop_reason: Option<Arc<str>>,
+    /// The blocks on this line.
+    pub blocks: BlockCounts,
+    /// The `tool_use` ids on this line: the calls this response made.
+    pub tool_uses: Vec<Arc<str>>,
+    pub usage: Usage,
+    pub meta: InferenceMeta,
+}
+
+/// How many blocks of each kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlockCounts {
+    pub thinking: u32,
+    pub text: u32,
+    pub tool_use: u32,
+}
+
+impl BlockCounts {
+    pub fn add(&mut self, other: BlockCounts) {
+        self.thinking += other.thinking;
+        self.text += other.text;
+        self.tool_use += other.tool_use;
+    }
+}
+
+/// A response's token counts, as `message.usage` gives them. Each is `None`
+/// when the log does not say.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// Input tokens neither read from nor written to the cache.
+    pub input: Option<u64>,
+    pub output: Option<u64>,
+    /// The part of `output` spent thinking.
+    pub thinking: Option<u64>,
+    pub cache_read: Option<u64>,
+    /// Input written to the cache, in all, and by how long it is kept.
+    pub cache_write: Option<u64>,
+    pub cache_write_5m: Option<u64>,
+    pub cache_write_1h: Option<u64>,
+    pub web_searches: Option<u64>,
+    pub web_fetches: Option<u64>,
+}
+
+impl Usage {
+    /// Everything the model was given: uncached input plus what was read
+    /// from and written to the cache. How full its context was.
+    pub fn context(&self) -> Option<u64> {
+        let parts = [self.input, self.cache_read, self.cache_write];
+        parts
+            .iter()
+            .any(Option::is_some)
+            .then(|| parts.iter().flatten().sum())
+    }
+}
+
+/// What a response says about the request behind it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InferenceMeta {
+    /// The model that answered.
+    pub model: Option<Arc<str>>,
+    /// The model asked for, when the log names it.
+    pub requested_model: Option<Arc<str>>,
+    pub request_id: Option<Arc<str>>,
+    pub max_tokens: Option<u64>,
+    pub effort: Option<Arc<str>>,
+    pub speed: Option<Arc<str>>,
+    pub service_tier: Option<Arc<str>>,
+    pub inference_geo: Option<Arc<str>>,
+    pub advisor_model: Option<Arc<str>>,
+    /// `thinkingDurationMs`, on the lines that carry it.
+    pub thinking_ms: Option<u64>,
+    /// Claude Code wrote this response itself (`<synthetic>`), for an API
+    /// error or a message of its own: it carries no real usage.
+    pub synthetic: bool,
+    /// The API error it reports, when it is one (`authentication_failed`).
+    pub error: Option<String>,
 }
 
 /// A prompt the user typed (not a tool result, a notification, or text
@@ -255,6 +350,8 @@ pub struct FileReplay {
     /// Write calls whose results the replay had not reached (spec §1): a
     /// permission prompt or a long write can straddle the handoff.
     pub awaiting: Vec<AgentToolCall>,
+    /// What the lines read so far tell the ones still to come.
+    pub lines: claude::LineState,
 }
 
 /// What a session's replay hands to the tailer that follows it.
@@ -263,6 +360,9 @@ pub struct Handoff {
     /// Each log file, with the offset its replay stopped at.
     pub files: Vec<(PathBuf, u64)>,
     pub awaiting: Vec<AgentToolCall>,
+    /// Each file's line state where its replay stopped, so the tailer reads
+    /// on as if it had read those lines itself.
+    pub lines: Vec<(PathBuf, claude::LineState)>,
     /// The project, so the tailer maps a worktree session's paths to it
     /// exactly as the replay did.
     pub project_root: Option<PathBuf>,
@@ -279,6 +379,8 @@ pub struct TailerOutput {
     pub finished: Vec<ToolFinished>,
     /// Prompts typed in this poll.
     pub prompts: Vec<Prompt>,
+    /// Model response lines written in this poll.
+    pub inferences: Vec<InferenceBlock>,
 }
 
 /// Maps a raw tool call (name + JSON input) to an `AgentToolCall`.
@@ -362,6 +464,7 @@ pub trait SessionIngester: Send + Sync {
             events,
             offset,
             awaiting: Vec::new(),
+            lines: Default::default(),
         }
     }
 

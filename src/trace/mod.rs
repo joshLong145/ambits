@@ -338,7 +338,7 @@ impl Trace {
             }
             SessionEvent::SessionCleared => self.clear(),
             SessionEvent::Prompt(p) => self.prompt(p),
-            SessionEvent::Write(_) => {}
+            SessionEvent::Write(_) | SessionEvent::Inference(_) => {}
         }
     }
 
