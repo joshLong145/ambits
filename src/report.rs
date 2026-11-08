@@ -321,13 +321,13 @@ pub struct Inputs<'a> {
 }
 
 /// What `content` each span kind carries, as the TUI loads it; `None` for a
-/// prompt, which has no call.
+/// prompt or a model response, which have no call.
 pub fn content_kind(kind: SpanKind) -> Option<ContentKind> {
     match kind {
         SpanKind::Read(_) => Some(ContentKind::Read),
         SpanKind::Write => Some(ContentKind::Write),
         SpanKind::Delegate | SpanKind::Other => Some(ContentKind::Other),
-        SpanKind::Prompt => None,
+        SpanKind::Prompt | SpanKind::Inference => None,
     }
 }
 
@@ -347,11 +347,12 @@ pub fn build(inputs: Inputs<'_>) -> Result<Report> {
     } = inputs;
 
     let spans = spans(trace, &details, project_root);
+    let numbering = trace.numbering();
     let span_of_op: HashMap<&str, usize> = trace
         .spans()
         .iter()
-        .enumerate()
-        .filter_map(|(i, s)| Some((s.id.as_deref()?, i)))
+        .zip(&numbering)
+        .filter_map(|(s, n)| Some((s.id.as_deref()?, (*n)?)))
         .collect();
 
     let mut writes = writes;
@@ -544,19 +545,24 @@ fn spans(
     for root in trace.tree() {
         walk(&root, &mut parent, &mut end);
     }
+    // Spans are numbered without the model responses, which are listed on
+    // their own.
+    let numbering = trace.numbering();
     trace
         .spans()
         .iter()
         .enumerate()
-        .map(|(i, s)| SpanDto {
-            i,
-            parent: parent.get(&i).copied(),
+        .filter_map(|(i, s)| Some((i, numbering[i]?, s)))
+        .map(|(i, number, s)| SpanDto {
+            i: number,
+            parent: parent.get(&i).and_then(|&p| numbering[p]),
             agent: s.agent.to_string(),
             kind: match s.kind {
                 SpanKind::Prompt => "prompt",
                 SpanKind::Read(_) => "read",
                 SpanKind::Write => "write",
                 SpanKind::Delegate => "delegate",
+                SpanKind::Inference => "inference",
                 SpanKind::Other => "other",
             },
             tool: s.tool.to_string(),

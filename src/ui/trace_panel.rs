@@ -301,7 +301,7 @@ fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, width: usize) -> Vec<
                 out.extend(wrapped("task", &s.task(), Color::Gray, width, 4));
             }
         }
-        SpanKind::Other | SpanKind::Prompt => {}
+        SpanKind::Other | SpanKind::Prompt | SpanKind::Inference => {}
     }
     // A command or search — anything not about one file — in full, up to
     // six lines: a shell command can read (by naming symbols) as well.

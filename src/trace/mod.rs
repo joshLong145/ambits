@@ -31,8 +31,19 @@ pub enum SpanKind {
     Delegate,
     /// A prompt the user typed: the parent of the turn's calls.
     Prompt,
+    /// A model response: the request, from when it was sent to its last
+    /// block.
+    Inference,
     /// Anything else: a shell command, a search that saw nothing, …
     Other,
+}
+
+impl SpanKind {
+    /// A tool call: neither a prompt nor a model response. What a trace's
+    /// call and failure counts count.
+    pub fn is_call(self) -> bool {
+        !matches!(self, SpanKind::Prompt | SpanKind::Inference)
+    }
 }
 
 /// One tool call.
@@ -340,6 +351,22 @@ impl Trace {
             SessionEvent::Prompt(p) => self.prompt(p),
             SessionEvent::Write(_) | SessionEvent::Inference(_) => {}
         }
+    }
+
+    /// Each span's number among the spans that are not model responses;
+    /// `None` for a response. Exports know a span without an id of its own
+    /// by it, so responses, which traces gained later, move no other span.
+    pub fn numbering(&self) -> Vec<Option<usize>> {
+        let mut next = 0;
+        self.spans
+            .iter()
+            .map(|s| {
+                (s.kind != SpanKind::Inference).then(|| {
+                    next += 1;
+                    next - 1
+                })
+            })
+            .collect()
     }
 
     /// First and last moment anything happened, in milliseconds.

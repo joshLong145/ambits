@@ -34,8 +34,8 @@ fn trace_id(session: &str) -> String {
 }
 
 fn span_id(session: &str, span: &Span, index: usize) -> String {
-    // A call without a tool_use_id falls back to its position, still stable
-    // for a given log.
+    // A call without a tool_use_id falls back to its number (see
+    // `Trace::numbering`), still stable for a given log.
     let key = span
         .id
         .as_deref()
@@ -94,7 +94,7 @@ fn span_attributes(span: &Span) -> Vec<Value> {
         SpanKind::Read(depth) => attrs.push(attr("ambits.read.depth", json!(depth_name(depth)))),
         SpanKind::Write => attrs.push(attr("ambits.write", json!(true))),
         SpanKind::Prompt => attrs.push(attr("ambits.prompt", json!(true))),
-        SpanKind::Delegate | SpanKind::Other => {}
+        SpanKind::Delegate | SpanKind::Inference | SpanKind::Other => {}
     }
     if let Some(child) = &span.child_agent {
         attrs.push(attr("ambits.subagent.id", json!(&**child)));
@@ -172,11 +172,12 @@ pub fn otlp(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
         "status": {"code": 0},
     }));
 
+    let numbering = trace.numbering();
     let mut stack: Vec<(&Node, String)> =
         roots.iter().rev().map(|n| (*n, root_id.clone())).collect();
     while let Some((node, parent)) = stack.pop() {
         let span = &trace.spans()[node.span];
-        let id = span_id(session, span, node.span);
+        let id = span_id(session, span, numbering[node.span].unwrap_or(node.span));
         let why = span.message.as_deref().unwrap_or("tool call failed");
         let status = if span.error {
             json!({"code": 2, "message": why})
@@ -261,13 +262,17 @@ pub fn chrome(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
         };
         events.push(json!({"name": "thread_name", "ph": "M", "pid": 1, "tid": tids[a], "args": {"name": name}}));
     }
-    for (flow, n) in nodes.iter().enumerate() {
+    // Flow ids count the spans that are not model responses, which never
+    // start a flow, so responses move no other span's arrow.
+    let mut flow = 0;
+    for n in &nodes {
         let s = &trace.spans()[n.span];
         let cat = match s.kind {
             SpanKind::Read(_) => "read",
             SpanKind::Write => "write",
             SpanKind::Delegate => "delegate",
             SpanKind::Prompt => "prompt",
+            SpanKind::Inference => "inference",
             SpanKind::Other => "other",
         };
         let mut args = serde_json::Map::new();
@@ -287,16 +292,19 @@ pub fn chrome(trace: &Trace, session: &str, filter: AgentFilter<'_>) -> Value {
             "name": s.name(), "cat": cat, "ph": "X", "pid": 1, "tid": tid,
             "ts": micros(s.start), "dur": micros(n.end - s.start), "args": args,
         }));
-        // A delegation's flow arrow to the first span of its subagent.
+        // A delegation's flow arrow to the first call of its subagent.
         let first = n
             .children
             .iter()
             .map(|c| &trace.spans()[c.span])
-            .filter(|c| s.child_agent.as_ref() == Some(&c.agent))
+            .filter(|c| s.child_agent.as_ref() == Some(&c.agent) && c.kind.is_call())
             .min_by_key(|c| c.start);
         if let Some(first) = first {
             events.push(json!({"name": "delegate", "cat": "delegate", "ph": "s", "id": flow, "pid": 1, "tid": tid, "ts": micros(s.start)}));
             events.push(json!({"name": "delegate", "cat": "delegate", "ph": "f", "bp": "e", "id": flow, "pid": 1, "tid": tids[&*first.agent], "ts": micros(first.start)}));
+        }
+        if s.kind != SpanKind::Inference {
+            flow += 1;
         }
     }
     for i in trace.instants() {

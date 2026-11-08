@@ -154,7 +154,11 @@ pub struct TraceDetail {
 pub fn detail(trace: &Trace, index: &TraceIndex, root: usize) -> Option<TraceDetail> {
     let node = index.tree.iter().find(|n| n.span == root)?;
     let spans = trace.spans();
-    let mut under: Vec<usize> = node.spans().into_iter().filter(|&i| i != root).collect();
+    let mut under: Vec<usize> = node
+        .spans()
+        .into_iter()
+        .filter(|&i| i != root && spans[i].kind.is_call())
+        .collect();
     under.sort_by_key(|&i| (spans[i].start, i));
 
     let mut by_tool: HashMap<Arc<str>, usize> = HashMap::new();
@@ -199,8 +203,14 @@ pub fn detail(trace: &Trace, index: &TraceIndex, root: usize) -> Option<TraceDet
                 agent: agent.clone(),
                 task: s.task(),
                 duration: end.saturating_sub(s.start),
-                calls: run.len().saturating_sub(1),
-                failed: run.iter().filter(|&&c| c != i && spans[c].error).count(),
+                calls: run
+                    .iter()
+                    .filter(|&&c| c != i && spans[c].kind.is_call())
+                    .count(),
+                failed: run
+                    .iter()
+                    .filter(|&&c| c != i && spans[c].kind.is_call() && spans[c].error)
+                    .count(),
             });
         }
     }

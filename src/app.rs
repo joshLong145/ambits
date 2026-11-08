@@ -1091,7 +1091,7 @@ impl App {
             SpanKind::Read(_) => Some(ContentKind::Read),
             SpanKind::Write => Some(ContentKind::Write),
             SpanKind::Delegate | SpanKind::Other => Some(ContentKind::Other),
-            SpanKind::Prompt => None,
+            SpanKind::Prompt | SpanKind::Inference => None,
         }
     }
 

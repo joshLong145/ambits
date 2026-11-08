@@ -197,12 +197,15 @@ pub fn traces(trace: &Trace, filter: Option<&str>) -> Vec<TraceSummary> {
                 }
             }
             let under = &all[1..];
+            let calls = || under.iter().filter(|&&i| spans[i].kind.is_call());
+            let root_failed =
+                usize::from(spans[node.span].kind.is_call() && spans[node.span].error);
             Some(TraceSummary {
                 root: node.span,
                 start: spans[node.span].start,
                 end: node.end,
-                calls: under.len(),
-                failed: all.iter().filter(|&&i| spans[i].error).count(),
+                calls: calls().count(),
+                failed: root_failed + calls().filter(|&&i| spans[i].error).count(),
                 agents: under
                     .iter()
                     .filter(|&&i| spans[i].child_agent.is_some())

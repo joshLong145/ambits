@@ -262,10 +262,10 @@ fn summary(app: &App, (start, end): (u64, u64)) -> Line<'static> {
         .and_then(|r| app.trace_list().into_iter().find(|t| t.root == r))
     {
         Some(t) => (t.calls, t.failed),
-        None => (
-            app.trace.spans().len(),
-            app.trace.spans().iter().filter(|s| s.error).count(),
-        ),
+        None => {
+            let calls = app.trace.spans().iter().filter(|s| s.kind.is_call());
+            (calls.clone().count(), calls.filter(|s| s.error).count())
+        }
     };
     let vp = app.trace_view.viewport(&app.trace);
     let shown = format!(
@@ -654,6 +654,7 @@ pub(super) fn span_color(app: &App, statuses: &Statuses, i: usize) -> Color {
         },
         SpanKind::Delegate => Color::Gray,
         SpanKind::Prompt => Color::Cyan,
+        SpanKind::Inference => colors::INFERENCE,
         SpanKind::Other => Color::Rgb(150, 150, 150),
     }
 }
