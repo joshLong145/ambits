@@ -1040,41 +1040,181 @@ pub fn call_detail(files: &[PathBuf], id: &str, kind: ContentKind) -> Option<Cal
     Some(assemble_detail(kind, input.as_ref(), result.as_ref()))
 }
 
-/// Model response `id` as its log recorded it: the text it wrote, block by
-/// block, its thinking too where the log kept it, which it mostly does not.
-/// For display only, as [`call_detail`] is.
+/// Each line of `path` that contains `needle`, parsed; lines that are not
+/// JSON are skipped. For display only: nothing is kept.
+fn lines_with(path: &Path, needle: &str, mut each: impl FnMut(Value) -> bool) {
+    let Ok(file) = fs::File::open(path) else {
+        return;
+    };
+    let mut reader = BufReader::new(file);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            continue;
+        };
+        if !line.contains(needle) {
+            continue;
+        }
+        if let Ok(obj) = serde_json::from_str::<Value>(line) {
+            if !each(obj) {
+                return;
+            }
+        }
+    }
+}
+
+/// What Claude Code put into request `request` beside the conversation,
+/// from `path`, the log it is in: the new messages the request names
+/// (`tail`) that are its own — system messages, and the `<system-reminder>`
+/// blocks it attached to a message — each keyed by what it is. A message
+/// the transcript already holds as it was sent has no blob, and is the
+/// conversation's, not injected.
+///
+/// A request with no `base` names every message it sent. When the log
+/// already had replies before it since the last compaction, that is the
+/// whole conversation sent again (a resumed session), whose new part is not
+/// known: it is said so, rather than every reminder of the session listed
+/// again. After a compaction it starts the conversation over, and all it
+/// carries is new.
+fn injected_into(path: &Path, request: &str) -> Vec<super::content::Arg> {
+    let Some((tail, resent)) = request_tail(path, request) else {
+        return Vec::new();
+    };
+    if resent {
+        return vec![super::content::Arg {
+            key: "resent".into(),
+            value: format!(
+                "The whole conversation ({} messages) was sent again, so what is new in it is not known.",
+                tail.len()
+            ),
+            bulk: false,
+        }];
+    }
+    let mut messages: HashMap<String, Value> = HashMap::new();
+    lines_with(path, "\"api-request-blob\"", |mut obj| {
+        let hash = obj.get("hash").and_then(Value::as_str).map(String::from);
+        if let Some(hash) = hash.filter(|h| tail.contains(h)) {
+            if let Some(message) = obj.get_mut("message").map(Value::take) {
+                messages.insert(hash, message);
+            }
+        }
+        messages.len() < tail.len()
+    });
+    let mut out = Vec::new();
+    let mut push = |text: &str, reminder: bool| {
+        let body = text
+            .trim()
+            .trim_start_matches("<system-reminder>")
+            .trim_end_matches("</system-reminder>")
+            .trim();
+        if !body.is_empty() {
+            out.push(super::content::Arg {
+                key: super::content::injected_label(body, reminder).to_string(),
+                value: body.to_string(),
+                bulk: false,
+            });
+        }
+    };
+    for message in tail.iter().filter_map(|h| messages.get(h)) {
+        let system = message.get("role").and_then(Value::as_str) == Some("system");
+        match message.get("content") {
+            Some(Value::String(text)) if system => push(text, false),
+            Some(Value::Array(blocks)) => {
+                for block in blocks {
+                    if block.get("type").and_then(Value::as_str) != Some("text") {
+                        continue;
+                    }
+                    let text = block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    // A user's own text is the conversation; only what
+                    // Claude Code wrapped as a reminder is injected.
+                    let reminder = text.trim_start().starts_with("<system-reminder>");
+                    if system || reminder {
+                        push(text, !system);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The new messages request `request` names (`tail`), and whether it sent
+/// the whole conversation again: it has no `base`, and replies came before
+/// it in `path` since the last compaction, which starts a conversation anew.
+fn request_tail(path: &Path, request: &str) -> Option<(Vec<String>, bool)> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut buf = Vec::new();
+    let mut replied = false;
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            continue;
+        };
+        if !line.contains(request) {
+            if line.contains("\"compact_boundary\"") {
+                replied = false;
+            } else {
+                replied |= line.contains("\"type\":\"assistant\"");
+            }
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if obj.get("type").and_then(Value::as_str) != Some("api-request")
+            || obj.get("id").and_then(Value::as_str) != Some(request)
+        {
+            continue;
+        }
+        let tail = obj
+            .get("tail")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|h| h.as_str().map(String::from))
+            .collect();
+        return Some((tail, replied && obj.get("base").is_none_or(Value::is_null)));
+    }
+}
+
+/// Model response `id` as its log recorded it: what Claude Code injected
+/// into its request, then the text it wrote, block by block, its thinking
+/// too where the log kept it, which it mostly does not. For display only,
+/// as [`call_detail`] is.
 fn response_detail(files: &[PathBuf], id: &str) -> Option<CallDetail> {
     let mut text: Vec<String> = Vec::new();
     let mut unlogged_thinking = false;
-    let mut found = false;
-    let mut buf = Vec::new();
+    let mut found = None;
+    let mut request: Option<String> = None;
     for path in files {
-        let Ok(file) = fs::File::open(path) else {
-            continue;
-        };
-        let mut reader = BufReader::new(file);
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-            let Ok(line) = std::str::from_utf8(&buf) else {
-                continue;
-            };
-            if !line.contains(id) {
-                continue;
-            }
-            let Ok(obj) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
+        lines_with(path, id, |obj| {
             let Some(message) = obj
                 .get("message")
                 .filter(|m| m.get("id").and_then(Value::as_str) == Some(id))
             else {
-                continue;
+                return true;
             };
-            found = true;
+            found = Some(path.clone());
+            if request.is_none() {
+                request = obj
+                    .get("requestRef")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+            }
             for block in message
                 .get("content")
                 .and_then(Value::as_array)
@@ -1092,15 +1232,14 @@ fn response_detail(files: &[PathBuf], id: &str) -> Option<CallDetail> {
                     _ => {}
                 }
             }
-        }
+            true
+        });
         // A response is logged in one agent's file.
-        if found {
+        if found.is_some() {
             break;
         }
     }
-    if !found {
-        return None;
-    }
+    let path = found?;
     if unlogged_thinking {
         text.insert(0, "[thinking not logged]".to_string());
     }
@@ -1108,6 +1247,9 @@ fn response_detail(files: &[PathBuf], id: &str) -> Option<CallDetail> {
     Some(CallDetail {
         args: Vec::new(),
         content: Some(CallContent::Reply { lines, cut }),
+        injected: request
+            .map(|r| injected_into(&path, &r))
+            .unwrap_or_default(),
     })
 }
 
@@ -1185,6 +1327,7 @@ fn assemble_detail(
     result: Option<&ToolResult>,
 ) -> CallDetail {
     CallDetail {
+        injected: Vec::new(),
         args: input.map(super::content::args).unwrap_or_default(),
         content: build_content(
             kind,
@@ -5409,5 +5552,123 @@ mod inference_tests {
                 cut: 0
             })
         );
+    }
+
+    /// What Claude Code put into a response's request beside the
+    /// conversation: the request names its new messages by hash, and those
+    /// it wrote itself are logged as blobs. A tool result the transcript
+    /// already holds is the conversation's, not injected.
+    #[test]
+    fn what_was_injected_into_a_responses_request_comes_with_its_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = response_log();
+        let blob = |hash: &str, message: serde_json::Value| json!({"type": "api-request-blob", "hash": hash, "message": message});
+        let blobs = [
+            blob(
+                "h-sys",
+                json!({"role": "system", "content":
+                "The following MCP servers are configured but failed to connect: tavily"}),
+            ),
+            blob(
+                "h-user",
+                json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_0", "content": "ok"},
+                {"type": "text", "text": "<system-reminder>\nKeep it short.\n</system-reminder>"},
+                {"type": "text", "text": "what I typed"}]}),
+            ),
+            blob(
+                "h-other",
+                json!({"role": "system", "content": "another request's"}),
+            ),
+        ];
+        let request = log[1].as_object_mut().unwrap();
+        request.insert("tail".into(), json!(["h-transcript", "h-sys", "h-user"]));
+        let request = log.remove(1);
+        log.splice(1..1, blobs.into_iter().chain([request]));
+        let path = write(dir.path(), &log);
+
+        let detail = call_detail(&[path], "msg_1", ContentKind::Inference).unwrap();
+        let injected: Vec<(&str, &str)> = detail
+            .injected
+            .iter()
+            .map(|a| (a.key.as_str(), a.value.as_str()))
+            .collect();
+        assert_eq!(
+            injected,
+            [
+                (
+                    "mcp failed",
+                    "The following MCP servers are configured but failed to connect: tavily"
+                ),
+                ("reminder", "Keep it short."),
+            ]
+        );
+    }
+
+    /// A response whose request is not logged has nothing injected to show.
+    #[test]
+    fn a_response_without_a_logged_request_shows_no_injected_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = response_log();
+        for line in &mut log {
+            line.as_object_mut().unwrap().remove("requestRef");
+        }
+        let path = write(dir.path(), &log);
+        let detail = call_detail(&[path], "msg_1", ContentKind::Inference).unwrap();
+        assert!(detail.injected.is_empty());
+    }
+
+    /// A request with no base after the conversation already had replies
+    /// sent it all again: its new part is not known, and is said so.
+    #[test]
+    fn a_resent_conversation_is_said_to_be_resent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = response_log();
+        log[1]
+            .as_object_mut()
+            .unwrap()
+            .insert("tail".into(), json!(["h-sys", "h-a", "h-b"]));
+        log.insert(1, json!({"type": "api-request-blob", "hash": "h-sys",
+            "message": {"role": "system", "content": "<total_tokens>9 tokens left</total_tokens>"}}));
+        log.insert(
+            0,
+            json!({"type": "assistant", "uuid": "m0", "timestamp": "2026-11-08T09:00:00.000Z",
+            "message": {"id": "msg_0", "content": [{"type": "text", "text": "earlier"}]}}),
+        );
+        let path = write(dir.path(), &log);
+        let detail = call_detail(&[path], "msg_1", ContentKind::Inference).unwrap();
+        let [only] = detail.injected.as_slice() else {
+            panic!("one note: {:?}", detail.injected)
+        };
+        assert_eq!(only.key, "resent");
+        assert!(only.value.contains("(3 messages)"), "{}", only.value);
+    }
+
+    /// After a compaction a request starts the conversation over: what it
+    /// carries is all new, though replies came before it.
+    #[test]
+    fn a_request_after_a_compaction_is_not_a_resend() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = response_log();
+        log[1]
+            .as_object_mut()
+            .unwrap()
+            .insert("tail".into(), json!(["h-skills"]));
+        log.insert(1, json!({"type": "api-request-blob", "hash": "h-skills",
+            "message": {"role": "system", "content": "The following skills are available for use with the Skill tool: a, b"}}));
+        log.insert(
+            0,
+            json!({"type": "system", "subtype": "compact_boundary",
+            "timestamp": "2026-11-08T09:30:00.000Z", "compactMetadata": {"trigger": "auto"}}),
+        );
+        log.insert(
+            0,
+            json!({"type": "assistant", "uuid": "m0", "timestamp": "2026-11-08T09:00:00.000Z",
+            "message": {"id": "msg_0", "content": [{"type": "text", "text": "earlier"}]}}),
+        );
+        let path = write(dir.path(), &log);
+        let detail = call_detail(&[path], "msg_1", ContentKind::Inference).unwrap();
+        let keys: Vec<&str> = detail.injected.iter().map(|a| a.key.as_str()).collect();
+        assert_eq!(keys, ["skills"]);
     }
 }

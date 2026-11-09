@@ -276,9 +276,17 @@ ambits knew created from edited lists every symbol it touched as edited.
 how it stopped (not logged, for many of a subagent's: its output is then a
 floor), how long until its first block and how long after, how long it
 thought, its context — cached, newly written to the cache, new — its output
-and thinking tokens, and how it was asked (effort, speed, tier). The text
-it wrote follows, as a [call's content](#a-calls-arguments-and-content)
-does; thinking Claude Code did not log is said to be missing. The calls it
+and thinking tokens, and how it was asked (effort, speed, tier). Then
+what Claude Code **injected** into its request beside the conversation, each
+keyed by what it is: `reminder` (a `<system-reminder>` it attached),
+`hook` output, `skills` listings, `mcp failed` servers, background-task
+`notification`s, `nudge`s, `tokens left`, else `system`. Newer Claude Code
+logs each request's new messages, which is where these come from; for a
+response from an older log there are none to show, and a request that sent
+a resumed conversation over again is said to be `resent`. The text it wrote
+follows, as a [call's content](#a-calls-arguments-and-content) does
+(`o` shows all of both); thinking Claude Code did not log is said to be
+missing. The calls it
 made are rows, and a call names the response that made it.
 
 A call is named by what the agent said it was for, when its tool takes a

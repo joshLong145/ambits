@@ -1016,6 +1016,7 @@ mod tests {
             Some(CallDetail {
                 args: args(&input),
                 content: Some(content),
+                injected: Vec::new(),
             }),
         );
         let text = crate::ui::test_render::lines(60, 40, |f| {
@@ -1415,5 +1416,52 @@ mod tests {
         );
         press(&mut app, KeyCode::Char('m'));
         assert_eq!(responses(&app), 1);
+    }
+
+    /// A response's panel shows what Claude Code injected into its request,
+    /// keyed by what each is, above the reply it wrote.
+    #[test]
+    fn a_response_shows_what_was_injected_into_its_request() {
+        use ambits::ingest::content::{Arg, CallContent, CallDetail, ContentKind};
+        let mut app = app_with_response();
+        app.trace_view.selected = Some(ambits::trace::view::Item::Span(4));
+        let (key, kind) = app
+            .content_request()
+            .expect("a response's content is asked for");
+        assert_eq!((&*key.id, kind), ("msg_1", ContentKind::Inference));
+        let arg = |key: &str, value: &str| Arg {
+            key: key.into(),
+            value: value.into(),
+            bulk: false,
+        };
+        app.set_call_content(
+            key,
+            Some(CallDetail {
+                args: Vec::new(),
+                content: Some(CallContent::Reply {
+                    lines: vec!["Reading the trace model.".into()],
+                    cut: 0,
+                }),
+                injected: vec![
+                    arg("mcp failed", "tavily (CONNECTION_CLOSED)"),
+                    arg(
+                        "tokens left",
+                        "<total_tokens>931270 tokens left</total_tokens>",
+                    ),
+                ],
+            }),
+        );
+        let text = screen(&app);
+        let injected = text.find("injected").expect(&text);
+        let reply = text.find("reply").expect(&text);
+        assert!(injected < reply, "what went in, then what came out: {text}");
+        for want in [
+            "mcp failed",
+            "tavily (CONNECTION_CLOSED)",
+            "tokens left",
+            "Reading the trace model.",
+        ] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
     }
 }
