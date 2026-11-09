@@ -142,13 +142,17 @@ focuses the inspector, `j` / `k` choose, `Enter` opens that
 
 `t` replaces the tree with the session's **traces, one per prompt**: when
 you asked, what, how long answering took, how many tool calls it made, how
-many failed, how many subagents it started, and how many git commits were
-made while it ran. The right-hand panel sums up the selected one. `j` / `k`
+many failed, how many subagents it started, how many git commits were
+made while it ran, what its model responses wrote (`≥` when a subagent's
+counts are only a floor) and the fullest any of their contexts was. The right-hand panel sums up the selected one. `j` / `k`
 choose, `Enter` opens one, `Esc` goes back to the tree.
 
-An open trace is that prompt's tool calls on a time axis: the prompt is the
-root span, every call made answering it a sub-span, each subagent's calls
-under the delegation that started it. It is the model
+An open trace is that prompt's tool calls and model responses on a time
+axis: the prompt is the root span, every call and response made answering
+it a sub-span, each subagent's under the delegation that started it. A
+response is named by its model, how it stopped, how full its context was
+and what it wrote (`opus-5-5 · tool_use ×2 · 105k ctx · 419 out`), and sits
+before the calls it made. It is the model
 [`ambits trace`](Traces) exports, so what you see here is what Jaeger or
 Perfetto would show. `Esc` returns to the list.
 
@@ -158,12 +162,13 @@ Two layouts, `v` to switch:
   call, nested by delegation, with its duration. A delegation lasts until
   its agent last stopped; `h` / `l` or `Space` fold its calls away.
 - **Tracks** (as Perfetto shows a system trace): one track per agent, in
-  delegation order, overlapping calls stacked into lanes, names drawn inside
-  bars wide enough to hold them. A folded track (`Space`) is one row of
-  density.
+  delegation order, overlapping calls stacked into lanes, its responses on a
+  lane of their own under them, names drawn inside bars wide enough to hold
+  them. A folded track (`Space`) is one row of density.
 
 Bars take the tree's colours: reads by depth, writes by whether their
-version is still there, failures red, delegations grey. `▼` marks a
+version is still there, failures red, delegations grey, model responses
+pink. `▼` marks a
 compaction, and `│` a git commit (hash and subject), among the calls it
 followed. Commits are found on local branches and `HEAD` by committer
 time, off the render thread, every few seconds while the view is open. The
@@ -183,7 +188,8 @@ Its keys are modal, as in Perfetto:
 | `Space` | Fold the selected delegation (waterfall) or track (tracks) |
 | `Enter` | On a delegation, into its agent's calls; on a read or write, to its symbol or file in the tree |
 | `/` | Waterfall: list only calls whose name contains the text (`Esc` clears) |
-| `e` | Next failed call |
+| `e` | Next failed call (an API error among them) |
+| `m` | Hide or show model responses |
 | `o` | The selected call's [arguments and content](#a-calls-arguments-and-content), full-width |
 | `v` | Waterfall / tracks |
 | `Esc` | Back to the list of traces |
@@ -219,7 +225,10 @@ In the trace view the right-hand panel follows the selection.
    commit 7fc8b45 Trace view: the layout core
 ```
 
-The prompt in full, when and how long, calls by tool, the files it read and
+The prompt in full, when and how long, calls by tool, its model responses
+summed up — how many, what they wrote, the fullest context, and the time
+some response was under way with no tool running against the time tools
+ran (an `AskUserQuestion` waiting on you included) — the files it read and
 wrote — and whether its writes are still there, changed or gone — its
 agents, its failed calls with the reason, and the commits made meanwhile.
 
@@ -263,6 +272,15 @@ edited, created (no symbol had its id before), deleted — and, unless
 deleted, whether its version is still there. A write recorded before
 ambits knew created from edited lists every symbol it touched as edited.
 
+**A model response**: the model (and the one asked for, when it differs),
+how it stopped (not logged, for many of a subagent's: its output is then a
+floor), how long until its first block and how long after, how long it
+thought, its context — cached, newly written to the cache, new — its output
+and thinking tokens, and how it was asked (effort, speed, tier). The text
+it wrote follows, as a [call's content](#a-calls-arguments-and-content)
+does; thinking Claude Code did not log is said to be missing. The calls it
+made are rows, and a call names the response that made it.
+
 A call is named by what the agent said it was for, when its tool takes a
 `description` — `Bash · Run the remote tests`, `Agent · Expert review of
 phase 6` — else by its symbol or file.
@@ -271,7 +289,8 @@ phase 6` — else by its symbol or file.
 selected in the tree, its file and the symbols around it unfolded (a
 deleted one selects its file) — `Enter` there opens it in your
 [editor](#opening-a-symbol-in-your-editor); a file shows in the tree; an agent,
-a failure, a related call or a commit is selected in the timeline (the trace
+a failure, a related call, a response or a call it made, or a commit is
+selected in the timeline (the trace
 opened, and unfolded down to it). Focus stays on
 the panel, so you can keep following the trail. `Esc` returns to the
 timeline.

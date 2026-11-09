@@ -1,9 +1,13 @@
-//! The session as a trace: every tool call a span with a start and an end,
-//! plus instants (compactions, snapshots, commits) — the model behind the
-//! TUI's trace view and `ambits trace` (OTLP / Chrome trace export).
+//! The session as a trace: every tool call and model response a span with a
+//! start and an end, plus instants (compactions, snapshots, commits) — the
+//! model behind the TUI's trace view and `ambits trace` (OTLP / Chrome trace
+//! export).
 //!
 //! A span starts at its `tool_use` and ends at its `tool_result`
 //! ([`crate::ingest::ToolFinished`]); a call without a result yet is open.
+//! A model response spans its request to its last block
+//! ([`crate::ingest::InferenceBlock`], merged by message id), beside the
+//! calls it made.
 //! A delegation (`Agent`, formerly `Task`) names the subagent it started,
 //! and every span of that subagent is its child — which is what nests a
 //! trace. Delegations are asynchronous, so a delegation's effective end is
