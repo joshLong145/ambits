@@ -494,20 +494,30 @@ pub fn tracks(
         .iter()
         .enumerate()
         .map(|(n, &(agent, depth))| {
-            let mut lanes: Vec<Vec<usize>> = Vec::new();
-            let mut lane_ends: Vec<u64> = Vec::new();
-            for &i in &by_agent[agent] {
-                match lane_ends.iter().position(|&e| e <= spans[i].start) {
-                    Some(l) => {
-                        lanes[l].push(i);
-                        lane_ends[l] = end_of(i);
-                    }
-                    None => {
-                        lanes.push(vec![i]);
-                        lane_ends.push(end_of(i));
+            // A model response overlaps the calls it made, so responses
+            // get lanes of their own, under the calls'.
+            let (responses, calls): (Vec<usize>, Vec<usize>) = by_agent[agent]
+                .iter()
+                .partition(|&&i| spans[i].kind == SpanKind::Inference);
+            let pack = |spans_in: &[usize]| {
+                let mut lanes: Vec<Vec<usize>> = Vec::new();
+                let mut lane_ends: Vec<u64> = Vec::new();
+                for &i in spans_in {
+                    match lane_ends.iter().position(|&e| e <= spans[i].start) {
+                        Some(l) => {
+                            lanes[l].push(i);
+                            lane_ends[l] = end_of(i);
+                        }
+                        None => {
+                            lanes.push(vec![i]);
+                            lane_ends.push(end_of(i));
+                        }
                     }
                 }
-            }
+                lanes
+            };
+            let mut lanes = pack(&calls);
+            lanes.extend(pack(&responses));
             let instants = (0..trace.instants().len())
                 .filter(|&i| match trace.instants()[i].agent.as_deref() {
                     Some(a) => a == agent,
@@ -629,6 +639,8 @@ pub struct TraceView {
     /// The waterfall's name filter, and whether it is being typed.
     pub query: String,
     pub typing: bool,
+    /// Model responses left out of the timeline (`m`).
+    pub hide_inferences: bool,
 }
 
 impl TraceView {
@@ -636,6 +648,7 @@ impl TraceView {
         *self = Self {
             open: self.open,
             layout: self.layout,
+            hide_inferences: self.hide_inferences,
             ..Self::default()
         };
     }
@@ -1268,5 +1281,26 @@ mod tests {
         };
         assert_eq!(span_at(&t, &[0, 1], &vp, 100, 5, BASE), Some(0));
         assert_eq!(span_at(&t, &[0, 1], &vp, 100, 50, BASE), None);
+    }
+
+    /// A response overlaps the calls it made, so it gets a lane of its own
+    /// under theirs rather than pushing them onto more lanes.
+    #[test]
+    fn responses_ride_a_lane_of_their_own() {
+        let mut t = trace(&[
+            ("main", "r1", "Read", 1_000, Some(2_000), None),
+            ("main", "r2", "Read", 3_000, Some(4_000), None),
+        ]);
+        t.inference(&crate::helpers::inference_block(
+            "main",
+            "m1",
+            &at(3_500),
+            Some(&at(500)),
+            &["r1", "r2"],
+            Some("tool_use"),
+            9,
+        ));
+        let tr = tracks(&t, None, None, BASE + 10_000);
+        assert_eq!(tr[0].lanes, [vec![0, 1], vec![2]]);
     }
 }

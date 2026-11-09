@@ -173,6 +173,40 @@ fn trace_lines(app: &App, d: &TraceDetail, width: usize) -> Vec<Line<'static>> {
     if !tally.is_empty() {
         out.push(Line::from(tally));
     }
+    out.extend(inference_totals(&d.inference));
+    out
+}
+
+/// A trace's model responses summed up: how many, what they wrote, the
+/// fullest context, and model time against tool time.
+fn inference_totals(totals: &ambits::trace::InferenceTotals) -> Vec<Line<'static>> {
+    use ambits::trace::tokens;
+    if totals.responses == 0 {
+        return Vec::new();
+    }
+    let mut first = format!(" {} model responses", totals.responses);
+    if let Some(out) = totals.usage.output {
+        let at_least = if totals.partial > 0 { "≥ " } else { "" };
+        first += &format!(" · {at_least}{} out", tokens(out));
+    }
+    if let Some(peak) = totals.peak_context {
+        first += &format!(" · {} fullest context", tokens(peak));
+    }
+    let mut out = vec![Line::from(text(first, colors::INFERENCE))];
+    out.push(Line::from(text(
+        format!(
+            " model {} · tools {}",
+            view::duration(totals.model_ms),
+            view::duration(totals.tool_ms)
+        ),
+        Color::Gray,
+    )));
+    if !totals.errors.is_empty() {
+        out.push(Line::from(text(
+            format!(" {} API error(s)", totals.errors.len()),
+            Color::Red,
+        )));
+    }
     out
 }
 
@@ -301,16 +335,120 @@ fn call_lines(app: &App, i: usize, frame: &TraceFrame<'_>, width: usize) -> Vec<
                 out.extend(wrapped("task", &s.task(), Color::Gray, width, 4));
             }
         }
-        SpanKind::Other | SpanKind::Prompt | SpanKind::Inference => {}
+        SpanKind::Inference => {
+            if let Some(inference) = &s.inference {
+                out.extend(inference_lines(s, inference, width));
+            }
+        }
+        SpanKind::Other | SpanKind::Prompt => {}
     }
     // A command or search — anything not about one file — in full, up to
     // six lines: a shell command can read (by naming symbols) as well.
     // Until its arguments are loaded, what it ran — a command or search
     // not about one file — in one line.
-    if s.file.is_none() && s.kind != SpanKind::Delegate && !has_args {
+    if s.file.is_none() && s.kind.is_call() && s.kind != SpanKind::Delegate && !has_args {
         out.extend(wrapped("ran", &s.description, Color::Gray, width, 6));
     }
     out.extend(super::content::preview(app, i, state, width));
+    out
+}
+
+/// A model response: the model, how it stopped, where its time went, how
+/// full its context was and what it wrote, and how it was asked. The calls
+/// it made are rows below.
+fn inference_lines(
+    s: &ambits::trace::Span,
+    inference: &ambits::trace::Inference,
+    width: usize,
+) -> Vec<Line<'static>> {
+    use ambits::trace::tokens;
+    let meta = &inference.meta;
+    let mut out = Vec::new();
+    let mut model = vec![text(
+        meta.model.as_deref().unwrap_or("not logged").to_string(),
+        Color::White,
+    )];
+    if let Some(asked) = meta
+        .requested_model
+        .as_deref()
+        .filter(|a| Some(*a) != meta.model.as_deref())
+    {
+        model.push(text(format!("  asked for {asked}"), Color::Gray));
+    }
+    out.push(fact("model", model));
+    if !meta.synthetic {
+        out.push(fact(
+            "stopped",
+            vec![match &inference.stop_reason {
+                Some(stop) => text(stop.to_string(), Color::Gray),
+                None => text("not logged, so output is a floor", Color::DarkGray),
+            }],
+        ));
+    }
+    // The wait before the first block is the model's; after it, the rest of
+    // the response, tools that ran meanwhile included.
+    let end = s.end.unwrap_or(s.start);
+    let mut took = format!(
+        "{} to first block · {} after",
+        view::duration(inference.first_block.saturating_sub(s.start)),
+        view::duration(end.saturating_sub(inference.first_block))
+    );
+    if let Some(ms) = meta.thinking_ms {
+        took += &format!(" · thought {}", view::duration(ms));
+    }
+    out.push(fact("took", vec![text(took, Color::Gray)]));
+    if inference.counts() {
+        let u = &inference.usage;
+        if let Some(context) = u.context() {
+            let parts: Vec<String> = [
+                (u.cache_read, "cached"),
+                (u.cache_write, "written to cache"),
+                (u.input, "new"),
+            ]
+            .iter()
+            .filter_map(|(n, what)| Some(format!("{} {what}", tokens((*n)?))))
+            .collect();
+            out.push(fact(
+                "context",
+                vec![
+                    text(tokens(context), Color::White),
+                    text(format!("  {}", parts.join(" · ")), Color::Gray),
+                ],
+            ));
+        }
+        if let Some(output) = u.output {
+            let at_least = if inference.usage_partial() {
+                "≥ "
+            } else {
+                ""
+            };
+            let mut wrote = vec![text(format!("{at_least}{}", tokens(output)), Color::White)];
+            if let Some(thinking) = u.thinking {
+                wrote.push(text(
+                    format!("  {} thinking", tokens(thinking)),
+                    Color::Gray,
+                ));
+            }
+            out.push(fact("output", wrote));
+        }
+    }
+    let settings: Vec<String> = [
+        (meta.effort.as_deref(), "effort"),
+        (meta.speed.as_deref(), "speed"),
+        (meta.service_tier.as_deref(), "tier"),
+    ]
+    .iter()
+    .filter_map(|(v, what)| Some(format!("{what} {}", (*v)?)))
+    .collect();
+    if !settings.is_empty() {
+        out.push(fact(
+            "asked",
+            vec![text(
+                fit(&settings.join(" · "), width.saturating_sub(12)),
+                Color::Gray,
+            )],
+        ));
+    }
     out
 }
 
@@ -571,6 +709,16 @@ fn rows_lines(
                 );
                 cells
             }
+            Row::MadeBy(j) | Row::Made(j) => vec![
+                text(
+                    format!("{} ", ambits::time::clock(spans[j].start)),
+                    Color::DarkGray,
+                ),
+                text(
+                    fit(&spans[j].name(), width.saturating_sub(17).max(8)),
+                    span_color(app, &frame.statuses, j),
+                ),
+            ],
             Row::Related { span: j, before } => vec![
                 text(
                     format!(
@@ -1174,5 +1322,98 @@ mod tests {
             Some(ambits::trace::view::Item::Span(1)),
             "the read before it on a.rs"
         );
+    }
+
+    /// The sample with a model response (4) that made the read (1).
+    fn app_with_response() -> App {
+        let mut app = app();
+        use ambits::ingest::{BlockCounts, InferenceBlock, InferenceMeta, Usage};
+        app.process_inference(&InferenceBlock {
+            message_id: "msg_1".into(),
+            agent_id: "sess".into(),
+            timestamp: "2026-09-27T10:00:00.700Z".into(),
+            requested_at: ambits::time::parse_rfc3339_millis("2026-09-27T10:00:00.200Z"),
+            stop_reason: Some("tool_use".into()),
+            blocks: BlockCounts {
+                tool_use: 1,
+                ..BlockCounts::default()
+            },
+            tool_uses: vec![Arc::from("r1")],
+            usage: Usage {
+                input: Some(10),
+                output: Some(419),
+                cache_read: Some(1_000),
+                ..Usage::default()
+            },
+            meta: InferenceMeta {
+                model: Some("claude-opus-5-5".into()),
+                ..InferenceMeta::default()
+            },
+        });
+        app.trace_view.open_trace(0);
+        app
+    }
+
+    /// A response says what model answered, how it stopped, where its time
+    /// went, how full its context was and what it wrote; the call it made
+    /// is a row, and the call names it back.
+    #[test]
+    fn a_response_shows_its_model_tokens_and_the_calls_it_made() {
+        let mut app = app_with_response();
+        app.trace_view.selected = Some(ambits::trace::view::Item::Span(4));
+        let text = screen(&app);
+        for want in [
+            "opus-5-5 · tool_use · 1.0k ctx · 419 out",
+            "model    claude-opus-5-5",
+            "stopped  tool_use",
+            "took     500ms to first block",
+            "context  1.0k  1.0k cached · 10 new",
+            "output   419",
+            "calls made",
+            "Read src/a.rs",
+        ] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+
+        app.trace_view.selected = Some(ambits::trace::view::Item::Span(1));
+        let text = screen(&app);
+        assert!(text.contains("made by"), "{text}");
+        assert!(text.contains("opus-5-5 · tool_use"), "{text}");
+    }
+
+    /// The trace's summary adds up its responses.
+    #[test]
+    fn a_traces_summary_adds_up_its_responses() {
+        let mut app = app_with_response();
+        app.trace_view.close_trace();
+        let text = screen(&app);
+        assert!(
+            text.contains("1 model responses · 419 out · 1.0k fullest context"),
+            "{text}"
+        );
+        assert!(text.contains("3 calls"), "responses are not calls: {text}");
+    }
+
+    /// `m` takes responses out of the timeline and puts them back.
+    #[test]
+    fn m_hides_and_shows_responses() {
+        use crossterm::event::KeyCode;
+        let mut app = app_with_response();
+        let responses = |app: &App| {
+            app.trace_rows()
+                .iter()
+                .filter(|r| r.item == ambits::trace::view::Item::Span(4))
+                .count()
+        };
+        assert_eq!(responses(&app), 1);
+        app.trace_view.selected = Some(ambits::trace::view::Item::Span(4));
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(responses(&app), 0);
+        assert_eq!(
+            app.trace_view.selected, None,
+            "a hidden response is not selected"
+        );
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(responses(&app), 1);
     }
 }

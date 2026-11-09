@@ -297,6 +297,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                     ("[o]", "content "),
                     ("[/]", "find "),
                     ("[e]", "rror "),
+                    ("[m]", "odel calls "),
                 ]),
                 (FocusPanel::Left, true, false) => keys(&[
                     ("[j/k]", "trace "),

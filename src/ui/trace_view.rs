@@ -160,8 +160,8 @@ fn render_list(f: &mut Frame, app: &App, inner: Rect) {
         .filter(|t| app.trace.spans()[t.root].kind == SpanKind::Prompt)
         .count();
 
-    // when · prompt · took · calls · failed · agents · commits
-    let text_w = (inner.width as usize).saturating_sub(13 + 8 + 10 + 9 + 9 + 9);
+    // when · prompt · took · calls · failed · agents · commits · out · context
+    let text_w = (inner.width as usize).saturating_sub(13 + 8 + 10 + 9 + 9 + 9 + 8 + 8);
     let mut lines = vec![
         Line::from(Span::styled(
             format!(
@@ -172,8 +172,8 @@ fn render_list(f: &mut Frame, app: &App, inner: Rect) {
         )),
         Line::from(Span::styled(
             format!(
-                " {:<11} {:<text_w$} {:>7} {:>9} {:>8} {:>8} {:>8}",
-                "when", "prompt", "took", "calls", "failed", "agents", "commits"
+                " {:<11} {:<text_w$} {:>7} {:>9} {:>8} {:>8} {:>8} {:>7} {:>7}",
+                "when", "prompt", "took", "calls", "failed", "agents", "commits", "out", "context"
             ),
             dim,
         )),
@@ -220,6 +220,14 @@ fn render_list(f: &mut Frame, app: &App, inner: Rect) {
             Span::styled(format!(" {failed:>8}"), style.fg(Color::Red)),
             Span::styled(format!(" {agents:>8}"), style.fg(Color::Gray)),
             Span::styled(format!(" {commits:>8}"), style.fg(Color::Cyan)),
+            Span::styled(
+                format!(
+                    " {:>7} {:>7}",
+                    output_of(&t.inference),
+                    context_of(&t.inference)
+                ),
+                style.fg(colors::INFERENCE),
+            ),
         ]));
     }
     lines.resize(2 + rows_h as usize, Line::from(""));
@@ -252,6 +260,23 @@ fn render_list(f: &mut Frame, app: &App, inner: Rect) {
         rows: rows_h,
         first_row: first,
     }));
+}
+
+/// What a trace's responses wrote, `≥` when a count is only a floor.
+fn output_of(totals: &ambits::trace::InferenceTotals) -> String {
+    match totals.usage.output {
+        Some(n) if totals.partial > 0 => format!("≥{}", ambits::trace::tokens(n)),
+        Some(n) => ambits::trace::tokens(n),
+        None => String::new(),
+    }
+}
+
+/// The fullest any of a trace's responses' context was.
+fn context_of(totals: &ambits::trace::InferenceTotals) -> String {
+    totals
+        .peak_context
+        .map(ambits::trace::tokens)
+        .unwrap_or_default()
 }
 
 /// `12m04s · 1,204 calls · 3 failed · 0s–12m04s shown`

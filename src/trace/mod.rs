@@ -474,6 +474,16 @@ impl Trace {
         }
     }
 
+    /// The call with `tool_use` id `id`.
+    pub fn span_of(&self, id: &str) -> Option<usize> {
+        self.by_id.get(id).copied()
+    }
+
+    /// The model response with message id `message`.
+    pub fn response_of(&self, message: &str) -> Option<usize> {
+        self.by_message.get(message).copied()
+    }
+
     /// The delegation that started subagent `agent`.
     pub fn delegation_of(&self, agent: &str) -> Option<usize> {
         self.by_child.get(agent).copied()

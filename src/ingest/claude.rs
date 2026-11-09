@@ -983,6 +983,9 @@ fn content_text(content: &Value) -> Option<String> {
 /// yet. Only lines naming `id` are parsed; nothing is kept but what is
 /// returned, and nothing is logged (spec §9.6).
 pub fn call_detail(files: &[PathBuf], id: &str, kind: ContentKind) -> Option<CallDetail> {
+    if kind == ContentKind::Inference {
+        return response_detail(files, id);
+    }
     let mut input: Option<Value> = None;
     let mut result: Option<ToolResult> = None;
     let mut buf = Vec::new();
@@ -1035,6 +1038,77 @@ pub fn call_detail(files: &[PathBuf], id: &str, kind: ContentKind) -> Option<Cal
         return None;
     }
     Some(assemble_detail(kind, input.as_ref(), result.as_ref()))
+}
+
+/// Model response `id` as its log recorded it: the text it wrote, block by
+/// block, its thinking too where the log kept it, which it mostly does not.
+/// For display only, as [`call_detail`] is.
+fn response_detail(files: &[PathBuf], id: &str) -> Option<CallDetail> {
+    let mut text: Vec<String> = Vec::new();
+    let mut unlogged_thinking = false;
+    let mut found = false;
+    let mut buf = Vec::new();
+    for path in files {
+        let Ok(file) = fs::File::open(path) else {
+            continue;
+        };
+        let mut reader = BufReader::new(file);
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let Ok(line) = std::str::from_utf8(&buf) else {
+                continue;
+            };
+            if !line.contains(id) {
+                continue;
+            }
+            let Ok(obj) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(message) = obj
+                .get("message")
+                .filter(|m| m.get("id").and_then(Value::as_str) == Some(id))
+            else {
+                continue;
+            };
+            found = true;
+            for block in message
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let field = |key: &str| block.get(key).and_then(Value::as_str);
+                match field("type") {
+                    Some("text") => text.extend(field("text").map(String::from)),
+                    Some("thinking") => match field("thinking").filter(|t| !t.is_empty()) {
+                        Some(t) => text.push(format!("[thinking] {t}")),
+                        None => unlogged_thinking = true,
+                    },
+                    Some("redacted_thinking") => unlogged_thinking = true,
+                    _ => {}
+                }
+            }
+        }
+        // A response is logged in one agent's file.
+        if found {
+            break;
+        }
+    }
+    if !found {
+        return None;
+    }
+    if unlogged_thinking {
+        text.insert(0, "[thinking not logged]".to_string());
+    }
+    let (lines, cut) = CallContent::capped(&text.join("\n"));
+    Some(CallDetail {
+        args: Vec::new(),
+        content: Some(CallContent::Reply { lines, cut }),
+    })
 }
 
 /// [`call_detail`] for every call in `wanted` at once, in one pass over
@@ -1232,6 +1306,8 @@ fn build_content(
             output(content)
         }
         ContentKind::Other => output(result?.0),
+        // A response has no call; `response_detail` reads its text.
+        ContentKind::Inference => None,
     }
 }
 
@@ -5304,5 +5380,34 @@ mod inference_tests {
         };
         assert!(block.is_none());
         assert_eq!(calls.len(), 1);
+    }
+
+    /// The text a response wrote, read by its message id, for the TUI: its
+    /// text blocks in order, and a note that its thinking was not logged.
+    #[test]
+    fn a_responses_text_is_read_by_its_message_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = response_log();
+        log.push(
+            json!({"type": "assistant", "uuid": "m3", "timestamp": "2026-11-08T10:00:05.000Z",
+            "message": {"id": "msg_1", "content": [{"type": "text", "text": "Done.\nAll good."}]}}),
+        );
+        log.push(
+            json!({"type": "assistant", "uuid": "m4", "timestamp": "2026-11-08T10:00:06.000Z",
+            "message": {"id": "msg_2", "content": [{"type": "text", "text": "another"}]}}),
+        );
+        let path = write(dir.path(), &log);
+        let detail = call_detail(&[path], "msg_1", ContentKind::Inference).unwrap();
+        assert_eq!(
+            detail.content,
+            Some(CallContent::Reply {
+                lines: vec![
+                    "[thinking not logged]".into(),
+                    "Done.".into(),
+                    "All good.".into()
+                ],
+                cut: 0
+            })
+        );
     }
 }

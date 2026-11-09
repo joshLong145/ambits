@@ -208,6 +208,8 @@ pub enum ContentKind {
     Read,
     Write,
     Other,
+    /// A model response, known by its message id: the text it wrote.
+    Inference,
 }
 
 /// A call's content.
@@ -231,6 +233,8 @@ pub enum CallContent {
     },
     /// What a call returned; `cut` lines more were left out.
     Output { lines: Vec<String>, cut: usize },
+    /// What a model response wrote; `cut` lines more were left out.
+    Reply { lines: Vec<String>, cut: usize },
 }
 
 /// One hunk of a change. Line numbers are 1-based; `None` when unknown.
@@ -336,6 +340,7 @@ impl CallContent {
             CallContent::Change { .. } => "change",
             CallContent::Read { .. } => "read",
             CallContent::Output { .. } => "output",
+            CallContent::Reply { .. } => "reply",
         }
     }
 
@@ -381,7 +386,7 @@ impl CallContent {
                 );
                 out.extend(Self::cut_note(*cut));
             }
-            CallContent::Output { lines, cut } => {
+            CallContent::Output { lines, cut } | CallContent::Reply { lines, cut } => {
                 out.extend(
                     lines
                         .iter()

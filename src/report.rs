@@ -748,6 +748,8 @@ fn content(c: &CallContent) -> Option<ContentDto> {
             lines: lines.clone(),
             cut: *cut,
         }),
+        // A model response's text is never exported.
+        CallContent::Reply { .. } => None,
     }
 }
 
