@@ -206,8 +206,9 @@ enum Commands {
         into: Option<String>,
     },
 
-    /// Export the session as a trace: every tool call a span with its
-    /// duration, subagents nested under the call that started them.
+    /// Export the session as a trace: every tool call and model response a
+    /// span with its duration, subagents nested under the call that started
+    /// them.
     ///
     /// `otlp` is OpenTelemetry's JSON format, for Jaeger, Grafana Tempo or a
     /// collector; `chrome` is the Chrome trace format, for Perfetto

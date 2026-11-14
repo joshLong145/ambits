@@ -28,6 +28,10 @@ pub const PCT_MID_LOW: Color = Color::Rgb(230, 160, 60);
 pub const PCT_MID_HIGH: Color = Color::Rgb(200, 200, 80);
 pub const PCT_HIGH: Color = Color::Rgb(80, 220, 120);
 
+// ── Trace ───────────────────────────────────────────────────────────
+/// A model response in the trace view.
+pub const INFERENCE: Color = Color::Rgb(240, 110, 170);
+
 // ── Accent / chrome ─────────────────────────────────────────────────
 pub const ACCENT_MUTED: Color = Color::Rgb(120, 120, 180);
 pub const HIGHLIGHT_BG: Color = Color::Rgb(60, 55, 50);
