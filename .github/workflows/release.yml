@@ -8,6 +8,11 @@ on:
   push:
     tags: ['[0-9]+.[0-9]+.[0-9]+']
 
+# The GITHUB_TOKEN only reads the repository; a job that needs more
+# asks for it itself.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -18,7 +23,7 @@ jobs:
     name: Tag matches Cargo.toml
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Compare
         run: |
           crate=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "ambits") | .version')
@@ -46,7 +51,7 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.88
         with:
           targets: ${{ matrix.target }}
@@ -84,7 +89,7 @@ jobs:
           SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) cargo cyclonedx \
             --format json --spec-version 1.5 --describe binaries --target ${{ matrix.target }}
           mv -f ambits_bin.cdx.json "ambits-$GITHUB_REF_NAME-${{ matrix.target }}.cdx.json"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: |
@@ -99,7 +104,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
       # With CycloneDX's own CLI, pinned and checked against its release digest.
