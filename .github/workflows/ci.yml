@@ -6,6 +6,10 @@ on:
   push:
     branches: [main, nighthawk-integration]
 
+# The GITHUB_TOKEN only reads the repository.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -14,7 +18,7 @@ jobs:
     name: Build & Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -44,7 +48,7 @@ jobs:
           - { runner: ubuntu-latest, target: x86_64-unknown-linux-musl }
           - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.88
         with:
           targets: ${{ matrix.target }}
