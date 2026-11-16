@@ -11,7 +11,8 @@ license = "MIT"
 keywords = ["claude", "claude-code", "serena"]
 categories = ["command-line-utilities"]
 exclude = [
-    "images/*"
+    "images/*",
+    "tools/*"
 ]
 
 [dependencies]
