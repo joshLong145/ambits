@@ -1,11 +1,19 @@
-# Ambits
+# ambits — context memory, code search and traces for Claude Code
 
 [![e2e](https://github.com/joshLong145/ambits/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/joshLong145/ambits/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/joshLong145/ambits/graph/badge.svg?token=9Q8GWA8H6Y)](https://codecov.io/gh/joshLong145/ambits)
+[![release](https://img.shields.io/github/v/release/joshLong145/ambits)](https://github.com/joshLong145/ambits/releases)
+![license: MIT](https://img.shields.io/badge/license-MIT-blue)
 
-**A code-reading tool for AI agents, and a memory of what they have read.**
+**See what your AI coding agent has read, keep it across context compaction, and trace every tool call it makes.**
 
-Coding agents read whole files to find one function, re-read code they already know, and lose all of it when the context window compacts. ambits answers in symbols instead of files, records every symbol an agent reads and at what depth, and hands that history back after a compaction. Output is plain text and JSON; session ingestion is built for Claude Code.
+AI coding agents like Claude Code read whole files to find one function, re-read code they already know, and forget all of it when the context window compacts. ambits is a Rust CLI and terminal UI for those sessions:
+
+- **Symbol-level code search for agents**: ripgrep and grep with every match attributed to its function or class, call sites from tree-sitter grammars, and single-symbol reads, so the agent spends tokens on the code it needs.
+- **Context memory across compactions**: every symbol the agent reads, and how deeply, is recorded; after a compaction a SessionStart hook hands that history back.
+- **Observability for agent sessions**: watch a session live, measure code coverage, and export each prompt's tool calls and subagents as OpenTelemetry or Perfetto traces, or as an HTML report.
+
+Everything is plain text and JSON. Session ingestion is built for [Claude Code](https://www.anthropic.com/claude-code); symbols come from tree-sitter or [Serena](https://github.com/oraios/serena).
 
 ![The ambits TUI: this repo's symbol tree, shaded by how deeply the session has read each symbol](./images/tui.svg)
 
@@ -18,7 +26,7 @@ ambits hook install --project .     # restore read history after every compactio
 ambits -p .                         # watch the session live
 ```
 
-## For the agent
+## Code search for AI agents
 
 **Search, with every hit attributed to a symbol**, using ripgrep's flags (or GNU grep's via `ambits grep`). The bracket names the enclosing symbol and how deeply this session has read it:
 
@@ -42,6 +50,8 @@ centered_rect — 2 call sites in 2 callers
 ambits -p . show 'src/app.rs::App/process_compaction'
 ```
 
+## Context memory across compactions
+
 **Recall what it has already read**, with line ranges that stay correct after edits:
 
 ```console
@@ -50,13 +60,17 @@ $ ambits -p . restore-context
 grouped:64-84, symbol_label:104-119, fit_names:126-141, …
 ```
 
-## For you
+`ambits hook install` runs this for the agent after every compaction, so it starts again knowing what it read instead of rediscovering it.
+
+## Watch a Claude Code session live
 
 **The TUI** tails the session live: the symbol tree shaded by read depth, per-agent filtering for subagents, compactions, and the files each agent wrote. Press `t` for traces: each prompt's tool calls on a timeline, subagents nested under the call that started them.
 
 ![The trace view: a prompt's tool calls on a waterfall, with a subagent's calls nested under its delegation](./images/trace.svg)
 
-**Coverage** for scripts and CI:
+## Coverage, traces and reports
+
+**Coverage** of the codebase by the session, for scripts and CI:
 
 ```bash
 ambits -p . --coverage --format json | jq '.totals.full_percent'
@@ -69,6 +83,8 @@ ambits -p . trace > session.otlp.json
 ambits -p . trace --format chrome > session.trace.json   # ui.perfetto.dev
 ambits -p . report --format html > session.html
 ```
+
+## Agent writes, snapshots and sharing
 
 **Agent writes**: when an agent last wrote a file or symbol, and whether that version is still on disk:
 
@@ -83,7 +99,7 @@ ambits -p . snapshot && ambits -p . remote add origin /mnt/team/ambits && ambits
 ambits -p . fetch && ambits -p . restore origin/<session>   # on another machine
 ```
 
-## Languages
+## Supported languages
 
 | Backend | Languages |
 |---|---|

@@ -1,0 +1,63 @@
+name: README images
+
+# When a pull request changes the generator, draw the README's TUI images
+# again from the pull request's code and commit them to its branch. A pull
+# request from a fork cannot be pushed to, so there the check fails instead
+# when the images are out of date.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tools/readme-images/**'
+      - '.github/workflows/readme-images.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: readme-images-${{ github.head_ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  images:
+    name: Regenerate README images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            tools/readme-images
+      - name: Build ambits
+        run: cargo build --release --locked
+      - name: Draw the images
+        run: cargo run --release --locked --manifest-path tools/readme-images/Cargo.toml
+      - name: Commit them to the pull request
+        env:
+          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+        run: |
+          if git diff --quiet -- images/; then
+            echo "The images are up to date."
+            exit 0
+          fi
+          git diff --stat -- images/
+          if [ "$SAME_REPO" != "true" ]; then
+            echo "::error::The README images are out of date. Run \`cargo build --release && cargo run --manifest-path tools/readme-images/Cargo.toml\` and commit images/."
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add images/
+          git commit -m "README: regenerate the TUI images"
+          git push
