@@ -169,6 +169,17 @@ pub(super) fn preview(
         out.push(super::heading(" arguments"));
         out.extend(args.iter().map(|row| indent(row_line(row, cols, width))));
     }
+    let injected = detail.injected_rows(width, ARG_PREVIEW);
+    if !injected.is_empty() {
+        let cols = Columns::new(Numbers::One, detail, &[]);
+        out.push(Line::from(""));
+        out.push(super::heading(" injected"));
+        out.extend(
+            injected
+                .iter()
+                .map(|row| indent(row_line(row, cols, width))),
+        );
+    }
     let mut more = 0;
     if let Some(content) = &detail.content {
         let rows = content.rows();
@@ -285,6 +296,7 @@ mod tests {
         let detail = CallDetail {
             args: Vec::new(),
             content: None,
+            injected: Vec::new(),
         };
         let cols = Columns::new(numbers, &detail, &rows);
         rows.iter()

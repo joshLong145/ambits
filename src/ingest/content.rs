@@ -18,6 +18,10 @@ pub const MAX_LINES: usize = 5000;
 pub struct CallDetail {
     pub args: Vec<Arg>,
     pub content: Option<CallContent>,
+    /// For a model response, what Claude Code put into its request beside
+    /// the conversation — reminders, hook output, skill listings, failed
+    /// MCP servers — each keyed by what it is ([`injected_label`]).
+    pub injected: Vec<Arg>,
 }
 
 /// One argument of a call, for display.
@@ -110,11 +114,40 @@ pub fn args(input: &Value) -> Vec<Arg> {
 /// The widest an argument's key column gets; a longer key is cut.
 const KEY_MAX: usize = 16;
 
+/// What text Claude Code injected into a request is, as a key for it: a
+/// count of tokens left, a nudge, a hook's output, a skill listing, MCP
+/// servers that failed to connect, a background-task notice. Matched on
+/// Claude Code's own wording, so anything else is just `system`, or
+/// `reminder` for a `<system-reminder>` it attached to a message.
+pub fn injected_label(text: &str, reminder: bool) -> &'static str {
+    let starts = |p: &str| text.trim_start().starts_with(p);
+    if starts("The user hasn't heard from you") {
+        "nudge"
+    } else if text.contains("MCP servers") && text.contains("failed to connect") {
+        "mcp failed"
+    } else if starts("The following skills are available") {
+        "skills"
+    } else if starts("[SYSTEM NOTIFICATION") || text.contains("<task-notification>") {
+        "notification"
+    } else if text.contains(" hook success") || text.contains(" hook additional context") {
+        "hook"
+    } else if text.contains("deferred tools") || text.contains("tools just became available") {
+        "tools"
+    } else if starts("<total_tokens>") {
+        "tokens left"
+    } else if reminder {
+        "reminder"
+    } else {
+        "system"
+    }
+}
+
 impl CallDetail {
-    /// The width of the arguments' key column.
+    /// The width of the key column: its arguments' and injected texts'.
     pub fn key_width(&self) -> usize {
         self.args
             .iter()
+            .chain(&self.injected)
             .map(|a| a.key.chars().count())
             .max()
             .unwrap_or(0)
@@ -125,9 +158,19 @@ impl CallDetail {
     /// value beside it, wrapped under it — at most `keep` rows of each, and
     /// a row saying how many more there are.
     pub fn arg_rows(&self, width: usize, keep: usize) -> Vec<ContentRow<'_>> {
+        self.keyed_rows(&self.args, width, keep)
+    }
+
+    /// What was injected into a model response's request, as
+    /// [`Self::arg_rows`] lays out arguments.
+    pub fn injected_rows(&self, width: usize, keep: usize) -> Vec<ContentRow<'_>> {
+        self.keyed_rows(&self.injected, width, keep)
+    }
+
+    fn keyed_rows<'a>(&self, items: &'a [Arg], width: usize, keep: usize) -> Vec<ContentRow<'a>> {
         let room = width.saturating_sub(self.key_width() + 2).max(8);
         let mut out = Vec::new();
-        for arg in &self.args {
+        for arg in items {
             if arg.bulk {
                 out.push(ContentRow {
                     key: Some(&arg.key),
@@ -177,6 +220,10 @@ impl CallDetail {
             out.push(ContentRow::new(RowKind::Section, None, None, "arguments"));
             out.extend(self.arg_rows(width, usize::MAX));
         }
+        if !self.injected.is_empty() {
+            out.push(ContentRow::new(RowKind::Section, None, None, "injected"));
+            out.extend(self.injected_rows(width, usize::MAX));
+        }
         if let Some(content) = &self.content {
             if !out.is_empty() {
                 out.push(ContentRow::new(RowKind::Note, None, None, ""));
@@ -208,6 +255,8 @@ pub enum ContentKind {
     Read,
     Write,
     Other,
+    /// A model response, known by its message id: the text it wrote.
+    Inference,
 }
 
 /// A call's content.
@@ -231,6 +280,8 @@ pub enum CallContent {
     },
     /// What a call returned; `cut` lines more were left out.
     Output { lines: Vec<String>, cut: usize },
+    /// What a model response wrote; `cut` lines more were left out.
+    Reply { lines: Vec<String>, cut: usize },
 }
 
 /// One hunk of a change. Line numbers are 1-based; `None` when unknown.
@@ -336,6 +387,7 @@ impl CallContent {
             CallContent::Change { .. } => "change",
             CallContent::Read { .. } => "read",
             CallContent::Output { .. } => "output",
+            CallContent::Reply { .. } => "reply",
         }
     }
 
@@ -381,7 +433,7 @@ impl CallContent {
                 );
                 out.extend(Self::cut_note(*cut));
             }
-            CallContent::Output { lines, cut } => {
+            CallContent::Output { lines, cut } | CallContent::Reply { lines, cut } => {
                 out.extend(
                     lines
                         .iter()
@@ -454,6 +506,7 @@ mod tests {
         let detail = CallDetail {
             args: args(&serde_json::json!({"file_path": "a.rs", "old_string": "x\ny"})),
             content: Some(c),
+            injected: Vec::new(),
         };
         let kinds: Vec<RowKind> = detail.rows(40).iter().map(|r| r.kind).take(6).collect();
         assert_eq!(
@@ -526,6 +579,7 @@ mod tests {
         let d = CallDetail {
             args: args(&serde_json::json!({"command": "abcdefghij\tk"})),
             content: None,
+            injected: Vec::new(),
         };
         let rows = |keep| -> Vec<(RowKind, Option<&str>, String)> {
             d.arg_rows(7 + 2 + 8, keep)
@@ -573,5 +627,50 @@ mod tests {
         let rows = c.rows();
         assert_eq!((rows[0].new, rows[1].new), (Some(40), Some(41)));
         assert_eq!(rows[2].kind, RowKind::Note);
+    }
+
+    #[test]
+    fn injected_text_is_labelled_by_what_it_is() {
+        let cases = [
+            (
+                "<total_tokens>931270 tokens left</total_tokens>",
+                false,
+                "tokens left",
+            ),
+            (
+                "The user hasn't heard from you in a while — say what you're doing.",
+                false,
+                "nudge",
+            ),
+            (
+                "UserPromptSubmit hook success: === RUST SKILLS ===",
+                false,
+                "hook",
+            ),
+            (
+                "The following MCP servers are configured but failed to connect — ambit",
+                false,
+                "mcp failed",
+            ),
+            (
+                "The following skills are available for use with the Skill tool:",
+                false,
+                "skills",
+            ),
+            (
+                "[SYSTEM NOTIFICATION - NOT USER INPUT] a background task",
+                true,
+                "notification",
+            ),
+            (
+                "Codebase and user instructions are shown below.",
+                true,
+                "reminder",
+            ),
+            ("While auto mode is active: …", false, "system"),
+        ];
+        for (text, reminder, label) in cases {
+            assert_eq!(injected_label(text, reminder), label, "{text}");
+        }
     }
 }

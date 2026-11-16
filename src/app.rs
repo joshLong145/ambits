@@ -1083,7 +1083,7 @@ impl App {
     }
 
     /// What content a call has: a read's text, a write's change, anything
-    /// else's output — nothing for a prompt.
+    /// else's output, a model response's text — nothing for a prompt.
     pub fn content_kind(&self, span: usize) -> Option<crate::ingest::content::ContentKind> {
         use crate::ingest::content::ContentKind;
         use crate::trace::SpanKind;
@@ -1091,6 +1091,9 @@ impl App {
             SpanKind::Read(_) => Some(ContentKind::Read),
             SpanKind::Write => Some(ContentKind::Write),
             SpanKind::Delegate | SpanKind::Other => Some(ContentKind::Other),
+            // Its text, which only the TUI shows: the report's own
+            // `content_kind` leaves it out.
+            SpanKind::Inference => Some(ContentKind::Inference),
             SpanKind::Prompt => None,
         }
     }
@@ -1228,13 +1231,22 @@ impl App {
     /// The trace view's rows under the current agent filter.
     pub fn trace_rows(&self) -> Vec<crate::trace::view::Row> {
         let tv = &self.trace_view;
-        crate::trace::view::waterfall(
+        let mut rows = crate::trace::view::waterfall(
             &self.trace,
             self.agent_filter.as_deref(),
             tv.focus,
             &tv.collapsed_spans,
             &tv.query,
-        )
+        );
+        if tv.hide_inferences {
+            rows.retain(|r| !self.is_inference(r.item));
+        }
+        rows
+    }
+
+    fn is_inference(&self, item: crate::trace::view::Item) -> bool {
+        matches!(item, crate::trace::view::Item::Span(i)
+            if self.trace.spans()[i].kind == crate::trace::SpanKind::Inference)
     }
 
     /// The tracks and their screen rows under the current agent filter.
@@ -1244,12 +1256,21 @@ impl App {
         Vec<crate::trace::view::Track>,
         Vec<crate::trace::view::TrackRow>,
     ) {
-        let tracks = crate::trace::view::tracks(
+        let mut tracks = crate::trace::view::tracks(
             &self.trace,
             self.agent_filter.as_deref(),
             self.trace_view.focus,
             self.trace_open_end(),
         );
+        if self.trace_view.hide_inferences {
+            for track in &mut tracks {
+                track.lanes.retain(|lane| {
+                    !lane
+                        .iter()
+                        .all(|&i| self.trace.spans()[i].kind == crate::trace::SpanKind::Inference)
+                });
+            }
+        }
         let rows = crate::trace::view::track_rows(&tracks, &self.trace_view.collapsed_agents);
         (tracks, rows)
     }
@@ -1337,6 +1358,17 @@ impl App {
                 let rows = self.trace_rows();
                 self.trace_view.next_error(&self.trace, &rows);
                 self.follow_selection_to_track();
+            }
+            KeyCode::Char('m') => {
+                let hide = !self.trace_view.hide_inferences;
+                let on_one = self
+                    .trace_view
+                    .selected
+                    .is_some_and(|s| self.is_inference(s));
+                self.trace_view.hide_inferences = hide;
+                if hide && on_one {
+                    self.trace_view.selected = None;
+                }
             }
             KeyCode::Enter => self.follow_trace_selection(),
             _ => {}
@@ -2019,6 +2051,12 @@ impl App {
     /// A prompt starts a turn: the trace nests the calls that follow under it.
     pub fn process_prompt(&mut self, prompt: &crate::ingest::Prompt) {
         self.trace.prompt(prompt);
+    }
+
+    /// A line of a model response. Only the trace shows responses, so the
+    /// tree's rows are left as they are.
+    pub fn process_inference(&mut self, block: &crate::ingest::InferenceBlock) {
+        self.trace.inference(block);
     }
 
     /// Queue a write for attribution, tagged with the current session (see

@@ -151,6 +151,7 @@ fn apply_replayed(app: &mut App, event: ambits::ingest::SessionEvent) {
         SessionEvent::Write(w) => app.queue_write(w),
         SessionEvent::ToolFinished(f) => app.process_tool_finished(&f),
         SessionEvent::Prompt(p) => app.process_prompt(&p),
+        SessionEvent::Inference(block) => app.process_inference(&block),
     }
 }
 
@@ -174,6 +175,7 @@ pub fn replay_session(
             for event in replay.events {
                 apply_replayed(app, event);
             }
+            handoff.lines.push((file.clone(), replay.lines));
             handoff.files.push((file, replay.offset));
             handoff.awaiting.extend(replay.awaiting);
         }
@@ -385,6 +387,9 @@ impl TuiSession {
             }
             for prompt in &output.prompts {
                 app.process_prompt(prompt);
+            }
+            for block in &output.inferences {
+                app.process_inference(block);
             }
             for compaction in output.compactions {
                 app.process_compaction(
@@ -636,6 +641,7 @@ mod tests {
                 writes: std::mem::take(&mut self.writes),
                 finished: Vec::new(),
                 prompts: Vec::new(),
+                inferences: Vec::new(),
             }
         }
     }

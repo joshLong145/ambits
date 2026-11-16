@@ -23,7 +23,8 @@ nothing. To have the journal hold everything first, run `cache sync`.
 a summary, the files with each symbol's read depth and the writes that
 touched it, the writes grouped by the commit they landed in, and the trace as
 a timeline with one lane per agent above every call, under any lanes the
-harness supplied (see [A harness's phases](#a-harnesss-phases)). A call expands in place
+harness supplied (see [A harness's phases](#a-harnesss-phases)), each agent's model
+responses as a thin bar under its calls. A call expands in place
 when clicked, as in the TUI: its arguments, and the change it made, the
 text it read with line numbers, or what it printed. Open it in any browser; it needs no
 server.
@@ -107,6 +108,9 @@ as the transcript itself. It holds file contents, and a command or a call's
 description says whatever it said, secrets included, so screen it before
 publishing it. Unlike a [snapshot](Snapshots), which never holds contents.
 
+The text a model response wrote is the one thing it leaves out: responses
+carry their metadata only.
+
 Files are named by project-relative path, path arguments included, and the
 project by its directory's name, never its path.
 
@@ -118,10 +122,11 @@ project by its directory's name, never its path.
 |---|---|
 | `session_id`, `ambits_version`, `generated_at` | Which session, made by which ambits, when (RFC 3339) |
 | `project` | `name`, the project directory's name; `head`, the commit checked out, or `null` |
-| `totals` | `files`, `symbols`, `symbols_read`, `symbols_read_full`, `symbols_written`, `writes`, `spans`, `agents` |
+| `totals` | `files`, `symbols`, `symbols_read`, `symbols_read_full`, `symbols_written`, `writes`, `spans`, `inferences`, `agents` |
 | `truncated` | What `--max-bytes` cut, in order; empty when nothing was |
 | `agents` | `id`, `label`, `parent` (`null` for the session's own agent) |
 | `spans` | One per tool call or prompt, as in [Traces](Traces) |
+| `inferences` | One per model response, as in [Traces](Traces#model-responses) |
 | `instants` | `compaction`, `commit` (`sha`, `subject`) and `snapshot` events, by `t_ms` |
 | `files` | Every file, with `symbols` listed for those something read or wrote |
 | `writes` | Every attributed write, oldest first |
@@ -150,6 +155,16 @@ the change below`), since `content` shows them. `content` is `null`, or:
 
 `cut` counts lines left out past the TUI's limit of 5000 per call.
 
+A model response: `id` (its message id), `parent` (the span it sits under),
+`agent`, `start_ms` (when its request was sent), `first_block_ms`, `end_ms`,
+`model`, `requested_model`, `stop_reason`, `error` (an API error's kind),
+`synthetic` (Claude Code wrote it; its usage is `null`), `usage_partial`
+(its `output_tokens` is a floor), `input_tokens` (uncached),
+`cache_read_tokens`, `cache_write_tokens`, `context_tokens` (all three),
+`output_tokens`, `thinking_tokens`, `max_tokens`, `effort`, `speed`,
+`service_tier`, `thinking_ms`, and `calls`, the spans it made. Any the log
+does not give is `null`.
+
 A symbol, under its file: `id`, `name`, `kind` (the language's word: `fn`,
 `class`, `def`), `level` (0 for top level), `lines` (1-based, inclusive),
 `reads` (each agent's depth), `writes` (the `op`s that touched, created or
@@ -172,8 +187,9 @@ cut in `truncated`:
 4. `span_reads`: every span's `read` list; `read_count` stays.
 5. `arguments`: every call's `args`.
 6. `phase_attrs`: the `attrs` of every phase span and marker.
-7. `diffs`: every write's `content`.
-8. `other_spans`: spans that neither read, wrote nor delegated.
+7. `inferences`: every model response.
+8. `diffs`: every write's `content`.
+9. `other_spans`: spans that neither read, wrote nor delegated.
 
 Writes, totals, phase times and the remaining spans are never cut, so a
 report can still exceed the limit.

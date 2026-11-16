@@ -147,6 +147,8 @@ pub struct TraceDetail {
     pub failed: Vec<usize>,
     /// Commits made while it ran (instant indices), in time order.
     pub commits: Vec<usize>,
+    /// Its model responses, summed up.
+    pub inference: super::InferenceTotals,
 }
 
 /// The trace rooted at span `root`, summed up; `None` for a span that is
@@ -154,7 +156,11 @@ pub struct TraceDetail {
 pub fn detail(trace: &Trace, index: &TraceIndex, root: usize) -> Option<TraceDetail> {
     let node = index.tree.iter().find(|n| n.span == root)?;
     let spans = trace.spans();
-    let mut under: Vec<usize> = node.spans().into_iter().filter(|&i| i != root).collect();
+    let mut under: Vec<usize> = node
+        .spans()
+        .into_iter()
+        .filter(|&i| i != root && spans[i].kind.is_call())
+        .collect();
     under.sort_by_key(|&i| (spans[i].start, i));
 
     let mut by_tool: HashMap<Arc<str>, usize> = HashMap::new();
@@ -199,8 +205,14 @@ pub fn detail(trace: &Trace, index: &TraceIndex, root: usize) -> Option<TraceDet
                 agent: agent.clone(),
                 task: s.task(),
                 duration: end.saturating_sub(s.start),
-                calls: run.len().saturating_sub(1),
-                failed: run.iter().filter(|&&c| c != i && spans[c].error).count(),
+                calls: run
+                    .iter()
+                    .filter(|&&c| c != i && spans[c].kind.is_call())
+                    .count(),
+                failed: run
+                    .iter()
+                    .filter(|&&c| c != i && spans[c].kind.is_call() && spans[c].error)
+                    .count(),
             });
         }
     }
@@ -231,6 +243,7 @@ pub fn detail(trace: &Trace, index: &TraceIndex, root: usize) -> Option<TraceDet
         agents,
         failed,
         commits,
+        inference: super::InferenceTotals::of(trace, &node.spans()),
     })
 }
 
@@ -286,6 +299,10 @@ pub enum Row<'a> {
         change: SymbolChange,
         file: &'a str,
     },
+    /// The model response that made the call.
+    MadeBy(usize),
+    /// A call the model response made.
+    Made(usize),
 }
 
 impl Row<'_> {
@@ -299,6 +316,8 @@ impl Row<'_> {
             Row::ThisFile(_) | Row::Related { .. } => "on this file",
             Row::Read { .. } => "symbols read",
             Row::Wrote { .. } => "symbols written",
+            Row::MadeBy(_) => "made by",
+            Row::Made(_) => "calls made",
         }
     }
 
@@ -307,7 +326,9 @@ impl Row<'_> {
             Row::File(f) => Target::File(f.file.clone()),
             Row::ThisFile(file) => Target::File(file.to_string()),
             Row::Agent(a) => Target::Span(a.delegation),
-            Row::Failed(i) | Row::Related { span: i, .. } => Target::Span(i),
+            Row::Failed(i) | Row::Related { span: i, .. } | Row::MadeBy(i) | Row::Made(i) => {
+                Target::Span(i)
+            }
             Row::Commit(i) => Target::Instant(i),
             // A deleted symbol has no definition left to open: its file.
             Row::Wrote {
@@ -331,8 +352,9 @@ impl TraceDetail {
     }
 }
 
-/// A call's rows: the symbols it read, or — `write`, its write record —
-/// wrote; its file; then the other calls on that file in its trace.
+/// A call's rows: the model response that made it; the symbols it read,
+/// or — `write`, its write record — wrote; its file; then the other calls
+/// on that file in its trace. A model response's: the calls it made.
 pub fn call_rows<'t>(
     trace: &'t Trace,
     index: &TraceIndex,
@@ -342,6 +364,19 @@ pub fn call_rows<'t>(
     let Some(s) = trace.spans().get(span) else {
         return Vec::new();
     };
+    if let Some(inference) = &s.inference {
+        return inference
+            .calls
+            .iter()
+            .filter_map(|id| trace.span_of(id))
+            .map(Row::Made)
+            .collect();
+    }
+    let made_by = s
+        .issued_by
+        .as_deref()
+        .and_then(|m| trace.response_of(m))
+        .map(Row::MadeBy);
     let read = s
         .read
         .iter()
@@ -354,7 +389,13 @@ pub fn call_rows<'t>(
             span: j,
             before: j < span,
         });
-    read.chain(wrote).chain(file).chain(related).collect()
+    made_by
+        .into_iter()
+        .chain(read)
+        .chain(wrote)
+        .chain(file)
+        .chain(related)
+        .collect()
 }
 
 /// A write's symbols, each with what it did: edited, then created, then

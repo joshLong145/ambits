@@ -12,6 +12,7 @@
   --accent: #2f5fd0; --d1: #eef1f8; --d2: #d9e1f4; --d3: #b5c6ec; --d4: #7d9be0;
   --ok: #1f7a4d; --warn: #a15c00; --bad: #b3261e; --prompt: #6d4bc4; --read: #2f5fd0;
   --write: #c2410c; --delegate: #0f766e; --other: #8a8a84; --phase: #a3367a;
+  --inference: #a07800;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -19,6 +20,7 @@
     --accent: #7ea2ff; --d1: #22283a; --d2: #2a3552; --d3: #36497a; --d4: #4f6fc0;
     --ok: #5cc493; --warn: #e3a54a; --bad: #f2867d; --prompt: #b29cf2; --read: #7ea2ff;
     --write: #f59b6b; --delegate: #4fc7b8; --other: #8f8e88; --phase: #e58ac0;
+    --inference: #e8c547;
   }
 }
 :root[data-theme="dark"] {
@@ -26,6 +28,7 @@
   --accent: #7ea2ff; --d1: #22283a; --d2: #2a3552; --d3: #36497a; --d4: #4f6fc0;
   --ok: #5cc493; --warn: #e3a54a; --bad: #f2867d; --prompt: #b29cf2; --read: #7ea2ff;
   --write: #f59b6b; --delegate: #4fc7b8; --other: #8f8e88; --phase: #e58ac0;
+  --inference: #e8c547;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
@@ -74,6 +77,8 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
 .span.prompt { background: var(--prompt); top: 0; height: 20px; opacity: .25; }
 .span.read { background: var(--read); } .span.write { background: var(--write); }
 .span.delegate { background: var(--delegate); } .span.other { background: var(--other); }
+/* A model response overlaps the calls it made, so it runs under them. */
+.span.inference { background: var(--inference); top: 17px; height: 4px; border-radius: 2px; }
 .span.error { outline: 2px solid var(--bad); }
 .span.phase { background: var(--phase); }
 .span.phase.l1 { background: color-mix(in srgb, var(--phase) 75%, var(--panel)); }
@@ -164,6 +169,19 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
   const clock = ms => new Date(ms).toISOString().slice(11, 19);
   const depthClass = d => "d" + Math.max(0, DEPTHS.indexOf(d));
   const pct = (a, b) => (b ? Math.round((100 * a) / b) : 0);
+  // Model responses; a report made before they were listed has none.
+  const I = R.inferences || [];
+  const tokens = n => n < 1000 ? String(n) : n < 10000 ? (n / 1000).toFixed(1) + "k" : n < 1e6 ? Math.floor(n / 1000) + "k" : (n / 1e6).toFixed(1) + "M";
+  // `opus-5-5 · tool_use · 105k ctx · 419 out · 3.2 s`, as the TUI names one.
+  const inferenceLabel = x => {
+    if (x.error) return "API error · " + x.error;
+    const parts = [(x.model || "model").replace(/^claude-/, "")];
+    if (x.stop_reason) parts.push(x.stop_reason + (x.calls.length > 1 ? " ×" + x.calls.length : ""));
+    if (x.context_tokens !== null) parts.push(tokens(x.context_tokens) + " ctx");
+    if (x.output_tokens !== null) parts.push((x.usage_partial ? "≥" : "") + tokens(x.output_tokens) + " out");
+    parts.push(((x.end_ms - x.start_ms) / 1000).toFixed(1) + " s");
+    return parts.join(" · ");
+  };
 
   // A subagent goes by what its delegation was for, else its own label.
   const delegatedAs = new Map(R.spans.filter(x => x.child_agent).map(x => [x.child_agent, x.name.replace(/^[^·]*·\s*/, "")]));
@@ -218,6 +236,15 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
       s.append(el("div", { class: "notice", text: "This report was cut to fit a size limit: " + R.truncated.join(", ") + ". Writes and totals are complete." }));
     }
     const tile = (v, k) => el("div", { class: "tile" }, el("div", { class: "v", text: v }), el("div", { class: "k", text: k }));
+    // What the model responses wrote, and the fullest any context was. A
+    // partial count is where its stream began, so the sum is a floor then.
+    function inferenceTiles() {
+      const counted = I.filter(x => !x.synthetic);
+      const out = counted.reduce((sum, x) => sum + (x.output_tokens || 0), 0);
+      const peak = Math.max(0, ...counted.map(x => x.context_tokens || 0));
+      const floor = counted.some(x => x.usage_partial) ? "≥ " : "";
+      return [tile(t.inferences, "model responses"), tile(floor + tokens(out), "output tokens"), tile(tokens(peak), "fullest context")];
+    }
     s.append(el("div", { class: "tiles" },
       tile(t.writes, "writes"),
       tile(t.symbols_written, "symbols written"),
@@ -225,6 +252,7 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
       tile(t.symbols_read_full, "read in full"),
       tile(t.files, "files"),
       tile(t.spans, "tool calls and prompts"),
+      ...(I.length ? inferenceTiles() : []),
       tile(t.agents, "agents")));
 
     const commits = new Map();
@@ -240,9 +268,10 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
     const agents = el("div", { class: "card" }, el("h2", { text: "Agents" }));
     for (const a of R.agents) {
       const calls = R.spans.filter(x => x.agent === a.id && x.kind !== "prompt").length;
+      const responses = I.filter(x => x.agent === a.id).length;
       agents.append(el("div", null, el("strong", { text: nameOf(a.id) }), " ", el("code", { class: "counts", text: a.id }),
         a.parent ? el("span", { class: "counts", text: " · started by " + nameOf(a.parent) }) : null,
-        el("span", { class: "counts", text: " · " + calls + " calls" })));
+        el("span", { class: "counts", text: " · " + calls + " calls" + (responses ? " · " + responses + " model responses" : "") })));
     }
     s.append(agents);
 
@@ -349,13 +378,13 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
     const P = R.phases || { lanes: [], markers: [], incomplete: false };
     const phaseSpans = P.lanes.flatMap(l => l.spans);
     if (!R.spans.length && !phaseSpans.length) { s.append(el("div", { class: "empty", text: "No tool calls." })); return; }
-    const ends = R.spans.map(x => x.end_ms || x.start_ms);
-    const t0 = Math.min(...R.spans.map(x => x.start_ms), ...phaseSpans.map(p => p.start_ms), ...P.markers.map(m => m.t_ms));
+    const ends = [...R.spans.map(x => x.end_ms || x.start_ms), ...I.map(x => x.end_ms)];
+    const t0 = Math.min(...R.spans.map(x => x.start_ms), ...I.map(x => x.start_ms), ...phaseSpans.map(p => p.start_ms), ...P.markers.map(m => m.t_ms));
     const t1 = Math.max(t0 + 1, ...ends, ...R.instants.map(i => i.t_ms), ...phaseSpans.map(p => p.end_ms), ...P.markers.map(m => m.t_ms));
     const at = t => (100 * (t - t0)) / (t1 - t0);
 
     if (P.incomplete) s.append(el("div", { class: "notice", text: "The harness could not record its whole timeline, so a phase missing here may still have run." }));
-    s.append(el("div", { class: "legend" }, ...[...(phaseSpans.length ? ["phase"] : []), "prompt", "read", "write", "delegate", "other"].map(k => {
+    s.append(el("div", { class: "legend" }, ...[...(phaseSpans.length ? ["phase"] : []), "prompt", "read", "write", "delegate", "other", ...(I.length ? ["inference"] : [])].map(k => {
       return el("span", null, el("i", { class: "span " + k }), k);
     }), el("span", { text: clock(t0) + " → " + clock(t1) })));
 
@@ -508,6 +537,12 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
         b.style.width = Math.max(0.25, at(x.end_ms || x.start_ms) - at(x.start_ms)) + "%";
         track.append(b);
         entries.set("c" + x.i, { bar: b, row: null, box: null });
+      }
+      for (const x of I.filter(x => x.agent === agent)) {
+        const b = el("div", { class: "span inference" + (x.error ? " error" : ""), title: inferenceLabel(x) });
+        b.style.left = at(x.start_ms) + "%";
+        b.style.width = Math.max(0.25, at(x.end_ms) - at(x.start_ms)) + "%";
+        track.append(b);
       }
       for (const i of R.instants.filter(i => i.agent === null || i.agent === agent)) {
         const m = el("div", { class: "instant " + i.kind, title: i.kind + (i.sha ? " " + short(i.sha) : "") + (i.subject ? " " + i.subject : "") + " at " + clock(i.t_ms) });

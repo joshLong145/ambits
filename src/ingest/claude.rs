@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -8,9 +8,9 @@ use super::content::{CallContent, CallDetail, ContentKind};
 use super::tool_config::ToolMappingConfig;
 use super::Caller;
 use super::{
-    AgentToolCall, CompactionMetadata, Effect, EventTailer, FileReplay, Handoff, Hunk,
-    SessionEvent, SessionIngester, TailedCompaction, TailerOutput, ToolCallMapper, WriteEvent,
-    WriteSource,
+    AgentToolCall, BlockCounts, CompactionMetadata, Effect, EventTailer, FileReplay, Handoff, Hunk,
+    InferenceBlock, InferenceMeta, SessionEvent, SessionIngester, TailedCompaction, TailerOutput,
+    ToolCallMapper, Usage, WriteEvent, WriteSource,
 };
 use crate::tracking::ReadDepth;
 use serde_json::Value;
@@ -396,7 +396,15 @@ pub fn extract_agent_label(path: &Path) -> String {
 
 /// The result of parsing a single JSONL line.
 pub enum ParsedLine {
-    Events(Vec<AgentToolCall>),
+    /// `type:"assistant"`: the tool calls on the line, and its share of the
+    /// model response, when the line names its message.
+    Assistant {
+        calls: Vec<AgentToolCall>,
+        block: Option<Box<InferenceBlock>>,
+    },
+    /// `type:"api-request"`: Claude Code sent a request. Its response's
+    /// lines name it by `requestRef`.
+    ApiRequest(ApiRequest),
     /// `type:"user", isCompactSummary:true` — carries the post-compaction summary text.
     Compacted {
         summary: String,
@@ -975,6 +983,9 @@ fn content_text(content: &Value) -> Option<String> {
 /// yet. Only lines naming `id` are parsed; nothing is kept but what is
 /// returned, and nothing is logged (spec §9.6).
 pub fn call_detail(files: &[PathBuf], id: &str, kind: ContentKind) -> Option<CallDetail> {
+    if kind == ContentKind::Inference {
+        return response_detail(files, id);
+    }
     let mut input: Option<Value> = None;
     let mut result: Option<ToolResult> = None;
     let mut buf = Vec::new();
@@ -1027,6 +1038,219 @@ pub fn call_detail(files: &[PathBuf], id: &str, kind: ContentKind) -> Option<Cal
         return None;
     }
     Some(assemble_detail(kind, input.as_ref(), result.as_ref()))
+}
+
+/// Each line of `path` that contains `needle`, parsed; lines that are not
+/// JSON are skipped. For display only: nothing is kept.
+fn lines_with(path: &Path, needle: &str, mut each: impl FnMut(Value) -> bool) {
+    let Ok(file) = fs::File::open(path) else {
+        return;
+    };
+    let mut reader = BufReader::new(file);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            continue;
+        };
+        if !line.contains(needle) {
+            continue;
+        }
+        if let Ok(obj) = serde_json::from_str::<Value>(line) {
+            if !each(obj) {
+                return;
+            }
+        }
+    }
+}
+
+/// What Claude Code put into request `request` beside the conversation,
+/// from `path`, the log it is in: the new messages the request names
+/// (`tail`) that are its own — system messages, and the `<system-reminder>`
+/// blocks it attached to a message — each keyed by what it is. A message
+/// the transcript already holds as it was sent has no blob, and is the
+/// conversation's, not injected.
+///
+/// A request with no `base` names every message it sent. When the log
+/// already had replies before it since the last compaction, that is the
+/// whole conversation sent again (a resumed session), whose new part is not
+/// known: it is said so, rather than every reminder of the session listed
+/// again. After a compaction it starts the conversation over, and all it
+/// carries is new.
+fn injected_into(path: &Path, request: &str) -> Vec<super::content::Arg> {
+    let Some((tail, resent)) = request_tail(path, request) else {
+        return Vec::new();
+    };
+    if resent {
+        return vec![super::content::Arg {
+            key: "resent".into(),
+            value: format!(
+                "The whole conversation ({} messages) was sent again, so what is new in it is not known.",
+                tail.len()
+            ),
+            bulk: false,
+        }];
+    }
+    let mut messages: HashMap<String, Value> = HashMap::new();
+    lines_with(path, "\"api-request-blob\"", |mut obj| {
+        let hash = obj.get("hash").and_then(Value::as_str).map(String::from);
+        if let Some(hash) = hash.filter(|h| tail.contains(h)) {
+            if let Some(message) = obj.get_mut("message").map(Value::take) {
+                messages.insert(hash, message);
+            }
+        }
+        messages.len() < tail.len()
+    });
+    let mut out = Vec::new();
+    let mut push = |text: &str, reminder: bool| {
+        let body = text
+            .trim()
+            .trim_start_matches("<system-reminder>")
+            .trim_end_matches("</system-reminder>")
+            .trim();
+        if !body.is_empty() {
+            out.push(super::content::Arg {
+                key: super::content::injected_label(body, reminder).to_string(),
+                value: body.to_string(),
+                bulk: false,
+            });
+        }
+    };
+    for message in tail.iter().filter_map(|h| messages.get(h)) {
+        let system = message.get("role").and_then(Value::as_str) == Some("system");
+        match message.get("content") {
+            Some(Value::String(text)) if system => push(text, false),
+            Some(Value::Array(blocks)) => {
+                for block in blocks {
+                    if block.get("type").and_then(Value::as_str) != Some("text") {
+                        continue;
+                    }
+                    let text = block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    // A user's own text is the conversation; only what
+                    // Claude Code wrapped as a reminder is injected.
+                    let reminder = text.trim_start().starts_with("<system-reminder>");
+                    if system || reminder {
+                        push(text, !system);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The new messages request `request` names (`tail`), and whether it sent
+/// the whole conversation again: it has no `base`, and replies came before
+/// it in `path` since the last compaction, which starts a conversation anew.
+fn request_tail(path: &Path, request: &str) -> Option<(Vec<String>, bool)> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut buf = Vec::new();
+    let mut replied = false;
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            continue;
+        };
+        if !line.contains(request) {
+            if line.contains("\"compact_boundary\"") {
+                replied = false;
+            } else {
+                replied |= line.contains("\"type\":\"assistant\"");
+            }
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if obj.get("type").and_then(Value::as_str) != Some("api-request")
+            || obj.get("id").and_then(Value::as_str) != Some(request)
+        {
+            continue;
+        }
+        let tail = obj
+            .get("tail")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|h| h.as_str().map(String::from))
+            .collect();
+        return Some((tail, replied && obj.get("base").is_none_or(Value::is_null)));
+    }
+}
+
+/// Model response `id` as its log recorded it: what Claude Code injected
+/// into its request, then the text it wrote, block by block, its thinking
+/// too where the log kept it, which it mostly does not. For display only,
+/// as [`call_detail`] is.
+fn response_detail(files: &[PathBuf], id: &str) -> Option<CallDetail> {
+    let mut text: Vec<String> = Vec::new();
+    let mut unlogged_thinking = false;
+    let mut found = None;
+    let mut request: Option<String> = None;
+    for path in files {
+        lines_with(path, id, |obj| {
+            let Some(message) = obj
+                .get("message")
+                .filter(|m| m.get("id").and_then(Value::as_str) == Some(id))
+            else {
+                return true;
+            };
+            found = Some(path.clone());
+            if request.is_none() {
+                request = obj
+                    .get("requestRef")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+            }
+            for block in message
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let field = |key: &str| block.get(key).and_then(Value::as_str);
+                match field("type") {
+                    Some("text") => text.extend(field("text").map(String::from)),
+                    Some("thinking") => match field("thinking").filter(|t| !t.is_empty()) {
+                        Some(t) => text.push(format!("[thinking] {t}")),
+                        None => unlogged_thinking = true,
+                    },
+                    Some("redacted_thinking") => unlogged_thinking = true,
+                    _ => {}
+                }
+            }
+            true
+        });
+        // A response is logged in one agent's file.
+        if found.is_some() {
+            break;
+        }
+    }
+    let path = found?;
+    if unlogged_thinking {
+        text.insert(0, "[thinking not logged]".to_string());
+    }
+    let (lines, cut) = CallContent::capped(&text.join("\n"));
+    Some(CallDetail {
+        args: Vec::new(),
+        content: Some(CallContent::Reply { lines, cut }),
+        injected: request
+            .map(|r| injected_into(&path, &r))
+            .unwrap_or_default(),
+    })
 }
 
 /// [`call_detail`] for every call in `wanted` at once, in one pass over
@@ -1103,6 +1327,7 @@ fn assemble_detail(
     result: Option<&ToolResult>,
 ) -> CallDetail {
     CallDetail {
+        injected: Vec::new(),
         args: input.map(super::content::args).unwrap_or_default(),
         content: build_content(
             kind,
@@ -1224,6 +1449,8 @@ fn build_content(
             output(content)
         }
         ContentKind::Other => output(result?.0),
+        // A response has no call; `response_detail` reads its text.
+        ContentKind::Inference => None,
     }
 }
 
@@ -1327,6 +1554,7 @@ fn replay_log_file(
         events,
         offset,
         awaiting: writes.into_pending(),
+        lines: feed.state,
     }
 }
 
@@ -1360,6 +1588,89 @@ fn feed_complete_lines(reader: &mut impl BufRead, mut feed: impl FnMut(&str)) ->
     }
 }
 
+/// How many recent lines and requests a feed remembers. A response's first
+/// line points back a few lines at most: past the attachments Claude Code
+/// writes with it, to the result or prompt it answers.
+const RECENT: usize = 32;
+
+/// A line's place in the log's chain: its `uuid`, the `parentUuid` it
+/// follows, and when it was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stamp {
+    uuid: String,
+    parent: Option<String>,
+    at: u64,
+}
+
+/// What any line says of its place in the log, beside what it means.
+struct LineRef {
+    stamp: Stamp,
+    /// `requestRef`: the `api-request` a response line answers.
+    request: Option<String>,
+}
+
+/// A `type:"api-request"` line: when a request was sent, and what it asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiRequest {
+    id: String,
+    at: u64,
+    model: Option<Arc<str>>,
+    max_tokens: Option<u64>,
+}
+
+/// What a log file's earlier lines tell its later ones. Carried from a
+/// replay to the tailer that follows it, so a response or compaction cut by
+/// the handoff reads as it would have in one pass.
+#[derive(Debug, Clone, Default)]
+pub struct LineState {
+    /// The most recent `compact_boundary`. Claude Code writes it just before
+    /// its `isCompactSummary` line, and the two may arrive in different polls.
+    pending_metadata: Option<CompactionMetadata>,
+    /// The latest lines, oldest first.
+    stamps: VecDeque<Stamp>,
+    /// The latest requests, oldest first.
+    requests: VecDeque<ApiRequest>,
+}
+
+impl LineState {
+    fn remember<T>(list: &mut VecDeque<T>, item: T) {
+        if list.len() == RECENT {
+            list.pop_front();
+        }
+        list.push_back(item);
+    }
+
+    /// The request a response answered, when its line names one.
+    fn request(&self, id: &str) -> Option<&ApiRequest> {
+        self.requests.iter().rev().find(|r| r.id == id)
+    }
+
+    /// When the request behind a response first written at `first` was
+    /// sent: its `api-request` line when `request` names one, else the
+    /// nearest line up the chain from `parent` written before `first`.
+    /// Claude Code stamps some lines, such as its record of deferred tools,
+    /// as it writes the response, so the line a response follows is not
+    /// always one written before the request.
+    fn requested_at(&self, request: Option<&str>, parent: Option<&str>, first: u64) -> Option<u64> {
+        if let Some(r) = request.and_then(|id| self.request(id)) {
+            return Some(r.at);
+        }
+        let mut next = parent;
+        for _ in 0..RECENT {
+            let stamp = self
+                .stamps
+                .iter()
+                .rev()
+                .find(|s| Some(s.uuid.as_str()) == next)?;
+            if stamp.at < first {
+                return Some(stamp.at);
+            }
+            next = stamp.parent.as_deref();
+        }
+        None
+    }
+}
+
 /// Turns one log file's lines into events. The one implementation behind
 /// both the batch replay and the live tailer, so a line means the same
 /// thing whichever reads it: same agent id and label, same worktree path
@@ -1370,9 +1681,7 @@ struct LineFeed {
     /// `(worktree, project)` when the session ran in a worktree of the
     /// project: tool paths are rewritten from one to the other.
     remap: Option<(PathBuf, PathBuf)>,
-    /// The most recent `compact_boundary`. Claude Code writes it just before
-    /// its `isCompactSummary` line, and the two may arrive in different polls.
-    pending_metadata: Option<CompactionMetadata>,
+    state: LineState,
 }
 
 impl LineFeed {
@@ -1399,7 +1708,7 @@ impl LineFeed {
             default_id,
             label: Arc::from(extract_agent_label(path).as_str()),
             remap,
-            pending_metadata: None,
+            state: LineState::default(),
         }
     }
 
@@ -1411,8 +1720,30 @@ impl LineFeed {
         writes: &mut ResultCorrelator,
         out: &mut Vec<SessionEvent>,
     ) {
-        match parse_jsonl_line(line.trim(), &self.default_id, mapper) {
-            ParsedLine::Events(mut calls) => {
+        let (line_ref, mut parsed) = parse_record(line.trim(), &self.default_id, mapper);
+        if let Some(LineRef { stamp, request }) = line_ref {
+            if let ParsedLine::Assistant {
+                block: Some(block), ..
+            } = &mut parsed
+            {
+                let request = request.as_deref();
+                block.requested_at =
+                    self.state
+                        .requested_at(request, stamp.parent.as_deref(), stamp.at);
+                if let Some(r) = request.and_then(|id| self.state.request(id)) {
+                    block.meta.max_tokens = r.max_tokens;
+                    if block.meta.requested_model.is_none() {
+                        block.meta.requested_model = r.model.clone();
+                    }
+                }
+            }
+            LineState::remember(&mut self.state.stamps, stamp);
+        }
+        match parsed {
+            ParsedLine::Assistant { mut calls, block } => {
+                if let Some(block) = block {
+                    out.push(SessionEvent::Inference(*block));
+                }
                 for call in &mut calls {
                     if let Some((worktree, project)) = &self.remap {
                         if let Some(fp) = &call.file_path {
@@ -1458,12 +1789,17 @@ impl LineFeed {
                 }
                 out.extend(written.into_iter().map(SessionEvent::Write));
             }
-            ParsedLine::CompactBoundary { metadata, .. } => self.pending_metadata = Some(metadata),
+            ParsedLine::ApiRequest(request) => {
+                LineState::remember(&mut self.state.requests, request)
+            }
+            ParsedLine::CompactBoundary { metadata, .. } => {
+                self.state.pending_metadata = Some(metadata)
+            }
             ParsedLine::Compacted { summary, timestamp } => out.push(SessionEvent::Compacted {
                 summary,
                 timestamp,
                 agent_id: Arc::from(self.default_id.as_str()),
-                metadata: self.pending_metadata.take(),
+                metadata: self.state.pending_metadata.take(),
             }),
             ParsedLine::SessionCleared => out.push(SessionEvent::SessionCleared),
             ParsedLine::AgentStopped {
@@ -1602,15 +1938,128 @@ pub fn parse_jsonl_line(
     default_agent_id: &str,
     mapper: &dyn ToolCallMapper,
 ) -> ParsedLine {
-    let mut obj: Value = match serde_json::from_str(line) {
-        Ok(v) => v,
-        Err(_) => return ParsedLine::Ignored,
-    };
+    parse_record(line, default_agent_id, mapper).1
+}
 
+/// Parse a line, and say where it sits in the log's chain of lines, which
+/// is how a response is placed after the request it answers.
+fn parse_record(
+    line: &str,
+    default_agent_id: &str,
+    mapper: &dyn ToolCallMapper,
+) -> (Option<LineRef>, ParsedLine) {
+    let Ok(mut obj) = serde_json::from_str::<Value>(line) else {
+        return (None, ParsedLine::Ignored);
+    };
+    let str_field = |key: &str| obj.get(key).and_then(Value::as_str);
+    let line_ref = str_field("uuid")
+        .zip(str_field("timestamp"))
+        .and_then(|(uuid, ts)| {
+            Some(LineRef {
+                stamp: Stamp {
+                    uuid: uuid.to_string(),
+                    parent: str_field("parentUuid").map(String::from),
+                    at: crate::time::parse_rfc3339_millis(ts)?,
+                },
+                request: str_field("requestRef").map(String::from),
+            })
+        });
+    let parsed = parse_value(&mut obj, default_agent_id, mapper);
+    (line_ref, parsed)
+}
+
+/// An `api-request` line: its id, time, and the model and output limit asked.
+fn parse_api_request(obj: &Value) -> Option<ParsedLine> {
+    let params = obj.get("params");
+    Some(ParsedLine::ApiRequest(ApiRequest {
+        id: obj.get("id")?.as_str()?.to_string(),
+        at: crate::time::parse_rfc3339_millis(obj.get("timestamp")?.as_str()?)?,
+        model: params.and_then(|p| p.get("model")?.as_str()).map(Arc::from),
+        max_tokens: params.and_then(|p| p.get("max_tokens")?.as_u64()),
+    }))
+}
+
+/// The share of a model response an assistant line holds: `None` for a
+/// line that names no message.
+fn inference_block(obj: &Value, agent_id: &Arc<str>, timestamp: &str) -> Option<InferenceBlock> {
+    let message = obj.get("message")?;
+    let message_id = message.get("id")?.as_str()?;
+    let text = |v: Option<&Value>| v.and_then(Value::as_str).map(Arc::from);
+    let usage = message.get("usage");
+    let count = |path: &str| usage.and_then(|u| u.pointer(path)?.as_u64());
+    let mut blocks = BlockCounts::default();
+    let mut tool_uses = Vec::new();
+    for block in message
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match block.get("type").and_then(Value::as_str) {
+            Some("thinking" | "redacted_thinking") => blocks.thinking += 1,
+            Some("text") => blocks.text += 1,
+            Some("tool_use") => {
+                blocks.tool_use += 1;
+                tool_uses.extend(text(block.get("id")));
+            }
+            _ => {}
+        }
+    }
+    let model = text(message.get("model"));
+    let synthetic = model.as_deref() == Some("<synthetic>");
+    let api_error = obj.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true);
+    Some(InferenceBlock {
+        message_id: Arc::from(message_id),
+        agent_id: agent_id.clone(),
+        timestamp: timestamp.to_string(),
+        requested_at: None,
+        // A synthetic message's stop reason is Claude Code's, not a model's.
+        stop_reason: text(message.get("stop_reason")).filter(|_| !synthetic),
+        blocks,
+        tool_uses,
+        usage: Usage {
+            input: count("/input_tokens"),
+            output: count("/output_tokens"),
+            thinking: count("/output_tokens_details/thinking_tokens"),
+            cache_read: count("/cache_read_input_tokens"),
+            cache_write: count("/cache_creation_input_tokens"),
+            cache_write_5m: count("/cache_creation/ephemeral_5m_input_tokens"),
+            cache_write_1h: count("/cache_creation/ephemeral_1h_input_tokens"),
+            web_searches: count("/server_tool_use/web_search_requests"),
+            web_fetches: count("/server_tool_use/web_fetch_requests"),
+        },
+        meta: InferenceMeta {
+            model,
+            requested_model: text(obj.get("requestedModel")),
+            request_id: text(obj.get("requestId")),
+            max_tokens: None,
+            effort: text(obj.get("effort")),
+            speed: text(usage.and_then(|u| u.get("speed"))),
+            service_tier: text(usage.and_then(|u| u.get("service_tier"))),
+            inference_geo: text(usage.and_then(|u| u.get("inference_geo"))),
+            advisor_model: text(obj.get("advisorModel")),
+            thinking_ms: obj.get("thinkingDurationMs").and_then(Value::as_u64),
+            synthetic,
+            // Not every synthetic message is an error: an interrupted turn
+            // gets one too.
+            error: match obj.get("error").and_then(Value::as_str) {
+                Some(kind) => Some(kind.to_string()),
+                None => api_error.then(|| "api_error".to_string()),
+            },
+        },
+    })
+}
+
+/// What a parsed line means: [`parse_jsonl_line`] without the parsing.
+fn parse_value(obj: &mut Value, default_agent_id: &str, mapper: &dyn ToolCallMapper) -> ParsedLine {
     let msg_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     if msg_type == "queue-operation" {
-        return parse_agent_stopped(&obj).unwrap_or(ParsedLine::Ignored);
+        return parse_agent_stopped(obj).unwrap_or(ParsedLine::Ignored);
+    }
+
+    if msg_type == "api-request" {
+        return parse_api_request(obj).unwrap_or(ParsedLine::Ignored);
     }
 
     // Detect the compaction boundary marker (precedes the summary by one line).
@@ -1656,10 +2105,10 @@ pub fn parse_jsonl_line(
         if content.contains("<command-name>/clear</command-name>") {
             return ParsedLine::SessionCleared;
         }
-        if let Some(prompt) = parse_prompt(&obj) {
+        if let Some(prompt) = parse_prompt(obj) {
             return prompt;
         }
-        let results = parse_tool_results(&mut obj);
+        let results = parse_tool_results(obj);
         return if results.is_empty() {
             ParsedLine::Ignored
         } else {
@@ -1685,6 +2134,7 @@ pub fn parse_jsonl_line(
         .unwrap_or("")
         .to_string();
 
+    let block = inference_block(obj, &agent_id, &timestamp_str).map(Box::new);
     let content = match obj.pointer("/message/content") {
         Some(Value::Array(arr)) => arr,
         _ => return ParsedLine::Ignored,
@@ -1780,7 +2230,10 @@ pub fn parse_jsonl_line(
         });
     }
 
-    ParsedLine::Events(events)
+    ParsedLine::Assistant {
+        calls: events,
+        block,
+    }
 }
 
 /// Render a description template by substituting `{key}`, `{key|short}`, and `{key|cmd}`
@@ -2050,6 +2503,9 @@ pub struct LogTailer {
     /// Per-file line state (label, worktree remap, pending compaction),
     /// set up when a file is first read and kept across polls.
     feeds: std::collections::HashMap<PathBuf, LineFeed>,
+    /// Line state from the replay this tailer took over from, for each
+    /// file's feed when it is set up.
+    handed_over: std::collections::HashMap<PathBuf, LineState>,
     /// The project, for recognizing a session run in a worktree of it.
     project_root: Option<PathBuf>,
     /// Write calls awaiting their results, kept across polls: a result can
@@ -2078,6 +2534,7 @@ impl LogTailer {
             positions,
             mapper,
             feeds: Default::default(),
+            handed_over: Default::default(),
             project_root: None,
             writes: ResultCorrelator::default(),
         }
@@ -2095,6 +2552,7 @@ impl LogTailer {
             positions,
             mapper,
             feeds: Default::default(),
+            handed_over: handoff.lines.into_iter().collect(),
             project_root: handoff.project_root,
             writes,
         }
@@ -2122,10 +2580,10 @@ impl LogTailer {
             if current_len <= pos {
                 continue;
             }
-            let feed = self
-                .feeds
-                .entry(path.clone())
-                .or_insert_with(|| LineFeed::for_file(path, self.project_root.as_deref()));
+            let feed = self.feeds.entry(path.clone()).or_insert_with(|| LineFeed {
+                state: self.handed_over.remove(path).unwrap_or_default(),
+                ..LineFeed::for_file(path, self.project_root.as_deref())
+            });
             let mut read = 0;
             if let Ok(file) = fs::File::open(path) {
                 use std::io::{Seek, SeekFrom};
@@ -2151,6 +2609,7 @@ impl LogTailer {
             writes: Vec::new(),
             finished: Vec::new(),
             prompts: Vec::new(),
+            inferences: Vec::new(),
         };
         for event in events {
             match event {
@@ -2170,6 +2629,7 @@ impl LogTailer {
                 SessionEvent::SessionCleared => output.session_cleared = true,
                 SessionEvent::ToolFinished(f) => output.finished.push(f),
                 SessionEvent::Prompt(p) => output.prompts.push(p),
+                SessionEvent::Inference(i) => output.inferences.push(i),
             }
         }
         output
@@ -2593,7 +3053,7 @@ mod tests {
     fn parse_events(line: &str, agent_id: &str) -> Vec<AgentToolCall> {
         let config = ToolMappingConfig::builtin().expect("builtin config");
         match parse_jsonl_line(line, agent_id, &config) {
-            ParsedLine::Events(evs) => evs,
+            ParsedLine::Assistant { calls: evs, .. } => evs,
             _ => vec![],
         }
     }
@@ -3469,6 +3929,7 @@ mod tests {
             Handoff {
                 files: vec![(log.clone(), replay.offset)],
                 awaiting: replay.awaiting,
+                lines: vec![(log.clone(), replay.lines)],
                 project_root: None,
             },
             config,
@@ -3943,7 +4404,8 @@ description  = "UserTool {target}"
             other => panic!(
                 "expected ParsedLine::Compacted, got {:?}",
                 match other {
-                    ParsedLine::Events(_) => "Events",
+                    ParsedLine::Assistant { .. } => "Assistant",
+                    ParsedLine::ApiRequest(_) => "ApiRequest",
                     ParsedLine::Compacted { .. } => "Compacted",
                     ParsedLine::CompactBoundary { .. } => "CompactBoundary",
                     ParsedLine::SessionCleared => "SessionCleared",
@@ -4365,7 +4827,7 @@ mod write_tests {
     fn a_tool_use_carries_its_id() {
         let line = call("toolu_1", "Edit", "/p/src/a.rs");
         match parse_jsonl_line(&line, "d", &write_config()) {
-            ParsedLine::Events(evs) => {
+            ParsedLine::Assistant { calls: evs, .. } => {
                 assert_eq!(evs[0].tool_use_id.as_deref(), Some("toolu_1"));
                 assert_eq!(evs[0].effect, Effect::Write);
                 assert_eq!(
@@ -4520,6 +4982,7 @@ mod write_tests {
         let handoff = Handoff {
             files: vec![(path.clone(), replay.offset)],
             awaiting: replay.awaiting.clone(),
+            lines: vec![(path.clone(), replay.lines.clone())],
             project_root: None,
         };
         let tailer = LogTailer::resume(handoff, config);
@@ -4583,7 +5046,7 @@ mod write_tests {
 
     fn write_call(id: &str) -> AgentToolCall {
         match parse_jsonl_line(&call(id, "Edit", "/p/src/a.rs"), "d", &write_config()) {
-            ParsedLine::Events(mut evs) => evs.remove(0),
+            ParsedLine::Assistant { calls: mut evs, .. } => evs.remove(0),
             _ => unreachable!(),
         }
     }
@@ -4653,6 +5116,7 @@ mod write_tests {
         let handoff = Handoff {
             files: vec![(path.clone(), replay.offset)],
             awaiting: replay.awaiting,
+            lines: vec![(path.clone(), replay.lines)],
             project_root: Some(PathBuf::from("/proj")),
         };
         let mut tailer = LogTailer::resume(handoff, config);
@@ -4813,5 +5277,398 @@ mod write_tests {
         }
         assert_eq!(parse_hunks(None), None);
         assert_eq!(parse_hunks(Some(&json!("not an array"))), None);
+    }
+}
+
+#[cfg(test)]
+mod inference_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ms(ts: &str) -> u64 {
+        crate::time::parse_rfc3339_millis(ts).unwrap()
+    }
+
+    fn config() -> Arc<dyn ToolCallMapper> {
+        Arc::new(ToolMappingConfig::builtin().unwrap())
+    }
+
+    /// A response to a tool result, as Claude Code logs one: the result,
+    /// the request, a record stamped as the response is written, then the
+    /// response itself over two lines, one per block.
+    fn response_log() -> Vec<serde_json::Value> {
+        let usage = json!({
+            "input_tokens": 2, "output_tokens": 419,
+            "output_tokens_details": {"thinking_tokens": 82},
+            "cache_read_input_tokens": 97967, "cache_creation_input_tokens": 7136,
+            "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 7136},
+            "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
+            "service_tier": "standard", "speed": "standard", "inference_geo": "global"
+        });
+        vec![
+            json!({"type": "user", "uuid": "u1", "timestamp": "2026-11-08T10:00:00.000Z",
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_0", "content": "ok"}]}}),
+            json!({"type": "api-request", "id": "r1", "timestamp": "2026-11-08T10:00:00.040Z",
+                "params": {"model": "claude-x", "max_tokens": 64000}}),
+            json!({"type": "attachment", "uuid": "a1", "parentUuid": "u1",
+                "timestamp": "2026-11-08T10:00:03.000Z"}),
+            json!({"type": "assistant", "uuid": "m1", "parentUuid": "a1", "requestRef": "r1",
+                "requestId": "req_1", "effort": "medium",
+                "timestamp": "2026-11-08T10:00:03.000Z",
+                "message": {"id": "msg_1", "model": "claude-x", "stop_reason": null,
+                    "content": [{"type": "thinking", "thinking": ""}], "usage": usage}}),
+            json!({"type": "assistant", "uuid": "m2", "parentUuid": "m1", "requestRef": "r1",
+                "requestId": "req_1", "timestamp": "2026-11-08T10:00:04.000Z",
+                "message": {"id": "msg_1", "model": "claude-x", "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read",
+                        "input": {"file_path": "/p/a.rs"}}],
+                    "usage": usage}}),
+        ]
+    }
+
+    fn write(dir: &Path, lines: &[serde_json::Value]) -> PathBuf {
+        let path = dir.join("s.jsonl");
+        let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    fn blocks(events: &[SessionEvent]) -> Vec<&InferenceBlock> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Inference(b) => Some(b),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn each_line_of_a_response_is_a_block_of_the_same_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), &response_log());
+        let replay = replay_log_file(&path, &*config(), None);
+        let found = blocks(&replay.events);
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|b| &*b.message_id == "msg_1"));
+        assert_eq!(
+            found[0].blocks,
+            BlockCounts {
+                thinking: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            found[1].blocks,
+            BlockCounts {
+                tool_use: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(found[1].tool_uses, [Arc::from("toolu_1")]);
+        assert_eq!(found[0].stop_reason, None);
+        assert_eq!(found[1].stop_reason.as_deref(), Some("tool_use"));
+
+        let usage = found[0].usage;
+        assert_eq!((usage.output, usage.thinking), (Some(419), Some(82)));
+        assert_eq!(
+            (usage.cache_write_5m, usage.cache_write_1h),
+            (Some(0), Some(7136))
+        );
+        assert_eq!(usage.context(), Some(2 + 97967 + 7136));
+        let meta = &found[0].meta;
+        assert_eq!(meta.request_id.as_deref(), Some("req_1"));
+        assert_eq!(meta.effort.as_deref(), Some("medium"));
+        assert_eq!(meta.inference_geo.as_deref(), Some("global"));
+        assert!(!meta.synthetic && meta.error.is_none());
+    }
+
+    /// The request line is when the request went out, and what it asked for.
+    #[test]
+    fn a_response_was_requested_when_its_request_line_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), &response_log());
+        let replay = replay_log_file(&path, &*config(), None);
+        let first = blocks(&replay.events)[0];
+        assert_eq!(first.requested_at, Some(ms("2026-11-08T10:00:00.040Z")));
+        assert_eq!(first.meta.requested_model.as_deref(), Some("claude-x"));
+        assert_eq!(first.meta.max_tokens, Some(64000));
+    }
+
+    /// Without one, the response follows a record stamped as it was written,
+    /// which says nothing of the request: the line before that does.
+    #[test]
+    fn without_a_request_line_a_response_follows_the_last_line_written_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = response_log();
+        log.remove(1);
+        for line in &mut log {
+            line.as_object_mut().unwrap().remove("requestRef");
+        }
+        let path = write(dir.path(), &log);
+        let replay = replay_log_file(&path, &*config(), None);
+        let first = blocks(&replay.events)[0];
+        assert_eq!(first.requested_at, Some(ms("2026-11-08T10:00:00.000Z")));
+        assert_eq!(first.meta.max_tokens, None);
+    }
+
+    /// A response the tailer reads after the replay stopped still finds the
+    /// request the replay read, as does a compaction whose boundary it read.
+    #[test]
+    fn what_the_replay_read_reaches_the_lines_the_tailer_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = response_log();
+        let rest: Vec<_> = log.split_off(3);
+        log.push(json!({"type": "system", "subtype": "compact_boundary",
+            "timestamp": "2026-11-08T10:00:01.000Z",
+            "compactMetadata": {"trigger": "auto", "preTokens": 9}}));
+        let path = write(dir.path(), &log);
+        let replay = replay_log_file(&path, &*config(), None);
+        let handoff = Handoff {
+            files: vec![(path.clone(), replay.offset)],
+            awaiting: replay.awaiting,
+            lines: vec![(path.clone(), replay.lines)],
+            project_root: None,
+        };
+        let mut tailer = LogTailer::resume(handoff, config());
+        let mut tail: String = rest.iter().map(|l| format!("{l}\n")).collect();
+        tail += &format!(
+            "{}\n",
+            json!({"type": "user", "isCompactSummary": true,
+                "timestamp": "2026-11-08T10:00:05.000Z", "message": {"content": "summary"}})
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, tail.as_bytes()))
+            .unwrap();
+
+        let out = tailer.read_new_events();
+        assert_eq!(out.inferences.len(), 2);
+        assert_eq!(
+            out.inferences[0].requested_at,
+            Some(ms("2026-11-08T10:00:00.040Z"))
+        );
+        assert_eq!(
+            out.compactions[0].metadata.as_ref().map(|m| m.pre_tokens),
+            Some(9)
+        );
+    }
+
+    /// Claude Code's own message for a failed request: an error, with no
+    /// usage worth counting and no stop reason of a model's.
+    #[test]
+    fn a_synthetic_api_error_is_an_error_without_a_stop_reason() {
+        let line = json!({"type": "assistant", "uuid": "e1", "isApiErrorMessage": true,
+            "error": "authentication_failed", "timestamp": "2026-11-08T10:00:00.000Z",
+            "message": {"id": "0323f155", "model": "<synthetic>", "stop_reason": "stop_sequence",
+                "content": [{"type": "text", "text": "Login expired"}],
+                "usage": {"input_tokens": 0, "output_tokens": 0}}});
+        let ParsedLine::Assistant {
+            block: Some(block), ..
+        } = parse_jsonl_line(&line.to_string(), "s", &*config())
+        else {
+            panic!("an assistant line with a message is a block");
+        };
+        assert!(block.meta.synthetic);
+        assert_eq!(block.meta.error.as_deref(), Some("authentication_failed"));
+        assert_eq!(block.stop_reason, None);
+        assert_eq!(block.blocks.text, 1);
+    }
+
+    /// An interrupted turn gets a synthetic message too, and is no error.
+    #[test]
+    fn a_synthetic_message_without_an_error_is_not_one() {
+        let line = json!({"type": "assistant", "message": {"id": "x", "model": "<synthetic>",
+            "content": [{"type": "text", "text": "No response requested."}]}});
+        let ParsedLine::Assistant {
+            block: Some(block), ..
+        } = parse_jsonl_line(&line.to_string(), "s", &*config())
+        else {
+            panic!("an assistant line with a message is a block");
+        };
+        assert!(block.meta.synthetic);
+        assert_eq!(block.meta.error, None);
+    }
+
+    /// Older logs leave out most of what newer ones carry: whatever is
+    /// missing is unknown, and the line still counts.
+    #[test]
+    fn a_line_naming_only_its_message_is_a_block_of_unknowns() {
+        let line = json!({"type": "assistant", "message": {"id": "msg_9", "content": []}});
+        let ParsedLine::Assistant {
+            block: Some(block),
+            calls,
+        } = parse_jsonl_line(&line.to_string(), "s", &*config())
+        else {
+            panic!("an assistant line with a message is a block");
+        };
+        assert!(calls.is_empty());
+        assert_eq!(block.usage, Usage::default());
+        assert_eq!(block.usage.context(), None);
+        assert_eq!(block.meta, InferenceMeta::default());
+        assert_eq!(block.requested_at, None);
+    }
+
+    /// No message id, no response to merge it into.
+    #[test]
+    fn a_line_without_a_message_id_is_no_block() {
+        let line = json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t", "name": "Read", "input": {"file_path": "/a"}}]}});
+        let ParsedLine::Assistant { block, calls } =
+            parse_jsonl_line(&line.to_string(), "s", &*config())
+        else {
+            panic!("an assistant line");
+        };
+        assert!(block.is_none());
+        assert_eq!(calls.len(), 1);
+    }
+
+    /// The text a response wrote, read by its message id, for the TUI: its
+    /// text blocks in order, and a note that its thinking was not logged.
+    #[test]
+    fn a_responses_text_is_read_by_its_message_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = response_log();
+        log.push(
+            json!({"type": "assistant", "uuid": "m3", "timestamp": "2026-11-08T10:00:05.000Z",
+            "message": {"id": "msg_1", "content": [{"type": "text", "text": "Done.\nAll good."}]}}),
+        );
+        log.push(
+            json!({"type": "assistant", "uuid": "m4", "timestamp": "2026-11-08T10:00:06.000Z",
+            "message": {"id": "msg_2", "content": [{"type": "text", "text": "another"}]}}),
+        );
+        let path = write(dir.path(), &log);
+        let detail = call_detail(&[path], "msg_1", ContentKind::Inference).unwrap();
+        assert_eq!(
+            detail.content,
+            Some(CallContent::Reply {
+                lines: vec![
+                    "[thinking not logged]".into(),
+                    "Done.".into(),
+                    "All good.".into()
+                ],
+                cut: 0
+            })
+        );
+    }
+
+    /// What Claude Code put into a response's request beside the
+    /// conversation: the request names its new messages by hash, and those
+    /// it wrote itself are logged as blobs. A tool result the transcript
+    /// already holds is the conversation's, not injected.
+    #[test]
+    fn what_was_injected_into_a_responses_request_comes_with_its_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = response_log();
+        let blob = |hash: &str, message: serde_json::Value| json!({"type": "api-request-blob", "hash": hash, "message": message});
+        let blobs = [
+            blob(
+                "h-sys",
+                json!({"role": "system", "content":
+                "The following MCP servers are configured but failed to connect: tavily"}),
+            ),
+            blob(
+                "h-user",
+                json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_0", "content": "ok"},
+                {"type": "text", "text": "<system-reminder>\nKeep it short.\n</system-reminder>"},
+                {"type": "text", "text": "what I typed"}]}),
+            ),
+            blob(
+                "h-other",
+                json!({"role": "system", "content": "another request's"}),
+            ),
+        ];
+        let request = log[1].as_object_mut().unwrap();
+        request.insert("tail".into(), json!(["h-transcript", "h-sys", "h-user"]));
+        let request = log.remove(1);
+        log.splice(1..1, blobs.into_iter().chain([request]));
+        let path = write(dir.path(), &log);
+
+        let detail = call_detail(&[path], "msg_1", ContentKind::Inference).unwrap();
+        let injected: Vec<(&str, &str)> = detail
+            .injected
+            .iter()
+            .map(|a| (a.key.as_str(), a.value.as_str()))
+            .collect();
+        assert_eq!(
+            injected,
+            [
+                (
+                    "mcp failed",
+                    "The following MCP servers are configured but failed to connect: tavily"
+                ),
+                ("reminder", "Keep it short."),
+            ]
+        );
+    }
+
+    /// A response whose request is not logged has nothing injected to show.
+    #[test]
+    fn a_response_without_a_logged_request_shows_no_injected_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = response_log();
+        for line in &mut log {
+            line.as_object_mut().unwrap().remove("requestRef");
+        }
+        let path = write(dir.path(), &log);
+        let detail = call_detail(&[path], "msg_1", ContentKind::Inference).unwrap();
+        assert!(detail.injected.is_empty());
+    }
+
+    /// A request with no base after the conversation already had replies
+    /// sent it all again: its new part is not known, and is said so.
+    #[test]
+    fn a_resent_conversation_is_said_to_be_resent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = response_log();
+        log[1]
+            .as_object_mut()
+            .unwrap()
+            .insert("tail".into(), json!(["h-sys", "h-a", "h-b"]));
+        log.insert(1, json!({"type": "api-request-blob", "hash": "h-sys",
+            "message": {"role": "system", "content": "<total_tokens>9 tokens left</total_tokens>"}}));
+        log.insert(
+            0,
+            json!({"type": "assistant", "uuid": "m0", "timestamp": "2026-11-08T09:00:00.000Z",
+            "message": {"id": "msg_0", "content": [{"type": "text", "text": "earlier"}]}}),
+        );
+        let path = write(dir.path(), &log);
+        let detail = call_detail(&[path], "msg_1", ContentKind::Inference).unwrap();
+        let [only] = detail.injected.as_slice() else {
+            panic!("one note: {:?}", detail.injected)
+        };
+        assert_eq!(only.key, "resent");
+        assert!(only.value.contains("(3 messages)"), "{}", only.value);
+    }
+
+    /// After a compaction a request starts the conversation over: what it
+    /// carries is all new, though replies came before it.
+    #[test]
+    fn a_request_after_a_compaction_is_not_a_resend() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = response_log();
+        log[1]
+            .as_object_mut()
+            .unwrap()
+            .insert("tail".into(), json!(["h-skills"]));
+        log.insert(1, json!({"type": "api-request-blob", "hash": "h-skills",
+            "message": {"role": "system", "content": "The following skills are available for use with the Skill tool: a, b"}}));
+        log.insert(
+            0,
+            json!({"type": "system", "subtype": "compact_boundary",
+            "timestamp": "2026-11-08T09:30:00.000Z", "compactMetadata": {"trigger": "auto"}}),
+        );
+        log.insert(
+            0,
+            json!({"type": "assistant", "uuid": "m0", "timestamp": "2026-11-08T09:00:00.000Z",
+            "message": {"id": "msg_0", "content": [{"type": "text", "text": "earlier"}]}}),
+        );
+        let path = write(dir.path(), &log);
+        let detail = call_detail(&[path], "msg_1", ContentKind::Inference).unwrap();
+        let keys: Vec<&str> = detail.injected.iter().map(|a| a.key.as_str()).collect();
+        assert_eq!(keys, ["skills"]);
     }
 }

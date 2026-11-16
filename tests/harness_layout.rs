@@ -412,6 +412,7 @@ fn max_bytes_cuts_in_order_and_says_so() {
             "span_reads",
             "arguments",
             "phase_attrs",
+            "inferences",
             "diffs",
             "other_spans"
         ])

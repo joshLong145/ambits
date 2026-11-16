@@ -142,3 +142,40 @@ pub fn jsonl_assistant(tool_name: &str, input_json: &str) -> String {
 pub fn jsonl_user_msg() -> String {
     r#"{"type":"user","message":{"role":"user","content":"hello"}}"#.to_string()
 }
+
+/// One line of model response `message` by `agent`, written at `at`, that
+/// was asked for at `requested` and made the calls `tools`. Its usage gives
+/// `output` tokens and a context of 1,000 cached plus 10 new.
+pub fn inference_block(
+    agent: &str,
+    message: &str,
+    at: &str,
+    requested: Option<&str>,
+    tools: &[&str],
+    stop: Option<&str>,
+    output: u64,
+) -> crate::ingest::InferenceBlock {
+    use crate::ingest::{BlockCounts, InferenceBlock, InferenceMeta, Usage};
+    InferenceBlock {
+        message_id: message.into(),
+        agent_id: agent.into(),
+        timestamp: at.to_string(),
+        requested_at: requested.and_then(crate::time::parse_rfc3339_millis),
+        stop_reason: stop.map(Arc::from),
+        blocks: BlockCounts {
+            tool_use: tools.len() as u32,
+            ..BlockCounts::default()
+        },
+        tool_uses: tools.iter().map(|t| Arc::from(*t)).collect(),
+        usage: Usage {
+            input: Some(10),
+            output: Some(output),
+            cache_read: Some(1_000),
+            ..Usage::default()
+        },
+        meta: InferenceMeta {
+            model: Some("claude-opus-5-5".into()),
+            ..InferenceMeta::default()
+        },
+    }
+}
