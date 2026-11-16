@@ -3,7 +3,7 @@
 [![e2e](https://github.com/joshLong145/ambits/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/joshLong145/ambits/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/joshLong145/ambits/graph/badge.svg?token=9Q8GWA8H6Y)](https://codecov.io/gh/joshLong145/ambits)
 [![release](https://img.shields.io/github/v/release/joshLong145/ambits)](https://github.com/joshLong145/ambits/releases)
-![license: MIT](https://img.shields.io/badge/license-MIT-blue)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 **See what your AI coding agent has read, keep it across context compaction, and trace every tool call it makes.**
 
